@@ -1,0 +1,50 @@
+name: "Coupon: Build"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - 'src/CouponHubBot/**'
+      - 'tests/CouponHubBot.Tests/**'
+      - 'tests/CouponHubBot.Ocr.Tests/**'
+      - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
+      - 'NuGet.Config'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-dotnet@v4
+      with:
+        global-json-file: global.json
+
+    - name: Tests
+      run: |
+        dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
+        dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
+
+    - name: Upload dotnet test results
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: "**/*.trx"
+      if: ${{ always() }}
+
+    - name: Upload container logs
+      uses: actions/upload-artifact@v4
+      with:
+        name: container-logs
+        path: test-artifacts/
+      if: ${{ always() }}

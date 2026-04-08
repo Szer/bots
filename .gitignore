@@ -1,0 +1,12 @@
+**/obj
+**/bin
+.idea
+.env
+flyway.conf
+*sln.DotSettings.user
+TestResults
+*.trx
+test-artifacts/
+tmp/
+test-output.txt
+.claude/settings.local.json

@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Telemetry.fs" />
+    <Compile Include="Utils.fs" />
+    <Compile Include="Types.fs" />
+    <Compile Include="Services/DbService.fs" />
+    <Compile Include="Services/MembershipService.fs" />
+    <Compile Include="Services/NotificationService.fs" />
+    <Compile Include="Services/OcrService.fs" />
+    <Compile Include="Services/CouponOcrEngine.fs" />
+    <Compile Include="Services/GitHubService.fs" />
+    <Compile Include="Services/ReminderService.fs" />
+    <Compile Include="Services/BotHelpers.fs" />
+    <Compile Include="Services/CouponFlowHandler.fs" />
+    <Compile Include="Services/CommandHandler.fs" />
+    <Compile Include="Services/CallbackHandler.fs" />
+    <Compile Include="Services/BotService.fs" />
+    <Compile Include="Services/BotCommandsSetup.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Npgsql.OpenTelemetry" />
+    <PackageReference Include="OpenTelemetry.Exporter.Console" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    <PackageReference Include="Serilog.AspNetCore" />
+    <PackageReference Include="Serilog.Enrichers.Span" />
+    <PackageReference Include="Serilog.Formatting.Compact" />
+    <PackageReference Include="SixLabors.ImageSharp" />
+    <PackageReference Include="Telegram.Bot" />
+    <PackageReference Include="ZXing.Net" />
+    <PackageReference Include="ZXing.Net.Bindings.ImageSharp.V3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BotInfra\BotInfra.fsproj" />
+  </ItemGroup>
+
+</Project>

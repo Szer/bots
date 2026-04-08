@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/BotInfra/BotInfra.fsproj" />
+    <Project Path="src/CouponHubBot/CouponHubBot.fsproj" />
+    <Project Path="src/VahterBanBot/VahterBanBot.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj" />
+    <Project Path="tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj" />
+    <Project Path="tests/FakeAzureOcrApi/FakeAzureOcrApi.fsproj" />
+    <Project Path="tests/FakeTgApi/FakeTgApi.fsproj" />
+    <Project Path="tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj" />
+  </Folder>
+</Solution>

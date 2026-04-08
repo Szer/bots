@@ -1,0 +1,96 @@
+name: "Vahter: Upstream Sync"
+
+# Auto-exports VahterBanBot + BotInfra to the fsharplang-ru/vahter-bot org repo
+# so it remains a standalone buildable repository.
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - 'src/VahterBanBot/**'
+      - 'src/vahter-bot/**'
+      - 'tests/VahterBanBot.Tests/**'
+      - 'tests/FakeTgApi/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
+      - 'NuGet.Config'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout monorepo
+      uses: actions/checkout@v4
+      with:
+        path: monorepo
+
+    - name: Checkout upstream
+      uses: actions/checkout@v4
+      with:
+        repository: fsharplang-ru/vahter-bot
+        token: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
+        path: upstream
+
+    - name: Sync files
+      run: |
+        set -euo pipefail
+
+        # Clean upstream src/ and tests/ (we'll overwrite)
+        rm -rf upstream/src upstream/tests
+
+        # Copy shared infra
+        mkdir -p upstream/src/BotInfra
+        cp -r monorepo/src/BotInfra/ upstream/src/BotInfra/
+
+        # Copy VahterBanBot source
+        mkdir -p upstream/src/VahterBanBot
+        cp -r monorepo/src/VahterBanBot/ upstream/src/VahterBanBot/
+
+        # Copy deployment assets (migrations, Dockerfile, init.sql)
+        mkdir -p upstream/src/vahter-bot
+        cp -r monorepo/src/vahter-bot/ upstream/src/vahter-bot/
+
+        # Copy tests
+        mkdir -p upstream/tests/VahterBanBot.Tests
+        cp -r monorepo/tests/VahterBanBot.Tests/ upstream/tests/VahterBanBot.Tests/
+        mkdir -p upstream/tests/FakeTgApi
+        cp -r monorepo/tests/FakeTgApi/ upstream/tests/FakeTgApi/
+
+        # Copy build infrastructure
+        cp monorepo/Directory.Build.props upstream/
+        cp monorepo/Directory.Packages.props upstream/
+        cp monorepo/global.json upstream/
+        cp monorepo/NuGet.Config upstream/
+        cp monorepo/.gitignore upstream/
+
+    - name: Generate solution file
+      run: |
+        cd upstream
+        dotnet new sln --name vahter-ban-bot --force
+        # Find whatever extension was created (.sln or .slnx)
+        SLN=$(ls vahter-ban-bot.sln* 2>/dev/null | head -1)
+        dotnet sln "$SLN" add \
+          src/BotInfra/BotInfra.fsproj \
+          src/VahterBanBot/VahterBanBot.fsproj \
+          tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj \
+          tests/FakeTgApi/FakeTgApi.fsproj
+
+    - name: Commit and push
+      run: |
+        cd upstream
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add -A
+        if git diff --cached --quiet; then
+          echo "No changes to sync"
+        else
+          git commit -m "Sync from monorepo (${GITHUB_SHA:0:7})"
+          git push
+        fi

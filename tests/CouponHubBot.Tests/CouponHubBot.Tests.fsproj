@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="TgMessageUtils.fs" />
+    <Compile Include="ContainerTestBase.fs" />
+    <Compile Include="FakeCallHelpers.fs" />
+    <Compile Include="MembershipTests.fs" />
+    <Compile Include="OcrAddFlowTests.fs" />
+    <Compile Include="CouponTests.fs" />
+    <Compile Include="ReminderTests.fs" />
+    <Compile Include="ChatMonitoringTests.fs" />
+    <Compile Include="FeedbackFlowTests.fs" />
+    <Compile Include="AdminDebugTests.fs" />
+    <Compile Include="VoidFlowTests.fs" />
+    <Compile Include="StatsTests.fs" />
+    <Compile Include="HealthCheckTests.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Testcontainers" />
+    <PackageReference Include="Testcontainers.PostgreSql" />
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="Telegram.Bot" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CouponHubBot\CouponHubBot.fsproj" />
+  </ItemGroup>
+
+</Project>
