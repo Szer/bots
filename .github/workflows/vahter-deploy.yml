@@ -7,12 +7,14 @@ on:
       - 'src/BotInfra/**'
       - 'src/VahterBanBot/**'
       - 'src/vahter-bot/**'
+      - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
+      - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
-      - 'NuGet.Config'
   workflow_dispatch:
 
 permissions:
@@ -111,5 +113,6 @@ jobs:
       with:
         push: true
         tags: ghcr.io/fsharplang-ru/vahter-bot:${{ github.sha }}, ghcr.io/fsharplang-ru/vahter-bot:latest
-        file: ./src/vahter-bot/Dockerfile
+        file: ./src/Dockerfile.bot
+        build-args: BOT_PROJECT=VahterBanBot
         platforms: linux/arm64

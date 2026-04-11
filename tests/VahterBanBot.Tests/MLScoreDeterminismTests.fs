@@ -2,7 +2,7 @@ module VahterBanBot.Tests.MLScoreDeterminismTests
 
 open Xunit
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 
 /// Asserts exact ML scores for known texts to catch non-determinism in the training pipeline.
 /// If this test fails, it means something changed the ML model output — likely:

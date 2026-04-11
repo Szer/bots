@@ -2,7 +2,7 @@ module VahterBanBot.Tests.ReactionSpamTests
 
 open System.Net
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open Xunit
 
 type ReactionSpamTests(fixture: MlEnabledVahterTestContainers) =

@@ -7,11 +7,12 @@ open System.Net.Http.Json
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
+open BotTestInfra
+open BotTestInfra.ContainerHelpers
 open Dapper
 open DotNet.Testcontainers.Builders
-open DotNet.Testcontainers.Configurations
+open DotNet.Testcontainers.Containers
 open Npgsql
-open Testcontainers.PostgreSql
 open Xunit
 
 [<CLIMutable>]
@@ -64,82 +65,31 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
     let mutable publicConnectionString: string = null
     let mutable adminConnectionString: string = null
 
-    let network: DotNet.Testcontainers.Networks.INetwork = NetworkBuilder().Build()
+    let network = createNetwork()
+    let dbContainer = createPostgresContainer network dbAlias "postgres:15.6"
+    let migrationsPath = Path.Combine(solutionDirPath, "src", "coupon-hub-bot", "migrations")
+    let flywayContainer = createFlywayContainer network migrationsPath dbAlias "coupon_hub_bot" dbContainer
 
-    let dbContainer =
-        PostgreSqlBuilder("postgres:15.6")
-            .WithNetwork(network)
-            .WithNetworkAliases(dbAlias)
-            .Build()
+    let fakeImage, fakeBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "coupon-hub-fake-tg-api-test" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"]
+    let fakeContainer = createFakeTgApiContainer fakeImage network fakeAlias
 
-    let flywayContainer =
-        ContainerBuilder("flyway/flyway")
-            .WithNetwork(network)
-            .WithBindMount(Path.Combine(solutionDirPath, "src", "coupon-hub-bot", "migrations"), "/flyway/sql", AccessMode.ReadOnly)
-            .WithEnvironment("FLYWAY_URL", $"jdbc:postgresql://{dbAlias}:5432/coupon_hub_bot")
-            .WithEnvironment("FLYWAY_USER", "admin")
-            .WithEnvironment("FLYWAY_PASSWORD", "admin")
-            .WithCommand("migrate", "-schemas=public")
-            .DependsOn(dbContainer)
-            .WithWaitStrategy(
-                Wait.ForUnixContainer().AddCustomWaitStrategy(
-                    { new IWaitUntil with
-                        member _.UntilAsync(container) =
-                            task {
-                                let! _ = container.GetExitCodeAsync()
-                                return true
-                            } }))
-            .Build()
+    let fakeAzureImage, fakeAzureBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "coupon-hub-fake-azure-ocr-test" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"]
+    let fakeAzureContainer = createFakeAzureOcrContainer fakeAzureImage network fakeAzureAlias
 
-    let fakeImage =
-        ImageFromDockerfileBuilder()
-            .WithDockerfileDirectory(solutionDir, String.Empty)
-            .WithDockerfile("./tests/FakeTgApi/Dockerfile")
-            .WithName("coupon-hub-fake-tg-api-test")
-            .WithDeleteIfExists(true)
-            .WithCleanUp(true)
-            // Force rebuild by adding unique build arg (prevents Docker layer caching)
-            .WithBuildArgument("FORCE_REBUILD", DateTime.UtcNow.Ticks.ToString())
-            .Build()
-
-    let fakeContainer =
-        ContainerBuilder(fakeImage)
-            .WithNetwork(network)
-            .WithNetworkAliases(fakeAlias)
-            .WithPortBinding(8080, true)
-            .WithEnvironment("ASPNETCORE_URLS", "http://*:8080")
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8080))
-            .Build()
-
-    let fakeAzureImage =
-        ImageFromDockerfileBuilder()
-            .WithDockerfileDirectory(solutionDir, String.Empty)
-            .WithDockerfile("./tests/FakeAzureOcrApi/Dockerfile")
-            .WithName("coupon-hub-fake-azure-ocr-test")
-            .WithDeleteIfExists(true)
-            .WithCleanUp(true)
-            .WithBuildArgument("FORCE_REBUILD", DateTime.UtcNow.Ticks.ToString())
-            .Build()
-
-    let fakeAzureContainer =
-        ContainerBuilder(fakeAzureImage)
-            .WithNetwork(network)
-            .WithNetworkAliases(fakeAzureAlias)
-            .WithPortBinding(8081, true)
-            .WithEnvironment("ASPNETCORE_URLS", "http://*:8081")
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8081))
-            .Build()
-
-    let botImage =
-        ImageFromDockerfileBuilder()
-            .WithDockerfileDirectory(solutionDir, String.Empty)
-            .WithDockerfile("./src/coupon-hub-bot/Dockerfile")
-            .WithName("coupon-hub-bot-test")
-            .WithDeleteIfExists(true)
-            .WithCleanUp(true)
-            // Force rebuild by adding unique build arg (prevents Docker layer caching)
-            .WithBuildArgument("FORCE_REBUILD", DateTime.UtcNow.Ticks.ToString())
-            .Build()
+    let botImage, botBuildLogger =
+        let logger = StringLogger()
+        let img =
+            ImageFromDockerfileBuilder()
+                .WithDockerfileDirectory(solutionDir, String.Empty)
+                .WithDockerfile("./src/Dockerfile.bot")
+                .WithName("coupon-hub-bot-test")
+                .WithBuildArgument("BOT_PROJECT", "CouponHubBot")
+                .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
+                .WithDeleteIfExists(true)
+                .WithCleanUp(true)
+                .WithLogger(logger)
+                .Build()
+        (img, logger)
 
     let botContainer =
         let b =
@@ -174,23 +124,6 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
 
     let mutable testArtifactsDir: string = null
 
-    let dumpContainerLogs (containerName: string) (container: DotNet.Testcontainers.Containers.IContainer) =
-        task {
-            try
-                let! (stdout, stderr) = container.GetLogsAsync()
-                let dir = testArtifactsDir
-                if not (isNull dir) then
-                    Directory.CreateDirectory(dir) |> ignore
-                    let path = Path.Combine(dir, $"{containerName}.log")
-                    let content =
-                        $"=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}\n"
-                    File.WriteAllText(path, content)
-                return (stdout, stderr)
-            with ex ->
-                eprintfn $"Failed to get logs for {containerName}: {ex.Message}"
-                return ("", "")
-        }
-
     let seedDb () =
         task {
             use conn = new NpgsqlConnection(publicConnectionString)
@@ -224,8 +157,7 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
                 task {
                     // Set up test artifacts directory for container logs
                     let fixtureName = if ocrEnabled then "OcrCouponHubTestContainers" else "DefaultCouponHubTestContainers"
-                    testArtifactsDir <- Path.Combine(solutionDirPath, "test-artifacts", fixtureName)
-
+                    testArtifactsDir <- Path.Combine(solutionDirPath, "test-artifacts", "CouponHubBot.Tests", fixtureName)
                     do! dbContainer.StartAsync()
 
                     publicConnectionString <- $"Server=127.0.0.1;Database=coupon_hub_bot;Port={dbContainer.GetMappedPublicPort(5432)};User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;Timeout=120;Command Timeout=120;Keepalive=30;"
@@ -242,23 +174,12 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
                     // seed if needed (after migrations)
                     do! seedDb ()
 
-                    // build images & start fake + bot
-                    let buildImage (name: string) (buildTask: unit -> Task) =
-                        task {
-                            try
-                                do! buildTask()
-                            with ex ->
-                                let errorFile = Path.Combine(testArtifactsDir, $"{name}-build-error.txt")
-                                Directory.CreateDirectory(testArtifactsDir) |> ignore
-                                let msg = $"Docker image build failed for {name}\n\nException: {ex.GetType().FullName}\nMessage: {ex.Message}\n\nFull:\n{ex}"
-                                File.WriteAllText(errorFile, msg)
-                                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw()
-                        } :> Task
-
-                    let fakeImageTask = buildImage "fake-tg-api" (fun () -> fakeImage.CreateAsync())
+                    // build images in parallel with log capture
+                    let fakeImageTask = buildImageWithLogs testArtifactsDir "fake-tg-api" fakeImage fakeBuildLogger
                     let fakeAzureImageTask =
-                        if ocrEnabled then buildImage "fake-azure-ocr" (fun () -> fakeAzureImage.CreateAsync()) else Task.CompletedTask
-                    let botImageTask = buildImage "bot" (fun () -> botImage.CreateAsync())
+                        if ocrEnabled then buildImageWithLogs testArtifactsDir "fake-azure-ocr" fakeAzureImage fakeAzureBuildLogger
+                        else Task.CompletedTask
+                    let botImageTask = buildImageWithLogs testArtifactsDir "bot" botImage botBuildLogger
                     do! Task.WhenAll([| fakeImageTask; fakeAzureImageTask; botImageTask |])
 
                     do! fakeContainer.StartAsync()
@@ -283,13 +204,13 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
             ValueTask(
                 task {
                     // Dump container logs BEFORE stopping -- logs vanish after disposal.
-                    let! _ = dumpContainerLogs "bot" botContainer
-                    let! _ = dumpContainerLogs "fake-tg-api" fakeContainer
+                    let! _ = dumpContainerLogs testArtifactsDir "bot" botContainer
+                    let! _ = dumpContainerLogs testArtifactsDir "fake-tg-api" fakeContainer
                     if ocrEnabled then
-                        let! _ = dumpContainerLogs "fake-azure-ocr" fakeAzureContainer
+                        let! _ = dumpContainerLogs testArtifactsDir "fake-azure-ocr" fakeAzureContainer
                         ()
-                    let! _ = dumpContainerLogs "flyway" flywayContainer
-                    let! _ = dumpContainerLogs "postgres" dbContainer
+                    let! _ = dumpContainerLogs testArtifactsDir "flyway" flywayContainer
+                    let! _ = dumpContainerLogs testArtifactsDir "postgres" dbContainer
 
                     if not (isNull botHttp) then botHttp.Dispose()
                     if not (isNull fakeHttp) then fakeHttp.Dispose()

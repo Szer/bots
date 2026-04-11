@@ -30,6 +30,6 @@ type BaseTests(fixture: MlDisabledVahterTestContainers) =
         let! resp = Update(Id = 123) |>  fixture.SendMessage
         let! body = resp.Content.ReadAsStringAsync()
         Assert.Equal(System.Net.HttpStatusCode.OK, resp.StatusCode)
-        Assert.Equal("null", body)
+        Assert.Equal("", body)
     }
 

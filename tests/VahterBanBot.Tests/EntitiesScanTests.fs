@@ -3,7 +3,7 @@ module VahterBanBot.Tests.EntitiesScanTests
 open Telegram.Bot.Types
 open Telegram.Bot.Types.Enums
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open Xunit
 
 type EntitiesScanTestsWithoutMl(fixture: MlDisabledVahterTestContainers) =

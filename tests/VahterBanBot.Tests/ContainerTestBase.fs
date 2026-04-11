@@ -3,6 +3,7 @@ module VahterBanBot.Tests.ContainerTestBase
 open System
 open System.IO
 open System.Net.Http
+open System.Net.Http.Json
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
@@ -11,8 +12,8 @@ open DotNet.Testcontainers.Configurations
 open DotNet.Testcontainers.Containers
 open Npgsql
 open Telegram.Bot.Types
-open Testcontainers.PostgreSql
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
+open BotTestInfra.ContainerHelpers
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open BotInfra
@@ -38,87 +39,56 @@ type VahterTestContainers(mlEnabled: bool) =
     let solutionDir = CommonDirectoryPath.GetSolutionDirectory()
     let dbAlias = "vahter-db"
     let fakeTgAlias = "fake-tg-api"
+    let fakeAzureAlias = "fake-azure-ocr"
     let internalConnectionString = $"Server={dbAlias};Database=vahter_db;Port=5432;User Id=vahter_bot_ban_service;Password=vahter_bot_ban_service;Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
     let pgImage = "postgres:15.6" // same as in Azure
-    
+
     // will be filled in IAsyncLifetime.InitializeAsync
     let mutable uri: Uri = null
     let mutable httpClient: HttpClient = null
+    let mutable fakeAzureHttp: HttpClient = null
     let mutable publicConnectionString: string = null
     let mutable testArtifactsDir: string = null
-    
-    // base image for the app, we'll build exactly how we build it in Azure
-    let buildLogger = StringLogger()
-    let image =
-        ImageFromDockerfileBuilder()
-            .WithDockerfileDirectory(solutionDir, String.Empty)
-            .WithDockerfile("./src/vahter-bot/Dockerfile")
-            .WithName("vahter-bot-ban-test")
-            // workaround for multi-stage builds cleanup
-            .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
-            // it might speed up the process to not clean up the base image
-            .WithCleanUp(false)
-            .WithDeleteIfExists(true)
-            .WithLogger(buildLogger)
-            .Build()
+
+    // base image for the app — uses unified Dockerfile.bot with BOT_PROJECT arg
+    let appImage, appBuildLogger =
+        let logger = StringLogger()
+        let img =
+            ImageFromDockerfileBuilder()
+                .WithDockerfileDirectory(solutionDir, String.Empty)
+                .WithDockerfile("./src/Dockerfile.bot")
+                .WithName("vahter-bot-ban-test")
+                .WithBuildArgument("BOT_PROJECT", "VahterBanBot")
+                .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
+                .WithCleanUp(false)
+                .WithDeleteIfExists(true)
+                .WithLogger(logger)
+                .Build()
+        (img, logger)
 
     // private network for the containers
-    let network =
-        NetworkBuilder()
-            .Build()
+    let network = createNetwork()
 
     // FakeTgApi container — standalone mock Telegram API server
-    let fakeTgImage =
-        ImageFromDockerfileBuilder()
-            .WithDockerfileDirectory(solutionDir, String.Empty)
-            .WithDockerfile("./tests/FakeTgApi/Dockerfile")
-            .WithName("vahter-fake-tg-api-test")
-            .WithDeleteIfExists(true)
-            .WithCleanUp(true)
-            .WithBuildArgument("FORCE_REBUILD", DateTime.UtcNow.Ticks.ToString())
-            .Build()
+    let fakeTgImage, fakeTgBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "vahter-fake-tg-api-test" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"]
+    let fakeTgContainer = createFakeTgApiContainer fakeTgImage network fakeTgAlias
 
-    let fakeTgContainer =
-        ContainerBuilder(fakeTgImage)
-            .WithNetwork(network)
-            .WithNetworkAliases(fakeTgAlias)
-            .WithPortBinding(8080, true)
-            .WithEnvironment("ASPNETCORE_URLS", "http://*:8080")
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8080))
-            .Build()
+    // FakeAzureOcr container — standalone mock Azure OCR API
+    let fakeAzureImage, fakeAzureBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "vahter-fake-azure-ocr-test" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"]
+    let fakeAzureContainer = createFakeAzureOcrContainer fakeAzureImage network fakeAzureAlias
 
     // PostgreSQL container. Important to have the same image as in Azure
-    // and assign network alias to it as it will be "host" in DB connection string for the app
-    let dbContainer =
-        PostgreSqlBuilder(pgImage)
-            .WithNetwork(network)
-            .WithNetworkAliases(dbAlias)
-            .Build()
+    let dbContainer = createPostgresContainer network dbAlias pgImage
 
     // Flyway container to run migrations
-    let flywayContainer =
-        ContainerBuilder("flyway/flyway")
-            .WithNetwork(network)
-            .WithBindMount(CommonDirectoryPath.GetSolutionDirectory().DirectoryPath + "/src/vahter-bot/migrations", "/flyway/sql", AccessMode.ReadOnly)
-            .WithEnvironment("FLYWAY_URL", "jdbc:postgresql://vahter-db:5432/vahter_db")
-            .WithEnvironment("FLYWAY_USER", "admin")
-            .WithEnvironment("FLYWAY_PASSWORD", "admin")
-            .WithCommand("migrate", "-schemas=public")
-            .WithWaitStrategy(Wait.ForUnixContainer().AddCustomWaitStrategy(
-                { new IWaitUntil  with
-                    override this.UntilAsync(container) = task {
-                        let! _ = container.GetExitCodeAsync()
-                        return true
-                    }
-                }))
-            .DependsOn(dbContainer)
-            .Build()
+    let migrationsPath = Path.Combine(solutionDir.DirectoryPath, "src", "vahter-bot", "migrations")
+    let flywayContainer = createFlywayContainer network migrationsPath dbAlias "vahter_db" dbContainer
 
     // the app container
     // secrets and dev flags are env vars; all other settings come from bot_setting (seeded in InitializeAsync)
     let appContainer =
         let builder =
-            ContainerBuilder(image)
+            ContainerBuilder(appImage)
                 .WithNetwork(network)
                 .WithPortBinding(80, true)
                 .WithEnvironment("BOT_TELEGRAM_TOKEN", "123:456")
@@ -137,51 +107,33 @@ type VahterTestContainers(mlEnabled: bool) =
         if mlEnabled then
             builder
                 .WithEnvironment("AZURE_OCR_KEY", "secret-ocr-key")
+                .WithEnvironment("AZURE_OCR_ENDPOINT", $"http://{fakeAzureAlias}:8081/computervision/imageanalysis:analyze")
                 .WithEnvironment("AZURE_OPENAI_KEY", "fake-llm-key")
+                .DependsOn(fakeAzureContainer)
                 .Build()
         else
             builder.Build()
             
-    let dumpContainerLogs (containerName: string) (container: IContainer) =
-        task {
-            try
-                let! struct (stdout, stderr) = container.GetLogsAsync()
-                let dir = testArtifactsDir
-                if not (isNull dir) then
-                    Directory.CreateDirectory(dir) |> ignore
-                    let path = Path.Combine(dir, $"{containerName}.log")
-                    let content = $"=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}\n"
-                    File.WriteAllText(path, content)
-                return (stdout, stderr)
-            with ex ->
-                eprintfn $"Failed to get logs for {containerName}: {ex.Message}"
-                return ("", "")
-        }
-
     let startContainers() = task {
-        try
-            // start building images and spin up db at the same time
-            let imageTask = image.CreateAsync()
-            let fakeTgImageTask = fakeTgImage.CreateAsync()
-            let dbTask = dbContainer.StartAsync()
+        // build images and spin up db in parallel
+        let appBuildTask = buildImageWithLogs testArtifactsDir "app" appImage appBuildLogger
+        let fakeTgBuildTask = buildImageWithLogs testArtifactsDir "fake-tg-api" fakeTgImage fakeTgBuildLogger
+        let fakeAzureBuildTask =
+            if mlEnabled then buildImageWithLogs testArtifactsDir "fake-azure-ocr" fakeAzureImage fakeAzureBuildLogger
+            else Task.CompletedTask
+        let dbTask = dbContainer.StartAsync()
 
-            // wait for all to finish
-            do! imageTask
-            do! fakeTgImageTask
-            do! dbTask
+        do! Task.WhenAll([| appBuildTask; fakeTgBuildTask; fakeAzureBuildTask; dbTask |])
 
-            // start FakeTgApi container (needed before app starts)
-            do! fakeTgContainer.StartAsync()
-        with
-        | e ->
-            let logs = buildLogger.ExtractMessages()
-            let errorMessage = "Container startup failure, logs:\n" + if String.IsNullOrWhiteSpace logs then "<no logs provided>" else logs
-            raise <| Exception(errorMessage, e)
+        // start FakeTgApi container (needed before app starts)
+        do! fakeTgContainer.StartAsync()
+        if mlEnabled then
+            do! fakeAzureContainer.StartAsync()
     }
 
     interface IAsyncLifetime with
         member this.InitializeAsync() = ValueTask(task {
-            testArtifactsDir <- Path.Combine(solutionDir.DirectoryPath, "test-artifacts", this.GetType().Name)
+            testArtifactsDir <- Path.Combine(solutionDir.DirectoryPath, "test-artifacts", "VahterBanBot.Tests", this.GetType().Name)
             try
                 do! startContainers()
                 publicConnectionString <- $"Server=127.0.0.1;Database=vahter_db;Port={dbContainer.GetMappedPublicPort(5432)};User Id=vahter_bot_ban_service;Password=vahter_bot_ban_service;Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
@@ -235,7 +187,7 @@ type VahterTestContainers(mlEnabled: bool) =
                         "ML_SPAM_AUTOBAN_SCORE_THRESHOLD",     "-4.0",  "FREE_FORM",    "ML_SPAM_AUTOBAN"
                         "OCR_ENABLED",                         "true",  "FEATURE_FLAG", "OCR"
                         "OCR_MAX_FILE_SIZE_BYTES",             (20L * 1024L * 1024L).ToString(), "FREE_FORM", "OCR"
-                        "AZURE_OCR_ENDPOINT",                  "https://fake-azure-ocr.cognitiveservices.azure.com/ocr", "FREE_FORM", "OCR"
+                        "AZURE_OCR_ENDPOINT",                  $"http://{fakeAzureAlias}:8081/computervision/imageanalysis:analyze", "FREE_FORM", "OCR"
                         "REACTION_SPAM_ENABLED",               "true",  "FEATURE_FLAG", "REACTION_SPAM"
                         "REACTION_SPAM_MIN_MESSAGES",          "3",     "FREE_FORM",    "REACTION_SPAM"
                         "REACTION_SPAM_MAX_REACTIONS",         "5",     "FREE_FORM",    "REACTION_SPAM"
@@ -243,7 +195,7 @@ type VahterTestContainers(mlEnabled: bool) =
                         "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","true","FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
                         "ML_OLD_USER_MSG_COUNT",               "10",    "FREE_FORM",    "ML"
                         "LLM_TRIAGE_ENABLED",                  "true",  "FEATURE_FLAG", "LLM"
-                        "AZURE_OPENAI_ENDPOINT",               "https://fake-azure-openai.openai.azure.com", "FREE_FORM", "LLM"
+                        "AZURE_OPENAI_ENDPOINT",               $"http://{fakeAzureAlias}:8081", "FREE_FORM", "LLM"
                     ] else [
                         // these two default to true in code, so must be explicitly set to false
                         "FORWARD_SPAM_DETECTION_ENABLED",        "false", "FEATURE_FLAG", "FORWARD_SPAM"
@@ -264,6 +216,10 @@ type VahterTestContainers(mlEnabled: bool) =
                 uri <- Uri($"http://{appContainer.Hostname}:{appContainer.GetMappedPublicPort(80)}")
                 httpClient.BaseAddress <- uri
                 httpClient.DefaultRequestHeaders.Add("X-Telegram-Bot-Api-Secret-Token", "OUR_SECRET")
+
+                if mlEnabled then
+                    fakeAzureHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{fakeAzureContainer.GetMappedPublicPort(8081)}"))
+                    fakeAzureHttp.Timeout <- TimeSpan.FromSeconds(5.0)
             finally
                 if appContainer.State <> TestcontainersStates.Undefined then
                     let struct (_stdout, err) = appContainer.GetLogsAsync().Result
@@ -273,20 +229,33 @@ type VahterTestContainers(mlEnabled: bool) =
     interface IAsyncDisposable with
         member this.DisposeAsync() = ValueTask(task {
             // Dump logs FIRST — logs become inaccessible after container removal
-            let! _ = dumpContainerLogs "postgres" dbContainer
-            let! _ = dumpContainerLogs "flyway" flywayContainer
-            let! _ = dumpContainerLogs "app" appContainer
-            let! _ = dumpContainerLogs "fake-tg-api" fakeTgContainer
+            let! _ = dumpContainerLogs testArtifactsDir "postgres" dbContainer
+            let! _ = dumpContainerLogs testArtifactsDir "flyway" flywayContainer
+            let! _ = dumpContainerLogs testArtifactsDir "app" appContainer
+            let! _ = dumpContainerLogs testArtifactsDir "fake-tg-api" fakeTgContainer
+            if mlEnabled then
+                let! _ = dumpContainerLogs testArtifactsDir "fake-azure-ocr" fakeAzureContainer
+                ()
+            if not (isNull fakeAzureHttp) then fakeAzureHttp.Dispose()
             // stop all the containers, flyway might be dead already
             do! flywayContainer.DisposeAsync()
             do! appContainer.DisposeAsync()
             do! fakeTgContainer.DisposeAsync()
+            if mlEnabled then
+                do! fakeAzureContainer.DisposeAsync()
             do! dbContainer.DisposeAsync()
-            // do! image.DisposeAsync() // might be faster not to dispose base image to cache?
         })
 
     member _.Http = httpClient
     member _.Uri = uri
+
+    member _.SetOcrText(text: string) = task {
+        let ocrJson =
+            $"""{{"modelVersion":"2023-10-01","metadata":{{"width":1020,"height":638}},"readResult":{{"blocks":[{{"lines":[{{"text":"{text}","boundingPolygon":[{{"x":1,"y":24}},{{"x":1005,"y":27}},{{"x":1004,"y":377}},{{"x":0,"y":371}}],"words":[{{"text":"{text}","confidence":0.9}}]}}]}}]}}}}"""
+        let payload = {| status = 200; body = ocrJson |}
+        let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/response", payload)
+        return ()
+    }
     
     member this.SendMessage(update: Update) = task {
         let json = JsonSerializer.Serialize(update, options = telegramJsonOptions)

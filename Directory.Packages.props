@@ -2,11 +2,15 @@
 
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- F# -->
+    <PackageVersion Include="FSharp.Core" Version="10.1.201" />
+
     <!-- Telegram -->
-    <PackageVersion Include="Telegram.Bot" Version="22.9.0" />
+    <PackageVersion Include="Telegram.Bot" Version="22.9.6" />
 
     <!-- Database -->
     <PackageVersion Include="Dapper" Version="2.1.72" />

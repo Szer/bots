@@ -9,8 +9,6 @@
 
     <ItemGroup>
         <Content Include="test_seed.sql" CopyToOutputDirectory="PreserveNewest" />
-        <Compile Include="TgMessageUtils.fs" />
-        <Compile Include="Logging.fs" />
         <Compile Include="ContainerTestBase.fs" />
         <Compile Include="BaseTests.fs" />
         <Compile Include="MessageTests.fs" />
@@ -40,6 +38,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\..\src\VahterBanBot\VahterBanBot.fsproj" />
+      <ProjectReference Include="..\BotTestInfra\BotTestInfra.fsproj" />
     </ItemGroup>
 
 </Project>

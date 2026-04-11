@@ -10,12 +10,14 @@ on:
       - 'src/BotInfra/**'
       - 'src/VahterBanBot/**'
       - 'src/vahter-bot/**'
+      - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
+      - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
-      - 'NuGet.Config'
   workflow_dispatch:
 
 permissions:
@@ -58,16 +60,23 @@ jobs:
         cp -r monorepo/src/vahter-bot/ upstream/src/vahter-bot/
 
         # Copy tests
+        mkdir -p upstream/tests/BotTestInfra
+        cp -r monorepo/tests/BotTestInfra/ upstream/tests/BotTestInfra/
         mkdir -p upstream/tests/VahterBanBot.Tests
         cp -r monorepo/tests/VahterBanBot.Tests/ upstream/tests/VahterBanBot.Tests/
         mkdir -p upstream/tests/FakeTgApi
         cp -r monorepo/tests/FakeTgApi/ upstream/tests/FakeTgApi/
+        mkdir -p upstream/tests/FakeAzureOcrApi
+        cp -r monorepo/tests/FakeAzureOcrApi/ upstream/tests/FakeAzureOcrApi/
+
+        # Copy unified Dockerfiles
+        cp monorepo/src/Dockerfile.bot upstream/src/
+        cp monorepo/tests/Dockerfile.fake upstream/tests/
 
         # Copy build infrastructure
         cp monorepo/Directory.Build.props upstream/
         cp monorepo/Directory.Packages.props upstream/
         cp monorepo/global.json upstream/
-        cp monorepo/NuGet.Config upstream/
         cp monorepo/.gitignore upstream/
 
     - name: Generate solution file
@@ -79,8 +88,10 @@ jobs:
         dotnet sln "$SLN" add \
           src/BotInfra/BotInfra.fsproj \
           src/VahterBanBot/VahterBanBot.fsproj \
+          tests/BotTestInfra/BotTestInfra.fsproj \
           tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj \
-          tests/FakeTgApi/FakeTgApi.fsproj
+          tests/FakeTgApi/FakeTgApi.fsproj \
+          tests/FakeAzureOcrApi/FakeAzureOcrApi.fsproj
 
     - name: Commit and push
       run: |

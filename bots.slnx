@@ -5,6 +5,7 @@
     <Project Path="src/VahterBanBot/VahterBanBot.fsproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/BotTestInfra/BotTestInfra.fsproj" />
     <Project Path="tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj" />
     <Project Path="tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj" />
     <Project Path="tests/FakeAzureOcrApi/FakeAzureOcrApi.fsproj" />

@@ -2,7 +2,7 @@ module VahterBanBot.Tests.BanTests
 
 open System.Net
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open Xunit
 
 type BanTests(fixture: MlDisabledVahterTestContainers) =

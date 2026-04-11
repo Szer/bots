@@ -5,20 +5,25 @@ ARG RESOURCE_REAPER_SESSION_ID="00000000-0000-0000-0000-000000000000"
 LABEL "org.testcontainers.resource-reaper-session"=$RESOURCE_REAPER_SESSION_ID
 ### end of workaround
 
+ARG BOT_PROJECT
+ARG FORCE_REBUILD
+
 WORKDIR /repo
-COPY Directory.Build.props Directory.Packages.props global.json NuGet.Config ./
+COPY Directory.Build.props Directory.Packages.props global.json ./
 COPY src/BotInfra/BotInfra.fsproj src/BotInfra/
-COPY src/VahterBanBot/VahterBanBot.fsproj src/VahterBanBot/
-RUN dotnet restore src/VahterBanBot/VahterBanBot.fsproj
+COPY src/${BOT_PROJECT}/${BOT_PROJECT}.fsproj src/${BOT_PROJECT}/
+RUN dotnet restore src/${BOT_PROJECT}/${BOT_PROJECT}.fsproj
 
 COPY src/BotInfra/ src/BotInfra/
-COPY src/VahterBanBot/ src/VahterBanBot/
-RUN dotnet publish src/VahterBanBot/VahterBanBot.fsproj -c Release -o /publish
+COPY src/${BOT_PROJECT}/ src/${BOT_PROJECT}/
+RUN dotnet publish src/${BOT_PROJECT}/${BOT_PROJECT}.fsproj -c Release -o /publish
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0.2-noble AS runtime
+ARG BOT_PROJECT
+ENV BOT_DLL=${BOT_PROJECT}.dll
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libgssapi-krb5-2 \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /publish
+WORKDIR /app
 COPY --from=build /publish .
-ENTRYPOINT ["dotnet", "VahterBanBot.dll"]
+ENTRYPOINT ["sh", "-c", "dotnet $BOT_DLL"]

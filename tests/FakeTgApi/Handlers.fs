@@ -142,6 +142,29 @@ module Handlers =
 
     // ── Main dispatcher ──────────────────────────────────────────────────────
 
+    let private handleAuxMethod ctx (methodName: string) (body: string) (url: string)= task {
+        let len = if isNull body then 0 else body.Length
+        Console.WriteLine($"FAKE TG IN  {methodName} {url} bodyLen={len}")
+        Store.logCall methodName url body
+
+        match methodName with
+        | m when Store.methodErrors.TryGetValue(m) |> fst ->
+            do! handleSimulatedError ctx
+        | "sendMessage"      -> do! handleSendMessage ctx body
+        | "sendPhoto"        -> do! handleSendPhoto ctx body
+        | "sendMediaGroup"   -> do! handleSendMediaGroup ctx body
+        | "forwardMessage"   -> do! handleForwardMessage ctx body
+        | "answerCallbackQuery" | "deleteMessage"
+        | "banChatMember" | "unbanChatMember" | "restrictChatMember" ->
+            do! handleSimpleOk ctx
+        | "getChatMember"    -> do! handleGetChatMember ctx body
+        | "getFile"          -> do! handleGetFile ctx body
+        | "getChatAdministrators" -> do! handleGetChatAdministrators ctx
+        | "editMessageReplyMarkup" | "editMessageText" ->
+            do! handleMessageWithChatAndId ctx body
+        | _ -> do! handleSimpleOk ctx
+    }
+    
     let handleTelegramMethod (ctx: HttpContext) =
         task {
             let! body = readBody ctx
@@ -150,26 +173,7 @@ module Handlers =
             | None ->
                 do! respondJson ctx (int HttpStatusCode.NotFound) """{"ok":false}"""
             | Some methodName ->
-                let len = if isNull body then 0 else body.Length
-                Console.WriteLine($"FAKE TG IN  {methodName} {url} bodyLen={len}")
-                Store.logCall methodName url body
-
-                match methodName with
-                | m when Store.methodErrors.TryGetValue(m) |> fst ->
-                    do! handleSimulatedError ctx
-                | "sendMessage"      -> do! handleSendMessage ctx body
-                | "sendPhoto"        -> do! handleSendPhoto ctx body
-                | "sendMediaGroup"   -> do! handleSendMediaGroup ctx body
-                | "forwardMessage"   -> do! handleForwardMessage ctx body
-                | "answerCallbackQuery" | "deleteMessage"
-                | "banChatMember" | "unbanChatMember" | "restrictChatMember" ->
-                    do! handleSimpleOk ctx
-                | "getChatMember"    -> do! handleGetChatMember ctx body
-                | "getFile"          -> do! handleGetFile ctx body
-                | "getChatAdministrators" -> do! handleGetChatAdministrators ctx
-                | "editMessageReplyMarkup" | "editMessageText" ->
-                    do! handleMessageWithChatAndId ctx body
-                | _ -> do! handleSimpleOk ctx
+                do! handleAuxMethod ctx methodName body url
         }
 
     let handleFileDownload (ctx: HttpContext) =

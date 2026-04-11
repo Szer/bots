@@ -1,7 +1,7 @@
 module VahterBanBot.Tests.MLBanTests
 
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open Xunit
@@ -325,6 +325,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Spam detected in OCR text is auto deleted`` () = task {
+        do! fixture.SetOcrText "2222222"
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = null, photos = [| Tg.spamPhoto |])
 
         let! _ = fixture.SendMessage msgUpdate
@@ -338,6 +339,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Ham photo text does not trigger autoban`` () = task {
+        do! fixture.SetOcrText "b"
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = null, photos = [| Tg.hamPhoto |])
 
         let! _ = fixture.SendMessage msgUpdate
@@ -351,6 +353,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Spam photo chosen under size limit when oversized image exists`` () = task {
+        do! fixture.SetOcrText "2222222"
         let msgUpdate = Tg.quickMsg(
             chat = fixture.ChatsToMonitor[0],
             text = null,
@@ -371,6 +374,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Ham photo survives when only larger image is too big`` () = task {
+        do! fixture.SetOcrText "b"
         let msgUpdate = Tg.quickMsg(
             chat = fixture.ChatsToMonitor[0],
             text = null,
@@ -391,6 +395,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
     
     [<Fact>]
     let ``Original text and parsed text from photo should be combined`` () = task {
+        do! fixture.SetOcrText "b"
         let msgUpdate = Tg.quickMsg(
             chat = fixture.ChatsToMonitor[0],
             text = "Hello!",
@@ -542,6 +547,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Spam in external reply photo triggers auto-delete via OCR`` () = task {
+        do! fixture.SetOcrText "2222222"
         let msgUpdate = Tg.quickMsg(
             chat = fixture.ChatsToMonitor[0],
             text = "hello",
@@ -555,6 +561,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
 
     [<Fact>]
     let ``Ham in external reply photo does NOT trigger auto-delete`` () = task {
+        do! fixture.SetOcrText "b"
         let msgUpdate = Tg.quickMsg(
             chat = fixture.ChatsToMonitor[0],
             text = "hello",

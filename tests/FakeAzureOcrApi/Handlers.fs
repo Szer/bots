@@ -26,14 +26,67 @@ module Handlers =
 
     let handleAnalyze (ctx: HttpContext) =
         task {
-            // For debugging: store method/url and body length (binary body will be unreadable as UTF-8)
             let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
             let! body = readBody ctx
-            let len = body.Length
-            Console.WriteLine($"FAKE AZURE IN  {ctx.Request.Method} {url} bodyLen={len}")
+            Console.WriteLine($"FAKE AZURE IN  {ctx.Request.Method} {url} bodyLen={body.Length}")
             Store.logCall ctx.Request.Method url body
 
             do! respondJson ctx Store.responseStatus Store.responseBody
+        }
+
+    /// Fake Azure OpenAI Chat Completions handler.
+    /// Routes verdict based on keywords in the user message:
+    ///   "kill"  → SPAM,  "spam"  → SKIP,  otherwise → NOT_SPAM
+    let handleChatCompletions (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let verdict =
+                try
+                    use doc = JsonDocument.Parse(body)
+                    let msgs = doc.RootElement.GetProperty("messages")
+                    let userContent =
+                        msgs.EnumerateArray()
+                        |> Seq.tryFind (fun m ->
+                            match m.TryGetProperty("role") with
+                            | true, role -> role.GetString() = "user"
+                            | _ -> false)
+                        |> Option.bind (fun m ->
+                            match m.TryGetProperty("content") with
+                            | true, c -> Some (c.GetString())
+                            | _ -> None)
+                        |> Option.bind Option.ofObj
+                        |> Option.defaultValue ""
+                    if userContent.Contains("kill", StringComparison.OrdinalIgnoreCase) then "SPAM"
+                    elif userContent.Contains("spam", StringComparison.OrdinalIgnoreCase) then "SKIP"
+                    else "NOT_SPAM"
+                with _ -> "NOT_SPAM"
+
+            let responseJson =
+                $"""{{
+  "choices": [{{
+    "finish_reason": "stop",
+    "index": 0,
+    "message": {{
+      "content": "{{\"verdict\":\"{verdict}\"}}",
+      "role": "assistant"
+    }}
+  }}],
+  "created": 1774736361,
+  "id": "chatcmpl-fake",
+  "model": "gpt-4o-mini-2024-07-18",
+  "object": "chat.completion",
+  "usage": {{
+    "completion_tokens": 8,
+    "prompt_tokens": 264,
+    "total_tokens": 272
+  }}
+}}"""
+
+            do! respondJson ctx 200 responseJson
         }
 
     let getCalls (ctx: HttpContext) =

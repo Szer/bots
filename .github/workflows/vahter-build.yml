@@ -6,12 +6,14 @@ on:
     paths:
       - 'src/BotInfra/**'
       - 'src/VahterBanBot/**'
+      - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
+      - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
-      - 'NuGet.Config'
   workflow_dispatch:
 
 permissions:

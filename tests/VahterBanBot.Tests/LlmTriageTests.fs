@@ -1,7 +1,7 @@
 module VahterBanBot.Tests.LlmTriageTests
 
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open Xunit
 
 /// LLM triage tests share the ML-enabled container (which also has LLM_TRIAGE_ENABLED=true).

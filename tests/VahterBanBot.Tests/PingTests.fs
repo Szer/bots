@@ -2,7 +2,7 @@ module PingTests
 
 open System.Net
 open VahterBanBot.Tests.ContainerTestBase
-open VahterBanBot.Tests.TgMessageUtils
+open BotTestInfra
 open Xunit
 
 type PingTests(fixture: MlDisabledVahterTestContainers) =

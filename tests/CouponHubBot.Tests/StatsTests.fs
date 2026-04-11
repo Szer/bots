@@ -1,5 +1,6 @@
 namespace CouponHubBot.Tests
 
+open BotTestInfra
 open System.Net
 open System.Threading.Tasks
 open Dapper

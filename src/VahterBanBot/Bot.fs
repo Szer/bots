@@ -1010,7 +1010,8 @@ let private ocrPhotos
             logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
             return None
         else
-            let fileUrl = $"https://api.telegram.org/file/bot{botConfig.BotToken}/{file.FilePath}"
+            let apiBase = if isNull botConfig.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.TelegramApiBaseUrl
+            let fileUrl = $"{apiBase}/file/bot{botConfig.BotToken}/{file.FilePath}"
             let! ocrText = computerVision.TextFromImageUrl fileUrl
             if String.IsNullOrWhiteSpace ocrText then
                 return None

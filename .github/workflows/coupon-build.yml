@@ -6,14 +6,15 @@ on:
     paths:
       - 'src/BotInfra/**'
       - 'src/CouponHubBot/**'
+      - 'src/Dockerfile.bot'
       - 'tests/CouponHubBot.Tests/**'
       - 'tests/CouponHubBot.Ocr.Tests/**'
+      - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
       - 'tests/FakeAzureOcrApi/**'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
-      - 'NuGet.Config'
   workflow_dispatch:
 
 permissions:

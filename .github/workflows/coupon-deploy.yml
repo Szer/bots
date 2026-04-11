@@ -7,14 +7,15 @@ on:
       - 'src/BotInfra/**'
       - 'src/CouponHubBot/**'
       - 'src/coupon-hub-bot/**'
+      - 'src/Dockerfile.bot'
       - 'tests/CouponHubBot.Tests/**'
       - 'tests/CouponHubBot.Ocr.Tests/**'
+      - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
       - 'tests/FakeAzureOcrApi/**'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
-      - 'NuGet.Config'
   workflow_dispatch:
 
 permissions:
@@ -105,7 +106,8 @@ jobs:
       with:
         push: true
         tags: ghcr.io/szer/coupon-bot:${{ github.sha }}, ghcr.io/szer/coupon-bot:latest
-        file: ./src/coupon-hub-bot/Dockerfile
+        file: ./src/Dockerfile.bot
+        build-args: BOT_PROJECT=CouponHubBot
         platforms: linux/arm64
 
   verify-deploy:
