@@ -10,6 +10,10 @@ on:
         required: true
         type: string
         description: "Path to migrations dir relative to repo root"
+      db-name:
+        required: true
+        type: string
+        description: "Database name for Flyway migrations (e.g. vahter_db)"
       docker-image:
         required: true
         type: string
@@ -30,7 +34,7 @@ on:
     secrets:
       WIREGUARD_CONFIG:
         required: true
-      DB_PROD_URL:
+      DB_PROD_HOST:
         required: true
       DB_PROD_USERNAME:
         required: true
@@ -100,7 +104,7 @@ jobs:
         --volume ${{ github.workspace }}/${{ inputs.migrations-path }}:/flyway/sql:ro
         --volume ${{ github.workspace }}/reports:/flyway/reports
         "${{ env.DOCKER_IMAGE }}"
-        -url="${{ secrets.DB_PROD_URL }}"
+        -url="jdbc:postgresql://${{ secrets.DB_PROD_HOST }}/${{ inputs.db-name }}"
         -user="${{ secrets.DB_PROD_USERNAME }}"
         -password="${{ secrets.DB_PROD_PASSWORD }}"
         migrate -schemas="${{ env.SCHEMAS }}"

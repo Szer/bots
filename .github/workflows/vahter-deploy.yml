@@ -33,13 +33,14 @@ jobs:
         -c Release --logger "trx;LogFileName=test-results.trx"
         --logger "console;verbosity=detailed"
       migrations-path: src/vahter-bot/migrations
+      db-name: vahter_db_v2
       docker-image: ghcr.io/fsharplang-ru/vahter-bot
       bot-project: VahterBanBot
       argocd-app-name: vahter-bot
       container-name: vahter-bot
     secrets:
       WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-      DB_PROD_URL: ${{ secrets.VAHTER_DB_PROD_URL }}
-      DB_PROD_USERNAME: ${{ secrets.VAHTER_DB_PROD_USERNAME }}
-      DB_PROD_PASSWORD: ${{ secrets.VAHTER_DB_PROD_PASSWORD }}
+      DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
+      DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
+      DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}

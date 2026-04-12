@@ -33,13 +33,14 @@ jobs:
         dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
       migrations-path: src/coupon-hub-bot/migrations
+      db-name: coupon_hub_bot
       docker-image: ghcr.io/szer/coupon-bot
       bot-project: CouponHubBot
       argocd-app-name: coupon-bot
       container-name: coupon-bot
     secrets:
       WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-      DB_PROD_URL: ${{ secrets.COUPON_DB_PROD_URL }}
-      DB_PROD_USERNAME: ${{ secrets.COUPON_DB_PROD_USERNAME }}
-      DB_PROD_PASSWORD: ${{ secrets.COUPON_DB_PROD_PASSWORD }}
+      DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
+      DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
+      DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
