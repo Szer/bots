@@ -51,6 +51,7 @@ jobs:
 
         # Remove everything except .git
         find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
+        mkdir -p src tests .github/workflows
 
         # ── Source code ──
         cp -r ../monorepo/src/BotInfra src/BotInfra
