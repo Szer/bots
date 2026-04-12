@@ -126,11 +126,27 @@ jobs:
         git commit -m "Sync from monorepo (${GITHUB_SHA:0:7})"
         git push origin "$BRANCH"
 
-        gh pr create \
+        NEW_PR_URL=$(gh pr create \
           --repo fsharplang-ru/vahter-bot \
           --base main \
           --head "$BRANCH" \
           --title "Sync from monorepo (${GITHUB_SHA:0:7})" \
-          --body "Automated sync from monorepo commit ${GITHUB_SHA}."
+          --body "Automated sync from monorepo commit ${GITHUB_SHA}.")
+        echo "Created: $NEW_PR_URL"
+
+        # Close previous sync PRs (keep only the new one)
+        gh pr list \
+          --repo fsharplang-ru/vahter-bot \
+          --state open \
+          --head "sync/" \
+          --json number,headRefName \
+          --jq ".[] | select(.headRefName != \"$BRANCH\") | .number" \
+        | while read -r old_pr; do
+            echo "Closing old sync PR #${old_pr}"
+            gh pr close "$old_pr" \
+              --repo fsharplang-ru/vahter-bot \
+              --delete-branch \
+              --comment "Superseded by ${NEW_PR_URL}"
+          done
       env:
         GH_TOKEN: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
