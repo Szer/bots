@@ -20,99 +20,26 @@ on:
 permissions:
   contents: read
   packages: write
-
-env:
-  SQLFLUFF_DIALECT: postgres
-  DOCKER_IMAGE: flyway/flyway
-  SCHEMAS: public
+  issues: write
+  pull-requests: write
+  id-token: write
 
 jobs:
   deploy:
-    runs-on: ubuntu-22.04-arm
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 2
-
-    - uses: actions/setup-dotnet@v4
-      with:
-        global-json-file: global.json
-
-    - name: Tests
-      run: dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
-
-    - name: Upload dotnet test results
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-results
-        path: "**/*.trx"
-      if: ${{ always() }}
-
-    - name: Upload container logs
-      uses: actions/upload-artifact@v4
-      with:
-        name: container-logs
-        path: test-artifacts/
-      if: ${{ always() }}
-
-    - name: Check for new migrations
-      id: check-migrations
-      run: |
-        if git diff --name-only HEAD~1 HEAD | grep -q '^src/vahter-bot/migrations/'; then
-          echo "has_migrations=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "has_migrations=false" >> "$GITHUB_OUTPUT"
-        fi
-
-    - name: Setup WireGuard VPN
-      if: steps.check-migrations.outputs.has_migrations == 'true'
-      run: |
-        chmod +x scripts/setup-vpn.sh
-        ./scripts/setup-vpn.sh
-      env:
-        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-
-    - name: Apply migrations to production DB
-      if: steps.check-migrations.outputs.has_migrations == 'true'
-      run: >-
-        docker run --rm
-        --network host
-        --volume ${{ github.workspace }}/src/vahter-bot/migrations:/flyway/sql:ro
-        --volume ${{ github.workspace }}/reports:/flyway/reports
-        "${{ env.DOCKER_IMAGE }}"
-        -url="${{ secrets.VAHTER_DB_PROD_URL }}"
-        -user="${{ secrets.VAHTER_DB_PROD_USERNAME }}"
-        -password="${{ secrets.VAHTER_DB_PROD_PASSWORD }}"
-        migrate -schemas="${{ env.SCHEMAS }}"
-
-    - name: Disconnect VPN
-      if: steps.check-migrations.outputs.has_migrations == 'true'
-      run: sudo wg-quick down wg0 || true
-
-    - name: Upload Flyway report
-      if: steps.check-migrations.outputs.has_migrations == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: Database Report
-        path: reports/
-
-    - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Build and push to GHCR
-      uses: docker/build-push-action@v5
-      with:
-        push: true
-        tags: ghcr.io/fsharplang-ru/vahter-bot:${{ github.sha }}, ghcr.io/fsharplang-ru/vahter-bot:latest
-        file: ./src/Dockerfile.bot
-        build-args: BOT_PROJECT=VahterBanBot
-        platforms: linux/arm64
+    uses: ./.github/workflows/_bot-deploy.yml
+    with:
+      test-command: >-
+        dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj
+        -c Release --logger "trx;LogFileName=test-results.trx"
+        --logger "console;verbosity=detailed"
+      migrations-path: src/vahter-bot/migrations
+      docker-image: ghcr.io/fsharplang-ru/vahter-bot
+      bot-project: VahterBanBot
+      argocd-app-name: vahter-bot
+      container-name: vahter-bot
+    secrets:
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+      DB_PROD_URL: ${{ secrets.VAHTER_DB_PROD_URL }}
+      DB_PROD_USERNAME: ${{ secrets.VAHTER_DB_PROD_USERNAME }}
+      DB_PROD_PASSWORD: ${{ secrets.VAHTER_DB_PROD_PASSWORD }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}

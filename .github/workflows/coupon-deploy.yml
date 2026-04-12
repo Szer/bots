@@ -25,118 +25,21 @@ permissions:
   pull-requests: write
   id-token: write
 
-env:
-  SQLFLUFF_DIALECT: postgres
-  DOCKER_IMAGE: flyway/flyway
-  SCHEMAS: public
-
 jobs:
   deploy:
-    runs-on: ubuntu-22.04-arm
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - uses: actions/setup-dotnet@v4
-      with:
-        global-json-file: global.json
-
-    - name: Tests
-      run: |
+    uses: ./.github/workflows/_bot-deploy.yml
+    with:
+      test-command: |
         dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
-
-    - name: Upload dotnet test results
-      uses: actions/upload-artifact@v4
-      with:
-        name: test-results
-        path: "**/*.trx"
-      if: ${{ always() }}
-
-    - name: Upload container logs
-      uses: actions/upload-artifact@v4
-      with:
-        name: container-logs
-        path: test-artifacts/
-      if: ${{ always() }}
-
-    - name: Setup WireGuard VPN
-      run: |
-        chmod +x scripts/setup-vpn.sh
-        ./scripts/setup-vpn.sh
-      env:
-        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-        SPLIT_TUNNEL: "false"
-
-    - name: Apply migrations to production DB
-      run: >-
-        docker run --rm
-        --network host
-        --volume ${{ github.workspace }}/src/coupon-hub-bot/migrations:/flyway/sql:ro
-        --volume ${{ github.workspace }}/reports:/flyway/reports
-        "${{ env.DOCKER_IMAGE }}"
-        -url="${{ secrets.COUPON_DB_PROD_URL }}"
-        -user="${{ secrets.COUPON_DB_PROD_USERNAME }}"
-        -password="${{ secrets.COUPON_DB_PROD_PASSWORD }}"
-        migrate -schemas="${{ env.SCHEMAS }}"
-
-    - name: Disconnect VPN
-      if: always()
-      run: sudo wg-quick down wg0 || true
-
-    - name: Upload Flyway report
-      uses: actions/upload-artifact@v4
-      with:
-        name: Database Report
-        path: reports/
-
-    - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Build and push to GHCR
-      uses: docker/build-push-action@v5
-      with:
-        push: true
-        tags: ghcr.io/szer/coupon-bot:${{ github.sha }}, ghcr.io/szer/coupon-bot:latest
-        file: ./src/Dockerfile.bot
-        build-args: BOT_PROJECT=CouponHubBot
-        platforms: linux/arm64
-
-  verify-deploy:
-    needs: deploy
-    runs-on: ubuntu-22.04-arm
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Setup WireGuard VPN
-      run: |
-        chmod +x scripts/setup-vpn.sh
-        ./scripts/setup-vpn.sh
-      env:
-        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-
-    - name: Verify deployment
-      run: ./scripts/verify-deploy.sh
-      env:
-        ARGOCD_URL: http://argo.internal
-        LOKI_URL: http://loki.internal
-        PROMETHEUS_URL: http://prometheus.internal:9090
-        EXPECTED_IMAGE_TAG: ${{ github.sha }}
-        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-        ARGOCD_APP_NAME: coupon-bot
-        CONTAINER_NAME: coupon-bot
-        READINESS_GRACE_PERIOD: "180"
-
-    - name: Disconnect VPN
-      if: always()
-      run: sudo wg-quick down wg0 || true
+      migrations-path: src/coupon-hub-bot/migrations
+      docker-image: ghcr.io/szer/coupon-bot
+      bot-project: CouponHubBot
+      argocd-app-name: coupon-bot
+      container-name: coupon-bot
+    secrets:
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+      DB_PROD_URL: ${{ secrets.COUPON_DB_PROD_URL }}
+      DB_PROD_USERNAME: ${{ secrets.COUPON_DB_PROD_USERNAME }}
+      DB_PROD_PASSWORD: ${{ secrets.COUPON_DB_PROD_PASSWORD }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
