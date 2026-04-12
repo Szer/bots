@@ -1,3 +1,4 @@
+// Shared Telegram Bot helpers
 namespace BotInfra
 
 open System.Text.Json.Serialization
