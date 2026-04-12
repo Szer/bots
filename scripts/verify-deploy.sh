@@ -52,6 +52,7 @@ SYNC_TIMEOUT=600  # 10 minutes
 SYNC_INTERVAL=30
 elapsed=0
 
+synced=false
 while [ "$elapsed" -lt "$SYNC_TIMEOUT" ]; do
     RESPONSE=$(curl -sf "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" \
         -H "${AUTH_HEADER}" 2>/dev/null || echo "{}")
@@ -69,26 +70,27 @@ while [ "$elapsed" -lt "$SYNC_TIMEOUT" ]; do
         summary "- **Image Tag Match:** Yes"
         summary "- **Elapsed Time:** ${elapsed}s"
         summary ""
+        synced=true
         break
-    fi
-
-    if [ "$elapsed" -ge "$SYNC_TIMEOUT" ]; then
-        log "FAILED: Timed out waiting for ArgoCD sync after ${SYNC_TIMEOUT}s"
-        log "  Last sync status: ${SYNC_STATUS}"
-        log "  Running images: ${IMAGES}"
-        summary "### ❌ Phase 1: ArgoCD Sync FAILED"
-        summary "- **Reason:** Timeout after ${SYNC_TIMEOUT}s"
-        summary "- **Last Sync Status:** \`${SYNC_STATUS}\`"
-        summary "- **Running Images:**"
-        summary "\`\`\`"
-        summary "${IMAGES}"
-        summary "\`\`\`"
-        exit 1
     fi
 
     sleep "$SYNC_INTERVAL"
     elapsed=$((elapsed + SYNC_INTERVAL))
 done
+
+if [ "$synced" = false ]; then
+    log "FAILED: Timed out waiting for ArgoCD sync after ${SYNC_TIMEOUT}s"
+    log "  Last sync status: ${SYNC_STATUS}"
+    log "  Running images: ${IMAGES}"
+    summary "### ❌ Phase 1: ArgoCD Sync FAILED"
+    summary "- **Reason:** Timeout after ${SYNC_TIMEOUT}s"
+    summary "- **Last Sync Status:** \`${SYNC_STATUS}\`"
+    summary "- **Running Images:**"
+    summary "\`\`\`"
+    summary "${IMAGES}"
+    summary "\`\`\`"
+    exit 1
+fi
 
 # ─── Phase 2: Readiness grace period ─────────────────────────────────────────
 
