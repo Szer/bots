@@ -1,0 +1,175 @@
+# Telegram Bot Logic
+
+## Сообщение «Ты взял купон» (handleTake)
+
+При взятии купона (команда `/take`, кнопка «Взять N» или `take:{id}`) бот шлёт **одно** сообщение:
+
+- **SendPhoto** с `caption` и `replyMarkup` (не SendPhoto + отдельный SendMessage).
+- Caption: `Ты взял купон {id}: {v} EUR, истекает {d}`.
+- Кнопки: «Вернуть», «Использован» — `singleTakenKeyboard(coupon)`.
+- Callback: `return:{id}:del` и `used:{id}:del`. Суффикс **`:del`** = при успешном действии удалять **это** сообщение (`DeleteMessage`), чтобы в чате не оставалось ни фото, ни кнопок.
+
+## Команда /my (handleMy)
+
+- Показываем **только «Мои взятые»** (не «Мои добавленные»).
+- Список строится из `GetCouponsTakenBy`; под каждым купоном — кнопки «Вернуть» и «Использован».
+- Callback: `return:{id}` и `used:{id}` **без** `:del` — сообщение не удаляем (список может содержать несколько купонов).
+
+## Обработка callback (return / used)
+
+- `return:{id}` или `return:{id}:del` — `handleReturn`; при `:del` и успехе (`ok`) — `DeleteMessage(cq.Message)` в `try/with`.
+- `used:{id}` или `used:{id}:del` — `handleUsed`; при `:del` и успехе — `DeleteMessage(cq.Message)` в `try/with`.
+- Парсинг: `deleteOnSuccess = cq.Data.EndsWith(":del")`, для извлечения `id` отрезать `:del` и взять число после `return:` / `used:`.
+- `handleReturn` и `handleUsed` возвращают `bool` (успех операции), чтобы callback решал, вызывать ли `DeleteMessage`.
+
+## GetCouponsTakenBy (DbService)
+
+- Обязательно: `WHERE taken_by = @user_id AND status = 'taken'`.
+
+## /add wizard + OCR
+
+### Общий принцип
+
+- `CouponOcrEngine` делает barcode + Azure text OCR и возвращает `CouponOCR` как "есть значение / нет значения".
+- **Любой результат OCR — это лишь предзаполнение**: пользователь всё равно подтверждает финальные значения перед `AddCoupon`.
+
+### Стадии wizard (PendingAddFlow.stage)
+
+Базовые:
+- `awaiting_photo`
+- `awaiting_discount_choice`
+- `awaiting_date_choice`
+- `awaiting_confirm`
+
+OCR-ветка:
+- `awaiting_ocr_confirm` — когда OCR распознал value + min_check + expires_at и просим "Да/Нет".
+
+### Ввод пользователя в wizard (без кнопок "other")
+
+На шагах выбора пользователь может **либо нажать кнопки**, либо **ввести текстом**:
+
+- **Скидка + минимальный чек** (на `awaiting_discount_choice`):
+  - Формат `X Y` (например `10 50`)
+  - Формат `X/Y` (например `10/50`, пробелы вокруг `/` допустимы)
+- **Дата истечения** (на `awaiting_date_choice`):
+  - Полная дата (как раньше): `25.01.2026`, `2026-01-25`, `yyyy/MM/dd`, и т.п.
+  - Упрощённо: **одно число 1..31** (например `25`) — трактуем как **следующее** такое число **строго в будущем** (UTC). Если в ближайшем месяце такого дня нет, пропускаем месяц и ищем дальше.
+
+### Partial OCR (обязательное поведение)
+
+Если OCR распознал частично, **не откатываться "в ноль"**, а продолжать с первого недостающего шага, сохранив то, что нашли:
+
+- распознаны `value` и `min_check`, но нет `expires_at` → перейти в `awaiting_date_choice`.
+- распознана только `expires_at` → сохранить её, перейти в `awaiting_discount_choice`; после ввода скидки/чека можно сразу перейти в `awaiting_confirm`.
+- `barcode_text` опционален и **никогда не блокирует** добавление.
+
+### Callback-префиксы в /add wizard
+
+- `addflow:disc:<value>:<min_check>` — выбрать скидку и мин. чек.
+- `addflow:date:today|tomorrow` — выбрать дату.
+- `addflow:ocr:yes|no` — подтвердить/отклонить OCR-предзаполнение (актуально только для `awaiting_ocr_confirm`).
+- `addflow:confirm` — создать купон.
+- `addflow:cancel` — отмена wizard.
+
+## Команда /added (handleAdded)
+
+- Показывает купоны, добавленные пользователем, которые можно аннулировать (`status IN ('available', 'taken')` и не истёкшие).
+- Каждый купон показывается с кнопкой «Аннулировать N-ый» (`void:{id}`).
+- Если у купона есть `barcode_text`, в строке купона перед статусом выводятся последние 4 цифры штрихкода в формате `···XXXX` (например `···1191`). Если `barcode_text` равен null или короче 4 символов — суффикс не выводится.
+- Пример строки: `1. 10€ из 50€, до пн 26 янв ···1191 (взят)`
+- Также доступна по алиасу `/ad`.
+- Кнопка «Мои добавленные» добавлена в `/my` для быстрого доступа.
+
+## Void Flow (handleVoid)
+
+### Аннулирование купона
+
+- Владелец купона (или администратор) может аннулировать купон командой `/void <id>` или кнопкой из `/added`.
+- Допустимые статусы для аннулирования: `available`, `taken`. Нельзя аннулировать `used` или уже `voided`.
+- Купон не должен быть истёкшим.
+- При аннулировании:
+  1. Статус меняется на `voided` (терминальный).
+  2. Создаётся событие `voided` в `coupon_event`.
+  3. Если купон был взят (`taken`) — отправляется личное сообщение тому, кто его взял: «Купон ID:X был аннулирован владельцем. Он больше недоступен.»
+
+### Callback-префиксы void
+
+- `void:{id}` — аннулировать купон (без удаления сообщения).
+- `void:{id}:del` — аннулировать и удалить сообщение при успехе.
+- `myAdded` — открыть список добавленных (из кнопки в `/my`).
+
+### Переходы статусов
+
+```
+available → taken (take)
+available → voided (owner void / admin void)
+taken → used (taker marks used)
+taken → available (taker returns)
+taken → voided (owner void / admin void → notify taker)
+```
+
+`voided` и `used` — терминальные статусы.
+
+## Уведомления (TelegramNotificationService)
+
+Бот намеренно отправляет **только один** тип уведомлений через `TelegramNotificationService`:
+
+- **Уведомление получателю при аннулировании** (`NotifyTakerCouponVoided`): когда владелец аннулирует купон в статусе `taken`, получатель получает личное сообщение о том, что купон больше недоступен.
+
+Уведомления в групповом чате для других событий жизненного цикла купона (добавление, взятие, использование, возврат) **преднамеренно отключены**, чтобы не засорять чат сообщества. Эти события фиксируются во внутренней таблице `coupon_event` для статистики и напоминаний, но не рассылаются в групповой чат.
+
+## Daily Reminders (ReminderService)
+
+Бот отправляет автоматические напоминания каждый день в **10:00 по дублинскому времени** (с учётом DST: зимой — 10:00 UTC, летом — 09:00 UTC). Час задаётся переменной `REMINDER_HOUR_DUBLIN` (по умолчанию 10).
+
+### Виды напоминаний
+
+1. **Истекающие купоны** (в группу):
+   - Если сегодня истекают доступные купоны, бот отправляет сообщение в группу с информацией о количестве и общей сумме.
+
+2. **Ежемесячная статистика** (в группу, в первый понедельник месяца):
+   - В первый понедельник каждого месяца (день ≤ 7 и DayOfWeek = Monday) бот отправляет накопленную статистику за всё время: сколько купонов каждый участник использовал и добавил.
+
+3. **Просроченные взятые купоны** (личные сообщения):
+   - Если пользователь взял купон более 1 дня назад и не пометил его как «Использован» или «Вернуть», бот отправляет личное напоминание.
+
+4. **Напоминание добавить купоны** (личные сообщения):
+   - Если пользователь использовал хотя бы один купон вчера, но не добавил ни одного купона в тот же день, бот на следующий день отправляет личное напоминание: «Не забудь добавить купоны в бота».
+   - Одно напоминание на пользователя независимо от количества использованных купонов.
+   - Проверка основывается на событиях `coupon_event` с типами `'used'` и `'added'` за предыдущий календарный день (UTC).
+
+5. **Chat message retention cleanup** (daily):
+   - Deletes `chat_message` records older than 1 year.
+
+## Community Chat Monitoring
+
+The bot passively saves all content messages from the community group (`COMMUNITY_CHAT_ID`) to the `chat_message` table for analysis by the Product Manager agent.
+
+- Saved: text (including photo/document captions), photo/document presence flags, reply threading (`reply_to_message_id`).
+- Not saved: media content, bot messages, service messages (join/leave/pin/etc.).
+- Only `Text`, `Photo`, and `Document` message types are persisted; all other types are skipped.
+- For anonymous admin posts or channel-forwarded messages, `SenderChat.Id` is stored as the sender identifier.
+- Retention: 1 year (cleanup via `ReminderService`).
+- **Prerequisite**: Bot Privacy Mode must be disabled in BotFather, otherwise Telegram does not deliver non-command messages in groups.
+
+## Feedback Flow (/feedback)
+
+The `/feedback` command lets users send feedback to bot authors. The flow is:
+
+1. User sends `/feedback` → bot sets `pending_feedback` flag in DB and prompts the user
+2. Next non-command message from that user triggers feedback consumption:
+   a. Feedback text/media metadata is saved to the `user_feedback` table
+   b. Message is forwarded to all configured admin IDs (`FEEDBACK_ADMINS`)
+   c. A GitHub issue is created with the `user-feedback` label, and the Product Manager agent is assigned to triage it
+   d. The `user_feedback` row is updated with the GitHub issue number
+   e. User receives confirmation: "Спасибо! Сообщение отправлено авторам."
+3. Any command cancels pending feedback
+
+Steps (c) and (d) are best-effort — if the GitHub API call fails at runtime, feedback is still saved in DB and forwarded to admins. The user experience is unaffected. Note: `GITHUB_TOKEN` is required at startup; the bot will not start without it.
+
+### GitHub Issue Format
+
+- **Title:** `[Feedback] <first 60 chars of text>` (anonymous — no username exposed on public repo)
+- **Labels:** `user-feedback` (quarantines from coding agent — only Product agent triages)
+- **Assignment:** `copilot-swe-agent[bot]` with `custom_agent: product`
+- User content has `@` mentions neutralized to prevent unwanted GitHub notifications
