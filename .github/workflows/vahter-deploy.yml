@@ -34,7 +34,7 @@ jobs:
         --logger "console;verbosity=detailed"
       migrations-path: src/vahter-bot/migrations
       db-name: vahter_db_v2
-      docker-image: ghcr.io/szer/bots/vahter-bot
+      docker-image: ghcr.io/szer/vahter-bot
       bot-project: VahterBanBot
       argocd-app-name: vahter-bot
       container-name: vahter-bot
