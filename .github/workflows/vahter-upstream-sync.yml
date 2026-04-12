@@ -1,7 +1,8 @@
 name: "Vahter: Upstream Sync"
 
-# Auto-exports VahterBanBot + BotInfra to the fsharplang-ru/vahter-bot org repo
-# so it remains a standalone buildable repository.
+# Syncs VahterBanBot source to fsharplang-ru/vahter-bot via pull request.
+# The upstream repo is a read-only mirror for community visibility.
+# Deploy happens exclusively from this monorepo.
 
 on:
   push:
@@ -15,9 +16,12 @@ on:
       - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
       - 'tests/FakeAzureOcrApi/**'
+      - 'tests/Dockerfile.fake'
+      - 'tests/Directory.Build.targets'
       - 'Directory.Build.props'
       - 'Directory.Packages.props'
       - 'global.json'
+      - '.github/workflows/_bot-build.yml'
   workflow_dispatch:
 
 permissions:
@@ -40,50 +44,61 @@ jobs:
         token: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
         path: upstream
 
-    - name: Sync files
+    - name: Replace upstream content
       run: |
         set -euo pipefail
-
-        # Clean upstream src/ and tests/ (we'll overwrite)
-        rm -rf upstream/src upstream/tests
-
-        # Copy shared infra
-        mkdir -p upstream/src/BotInfra
-        cp -r monorepo/src/BotInfra/ upstream/src/BotInfra/
-
-        # Copy VahterBanBot source
-        mkdir -p upstream/src/VahterBanBot
-        cp -r monorepo/src/VahterBanBot/ upstream/src/VahterBanBot/
-
-        # Copy deployment assets (migrations, Dockerfile, init.sql)
-        mkdir -p upstream/src/vahter-bot
-        cp -r monorepo/src/vahter-bot/ upstream/src/vahter-bot/
-
-        # Copy tests
-        mkdir -p upstream/tests/BotTestInfra
-        cp -r monorepo/tests/BotTestInfra/ upstream/tests/BotTestInfra/
-        mkdir -p upstream/tests/VahterBanBot.Tests
-        cp -r monorepo/tests/VahterBanBot.Tests/ upstream/tests/VahterBanBot.Tests/
-        mkdir -p upstream/tests/FakeTgApi
-        cp -r monorepo/tests/FakeTgApi/ upstream/tests/FakeTgApi/
-        mkdir -p upstream/tests/FakeAzureOcrApi
-        cp -r monorepo/tests/FakeAzureOcrApi/ upstream/tests/FakeAzureOcrApi/
-
-        # Copy unified Dockerfiles
-        cp monorepo/src/Dockerfile.bot upstream/src/
-        cp monorepo/tests/Dockerfile.fake upstream/tests/
-
-        # Copy build infrastructure
-        cp monorepo/Directory.Build.props upstream/
-        cp monorepo/Directory.Packages.props upstream/
-        cp monorepo/global.json upstream/
-        cp monorepo/.gitignore upstream/
-
-    - name: Generate solution file
-      run: |
         cd upstream
+
+        # Remove everything except .git
+        find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
+
+        # ── Source code ──
+        cp -r ../monorepo/src/BotInfra src/BotInfra
+        cp -r ../monorepo/src/VahterBanBot src/VahterBanBot
+        cp -r ../monorepo/src/vahter-bot src/vahter-bot
+        cp ../monorepo/src/Dockerfile.bot src/
+
+        # ── Tests ──
+        cp -r ../monorepo/tests/BotTestInfra tests/BotTestInfra
+        cp -r ../monorepo/tests/VahterBanBot.Tests tests/VahterBanBot.Tests
+        cp -r ../monorepo/tests/FakeTgApi tests/FakeTgApi
+        cp -r ../monorepo/tests/FakeAzureOcrApi tests/FakeAzureOcrApi
+        cp ../monorepo/tests/Dockerfile.fake tests/
+        cp ../monorepo/tests/Directory.Build.targets tests/
+
+        # ── Build infrastructure ──
+        cp ../monorepo/Directory.Build.props .
+        cp ../monorepo/Directory.Packages.props .
+        cp ../monorepo/global.json .
+        cp ../monorepo/.gitignore .
+
+        # ── CI (build only — deploy lives in the monorepo) ──
+        mkdir -p .github/workflows
+        cp ../monorepo/.github/workflows/_bot-build.yml .github/workflows/
+
+        cat > .github/workflows/build.yml << 'EOF'
+        name: Build
+
+        on:
+          pull_request:
+            branches: [ "main" ]
+          push:
+            branches: [ "main" ]
+          workflow_dispatch:
+
+        jobs:
+          build:
+            uses: ./.github/workflows/_bot-build.yml
+            with:
+              test-command: >-
+                dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj
+                -c Release --logger "trx;LogFileName=test-results.trx"
+                --logger "console;verbosity=detailed"
+        EOF
+        sed -i 's/^        //' .github/workflows/build.yml
+
+        # ── Solution file ──
         dotnet new sln --name vahter-ban-bot --force
-        # Find whatever extension was created (.sln or .slnx)
         SLN=$(ls vahter-ban-bot.sln* 2>/dev/null | head -1)
         dotnet sln "$SLN" add \
           src/BotInfra/BotInfra.fsproj \
@@ -93,15 +108,28 @@ jobs:
           tests/FakeTgApi/FakeTgApi.fsproj \
           tests/FakeAzureOcrApi/FakeAzureOcrApi.fsproj
 
-    - name: Commit and push
+    - name: Create pull request
       run: |
         cd upstream
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add -A
+
         if git diff --cached --quiet; then
           echo "No changes to sync"
-        else
-          git commit -m "Sync from monorepo (${GITHUB_SHA:0:7})"
-          git push
+          exit 0
         fi
+
+        BRANCH="sync/monorepo-${GITHUB_SHA:0:7}"
+        git checkout -b "$BRANCH"
+        git commit -m "Sync from monorepo (${GITHUB_SHA:0:7})"
+        git push origin "$BRANCH"
+
+        gh pr create \
+          --repo fsharplang-ru/vahter-bot \
+          --base main \
+          --head "$BRANCH" \
+          --title "Sync from monorepo (${GITHUB_SHA:0:7})" \
+          --body "Automated sync from monorepo commit ${GITHUB_SHA}."
+      env:
+        GH_TOKEN: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
