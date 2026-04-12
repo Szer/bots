@@ -1,3 +1,4 @@
+// CouponHubBot — Telegram coupon management bot
 open System
 open System.Data
 open System.Text.Json
