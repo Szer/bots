@@ -1,3 +1,4 @@
+// VahterBanBot — Telegram moderation bot
 module VahterBanBot.Bot
 
 open System
