@@ -34,7 +34,7 @@ jobs:
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
       migrations-path: src/coupon-hub-bot/migrations
       db-name: coupon_hub_bot
-      docker-image: ghcr.io/szer/coupon-bot
+      docker-image: ghcr.io/szer/bots/coupon-bot
       bot-project: CouponHubBot
       argocd-app-name: coupon-bot
       container-name: coupon-bot
