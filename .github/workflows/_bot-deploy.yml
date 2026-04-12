@@ -155,7 +155,9 @@ jobs:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
 
     - name: Verify deployment
-      run: ./scripts/verify-deploy.sh
+      run: |
+        chmod +x scripts/verify-deploy.sh
+        ./scripts/verify-deploy.sh
       env:
         ARGOCD_URL: http://argo.internal
         LOKI_URL: http://loki.internal
