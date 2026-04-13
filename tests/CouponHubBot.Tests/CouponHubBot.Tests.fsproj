@@ -30,9 +30,6 @@
     <PackageReference Include="xunit.runner.visualstudio" />
     <PackageReference Include="Testcontainers" />
     <PackageReference Include="Testcontainers.PostgreSql" />
-    <PackageReference Include="Npgsql" />
-    <PackageReference Include="Dapper" />
-    <PackageReference Include="Telegram.Bot" />
   </ItemGroup>
 
   <ItemGroup>

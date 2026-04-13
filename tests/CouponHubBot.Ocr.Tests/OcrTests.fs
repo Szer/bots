@@ -11,6 +11,7 @@ open Xunit
 
 open CouponHubBot
 open CouponHubBot.Services
+open BotInfra
 
 module private XUnitLogging =
     type private NoopScope() =
@@ -194,7 +195,11 @@ type OcrTests(output: ITestOutputHelper) =
         let handler = new AzureOcrCachingHandler(cachePath, allowNetwork, fun s -> output.WriteLine(s))
         let http = new HttpClient(handler)
 
-        let azure = AzureOcrService(http, botConf, XUnitLogging.XUnitLogger<AzureOcrService>(output, logs)) :> IAzureTextOcr
+        let ocrConfig: BotOcrConfig =
+            { OcrEnabled = botConf.OcrEnabled
+              AzureOcrEndpoint = botConf.AzureOcrEndpoint
+              AzureOcrKey = botConf.AzureOcrKey }
+        let azure = AzureBotOcr(http, ocrConfig, XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs)) :> IBotOcr
 
         // Freeze "now" to 2026 so year inference is stable.
         let timeProvider =

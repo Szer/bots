@@ -3,17 +3,13 @@ module VahterBanBot.Tests.ContainerTestBase
 open System
 open System.IO
 open System.Net.Http
-open System.Net.Http.Json
 open System.Text
 open System.Text.Json
 open System.Threading.Tasks
 open DotNet.Testcontainers.Builders
-open DotNet.Testcontainers.Configurations
-open DotNet.Testcontainers.Containers
 open Npgsql
 open Telegram.Bot.Types
 open BotTestInfra
-open BotTestInfra.ContainerHelpers
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open BotInfra
@@ -34,237 +30,118 @@ type TestMessage =
       raw_message: string
       created_at: DateTime }
 
+module private VahterTestConfig =
+    let secret = "OUR_SECRET"
+    let fakeAzureAlias = "fake-azure-ocr"
+
+    let makeConfig (mlEnabled: bool) : BotContainerConfig =
+        let envVars = [
+            "BOT_TELEGRAM_TOKEN", "123:456"
+            "BOT_AUTH_TOKEN", secret
+            "IGNORE_SIDE_EFFECTS", "false"
+            "USE_POLLING", "false"
+            "TELEGRAM_API_URL", "http://fake-tg-api:8080"
+        ]
+        let envVars =
+            if mlEnabled then
+                envVars @ [
+                    "AZURE_OCR_KEY", "secret-ocr-key"
+                    "AZURE_OPENAI_KEY", "fake-llm-key"
+                ]
+            else envVars
+
+        { BotProject = "VahterBanBot"
+          MigrationsSubdir = "vahter-bot"
+          DbName = "vahter_db"
+          DbUser = "vahter_bot_ban_service"
+          DbPassword = "vahter_bot_ban_service"
+          AppImageName = "vahter-bot-ban-test"
+          OcrEnabled = mlEnabled
+          SecretToken = secret
+          WebhookRoute = "/bot"
+          AppEnvVars = envVars }
+
 [<AbstractClass>]
 type VahterTestContainers(mlEnabled: bool) =
-    let solutionDir = CommonDirectoryPath.GetSolutionDirectory()
-    let dbAlias = "vahter-db"
-    let fakeTgAlias = "fake-tg-api"
-    let fakeAzureAlias = "fake-azure-ocr"
-    let internalConnectionString = $"Server={dbAlias};Database=vahter_db;Port=5432;User Id=vahter_bot_ban_service;Password=vahter_bot_ban_service;Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
-    let pgImage = "postgres:15.6" // same as in Azure
+    inherit BotContainerBase(VahterTestConfig.makeConfig mlEnabled)
 
-    // will be filled in IAsyncLifetime.InitializeAsync
-    let mutable uri: Uri = null
-    let mutable httpClient: HttpClient = null
-    let mutable fakeAzureHttp: HttpClient = null
-    let mutable publicConnectionString: string = null
-    let mutable testArtifactsDir: string = null
+    override this.SeedDatabase(connString: string) =
+        task {
+            let solutionDir = CommonDirectoryPath.GetSolutionDirectory()
 
-    // base image for the app — uses unified Dockerfile.bot with BOT_PROJECT arg
-    let appImage, appBuildLogger =
-        let logger = StringLogger()
-        let img =
-            ImageFromDockerfileBuilder()
-                .WithDockerfileDirectory(solutionDir, String.Empty)
-                .WithDockerfile("./src/Dockerfile.bot")
-                .WithName("vahter-bot-ban-test")
-                .WithBuildArgument("BOT_PROJECT", "VahterBanBot")
-                .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
-                .WithCleanUp(false)
-                .WithDeleteIfExists(true)
-                .WithLogger(logger)
-                .Build()
-        (img, logger)
+            // seed test data
+            let script = File.ReadAllText(CommonDirectoryPath.GetCallerFileDirectory().DirectoryPath + "/test_seed.sql")
+            // We need to run the seed SQL via psql in the DB container, but we only have the public
+            // connection string here. Use it directly with Npgsql instead.
+            use conn = new NpgsqlConnection(connString)
+            do! conn.OpenAsync()
+            let! _ = conn.ExecuteAsync(script)
+            ()
 
-    // private network for the containers
-    let network = createNetwork()
-
-    // FakeTgApi container — standalone mock Telegram API server
-    let fakeTgImage, fakeTgBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "vahter-fake-tg-api-test" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"]
-    let fakeTgContainer = createFakeTgApiContainer fakeTgImage network fakeTgAlias
-
-    // FakeAzureOcr container — standalone mock Azure OCR API
-    let fakeAzureImage, fakeAzureBuildLogger = buildImageSpec solutionDir "./tests/Dockerfile.fake" "vahter-fake-azure-ocr-test" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"]
-    let fakeAzureContainer = createFakeAzureOcrContainer fakeAzureImage network fakeAzureAlias
-
-    // PostgreSQL container. Important to have the same image as in Azure
-    let dbContainer = createPostgresContainer network dbAlias pgImage
-
-    // Flyway container to run migrations
-    let migrationsPath = Path.Combine(solutionDir.DirectoryPath, "src", "vahter-bot", "migrations")
-    let flywayContainer = createFlywayContainer network migrationsPath dbAlias "vahter_db" dbContainer
-
-    // the app container
-    // secrets and dev flags are env vars; all other settings come from bot_setting (seeded in InitializeAsync)
-    let appContainer =
-        let builder =
-            ContainerBuilder(appImage)
-                .WithNetwork(network)
-                .WithPortBinding(80, true)
-                .WithEnvironment("BOT_TELEGRAM_TOKEN", "123:456")
-                .WithEnvironment("BOT_AUTH_TOKEN", "OUR_SECRET")
-                .WithEnvironment("IGNORE_SIDE_EFFECTS", "false")
-                .WithEnvironment("USE_POLLING", "false")
-                .WithEnvironment("TELEGRAM_API_URL", $"http://{fakeTgAlias}:8080")
-                .WithEnvironment("DATABASE_URL", internalConnectionString)
-                // .net 8.0 upgrade has a breaking change
-                // https://learn.microsoft.com/en-us/dotnet/core/compatibility/containers/8.0/aspnet-port
-                // Azure default port for containers is 80, so we need to explicitly set it
-                .WithEnvironment("ASPNETCORE_HTTP_PORTS", "80")
-                .DependsOn(flywayContainer)
-                .DependsOn(fakeTgContainer)
-                .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(80))
-        if mlEnabled then
-            builder
-                .WithEnvironment("AZURE_OCR_KEY", "secret-ocr-key")
-                .WithEnvironment("AZURE_OCR_ENDPOINT", $"http://{fakeAzureAlias}:8081/computervision/imageanalysis:analyze")
-                .WithEnvironment("AZURE_OPENAI_KEY", "fake-llm-key")
-                .DependsOn(fakeAzureContainer)
-                .Build()
-        else
-            builder.Build()
-            
-    let startContainers() = task {
-        // build images and spin up db in parallel
-        let appBuildTask = buildImageWithLogs testArtifactsDir "app" appImage appBuildLogger
-        let fakeTgBuildTask = buildImageWithLogs testArtifactsDir "fake-tg-api" fakeTgImage fakeTgBuildLogger
-        let fakeAzureBuildTask =
-            if mlEnabled then buildImageWithLogs testArtifactsDir "fake-azure-ocr" fakeAzureImage fakeAzureBuildLogger
-            else Task.CompletedTask
-        let dbTask = dbContainer.StartAsync()
-
-        do! Task.WhenAll([| appBuildTask; fakeTgBuildTask; fakeAzureBuildTask; dbTask |])
-
-        // start FakeTgApi container (needed before app starts)
-        do! fakeTgContainer.StartAsync()
-        if mlEnabled then
-            do! fakeAzureContainer.StartAsync()
-    }
-
-    interface IAsyncLifetime with
-        member this.InitializeAsync() = ValueTask(task {
-            testArtifactsDir <- Path.Combine(solutionDir.DirectoryPath, "test-artifacts", "VahterBanBot.Tests", this.GetType().Name)
-            try
-                do! startContainers()
-                publicConnectionString <- $"Server=127.0.0.1;Database=vahter_db;Port={dbContainer.GetMappedPublicPort(5432)};User Id=vahter_bot_ban_service;Password=vahter_bot_ban_service;Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
-                
-                // initialize DB with the schema, database and a DB user
-                let script = File.ReadAllText(CommonDirectoryPath.GetSolutionDirectory().DirectoryPath + "/src/vahter-bot/init.sql")
-                let! initResult = dbContainer.ExecScriptAsync(script)
-                if initResult.Stderr <> "" then
-                    failwith initResult.Stderr
-
-                // run migrations
-                do! flywayContainer.StartAsync()
-                let! out, err = flywayContainer.GetLogsAsync()
-                if err <> "" then
-                    failwith err
-                if not (out.Contains "Successfully applied") then
-                    failwith out
-                
-                // seed some test data
-                let script = File.ReadAllText(CommonDirectoryPath.GetCallerFileDirectory().DirectoryPath + "/test_seed.sql")
-                let scriptFilePath = String.Join("/", String.Empty, "tmp", Guid.NewGuid().ToString("D"), Path.GetRandomFileName())
-                do! dbContainer.CopyAsync(Encoding.Default.GetBytes script, scriptFilePath, fileMode = Unix.FileMode644)
-                let! scriptResult = dbContainer.ExecAsync [|"psql"; "--username"; "vahter_bot_ban_service"; "--dbname"; "vahter_db"; "--file"; scriptFilePath |]
-
-                if scriptResult.Stderr <> "" then
-                    failwith scriptResult.Stderr
-
-                // seed bot_setting — common settings + per-fixture overrides
-                let commonSettings = [
-                    "BOT_USER_ID",               "1337",                                    "FREE_FORM",    "BOT"
-                    "BOT_USER_NAME",             "test_bot",                                "FREE_FORM",    "BOT"
-                    "POTENTIAL_SPAM_CHANNEL_ID", "-101",                                    "FREE_FORM",    "CHANNELS"
-                    "DETECTED_SPAM_CHANNEL_ID",  "-102",                                    "FREE_FORM",    "CHANNELS"
-                    "ALL_LOGS_CHANNEL_ID",       "-103",                                    "FREE_FORM",    "CHANNELS"
-                    "DETECTED_SPAM_CLEANUP_AGE_HOURS", "24",                                "FREE_FORM",    "CHANNELS"
-                    "CHATS_TO_MONITOR",          """{"pro.hell":"-666","dotnetru":-42}""",  "JSON_BLOB",    "CHANNELS"
-                    "ALLOWED_USERS",             """{"vahter_1":"34","vahter_2":69}""",     "JSON_BLOB",    "CHANNELS"
-                    "UPDATE_CHAT_ADMINS",        "true",                                    "FEATURE_FLAG", "CLEANUP"
-                    "UPDATE_CHAT_ADMINS_INTERVAL_SEC", "86400",                             "FREE_FORM",    "CLEANUP"
+            // seed bot_setting -- common settings + per-fixture overrides
+            let commonSettings = [
+                "BOT_USER_ID",               "1337",                                    "FREE_FORM",    "BOT"
+                "BOT_USER_NAME",             "test_bot",                                "FREE_FORM",    "BOT"
+                "POTENTIAL_SPAM_CHANNEL_ID", "-101",                                    "FREE_FORM",    "CHANNELS"
+                "DETECTED_SPAM_CHANNEL_ID",  "-102",                                    "FREE_FORM",    "CHANNELS"
+                "ALL_LOGS_CHANNEL_ID",       "-103",                                    "FREE_FORM",    "CHANNELS"
+                "DETECTED_SPAM_CLEANUP_AGE_HOURS", "24",                                "FREE_FORM",    "CHANNELS"
+                "CHATS_TO_MONITOR",          """{"pro.hell":"-666","dotnetru":-42}""",  "JSON_BLOB",    "CHANNELS"
+                "ALLOWED_USERS",             """{"vahter_1":"34","vahter_2":69}""",     "JSON_BLOB",    "CHANNELS"
+                "UPDATE_CHAT_ADMINS",        "true",                                    "FEATURE_FLAG", "CLEANUP"
+                "UPDATE_CHAT_ADMINS_INTERVAL_SEC", "86400",                             "FREE_FORM",    "CLEANUP"
+            ]
+            let mlSettings =
+                if mlEnabled then [
+                    "ML_ENABLED",                          "true",  "FEATURE_FLAG", "ML"
+                    "ML_SEED",                             "42",    "FREE_FORM",    "ML"
+                    "ML_TRAIN_RANDOM_SORT_DATA",           "false", "FEATURE_FLAG", "ML"
+                    "ML_SPAM_THRESHOLD",                   "1.0",   "FREE_FORM",    "ML"
+                    "ML_STOP_WORDS_IN_CHATS",              """{"-42":["2"]}""", "JSON_BLOB", "ML"
+                    "ML_SPAM_DELETION_ENABLED",            "true",  "FEATURE_FLAG", "ML_SPAM_DELETION"
+                    "ML_SPAM_AUTOBAN_ENABLED",             "true",  "FEATURE_FLAG", "ML_SPAM_AUTOBAN"
+                    "ML_SPAM_AUTOBAN_CHECK_LAST_MSG_COUNT","10",    "FREE_FORM",    "ML_SPAM_AUTOBAN"
+                    "ML_SPAM_AUTOBAN_SCORE_THRESHOLD",     "-4.0",  "FREE_FORM",    "ML_SPAM_AUTOBAN"
+                    "OCR_ENABLED",                         "true",  "FEATURE_FLAG", "OCR"
+                    "OCR_MAX_FILE_SIZE_BYTES",             (20L * 1024L * 1024L).ToString(), "FREE_FORM", "OCR"
+                    "AZURE_OCR_ENDPOINT",                  $"http://{VahterTestConfig.fakeAzureAlias}:8081", "FREE_FORM", "OCR"
+                    "REACTION_SPAM_ENABLED",               "true",  "FEATURE_FLAG", "REACTION_SPAM"
+                    "REACTION_SPAM_MIN_MESSAGES",          "3",     "FREE_FORM",    "REACTION_SPAM"
+                    "REACTION_SPAM_MAX_REACTIONS",         "5",     "FREE_FORM",    "REACTION_SPAM"
+                    "FORWARD_SPAM_DETECTION_ENABLED",      "true",  "FEATURE_FLAG", "FORWARD_SPAM"
+                    "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","true","FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
+                    "ML_OLD_USER_MSG_COUNT",               "10",    "FREE_FORM",    "ML"
+                    "LLM_TRIAGE_ENABLED",                  "true",  "FEATURE_FLAG", "LLM"
+                    "AZURE_OPENAI_ENDPOINT",               $"http://{VahterTestConfig.fakeAzureAlias}:8081", "FREE_FORM", "LLM"
+                ] else [
+                    // these two default to true in code, so must be explicitly set to false
+                    "FORWARD_SPAM_DETECTION_ENABLED",        "false", "FEATURE_FLAG", "FORWARD_SPAM"
+                    "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","false", "FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
                 ]
-                let mlSettings =
-                    if mlEnabled then [
-                        "ML_ENABLED",                          "true",  "FEATURE_FLAG", "ML"
-                        "ML_SEED",                             "42",    "FREE_FORM",    "ML"
-                        "ML_TRAIN_RANDOM_SORT_DATA",           "false", "FEATURE_FLAG", "ML"
-                        "ML_SPAM_THRESHOLD",                   "1.0",   "FREE_FORM",    "ML"
-                        "ML_STOP_WORDS_IN_CHATS",              """{"-42":["2"]}""", "JSON_BLOB", "ML"
-                        "ML_SPAM_DELETION_ENABLED",            "true",  "FEATURE_FLAG", "ML_SPAM_DELETION"
-                        "ML_SPAM_AUTOBAN_ENABLED",             "true",  "FEATURE_FLAG", "ML_SPAM_AUTOBAN"
-                        "ML_SPAM_AUTOBAN_CHECK_LAST_MSG_COUNT","10",    "FREE_FORM",    "ML_SPAM_AUTOBAN"
-                        "ML_SPAM_AUTOBAN_SCORE_THRESHOLD",     "-4.0",  "FREE_FORM",    "ML_SPAM_AUTOBAN"
-                        "OCR_ENABLED",                         "true",  "FEATURE_FLAG", "OCR"
-                        "OCR_MAX_FILE_SIZE_BYTES",             (20L * 1024L * 1024L).ToString(), "FREE_FORM", "OCR"
-                        "AZURE_OCR_ENDPOINT",                  $"http://{fakeAzureAlias}:8081/computervision/imageanalysis:analyze", "FREE_FORM", "OCR"
-                        "REACTION_SPAM_ENABLED",               "true",  "FEATURE_FLAG", "REACTION_SPAM"
-                        "REACTION_SPAM_MIN_MESSAGES",          "3",     "FREE_FORM",    "REACTION_SPAM"
-                        "REACTION_SPAM_MAX_REACTIONS",         "5",     "FREE_FORM",    "REACTION_SPAM"
-                        "FORWARD_SPAM_DETECTION_ENABLED",      "true",  "FEATURE_FLAG", "FORWARD_SPAM"
-                        "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","true","FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
-                        "ML_OLD_USER_MSG_COUNT",               "10",    "FREE_FORM",    "ML"
-                        "LLM_TRIAGE_ENABLED",                  "true",  "FEATURE_FLAG", "LLM"
-                        "AZURE_OPENAI_ENDPOINT",               $"http://{fakeAzureAlias}:8081", "FREE_FORM", "LLM"
-                    ] else [
-                        // these two default to true in code, so must be explicitly set to false
-                        "FORWARD_SPAM_DETECTION_ENABLED",        "false", "FEATURE_FLAG", "FORWARD_SPAM"
-                        "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","false", "FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
-                    ]
-                use settingsConn = new NpgsqlConnection(publicConnectionString)
-                for (key, value, typ, group) in commonSettings @ mlSettings do
-                    do! settingsConn.ExecuteAsync(
-                            "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)",
-                            {| k = key; v = value; t = typ; g = group |})
-                        :> Task
+            for (key, value, typ, group) in commonSettings @ mlSettings do
+                do! conn.ExecuteAsync(
+                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)",
+                        {| k = key; v = value; t = typ; g = group |})
+                    :> Task
+        }
 
-                // start the app container
-                do! appContainer.StartAsync()
-                
-                // initialize the http client with correct hostname and port
-                httpClient <- new HttpClient()
-                uri <- Uri($"http://{appContainer.Hostname}:{appContainer.GetMappedPublicPort(80)}")
-                httpClient.BaseAddress <- uri
-                httpClient.DefaultRequestHeaders.Add("X-Telegram-Bot-Api-Secret-Token", "OUR_SECRET")
+    member this.Http = this.BotHttp
+    member this.Uri = this.BotHttp.BaseAddress
 
-                if mlEnabled then
-                    fakeAzureHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{fakeAzureContainer.GetMappedPublicPort(8081)}"))
-                    fakeAzureHttp.Timeout <- TimeSpan.FromSeconds(5.0)
-            finally
-                if appContainer.State <> TestcontainersStates.Undefined then
-                    let struct (_stdout, err) = appContainer.GetLogsAsync().Result
-                    if err <> "" then
-                        failwith err
-        })
-    interface IAsyncDisposable with
-        member this.DisposeAsync() = ValueTask(task {
-            // Dump logs FIRST — logs become inaccessible after container removal
-            let! _ = dumpContainerLogs testArtifactsDir "postgres" dbContainer
-            let! _ = dumpContainerLogs testArtifactsDir "flyway" flywayContainer
-            let! _ = dumpContainerLogs testArtifactsDir "app" appContainer
-            let! _ = dumpContainerLogs testArtifactsDir "fake-tg-api" fakeTgContainer
-            if mlEnabled then
-                let! _ = dumpContainerLogs testArtifactsDir "fake-azure-ocr" fakeAzureContainer
-                ()
-            if not (isNull fakeAzureHttp) then fakeAzureHttp.Dispose()
-            // stop all the containers, flyway might be dead already
-            do! flywayContainer.DisposeAsync()
-            do! appContainer.DisposeAsync()
-            do! fakeTgContainer.DisposeAsync()
-            if mlEnabled then
-                do! fakeAzureContainer.DisposeAsync()
-            do! dbContainer.DisposeAsync()
-        })
-
-    member _.Http = httpClient
-    member _.Uri = uri
-
-    member _.SetOcrText(text: string) = task {
+    member this.SetOcrText(text: string) = task {
         let ocrJson =
             $"""{{"modelVersion":"2023-10-01","metadata":{{"width":1020,"height":638}},"readResult":{{"blocks":[{{"lines":[{{"text":"{text}","boundingPolygon":[{{"x":1,"y":24}},{{"x":1005,"y":27}},{{"x":1004,"y":377}},{{"x":0,"y":371}}],"words":[{{"text":"{text}","confidence":0.9}}]}}]}}]}}}}"""
-        let payload = {| status = 200; body = ocrJson |}
-        let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/response", payload)
-        return ()
+        this.SetAzureOcrResponse(200, ocrJson) |> Async.AwaitTask |> Async.RunSynchronously
     }
-    
+
     member this.SendMessage(update: Update) = task {
         let json = JsonSerializer.Serialize(update, options = telegramJsonOptions)
         return! this.SendMessage(json)
     }
 
-    member _.SendMessage(json: string) = task {
+    member this.SendMessage(json: string) = task {
         let content = new StringContent(json, Encoding.UTF8, "application/json")
-        let! resp = httpClient.PostAsync("/bot", content)
+        let! resp = this.BotHttp.PostAsync("/bot", content)
         return resp
     }
 
@@ -272,7 +149,7 @@ type VahterTestContainers(mlEnabled: bool) =
         Tg.user(id = 34, username = "vahter_1")
         Tg.user(id = 69, username = "vahter_2")
     ]
-    
+
     member _.Admins = [
         Tg.user(id = 42, username = "just_admin")
     ]
@@ -285,8 +162,8 @@ type VahterTestContainers(mlEnabled: bool) =
         Tg.chat(id = -42, username = "dotnetru")
     ]
 
-    member _.TryGetDbMessage(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.TryGetDbMessage(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -305,8 +182,8 @@ WHERE event_type = 'MessageReceived'
         return dbMessage |> Seq.tryHead
     }
 
-    member _.MessageBanned(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.MessageBanned(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -331,8 +208,8 @@ SELECT EXISTS (
         return! conn.QuerySingleAsync<bool>(sql, {| chatId = msg.Chat.Id; messageId = msg.MessageId |})
     }
 
-    member _.UserBanned(userId: int64) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.UserBanned(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -346,8 +223,8 @@ WHERE stream_id   = 'user:' || @userId
         return count > 0
     }
 
-    member _.MessageEditedRecorded(chatId: int64, messageId: int) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.MessageEditedRecorded(chatId: int64, messageId: int) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -360,8 +237,8 @@ WHERE event_type = 'MessageEdited'
         return count > 0
     }
 
-    member _.MessageIsAutoDeleted(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.MessageIsAutoDeleted(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -373,8 +250,8 @@ WHERE event_type = 'BotAutoDeleted'
         let! count = conn.QuerySingleAsync<int>(sql, {| chatId = msg.Chat.Id; messageId = msg.MessageId |})
         return count > 0
     }
-    
-    member _.GetCallbackId(msg: TgMsg) (caseName: string) = task {
+
+    member this.GetCallbackId(msg: TgMsg) (caseName: string) = task {
         //language=postgresql
         let sql = """
 SELECT REPLACE(stream_id, 'callback:', '')::UUID
@@ -390,7 +267,7 @@ WHERE event_type = 'CallbackCreated'
         let mutable result = None
         let mutable attempt = 0
         while result.IsNone && attempt < 5 do
-            use conn = new NpgsqlConnection(publicConnectionString)
+            use conn = new NpgsqlConnection(this.DbConnectionString)
             let! rows = conn.QueryAsync<Guid>(sql, param)
             match rows |> Seq.tryHead with
             | Some id -> result <- Some id
@@ -401,11 +278,11 @@ WHERE event_type = 'CallbackCreated'
         | Some id -> return id
         | None -> return failwith $"Callback not found for message {msg.MessageId} in chat {msg.Chat.Id} with case {caseName}"
     }
-    
-    member _.IsMessageFalsePositive(msg: TgMsg) = task {
+
+    member this.IsMessageFalsePositive(msg: TgMsg) = task {
         if String.IsNullOrWhiteSpace(msg.Text) then return false else
 
-        use conn = new NpgsqlConnection(publicConnectionString)
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -418,8 +295,8 @@ SELECT EXISTS (
         return! conn.QuerySingleAsync<bool>(sql, {| text = msg.Text |})
     }
 
-    member _.UserBannedByBot(userId: int64) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.UserBannedByBot(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -433,8 +310,8 @@ WHERE stream_id  = 'user:' || @userId
         return count > 0
     }
 
-    member _.UserBannedByAI(userId: int64) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.UserBannedByAI(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -447,9 +324,9 @@ WHERE stream_id  = 'user:' || @userId
         let! count = conn.QuerySingleAsync<int>(sql, {| userId = userId |})
         return count > 0
     }
-    
-    member _.GetUserReactionCount(userId: int64) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+
+    member this.GetUserReactionCount(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -461,9 +338,9 @@ WHERE stream_id  = 'user:' || @userId
         let! result = conn.QuerySingleAsync<int>(sql, {| userId = userId |})
         return result
     }
-    
-    member _.IsMessageFalseNegative(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+
+    member this.IsMessageFalseNegative(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -477,8 +354,8 @@ WHERE event_type = 'MessageMarkedSpam'
     }
 
     /// Checks if message was auto-deleted by the bot
-    member _.MessageWasDeleted(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.MessageWasDeleted(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -492,7 +369,7 @@ WHERE event_type = 'BotAutoDeleted'
     }
 
     member this.TryGetLlmTriageVerdict(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -506,8 +383,8 @@ WHERE event_type = 'LlmClassified'
     }
 
     /// Gets the modelName from the LlmClassified event for a message (None if event absent or field missing).
-    member _.TryGetLlmClassifiedModelName(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.TryGetLlmClassifiedModelName(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -521,8 +398,8 @@ WHERE event_type = 'LlmClassified'
     }
 
     /// Gets the promptHash from the LlmClassified event for a message (None if event absent or field missing).
-    member _.TryGetLlmClassifiedPromptHash(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.TryGetLlmClassifiedPromptHash(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -536,8 +413,8 @@ WHERE event_type = 'LlmClassified'
     }
 
     /// Gets the ML score recorded for a message via MlScoredMessage event.
-    member _.GetMlScore(msg: TgMsg) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.GetMlScore(msg: TgMsg) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -551,8 +428,8 @@ WHERE event_type = 'MlScoredMessage'
     }
 
     /// Inserts a CallbackCreated event with a backdated created_at for testing orphaned cleanup.
-    member _.InsertOrphanedCallback(callbackId: Guid, daysOld: int) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.InsertOrphanedCallback(callbackId: Guid, daysOld: int) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -567,8 +444,8 @@ VALUES ('callback:' || @callbackId, 1,
     }
 
     /// Runs the same orphaned callback cleanup as DB.expireOrphanedCallbacks.
-    member _.CleanupOrphanedCallbacks(howOld: TimeSpan) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.CleanupOrphanedCallbacks(howOld: TimeSpan) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let findSql =
             """
@@ -600,8 +477,8 @@ ON CONFLICT (stream_id, stream_version) DO NOTHING
     }
 
     /// Checks if a CallbackExpired event exists for the given callback.
-    member _.HasCallbackExpired(callbackId: Guid) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.HasCallbackExpired(callbackId: Guid) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -612,8 +489,8 @@ WHERE stream_id = 'callback:' || @callbackId AND event_type = 'CallbackExpired'
         return count > 0
     }
 
-    member _.SetBotSetting(key: string, value: string) = task {
-        use conn = new NpgsqlConnection(publicConnectionString)
+    member this.SetBotSetting(key: string, value: string) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
             """
@@ -626,7 +503,7 @@ ON CONFLICT (key) DO UPDATE SET value = @value
     }
 
     member this.ReloadSettings() = task {
-        let! resp = httpClient.PostAsync("/reload-settings", null)
+        let! resp = this.BotHttp.PostAsync("/reload-settings", null)
         resp.EnsureSuccessStatusCode() |> ignore
     }
 
