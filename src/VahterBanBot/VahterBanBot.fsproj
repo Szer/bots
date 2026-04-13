@@ -9,10 +9,10 @@
     <Compile Include="TgMessage.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Metrics.fs" />
+    <Compile Include="Telemetry.fs" />
     <Compile Include="DB.fs" />
     <Compile Include="ML.fs" />
     <Compile Include="ComputerVision.fs" />
-    <Compile Include="Telemetry.fs" />
     <Compile Include="LlmTriage.fs" />
     <Compile Include="UpdateChatAdmins.fs" />
     <Compile Include="Bot.fs" />

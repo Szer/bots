@@ -45,8 +45,11 @@ module WebhookHost =
                 TelegramBotClient(options, httpClient) :> ITelegramBotClient
             )
 
-        // TimeProvider (frozen in tests via BOT_FIXED_UTC_NOW)
-        %builder.Services.AddSingleton<TimeProvider>(fun _sp -> Time.fromEnvironment())
+        // TimeProvider (frozen in tests via BOT_FIXED_UTC_NOW).
+        // Registered as MutableTimeProvider so the reload endpoint can advance time at runtime.
+        let mtp = Time.MutableTimeProvider(Time.fromEnvironment())
+        %builder.Services.AddSingleton<Time.MutableTimeProvider>(mtp)
+        %builder.Services.AddSingleton<TimeProvider>(mtp :> TimeProvider)
 
         // OpenTelemetry
         %Observability.addBotOpenTelemetry cfg.OtelServiceName cfg.ActivitySourceName cfg.MeterName builder.Services

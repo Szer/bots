@@ -17,8 +17,6 @@ open VahterBanBot.ML
 open VahterBanBot.ComputerVision
 open VahterBanBot.LlmTriage
 open VahterBanBot.Telemetry
-open VahterBanBot.Utils
-open VahterBanBot.Bot
 open VahterBanBot.Types
 open VahterBanBot.StartupMessage
 open VahterBanBot.UpdateChatAdmins
@@ -131,7 +129,6 @@ let mutable botConf = buildBotConf()
 let reloadSettings () =
     dbSettings <- loadDbSettings()
     botConf <- buildBotConf()
-    Time.provider <- BotInfra.Time.fromString (getSettingOr "BOT_FIXED_UTC_NOW" "")
 
 let webhookCfg: WebhookConfig =
     { BotToken = botConf.BotToken
@@ -148,6 +145,9 @@ WebhookHost.configureSharedServices webhookCfg builder
 
 %builder.Services
     .AddSingleton(botConf)
+    .AddSingleton<DbService>(fun sp ->
+        DbService(connString, sp.GetRequiredService<TimeProvider>()))
+    .AddSingleton<BotService>()
     // MachineLearning must start before CleanupService (loads model from DB on startup)
     .AddSingleton<MachineLearning>()
     .AddHostedService<MachineLearning>(fun sp -> sp.GetRequiredService<MachineLearning>())
@@ -164,10 +164,10 @@ WebhookHost.configureSharedServices webhookCfg builder
 %builder.Services.AddSingleton<IComputerVision, BotOcrComputerVision>()
 %builder.Services.AddHttpClient<ILlmTriage, AzureLlmTriage>()
 
-// Ensure bot user record exists in DB (result not needed -- identity comes from BotConfiguration.BotActor)
-(DB.upsertUser botConf.BotUserId (Some botConf.BotUserName)).Result |> ignore
-
 let app = builder.Build()
+
+// Ensure bot user record exists in DB (result not needed -- identity comes from BotConfiguration.BotActor)
+(app.Services.GetRequiredService<DbService>().UpsertUser(botConf.BotUserId, Some botConf.BotUserName)).Result |> ignore
 
 // Readiness check for ML model (used by startupProbe)
 %app.MapGet("/ready", Func<HttpContext, IResult>(fun ctx ->
@@ -187,6 +187,11 @@ let app = builder.Build()
         Results.Text("Access Denied", statusCode = 401)
     else
         reloadSettings()
+        // Update the runtime TimeProvider so BOT_FIXED_UTC_NOW changes take effect immediately.
+        // This is a no-op in production (setting is empty → System clock), but lets integration
+        // tests advance time without restarting the container.
+        let mtp = ctx.RequestServices.GetRequiredService<Time.MutableTimeProvider>()
+        mtp.SetInner(Time.fromString (getSettingOr "BOT_FIXED_UTC_NOW" ""))
         ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
         Results.Ok "Settings reloaded"
 ))
@@ -205,13 +210,9 @@ WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
               .SetTag("updateBodyObject", update)
               .SetTag("updateBodyJson", updateBodyJson)
 
-        use scope = ctx.RequestServices.CreateScope()
-        let telegramClient = scope.ServiceProvider.GetRequiredService<ITelegramBotClient>()
-        let ml = scope.ServiceProvider.GetRequiredService<MachineLearning>()
-        let computerVision = scope.ServiceProvider.GetRequiredService<IComputerVision>()
-        let llmTriage = scope.ServiceProvider.GetRequiredService<ILlmTriage>()
+        let bot = ctx.RequestServices.GetRequiredService<BotService>()
         try
-            do! onUpdate telegramClient botConf logger ml computerVision llmTriage update
+            do! bot.OnUpdate(update)
             %topActivity.SetTag("update-error", false)
             %topActivity.SetStatus(ActivityStatusCode.Ok)
         with e ->
@@ -230,13 +231,8 @@ if botConf.UsePolling then
           member x.HandleUpdateAsync (botClient: ITelegramBotClient, update: Update, cancellationToken: CancellationToken) =
             task {
                 if update.Message <> null && update.Message.Type = MessageType.Text then
-                    let ctx = app.Services.CreateScope()
-                    let logger = ctx.ServiceProvider.GetRequiredService<ILogger<IUpdateHandler>>()
-                    let client = ctx.ServiceProvider.GetRequiredService<ITelegramBotClient>()
-                    let ml = ctx.ServiceProvider.GetRequiredService<MachineLearning>()
-                    let ocr = ctx.ServiceProvider.GetRequiredService<IComputerVision>()
-                    let llmTriage = ctx.ServiceProvider.GetRequiredService<ILlmTriage>()
-                    do! onUpdate client botConf logger ml ocr llmTriage update
+                    let bot = app.Services.GetRequiredService<BotService>()
+                    do! bot.OnUpdate(update)
             }
           member this.HandleErrorAsync(botClient, ``exception``, source, cancellationToken) =
               Task.CompletedTask
