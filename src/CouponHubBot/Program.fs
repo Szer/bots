@@ -1,105 +1,98 @@
 // CouponHubBot — Telegram coupon management bot
 open System
-open System.Data
-open System.Text.Json
-open System.Text.Json.Serialization
+open System.Globalization
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
-open System.Globalization
-open Dapper
-open Telegram.Bot
-open Telegram.Bot.Types
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
 open BotInfra
-open BotInfra.TelegramHelpers
+open BotInfra.DbSettings
 
 type Root = class end
 
-/// Dapper type handler for DateOnly (maps to PostgreSQL DATE)
-type DateOnlyTypeHandler() =
-    inherit SqlMapper.TypeHandler<DateOnly>()
-    override _.SetValue(parameter: IDbDataParameter, value: DateOnly) =
-        parameter.Value <- value.ToDateTime(TimeOnly.MinValue)
-    override _.Parse(value: obj) =
-        match value with
-        | :? DateOnly as d -> d
-        | :? DateTime as dt -> DateOnly.FromDateTime(dt)
-        | x -> failwithf "Unsupported DateOnly value: %A" x
-SqlMapper.AddTypeHandler(DateOnlyTypeHandler())
+DapperSetup.registerDateOnlyHandler()
 
-let botConfJsonOptions =
-    let opts = JsonSerializerOptions(JsonSerializerDefaults.Web)
-    opts.NumberHandling <- JsonNumberHandling.AllowReadingFromString
-    Telegram.Bot.JsonBotAPI.Configure(opts)
-    opts
+let connString = getEnv "DATABASE_URL"
 
-let globalBotConfDontUseOnlyRegister =
-    let parseAdmins (raw: string) =
-        if String.IsNullOrWhiteSpace raw then
-            [||]
-        else
-            raw.Split([| ','; ';'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
-            |> Array.choose (fun s ->
-                match Int64.TryParse(s.Trim()) with
-                | true, v -> Some v
-                | _ -> None)
+let parseAdmins (raw: string) =
+    if String.IsNullOrWhiteSpace raw then
+        [||]
+    else
+        raw.Split([| ','; ';'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.choose (fun s ->
+            match Int64.TryParse(s.Trim()) with
+            | true, v -> Some v
+            | _ -> None)
 
+let loadDbSettings () =
+    try
+        DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
+    with e ->
+        eprintfn "[FATAL] Failed to load bot settings from database: %O" e
+        reraise()
+
+let mutable dbSettings = loadDbSettings()
+
+let getSetting key =
+    let accessor = BotSettingsAccessor(dbSettings)
+    accessor.GetSetting key
+
+let getSettingOr key def =
+    let accessor = BotSettingsAccessor(dbSettings)
+    accessor.GetSettingOr(key, def)
+
+let buildBotConf () =
     { BotToken = getEnv "BOT_TELEGRAM_TOKEN"
       SecretToken = getEnv "BOT_AUTH_TOKEN"
-      CommunityChatId = getEnv "COMMUNITY_CHAT_ID" |> int64
+      CommunityChatId = getSettingOr "COMMUNITY_CHAT_ID" (getEnvOr "COMMUNITY_CHAT_ID" "-1") |> int64
       TelegramApiBaseUrl =
         match getEnvOr "TELEGRAM_API_URL" "" with
         | "" -> null
         | v -> v
-      ReminderHourDublin = getEnvOr "REMINDER_HOUR_DUBLIN" "10" |> int
-      ReminderRunOnStart = getEnvOrBool "REMINDER_RUN_ON_START" false
-      OcrEnabled = getEnvOrBool "OCR_ENABLED" false
-      OcrMaxFileSizeBytes = getEnvOrInt64 "OCR_MAX_FILE_SIZE_BYTES" (20L * 1024L * 1024L)
-      AzureOcrEndpoint = getEnvOr "AZURE_OCR_ENDPOINT" ""
+      ReminderHourDublin = getSettingOr "REMINDER_HOUR_DUBLIN" "10" |> int
+      ReminderRunOnStart = getSettingOr "REMINDER_RUN_ON_START" "false" |> bool.Parse
+      OcrEnabled = getSettingOr "OCR_ENABLED" "false" |> bool.Parse
+      OcrMaxFileSizeBytes = getSettingOr "OCR_MAX_FILE_SIZE_BYTES" (string (20L * 1024L * 1024L)) |> int64
+      AzureOcrEndpoint = getSettingOr "AZURE_OCR_ENDPOINT" (getEnvOr "AZURE_OCR_ENDPOINT" "")
       AzureOcrKey = getEnvOr "AZURE_OCR_KEY" ""
-      FeedbackAdminIds = getEnvOr "FEEDBACK_ADMINS" "" |> parseAdmins
-      GitHubToken = getEnv "GITHUB_TOKEN"
-      GitHubRepo = getEnvOr "GITHUB_REPO" "Szer/coupon-bot"
-      TestMode = getEnvOrBool "TEST_MODE" false
-      MaxTakenCoupons = getEnvOr "MAX_TAKEN_COUPONS" "6" |> int }
+      FeedbackAdminIds = getSettingOr "FEEDBACK_ADMINS" (getEnvOr "FEEDBACK_ADMINS" "") |> parseAdmins
+      GitHubToken = getEnvOr "GITHUB_TOKEN" ""
+      GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/coupon-bot")
+      TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
+      MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int }
 
-let validateApiKey (ctx: HttpContext) =
-    let botConf = ctx.RequestServices.GetRequiredService<BotConfiguration>()
-    match ctx.Request.Headers.TryGetValue "X-Telegram-Bot-Api-Secret-Token" with
-    | true, headerValues when headerValues.Count > 0 && headerValues[0] = botConf.SecretToken -> true
-    | _ -> false
+let mutable botConf = buildBotConf()
+
+let reloadSettings () =
+    dbSettings <- loadDbSettings()
+    botConf <- buildBotConf()
+
+let webhookCfg: WebhookConfig =
+    { BotToken = botConf.BotToken
+      SecretToken = botConf.SecretToken
+      TelegramApiBaseUrl = botConf.TelegramApiBaseUrl
+      OtelServiceName = "coupon-hub-bot"
+      ActivitySourceName = botActivity.Name
+      MeterName = "CouponHubBot.Metrics"
+      WebhookRoute = "/bot" }
 
 let builder = WebApplication.CreateBuilder()
 
-// Configure Serilog for structured JSON logging with trace correlation
-Observability.configureSerilog builder.Host
+WebhookHost.configureSharedServices webhookCfg builder
 
-%builder.Services.AddSingleton globalBotConfDontUseOnlyRegister
-%builder.Services.AddSingleton<TimeProvider>(fun _sp -> Time.fromEnvironment ())
-// Configure JSON options for Telegram.Bot compatibility
-%builder.Services.Configure<JsonSerializerOptions>(fun (opts: JsonSerializerOptions) ->
-    opts.NumberHandling <- JsonNumberHandling.AllowReadingFromString
-    JsonBotAPI.Configure(opts)
-)
+%builder.Services.AddSingleton(botConf)
 
-%builder.Services
-    .AddHttpClient("telegram_bot_client")
-    .AddTypedClient(fun httpClient _sp ->
-        let botConf = _sp.GetRequiredService<BotConfiguration>()
-        let options =
-            if isNull botConf.TelegramApiBaseUrl then
-                TelegramBotClientOptions(botConf.BotToken)
-            else
-                // Telegram.Bot will omit path/query/fragment; we only need scheme://host:port
-                TelegramBotClientOptions(botConf.BotToken, botConf.TelegramApiBaseUrl)
-        TelegramBotClient(options, httpClient) :> ITelegramBotClient)
+// OCR: register shared IBotOcr
+%builder.Services.AddSingleton<BotOcrConfig>(
+    { OcrEnabled = botConf.OcrEnabled
+      AzureOcrEndpoint = botConf.AzureOcrEndpoint
+      AzureOcrKey = botConf.AzureOcrKey })
+%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
 
-%builder.Services.AddHttpClient<IAzureTextOcr, AzureOcrService>()
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()
 
@@ -111,7 +104,7 @@ Observability.configureSerilog builder.Host
     .AddSingleton<CallbackHandler>()
     .AddSingleton<DbService>(fun sp ->
         let botConf = sp.GetRequiredService<BotConfiguration>()
-        DbService(getEnv "DATABASE_URL", sp.GetRequiredService<TimeProvider>(), botConf.MaxTakenCoupons))
+        DbService(connString, sp.GetRequiredService<TimeProvider>(), botConf.MaxTakenCoupons))
     .AddSingleton<TelegramMembershipService>()
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
@@ -119,12 +112,8 @@ Observability.configureSerilog builder.Host
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
 
-%Observability.addBotOpenTelemetry "coupon-hub-bot" botActivity.Name "CouponHubBot.Metrics" builder.Services
-
 let app = builder.Build()
 
-// Health check
-%app.MapGet("/health", Func<string>(fun () -> "OK"))
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
 
 // Test-only hook to trigger reminder immediately
@@ -150,30 +139,25 @@ let app = builder.Build()
             return Results.Json({| ok = true; sent = sent |})
     }))
 
-// Main webhook endpoint
-%app.MapPost("/bot", Func<HttpContext, Task<IResult>>(fun ctx ->
+// Reload settings endpoint
+%app.MapPost("/reload-settings", Func<HttpContext, IResult>(fun ctx ->
+    if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
+        Results.Text("Access Denied", statusCode = 401)
+    else
+        reloadSettings()
+        ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
+        Results.Ok "Settings reloaded"
+))
+
+// Main webhook endpoint with bot-specific update handling
+WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
     task {
-        // Validate API key
-        if not (validateApiKey ctx) then
-            ctx.Response.StatusCode <- 401
-            return Results.Text("Access Denied")
-        else
-            let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
-
-            // Deserialize Update from request body
-            let! update = JsonSerializer.DeserializeAsync<Update>(ctx.Request.Body, telegramJsonOptions)
-
-            if isNull update then
-                return Results.BadRequest()
-            else
-
-            try
-                let bot = ctx.RequestServices.GetRequiredService<BotService>()
-                do! bot.OnUpdate(update)
-                return Results.Ok()
-            with ex ->
-                logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.Id)
-                return Results.Ok()
-    }))
+        let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
+        try
+            let bot = ctx.RequestServices.GetRequiredService<BotService>()
+            do! bot.OnUpdate(update)
+        with ex ->
+            logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.Id)
+    }) app
 
 app.Run()

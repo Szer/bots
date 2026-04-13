@@ -22,21 +22,9 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Dapper" />
     <PackageReference Include="Dapper.FSharp" />
     <PackageReference Include="FSharp.SystemTextJson" />
     <PackageReference Include="Microsoft.ML" />
-    <PackageReference Include="Npgsql" />
-    <PackageReference Include="Npgsql.OpenTelemetry" />
-    <PackageReference Include="OpenTelemetry.Exporter.Console" />
-    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
-    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
-    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
-    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
-    <PackageReference Include="Serilog.AspNetCore" />
-    <PackageReference Include="Serilog.Enrichers.Span" />
-    <PackageReference Include="Serilog.Formatting.Compact" />
-    <PackageReference Include="Telegram.Bot" />
   </ItemGroup>
 
   <ItemGroup>

@@ -8,9 +8,13 @@
     <Compile Include="Utils.fs" />
     <Compile Include="Time.fs" />
     <Compile Include="TelegramHelpers.fs" />
+    <Compile Include="JsonSetup.fs" />
     <Compile Include="AzureOcr.fs" />
+    <Compile Include="OcrService.fs" />
     <Compile Include="DbSettings.fs" />
+    <Compile Include="DapperSetup.fs" />
     <Compile Include="Observability.fs" />
+    <Compile Include="WebhookHost.fs" />
   </ItemGroup>
 
   <ItemGroup>

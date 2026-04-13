@@ -1,6 +1,7 @@
 namespace CouponHubBot.Tests
 
 open System.Text.Json
+open BotTestInfra
 
 module FakeCallHelpers =
     /// Parses JSON body from FakeTgApi call and extracts chat_id and text fields

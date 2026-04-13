@@ -7,6 +7,7 @@ open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open CouponHubBot
+open BotInfra
 
 open SixLabors.ImageSharp
 open SixLabors.ImageSharp.PixelFormats
@@ -198,7 +199,7 @@ module private CouponOcrParsing =
             |> Seq.sort
             |> Seq.toArray
 
-type CouponOcrEngine(azureTextOcr: IAzureTextOcr, logger: ILogger<CouponOcrEngine>, time: TimeProvider) =
+type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, time: TimeProvider) =
     let noneMoney: Nullable<decimal> = Nullable()
     let noneDate: Nullable<DateTime> = Nullable()
     let noneBarcode: string | null = null
