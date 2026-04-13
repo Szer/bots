@@ -672,7 +672,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
         Assert.True(userBanned, "User should be auto-banned after 4 spam messages")
 
         // Advance time past BAN_EXPIRY_DAYS (default 7)
-        let futureDate = Time.utcNow().AddDays(8.0).ToString("o")
+        let futureDate = System.DateTime.UtcNow.AddDays(8.0).ToString("o")
         do! fixture.SetBotSetting("BOT_FIXED_UTC_NOW", futureDate)
         do! fixture.ReloadSettings()
 

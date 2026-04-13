@@ -2,7 +2,6 @@ module VahterBanBot.Utils
 
 open System
 open Microsoft.FSharp.Reflection
-open BotInfra
 
 let caseName (x: 'a) =
     let case, _ = FSharpValue.GetUnionFields(x, x.GetType())
@@ -32,7 +31,3 @@ let timeSpanAsHumanReadable (ts: TimeSpan) =
     else
         pluralize ts.TotalDays "day"
 
-// TODO: Replace mutable global with DI-injected TimeProvider when codebase moves to class-based services.
-module Time =
-    let mutable provider: TimeProvider = Time.fromEnvironment()
-    let utcNow () = provider.GetUtcNow().UtcDateTime

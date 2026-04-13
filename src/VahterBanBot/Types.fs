@@ -79,11 +79,11 @@ type User =
       Banned:        (Actor * DateTime) option  // (bannedBy, bannedAt)
       Username:      string option
       ReactionCount: int }
-    member this.IsBanned(banExpiryDays: int) =
+    member this.IsBanned(banExpiryDays: int, now: DateTime) =
         match this.Banned with
         | None -> false
         | Some (_, bannedAt) ->
-            Time.utcNow() - bannedAt < TimeSpan.FromDays(float banExpiryDays)
+            now - bannedAt < TimeSpan.FromDays(float banExpiryDays)
     static member Zero = { Id = 0L; Banned = None; Username = None; ReactionCount = 0 }
     static member Fold (state: User, event: UserEvent) : User =
         match event with

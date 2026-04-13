@@ -439,7 +439,7 @@ VALUES ('callback:' || @callbackId, 1,
                            'data', 'test', 'targetUserId', 0, 'actionChannelId', 0),
         @now - make_interval(days => @daysOld))
             """
-        let! _ = conn.ExecuteAsync(sql, {| callbackId = callbackId; daysOld = daysOld; now = Time.utcNow() |})
+        let! _ = conn.ExecuteAsync(sql, {| callbackId = callbackId; daysOld = daysOld; now = DateTime.UtcNow |})
         return ()
     }
 
@@ -459,7 +459,7 @@ WHERE event_type = 'CallbackCreated'
         AND e2.event_type IN ('CallbackResolved', 'CallbackExpired')
   )
             """
-        let! orphanedIds = conn.QueryAsync<Guid>(findSql, {| cutoff = Time.utcNow().Subtract howOld |})
+        let! orphanedIds = conn.QueryAsync<Guid>(findSql, {| cutoff = DateTime.UtcNow.Subtract howOld |})
         let ids = Array.ofSeq orphanedIds
         //language=postgresql
         let expireSql =

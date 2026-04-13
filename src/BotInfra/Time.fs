@@ -27,3 +27,17 @@ module Time =
 
     let fromEnvironment () : TimeProvider =
         fromString (getEnvOr FixedUtcNowEnvVar "")
+
+    /// A TimeProvider whose inner delegate can be swapped at runtime.
+    /// Used to allow test environments to advance time after the DI container is built,
+    /// e.g. when `/reload-settings` is called with a new BOT_FIXED_UTC_NOW value.
+    type MutableTimeProvider(initial: TimeProvider) =
+        inherit TimeProvider()
+        let mutable inner: TimeProvider = initial
+        /// Replace the inner TimeProvider. Thread-safe (volatile write).
+        member _.SetInner(tp: TimeProvider) =
+            System.Threading.Volatile.Write(&inner, tp)
+        override _.GetUtcNow() =
+            System.Threading.Volatile.Read(&inner).GetUtcNow()
+        override _.GetTimestamp() =
+            System.Threading.Volatile.Read(&inner).GetTimestamp()
