@@ -804,44 +804,11 @@ ON CONFLICT (id) DO UPDATE
 
     /// Tries to acquire a scheduled job with lease mechanism.
     member _.TryAcquireScheduledJob(jobName: string, scheduledTime: TimeSpan, podId: string) : Task<bool> =
-        task {
-            use conn = new NpgsqlConnection(connString)
-
-            //language=postgresql
-            let sql =
-                """
-UPDATE scheduled_job
-SET locked_until = @now + INTERVAL '1 hour',
-    locked_by = @podId
-WHERE job_name = @jobName
-  AND @now >= (CURRENT_DATE + @scheduledTime)
-  AND (last_completed_at IS NULL OR last_completed_at < (CURRENT_DATE + @scheduledTime))
-  AND (locked_until IS NULL OR locked_until < @now)
-RETURNING job_name;
-                """
-
-            let! result = conn.QueryAsync<string>(sql, {| jobName = jobName; scheduledTime = scheduledTime; podId = podId; now = utcNow() |})
-            return Seq.length result > 0
-        }
+        BotInfra.ScheduledJobs.tryAcquire connString timeProvider jobName scheduledTime podId
 
     /// Marks a scheduled job as completed and releases the lock.
     member _.CompleteScheduledJob(jobName: string) : Task =
-        task {
-            use conn = new NpgsqlConnection(connString)
-
-            //language=postgresql
-            let sql =
-                """
-UPDATE scheduled_job
-SET last_completed_at = @now,
-    locked_until = NULL,
-    locked_by = NULL
-WHERE job_name = @jobName;
-                """
-
-            let! _ = conn.ExecuteAsync(sql, {| jobName = jobName; now = utcNow() |})
-            return ()
-        }
+        BotInfra.ScheduledJobs.complete connString timeProvider jobName
 
     /// Executes an action while holding a PostgreSQL session-level advisory lock.
     member _.WithAdvisoryLock(lockKey: int, action: unit -> Task) : Task<bool> =

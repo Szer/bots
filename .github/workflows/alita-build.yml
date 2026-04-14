@@ -1,0 +1,24 @@
+name: "Alita: Build"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - 'src/AlitaBot/**'
+      - 'src/Dockerfile.bot'
+      - 'tests/AlitaBot.Tests/**'
+      - 'tests/BotTestInfra/**'
+      - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureFoundryApi/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/_bot-build.yml
+    with:
+      test-command: |
+        dotnet test tests/AlitaBot.Tests/AlitaBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"

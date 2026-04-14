@@ -59,7 +59,8 @@ module private VahterTestConfig =
           OcrEnabled = mlEnabled
           SecretToken = secret
           WebhookRoute = "/bot"
-          AppEnvVars = envVars }
+          AppEnvVars = envVars
+          FakeAiProjectOverride = None }
 
 [<AbstractClass>]
 type VahterTestContainers(mlEnabled: bool) =

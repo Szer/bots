@@ -28,7 +28,10 @@ type BotContainerConfig =
       SecretToken: string
       WebhookRoute: string
       /// Extra environment variables for the app container.
-      AppEnvVars: (string * string) list }
+      AppEnvVars: (string * string) list
+      /// Override the fake AI API project name (default "FakeAzureOcrApi").
+      /// Set to e.g. "FakeAzureFoundryApi" for bots that use Azure AI Foundry instead of OCR.
+      FakeAiProjectOverride: string option }
 
 /// Shared container lifecycle for bot integration tests.
 /// Orchestrates: network, postgres, init.sql, flyway, fake TG API, fake Azure OCR, bot app.
@@ -40,7 +43,7 @@ type BotContainerBase(config: BotContainerConfig) =
     let dbAlias = config.MigrationsSubdir + "-db"
     let fakeAlias = "fake-tg-api"
     let fakeAzureAlias = "fake-azure-ocr"
-    let pgImage = "postgres:15.6"
+    let pgImage = "pgvector/pgvector:pg15"
 
     let internalConnectionString =
         $"Server={dbAlias};Database={config.DbName};Port=5432;User Id={config.DbUser};Password={config.DbPassword};Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
@@ -60,8 +63,9 @@ type BotContainerBase(config: BotContainerConfig) =
         buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-tg-api" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"]
     let fakeTgContainer = createFakeTgApiContainer fakeTgImage network fakeAlias
 
+    let fakeAiProject = config.FakeAiProjectOverride |> Option.defaultValue "FakeAzureOcrApi"
     let fakeAzureImage, fakeAzureBuildLogger =
-        buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-azure-ocr" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"]
+        buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-azure-ocr" true true ["FAKE_PROJECT", fakeAiProject; "FAKE_PORT", "8081"]
     let fakeAzureContainer = createFakeAzureOcrContainer fakeAzureImage network fakeAzureAlias
 
     let botImage, botBuildLogger =

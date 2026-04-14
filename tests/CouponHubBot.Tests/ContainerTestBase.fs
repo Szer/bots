@@ -31,7 +31,8 @@ module private CouponTestConfig =
               "GITHUB_TOKEN", ""
               "AZURE_OCR_KEY", (if ocrEnabled then "fake-key" else "")
               "BOT_FIXED_UTC_NOW", fixedUtcNow.ToString("o")
-          ] }
+          ]
+          FakeAiProjectOverride = None }
 
 [<AbstractClass>]
 type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =

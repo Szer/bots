@@ -86,7 +86,10 @@ let createFlywayContainer (network: INetwork) (migrationsPath: string) (dbAlias:
                 { new IWaitUntil with
                     member _.UntilAsync(container) =
                         task {
-                            let! _ = container.GetExitCodeAsync()
+                            let! exitCode = container.GetExitCodeAsync()
+                            if exitCode <> 0L then
+                                let! struct (stdout, stderr) = container.GetLogsAsync()
+                                failwith $"Flyway migration failed (exit {exitCode}):\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
                             return true
                         } }))
         .DependsOn(dbContainer)
