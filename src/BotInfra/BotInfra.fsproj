@@ -10,6 +10,7 @@
     <Compile Include="TelegramHelpers.fs" />
     <Compile Include="JsonSetup.fs" />
     <Compile Include="AzureOcr.fs" />
+    <Compile Include="LiveOptions.fs" />
     <Compile Include="OcrService.fs" />
     <Compile Include="DbSettings.fs" />
     <Compile Include="DapperSetup.fs" />

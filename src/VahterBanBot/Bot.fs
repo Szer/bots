@@ -7,6 +7,7 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open Telegram.Bot.Types.Enums
@@ -68,14 +69,14 @@ module private BotHelpers =
         isBanCommand msg &&
         msg.ReplyToMessage.IsSome
 
-    let isMessageFromAllowedChats (botConfig: BotConfiguration) (msg: TgMessage) =
-        botConfig.ChatsToMonitor.ContainsValue msg.ChatId
+    let isMessageFromAllowedChats (cfg: BotConfiguration) (msg: TgMessage) =
+        cfg.ChatsToMonitor.ContainsValue msg.ChatId
 
-    let isUserVahter (botConfig: BotConfiguration) (user: User) =
-        botConfig.AllowedUsers.ContainsValue user.Id
+    let isUserVahter (cfg: BotConfiguration) (user: User) =
+        cfg.AllowedUsers.ContainsValue user.Id
 
-    let isBannedPersonAdmin (botConfig: BotConfiguration) (msg: TgMessage) =
-        botConfig.AllowedUsers.ContainsValue msg.SenderId
+    let isBannedPersonAdmin (cfg: BotConfiguration) (msg: TgMessage) =
+        cfg.AllowedUsers.ContainsValue msg.SenderId
 
     let isKnownCommand (msg: TgMessage) =
         msg.Text <> null &&
@@ -85,7 +86,7 @@ module private BotHelpers =
          isSoftBanCommand msg)
 
     let isBanAuthorized
-        (botConfig: BotConfiguration)
+        (cfg: BotConfiguration)
         (bannedMsg: TgMessage)
         (vahter: User)
         (logger: ILogger) =
@@ -97,12 +98,12 @@ module private BotHelpers =
         let targetUsername = bannedMsg.SenderUsername
 
         // check that user is allowed to ban others
-        if isUserVahter botConfig vahter then
-            if not(isMessageFromAllowedChats botConfig bannedMsg) then
+        if isUserVahter cfg vahter then
+            if not(isMessageFromAllowedChats cfg bannedMsg) then
                 logger.LogWarning $"User {fromUsername} {fromUserId} tried to ban user {prependUsername targetUsername} ({targetUserId}) from not allowed chat {chatUsername} ({chatId})"
                 false
             // check that user is not trying to ban other admins
-            elif isBannedPersonAdmin botConfig bannedMsg then
+            elif isBannedPersonAdmin cfg bannedMsg then
                 logger.LogWarning $"User {fromUsername} ({fromUserId}) tried to ban admin {prependUsername targetUsername} ({targetUserId}) in chat {chatUsername} ({chatId})"
                 false
             else
@@ -200,7 +201,7 @@ module private BotHelpers =
 
 type BotService(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    botConfig: IOptions<BotConfiguration>,
     db: DbService,
     ml: MachineLearning,
     computerVision: IComputerVision,
@@ -216,7 +217,7 @@ type BotService(
 
     member private _.BanInAllChats(targetUserId) = task {
         let banTasks =
-            botConfig.ChatsToMonitor
+            botConfig.Value.ChatsToMonitor
             |> Seq.map (fun (KeyValue(chatUserName, chatId)) -> task {
                 try
                     do! botClient.BanChatMember(ChatId chatId, targetUserId, utcNow().AddMonths 13)
@@ -254,7 +255,7 @@ type BotService(
 
     member private _.UnbanInAllChats(targetUserId) = task {
         let unbanTasks =
-            botConfig.ChatsToMonitor
+            botConfig.Value.ChatsToMonitor
             |> Seq.map (fun (KeyValue(chatUserName, chatId)) -> task {
                 try
                     do! botClient.UnbanChatMember(ChatId chatId, targetUserId, true)
@@ -374,11 +375,11 @@ type BotService(
         // Cross-stream writes are not atomic (standard ES tradeoff). If the process crashes between
         // writing moderation and user events, one stream may be ahead. This is acceptable because
         // recordUserBanned is idempotent (skips if already banned) and can be retried.
-        do! db.RecordUserBanned(actor, msg, botConfig.BanExpiryDays)
+        do! db.RecordUserBanned(actor, msg, botConfig.Value.BanExpiryDays)
 
         // log both to logger and to All Logs channel
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -444,7 +445,7 @@ type BotService(
         do! deleteMsgTask
 
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logText
             ) |> taskIgnore
         logger.LogInformation logText
@@ -475,7 +476,7 @@ type BotService(
 
         // log both to logger and to All Logs channel
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -483,7 +484,7 @@ type BotService(
 
     /// Checks user's social score and triggers auto-ban if below threshold
     member private this.CheckAndAutoBan(msg: TgMessage, actor: Actor) = task {
-        if not botConfig.MlSpamAutobanEnabled then
+        if not botConfig.Value.MlSpamAutobanEnabled then
             return false
         else
             use banOnReplyActivity = botActivity.StartActivity("checkAndAutoBan")
@@ -492,18 +493,18 @@ type BotService(
                 .SetTag("spammerUsername", msg.SenderUsername)
                 .SetTag("actor", caseName actor)
 
-            let! userStats = db.GetUserStatsByLastNMessages(botConfig.MlSpamAutobanCheckLastMsgCount, msg.SenderId)
+            let! userStats = db.GetUserStatsByLastNMessages(botConfig.Value.MlSpamAutobanCheckLastMsgCount, msg.SenderId)
             let socialScore = userStats.good - userStats.bad
 
             %banOnReplyActivity.SetTag("socialScore", socialScore)
 
-            if double socialScore <= botConfig.MlSpamAutobanScoreThreshold then
+            if double socialScore <= botConfig.Value.MlSpamAutobanScoreThreshold then
                 // ban user in all monitored chats
                 do! this.TotalBan(msg, actor)
                 let logStr = $"Auto-banned user {prependUsername msg.SenderUsername} ({msg.SenderId}) due to the low social score {socialScore}"
                 logger.LogInformation logStr
                 do! botClient.SendMessage(
-                        chatId = ChatId(botConfig.AllLogsChannelId),
+                        chatId = ChatId(botConfig.Value.AllLogsChannelId),
                         text = logStr
                     ) |> taskIgnore
                 return true
@@ -529,12 +530,12 @@ type BotService(
         // 2. Post to detected spam channel with "NOT a spam" override button
         let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
         let callbackId = Guid.NewGuid()
-        do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.DetectedSpamChannelId)
+        do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.DetectedSpamChannelId)
         let markup = InlineKeyboardMarkup [
             InlineKeyboardButton.WithCallbackData("✅ NOT a spam", string callbackId)
         ]
         let! sent = botClient.SendMessage(
-            chatId = ChatId(botConfig.DetectedSpamChannelId),
+            chatId = ChatId(botConfig.Value.DetectedSpamChannelId),
             text = logMsg,
             replyMarkup = markup
         )
@@ -542,7 +543,7 @@ type BotService(
 
         // 3. All logs channel (readonly, no buttons)
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -566,16 +567,16 @@ type BotService(
         let killId = Guid.NewGuid()
         let softSpamId = Guid.NewGuid()
         let notSpamId = Guid.NewGuid()
-        do! db.RecordCallbackCreated(killId, CallbackMessage.Spam { message = msg.RawMessage }, msg.SenderId, botConfig.PotentialSpamChannelId)
-        do! db.RecordCallbackCreated(softSpamId, CallbackMessage.MarkAsSpam { message = msg.RawMessage }, msg.SenderId, botConfig.PotentialSpamChannelId)
-        do! db.RecordCallbackCreated(notSpamId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.PotentialSpamChannelId)
+        do! db.RecordCallbackCreated(killId, CallbackMessage.Spam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
+        do! db.RecordCallbackCreated(softSpamId, CallbackMessage.MarkAsSpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
+        do! db.RecordCallbackCreated(notSpamId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
         let markup = InlineKeyboardMarkup [|
             InlineKeyboardButton.WithCallbackData("🚫 KILL", string killId);
             InlineKeyboardButton.WithCallbackData("⚠️ SPAM", string softSpamId);
             InlineKeyboardButton.WithCallbackData("✅ NOT SPAM", string notSpamId)
         |]
         let! sent = botClient.SendMessage(
-            chatId = ChatId(botConfig.PotentialSpamChannelId),
+            chatId = ChatId(botConfig.Value.PotentialSpamChannelId),
             text = logMsg,
             replyMarkup = markup
         )
@@ -584,7 +585,7 @@ type BotService(
 
         // All logs channel (readonly, no buttons)
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -649,8 +650,8 @@ type BotService(
         // Record the auto-deletion and ban events (cross-stream, not atomic — see totalBan comment)
         do! db.RecordBotAutoDeleted(reaction.Chat.Id, reaction.MessageId, targetUser.Id, ReactionSpam {| reactionCount = targetUser.ReactionCount |})
         // No messageText for reaction spam — the ban reason is in the BotAutoDeleted event
-        let actor = botConfig.BotActor
-        do! db.RecordUserBannedNoMessage(targetUser.Id, actor, reaction.Chat.Id, reaction.MessageId, botConfig.BanExpiryDays)
+        let actor = botConfig.Value.BotActor
+        do! db.RecordUserBannedNoMessage(targetUser.Id, actor, reaction.Chat.Id, reaction.MessageId, botConfig.Value.BanExpiryDays)
 
         // metrics
         bannedUsersCounter.Add(1L, tagsForVahter actor)
@@ -671,7 +672,7 @@ type BotService(
 
         // log both to logger and to All Logs channel
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -686,17 +687,17 @@ type BotService(
         match ml.Predict(msg.Text, usrMsgCount, msg.Entities) with
         | None -> return None
         | Some prediction ->
-            do! db.RecordMlScoredMessage(msg.ChatId, msg.MessageId, float prediction.Score, prediction.Score >= botConfig.MlSpamThreshold)
+            do! db.RecordMlScoredMessage(msg.ChatId, msg.MessageId, float prediction.Score, prediction.Score >= botConfig.Value.MlSpamThreshold)
 
             // Old user immunity: skip triage when ML score is positive but user has enough history
-            if prediction.Score > 0f && usrMsgCount >= botConfig.MlOldUserMsgCount then
+            if prediction.Score > 0f && usrMsgCount >= botConfig.Value.MlOldUserMsgCount then
                 let logMsg = $"User {prependUsername msg.SenderUsername} ({msg.SenderId}) has {usrMsgCount} msgs (score: {prediction.Score}) — ML god shows mercy today, skipping triage"
-                do! botClient.SendMessage(ChatId(botConfig.AllLogsChannelId), text = logMsg) |> taskIgnore
+                do! botClient.SendMessage(ChatId(botConfig.Value.AllLogsChannelId), text = logMsg) |> taskIgnore
                 logger.LogInformation logMsg
                 return Some (AutoVerdict.NotSpam Actor.ML)
-            elif prediction.Score >= botConfig.MlSpamThreshold then
+            elif prediction.Score >= botConfig.Value.MlSpamThreshold then
                 return Some (AutoVerdict.Spam (float prediction.Score, Actor.ML))
-            elif prediction.Score >= botConfig.MlWarningThreshold then
+            elif prediction.Score >= botConfig.Value.MlWarningThreshold then
                 use cts = new CancellationTokenSource(TimeSpan.FromSeconds 60.)
                 let! llmVerdict = llmTriage.Classify(msg, int64 usrMsgCount, cts.Token)
                 match llmVerdict with
@@ -748,9 +749,9 @@ type BotService(
             | _ -> false
 
         if containsInvisibleMention then
-            do! this.DeleteSpam(msg, botConfig.BotActor, InvisibleMention)
+            do! this.DeleteSpam(msg, botConfig.Value.BotActor, InvisibleMention)
 
-        elif botConfig.MlEnabled && msg.Text <> null then
+        elif botConfig.Value.MlEnabled && msg.Text <> null then
             use mlActivity = botActivity.StartActivity("mlPrediction")
 
             let shouldBeSkipped =
@@ -759,15 +760,15 @@ type BotService(
                     true
                 // skip prediction for channel senders whose channel is in ChatsToMonitor
                 elif msg.IsChannelSender
-                     && botConfig.ChatsToMonitor.ContainsValue msg.SenderId then
+                     && botConfig.Value.ChatsToMonitor.ContainsValue msg.SenderId then
                     true
                 // skip prediction for vahters or local admins
-                elif botConfig.AllowedUsers.ContainsValue msg.SenderId
+                elif botConfig.Value.AllowedUsers.ContainsValue msg.SenderId
                      || UpdateChatAdmins.Admins.Contains msg.SenderId then
                     true
                 else
 
-                match botConfig.MlStopWordsInChats.TryGetValue msg.ChatId with
+                match botConfig.Value.MlStopWordsInChats.TryGetValue msg.ChatId with
                 | true, stopWords ->
                     stopWords
                     |> Seq.exists (fun sw -> msg.Text.Contains(sw, StringComparison.OrdinalIgnoreCase))
@@ -782,7 +783,7 @@ type BotService(
                 | Some (AutoVerdict.Spam (score, actor)) ->
                     %mlActivity.SetTag("spamScoreMl", score)
                     let reason = MlSpam {| score = score |}
-                    if botConfig.MlSpamDeletionEnabled then
+                    if botConfig.Value.MlSpamDeletionEnabled then
                         do! this.DeleteSpam(msg, actor, reason)
                     else
                         do! this.ReportPotentialSpam(msg, reason)
@@ -808,12 +809,12 @@ type BotService(
 
         // check if user got auto-banned already
         let! user = db.GetUserById(msg.SenderId)
-        if user |> Option.exists (fun u -> u.IsBanned(botConfig.BanExpiryDays, utcNow())) then
+        if user |> Option.exists (fun u -> u.IsBanned(botConfig.Value.BanExpiryDays, utcNow())) then
             // just delete message and move on
             let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned"
             logger.LogInformation logMsg
             do! botClient.SendMessage(
-                    chatId = ChatId(botConfig.AllLogsChannelId),
+                    chatId = ChatId(botConfig.Value.AllLogsChannelId),
                     text = logMsg
                 ) |> taskIgnore
             recordDeletedMessage msg.ChatId msg.ChatUsername "alreadyAutoBanned"
@@ -832,7 +833,7 @@ type BotService(
         let banOnReplyAux() = task {
             let authed =
                 isBanAuthorized
-                    botConfig
+                    botConfig.Value
                     msg.ReplyToMessage.Value
                     vahter
                     logger
@@ -840,7 +841,7 @@ type BotService(
                 do! this.BanOnReply(msg, vahter)
         }
         let unbanAux() = task {
-            if isUserVahter botConfig vahter then
+            if isUserVahter botConfig.Value vahter then
                 let targetUserId = msg.Text.Split(" ", StringSplitOptions.RemoveEmptyEntries)[1] |> int64
                 let! userToUnban = db.GetUserById(targetUserId)
                 match userToUnban with
@@ -852,7 +853,7 @@ type BotService(
         let softBanOnReplyAux() = task {
             let authed =
                 isBanAuthorized
-                    botConfig
+                    botConfig.Value
                     msg.ReplyToMessage.Value
                     vahter
                     logger
@@ -900,7 +901,7 @@ type BotService(
         else
 
         // early return if we don't monitor this chat
-        if not (botConfig.ChatsToMonitor.ContainsValue msg.ChatId) then
+        if not (botConfig.Value.ChatsToMonitor.ContainsValue msg.ChatId) then
             ()
         else
 
@@ -916,7 +917,7 @@ type BotService(
             db.UpsertUser(msg.SenderId, Option.ofObj msg.SenderUsername)
 
         // check if message is a known command from authorized user
-        if isKnownCommand msg && isUserVahter botConfig user then
+        if isKnownCommand msg && isUserVahter botConfig.Value user then
             do! this.AdminCommand(user, msg)
 
         // if message is not a command from authorized user, just save it ID to DB
@@ -933,12 +934,12 @@ type BotService(
             photos
             |> Array.filter (fun p ->
                 let size = int64 p.FileSize
-                size = 0L || size <= botConfig.OcrMaxFileSizeBytes)
+                size = 0L || size <= botConfig.Value.OcrMaxFileSizeBytes)
 
         if candidatePhotos.Length = 0 then
             logger.LogWarning(
                 "No photos under OCR limit of {LimitBytes} bytes for message {MessageId}",
-                botConfig.OcrMaxFileSizeBytes,
+                botConfig.Value.OcrMaxFileSizeBytes,
                 messageId)
             return None
         else
@@ -950,8 +951,8 @@ type BotService(
                 logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
                 return None
             else
-                let apiBase = if isNull botConfig.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.TelegramApiBaseUrl
-                let fileUrl = $"{apiBase}/file/bot{botConfig.BotToken}/{file.FilePath}"
+                let apiBase = if isNull botConfig.Value.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.Value.TelegramApiBaseUrl
+                let fileUrl = $"{apiBase}/file/bot{botConfig.Value.BotToken}/{file.FilePath}"
                 let! ocrText = computerVision.TextFromImageUrl fileUrl
                 if String.IsNullOrWhiteSpace ocrText then
                     return None
@@ -960,7 +961,7 @@ type BotService(
     }
 
     member private this.TryEnrichWithForwardedContent(msg: TgMessage) = task {
-        if botConfig.ForwardSpamDetectionEnabled && isMessageFromAllowedChats botConfig msg then
+        if botConfig.Value.ForwardSpamDetectionEnabled && isMessageFromAllowedChats botConfig.Value msg then
             use activity = botActivity.StartActivity("forwardedContentEnrichment")
             try
                 let mutable forwardedText: string = null
@@ -970,7 +971,7 @@ type BotService(
                     forwardedText <- msg.Quote.Text
                     %activity.SetTag("quoteTextLength", msg.Quote.Text.Length)
 
-                if botConfig.OcrEnabled
+                if botConfig.Value.OcrEnabled
                    && not (isNull msg.ExternalReply)
                    && not (isNull msg.ExternalReply.Photo)
                    && msg.ExternalReply.Photo.Length > 0 then
@@ -996,9 +997,9 @@ type BotService(
     }
 
     member private this.TryEnrichWithOcr(msg: TgMessage) = task {
-        if botConfig.OcrEnabled
+        if botConfig.Value.OcrEnabled
            && not (isNull msg.Photos) && msg.Photos.Length > 0
-           && isMessageFromAllowedChats botConfig msg then
+           && isMessageFromAllowedChats botConfig.Value msg then
             use activity = botActivity.StartActivity("ocrEnrichment")
             try
                 let! ocrResult = this.OcrPhotos(msg.Photos, msg.MessageId)
@@ -1017,10 +1018,10 @@ type BotService(
     }
 
     member private _.TryEnrichWithInlineKeyboardText(msg: TgMessage) = task {
-        if botConfig.InlineKeyboardSpamDetectionEnabled
+        if botConfig.Value.InlineKeyboardSpamDetectionEnabled
            && not (isNull msg.ReplyMarkup)
            && not (isNull msg.ReplyMarkup.InlineKeyboard)
-           && isMessageFromAllowedChats botConfig msg then
+           && isMessageFromAllowedChats botConfig.Value msg then
             use activity = botActivity.StartActivity("inlineKeyboardEnrichment")
             try
                 let sb = StringBuilder()
@@ -1064,7 +1065,7 @@ type BotService(
 
         let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as false-positive (NOT A SPAM)\n{tgMsg.Text}"
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -1079,7 +1080,7 @@ type BotService(
                 .SetTag("messageId", msgId)
                 .SetTag("chatId", chatId)
 
-        let isAuthed = isBanAuthorized botConfig tgMsg vahter logger
+        let isAuthed = isBanAuthorized botConfig.Value tgMsg vahter logger
         if isAuthed then
             let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
             do! this.TotalBan(tgMsg, actor)
@@ -1108,7 +1109,7 @@ type BotService(
         let vahterUsername = vahter.Username |> Option.defaultValue null
         let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as SPAM (soft, no ban)\n{tgMsg.Text}"
         do! botClient.SendMessage(
-                chatId = ChatId(botConfig.AllLogsChannelId),
+                chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
             ) |> taskIgnore
         logger.LogInformation logMsg
@@ -1130,7 +1131,7 @@ type BotService(
             | Spam _ -> PotentialKill
             | MarkAsSpam _ -> PotentialSoftSpam
             | NotASpam _ ->
-                if callbackState.ActionChannelId = botConfig.DetectedSpamChannelId
+                if callbackState.ActionChannelId = botConfig.Value.DetectedSpamChannelId
                 then DetectedNotSpam
                 else PotentialNotSpam
 
@@ -1203,7 +1204,7 @@ type BotService(
                 %onCallbackActivity.SetTag("vahterId", vahter.Id)
 
                 // only vahters should be able to press message buttons
-                let isAuthed = botConfig.AllowedUsers.ContainsValue vahter.Id
+                let isAuthed = botConfig.Value.AllowedUsers.ContainsValue vahter.Id
                 if not isAuthed then
                     logger.LogWarning $"User {callbackQuery.From.Username} ({callbackQuery.From.Id}) tried to press callback button while not being a certified vahter"
                     do! botClient.AnswerCallbackQuery(callbackQuery.Id, "Not authorized")
@@ -1227,10 +1228,10 @@ type BotService(
                 .SetTag("userUsername", reaction.User.Username)
 
         // Check if reaction spam detection is enabled
-        if not botConfig.ReactionSpamEnabled then
+        if not botConfig.Value.ReactionSpamEnabled then
             %activity.SetTag("skipped", "reactionSpamDisabled")
         // Check if chat is monitored
-        elif not (botConfig.ChatsToMonitor.ContainsValue reaction.Chat.Id) then
+        elif not (botConfig.Value.ChatsToMonitor.ContainsValue reaction.Chat.Id) then
             %activity.SetTag("skipped", "chatNotMonitored")
         else
             // Calculate added reactions (new - old)
@@ -1254,8 +1255,8 @@ type BotService(
                 let! msgCount = db.CountUniqueUserMsg(updatedUser.Id)
                 %activity.SetTag("messageCount", msgCount)
 
-                if msgCount < botConfig.ReactionSpamMinMessages &&
-                   updatedUser.ReactionCount >= botConfig.ReactionSpamMaxReactions then
+                if msgCount < botConfig.Value.ReactionSpamMinMessages &&
+                   updatedUser.ReactionCount >= botConfig.Value.ReactionSpamMaxReactions then
                     logger.LogWarning(
                         "Reaction spam detected: {Username} ({UserId}) has {MsgCount} messages but {ReactionCount} reactions",
                         reaction.User.Username,

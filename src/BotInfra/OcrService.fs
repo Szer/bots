@@ -5,6 +5,7 @@ open System.Net.Http
 open System.Net.Http.Headers
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 
 /// Shared OCR service backed by Azure Computer Vision.
 [<AllowNullLiteral>]
@@ -14,10 +15,13 @@ type IBotOcr =
 /// Configuration for the shared OCR service. Bots populate from their own config records.
 type BotOcrConfig =
     { OcrEnabled: bool
+      OcrMaxFileSizeBytes: int64
       AzureOcrEndpoint: string
       AzureOcrKey: string }
 
-type AzureBotOcr(httpClient: HttpClient, config: BotOcrConfig, logger: ILogger<AzureBotOcr>) =
+type AzureBotOcr(httpClient: HttpClient, options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>) =
+    let mutable warnedDisabled = false
+
     let buildAnalyzeUri (baseEndpoint: string) =
         // Expect base resource URL like:
         //   https://<name>.cognitiveservices.azure.com
@@ -40,12 +44,18 @@ type AzureBotOcr(httpClient: HttpClient, config: BotOcrConfig, logger: ILogger<A
     interface IBotOcr with
         member _.TextFromImageBytes(imageBytes: ReadOnlyMemory<byte>) =
             task {
+                let config = options.Value
                 if not config.OcrEnabled then
+                    if not warnedDisabled then
+                        logger.LogWarning("OCR is disabled (OCR_ENABLED setting is false); Azure OCR call skipped")
+                        warnedDisabled <- true
                     return null
                 elif String.IsNullOrWhiteSpace config.AzureOcrEndpoint || String.IsNullOrWhiteSpace config.AzureOcrKey then
                     logger.LogWarning("OCR is enabled but Azure configuration is missing")
                     return null
                 else
+                    // reset the once-flag so a later toggle back to disabled will warn again
+                    warnedDisabled <- false
                     try
                         use bytesContent = new ByteArrayContent(imageBytes.ToArray())
                         bytesContent.Headers.ContentType <- MediaTypeHeaderValue("application/octet-stream")

@@ -72,6 +72,13 @@ scripts/
 - VahterBanBot DB: `vahter_db_v2`, role: `vahter_bot_service`
 - CouponHubBot DB: `coupon_hub_bot`, role: `coupon_hub_bot_service`
 
+## Settings configuration
+
+- All **non-secret** bot configuration lives in the `bot_setting` table. Env vars are only for secrets (`BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`, `AZURE_OCR_KEY`, `GITHUB_TOKEN`, `DATABASE_URL`, etc.).
+- Each bot registers `BotConfiguration` (and `BotOcrConfig` where OCR is used) as `IOptions<_>` via `BotInfra.LiveOptions<_>`. Services inject `IOptions<T>` and read `.Value` — this lets `POST /reload-settings` pick up changes without a pod restart.
+- **DB-only settings** — keys with no env fallback — become silently wrong if missing from `bot_setting`. When adding such a setting in `buildBotConf`, either (a) give it an env fallback via `getEnvOr`, or (b) ship a seed INSERT in the same migration as the code change. Current DB-only keys in CouponHubBot: `OCR_ENABLED`, `OCR_MAX_FILE_SIZE_BYTES`, `REMINDER_HOUR_DUBLIN`, `REMINDER_RUN_ON_START`, `TEST_MODE`, `MAX_TAKEN_COUPONS`.
+- Never add `AddSingleton<BotConfiguration>(record)` — it captures a frozen copy, defeating reload. The `LiveOptions<_>` wrapper is the only correct registration.
+
 ## Security
 
 - Never commit secrets, tokens, or API keys — use environment variables

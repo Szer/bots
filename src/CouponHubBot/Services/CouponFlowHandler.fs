@@ -2,6 +2,7 @@ namespace CouponHubBot.Services
 
 open System
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open CouponHubBot
@@ -12,10 +13,11 @@ open BotInfra
 
 type CouponFlowHandler(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    ocrOptions: IOptions<BotOcrConfig>,
     db: DbService,
     couponOcr: CouponOcrEngine,
-    time: TimeProvider
+    time: TimeProvider,
+    logger: ILogger<CouponFlowHandler>
 ) =
     let sendText = BotHelpers.sendText botClient
 
@@ -107,7 +109,9 @@ type CouponFlowHandler(
                       updated_at = time.GetUtcNow().UtcDateTime }
                 )
 
-            if not botConfig.OcrEnabled then
+            let ocrConfig = ocrOptions.Value
+            if not ocrConfig.OcrEnabled then
+                logger.LogInformation("OCR disabled; falling back to manual entry for user {UserId}", user.id)
                 do!
                     botClient.SendMessage(
                         ChatId chatId,
@@ -119,6 +123,7 @@ type CouponFlowHandler(
                 // Attempt OCR prefill (optional). Download photo into memory, then run OCR engine.
                 let! file = botClient.GetFile(photoFileId)
                 if String.IsNullOrWhiteSpace(file.FilePath) then
+                    logger.LogWarning("Telegram file.FilePath missing for {FileId}; falling back to manual entry", photoFileId)
                     do!
                         botClient.SendMessage(
                             ChatId chatId,
@@ -131,7 +136,7 @@ type CouponFlowHandler(
                     do! botClient.DownloadFile(file.FilePath, ms)
                     let bytes = ms.ToArray()
 
-                    if int64 bytes.Length > botConfig.OcrMaxFileSizeBytes then
+                    if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                         do!
                             botClient.SendMessage(
                                 ChatId chatId,
@@ -164,6 +169,10 @@ type CouponFlowHandler(
                             | None -> Nullable()
                         let barcodeText =
                             if String.IsNullOrWhiteSpace ocr.barcode then null else ocr.barcode
+
+                        logger.LogInformation(
+                            "OCR result for user {UserId}: hasBarcode={HasBarcode} hasValue={HasValue} hasMinCheck={HasMinCheck} hasValidTo={HasValidTo}",
+                            user.id, not (isNull barcodeText), valueOpt.IsSome, minCheckOpt.IsSome, validToOpt.IsSome)
 
                         if isNull barcodeText then
                             // Barcode not recognized — photo quality is insufficient.

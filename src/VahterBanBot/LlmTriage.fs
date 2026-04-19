@@ -9,6 +9,7 @@ open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
 open VahterBanBot.Utils
@@ -43,7 +44,7 @@ type ILlmTriage =
     abstract member PromptHash: string
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmVerdict>
 
-type AzureLlmTriage(httpClient: HttpClient, botConf: BotConfiguration, logger: ILogger<AzureLlmTriage>, db: DbService) =
+type AzureLlmTriage(httpClient: HttpClient, botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService) =
 
     // Static part of the system prompt — used to compute the prompt hash once at startup.
     // Per-chat descriptions are configuration, not the prompt itself.
@@ -70,20 +71,20 @@ Respond with exactly: {"verdict":"SPAM"} or {"verdict":"SKIP"} or {"verdict":"NO
         |> Convert.ToHexString
         |> _.ToLower()
 
-    let modelName = botConf.AzureOpenAiDeployment
+    let modelName = botConf.Value.AzureOpenAiDeployment
 
     interface ILlmTriage with
         member _.ModelName  = modelName
         member _.PromptHash = promptHash
 
         member _.Classify(msg: TgMessage, userMsgCount: int64, ct: CancellationToken) = task {
-            if not botConf.LlmTriageEnabled then return LlmVerdict.Skip
+            if not botConf.Value.LlmTriageEnabled then return LlmVerdict.Skip
             else
 
             use activity = botActivity.StartActivity("llmTriage")
 
             let chatDescLine =
-                match botConf.LlmChatDescriptions.TryGetValue(msg.ChatId) with
+                match botConf.Value.LlmChatDescriptions.TryGetValue(msg.ChatId) with
                 | true, d -> $"\nChat: {d}"
                 | _       -> ""
 
@@ -123,11 +124,11 @@ Message:
   "temperature": 0
 }}"""
 
-            let url = $"{botConf.AzureOpenAiEndpoint}/openai/deployments/{botConf.AzureOpenAiDeployment}/chat/completions?api-version=2024-08-01-preview"
+            let url = $"{botConf.Value.AzureOpenAiEndpoint}/openai/deployments/{botConf.Value.AzureOpenAiDeployment}/chat/completions?api-version=2024-08-01-preview"
 
             let sw = Stopwatch.StartNew()
             use request = new HttpRequestMessage(HttpMethod.Post, url)
-            request.Headers.Add("api-key", botConf.AzureOpenAiKey)
+            request.Headers.Add("api-key", botConf.Value.AzureOpenAiKey)
             request.Content <- new StringContent(requestJson, Encoding.UTF8, "application/json")
 
             use! response = httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)

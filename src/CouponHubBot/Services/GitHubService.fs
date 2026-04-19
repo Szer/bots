@@ -6,9 +6,10 @@ open System.Net.Http.Headers
 open System.Text
 open System.Text.Json
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open CouponHubBot
 
-type GitHubService(httpClient: HttpClient, botConfig: BotConfiguration, logger: ILogger<GitHubService>, time: TimeProvider) =
+type GitHubService(httpClient: HttpClient, options: IOptions<BotConfiguration>, logger: ILogger<GitHubService>, time: TimeProvider) =
 
     do
         httpClient.BaseAddress <- Uri("https://api.github.com")
@@ -16,12 +17,14 @@ type GitHubService(httpClient: HttpClient, botConfig: BotConfiguration, logger: 
         httpClient.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28")
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("CouponHubBot/1.0")
 
-        if not (String.IsNullOrWhiteSpace botConfig.GitHubToken) then
+    let ensureAuthHeader () =
+        let token = options.Value.GitHubToken
+        if not (String.IsNullOrWhiteSpace token) then
             httpClient.DefaultRequestHeaders.Authorization <-
-                AuthenticationHeaderValue("Bearer", botConfig.GitHubToken)
+                AuthenticationHeaderValue("Bearer", token)
 
-    let repoApiUrl =
-        let repo = botConfig.GitHubRepo.Trim()
+    let repoApiUrl () =
+        let repo = options.Value.GitHubRepo.Trim()
         let parts = repo.Split('/', StringSplitOptions.RemoveEmptyEntries)
         if parts.Length = 2 then
             let owner = parts[0].Trim()
@@ -29,10 +32,10 @@ type GitHubService(httpClient: HttpClient, botConfig: BotConfiguration, logger: 
             if owner <> "" && name <> "" then
                 Some $"/repos/{owner}/{name}"
             else
-                logger.LogWarning("GITHUB_REPO must be in owner/repo format, got: {Repo}", botConfig.GitHubRepo)
+                logger.LogWarning("GITHUB_REPO must be in owner/repo format, got: {Repo}", options.Value.GitHubRepo)
                 None
         else
-            logger.LogWarning("GITHUB_REPO must be in owner/repo format, got: {Repo}", botConfig.GitHubRepo)
+            logger.LogWarning("GITHUB_REPO must be in owner/repo format, got: {Repo}", options.Value.GitHubRepo)
             None
 
     /// Neutralize GitHub @mentions to avoid unwanted notifications on the public repo
@@ -41,12 +44,13 @@ type GitHubService(httpClient: HttpClient, botConfig: BotConfiguration, logger: 
         else text.Replace("@", "@\u200B")
 
     member _.IsConfigured =
-        repoApiUrl.IsSome
-        && not (String.IsNullOrWhiteSpace botConfig.GitHubToken)
+        repoApiUrl().IsSome
+        && not (String.IsNullOrWhiteSpace options.Value.GitHubToken)
 
     member _.CreateFeedbackIssue(feedbackText: string | null, hasMedia: bool) =
         task {
-            match repoApiUrl with
+            ensureAuthHeader ()
+            match repoApiUrl () with
             | None ->
                 logger.LogWarning("GitHub integration not configured, skipping issue creation")
                 return None
@@ -106,7 +110,8 @@ type GitHubService(httpClient: HttpClient, botConfig: BotConfiguration, logger: 
 
     member _.AssignProductAgent(issueNumber: int) =
         task {
-            match repoApiUrl with
+            ensureAuthHeader ()
+            match repoApiUrl () with
             | None -> ()
             | Some baseUrl ->
                 let payload =
