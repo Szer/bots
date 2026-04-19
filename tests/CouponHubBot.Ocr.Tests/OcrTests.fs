@@ -7,6 +7,7 @@ open System.Net
 open System.Net.Http
 open System.Text
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Xunit
 
 open CouponHubBot
@@ -172,34 +173,19 @@ type OcrTests(output: ITestOutputHelper) =
         let effectiveEndpoint = if String.IsNullOrWhiteSpace endpoint then "https://example.com" else endpoint
         let effectiveKey = if String.IsNullOrWhiteSpace key then "cache-only" else key
 
-        let botConf: BotConfiguration =
-            { BotToken = "test"
-              SecretToken = "test"
-              CommunityChatId = 0L
-              TelegramApiBaseUrl = null
-              ReminderHourDublin = 10
-              ReminderRunOnStart = false
-              // Keep OCR enabled so we always go through HttpClient (cache handler may short-circuit).
-              OcrEnabled = true
-              OcrMaxFileSizeBytes = 50L * 1024L * 1024L
-              AzureOcrEndpoint = effectiveEndpoint
-              AzureOcrKey = effectiveKey
-              FeedbackAdminIds = [||]
-              GitHubToken = "test"
-              GitHubRepo = "Szer/coupon-bot"
-              TestMode = true
-              MaxTakenCoupons = 4 }
-
         let cacheDir = AzureCache.getCacheDir ()
         let cachePath = AzureCache.cachePathForImageFileName cacheDir imageFileName
         let handler = new AzureOcrCachingHandler(cachePath, allowNetwork, fun s -> output.WriteLine(s))
         let http = new HttpClient(handler)
 
-        let ocrConfig: BotOcrConfig =
-            { OcrEnabled = botConf.OcrEnabled
-              AzureOcrEndpoint = botConf.AzureOcrEndpoint
-              AzureOcrKey = botConf.AzureOcrKey }
-        let azure = AzureBotOcr(http, ocrConfig, XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs)) :> IBotOcr
+        let ocrOptions: IOptions<BotOcrConfig> =
+            LiveOptions(
+                // Keep OCR enabled so we always go through HttpClient (cache handler may short-circuit).
+                { OcrEnabled = true
+                  OcrMaxFileSizeBytes = 50L * 1024L * 1024L
+                  AzureOcrEndpoint = effectiveEndpoint
+                  AzureOcrKey = effectiveKey })
+        let azure = AzureBotOcr(http, ocrOptions, XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs)) :> IBotOcr
 
         // Freeze "now" to 2026 so year inference is stable.
         let timeProvider =

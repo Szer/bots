@@ -5,13 +5,14 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open CouponHubBot
 
 type ReminderService(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    options: IOptions<BotConfiguration>,
     db: DbService,
     logger: ILogger<ReminderService>,
     time: TimeProvider
@@ -69,7 +70,7 @@ type ReminderService(
                 let totalStr = total.ToString("0.##")
                 let couponWord = Utils.RussianPlural.choose coupons.Length "купон" "купона" "купонов"
                 let msg = $"Сегодня истекает {coupons.Length} {couponWord} на сумму {totalStr}€!"
-                do! botClient.SendMessage(ChatId botConfig.CommunityChatId, msg) :> Task
+                do! botClient.SendMessage(ChatId options.Value.CommunityChatId, msg) :> Task
                 anySent <- true
 
             if nowUtc.DayOfWeek = DayOfWeek.Monday && nowUtc.Day <= 7 then
@@ -80,7 +81,7 @@ type ReminderService(
                     "Статистика за всё время (использовано/добавлено):\n"
                     + formatCombinedStats usedRows addedRows
 
-                do! botClient.SendMessage(ChatId botConfig.CommunityChatId, text) :> Task
+                do! botClient.SendMessage(ChatId options.Value.CommunityChatId, text) :> Task
                 anySent <- true
 
             // DM reminder: user has taken coupons older than 1 day and forgot to mark used/return.
@@ -133,7 +134,7 @@ type ReminderService(
 
     override _.ExecuteAsync(stoppingToken: CancellationToken) =
         task {
-            if botConfig.ReminderRunOnStart then
+            if options.Value.ReminderRunOnStart then
                 try
                     let! _ = runOnce (time.GetUtcNow().UtcDateTime)
                     ()
@@ -141,7 +142,7 @@ type ReminderService(
                     logger.LogError(ex, "Failed to run reminder on startup")
 
             while not stoppingToken.IsCancellationRequested do
-                let next = nextRunUtc botConfig.ReminderHourDublin
+                let next = nextRunUtc options.Value.ReminderHourDublin
                 let delay = next - time.GetUtcNow().UtcDateTime
                 if delay > TimeSpan.Zero then
                     logger.LogInformation("Next reminder run at {NextRunUtc}", next)

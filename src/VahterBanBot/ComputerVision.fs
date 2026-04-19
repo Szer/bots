@@ -13,7 +13,7 @@ type IComputerVision =
     abstract member TextFromImageUrl: url: string -> Task<string>
 
 /// Adapter that delegates to the shared IBotOcr (bytes-based) by downloading the file first.
-type BotOcrComputerVision(botOcr: IBotOcr, botClient: ITelegramBotClient, botConf: BotConfiguration, logger: ILogger<BotOcrComputerVision>) =
+type BotOcrComputerVision(botOcr: IBotOcr, botClient: ITelegramBotClient, logger: ILogger<BotOcrComputerVision>) =
     interface IComputerVision with
         member _.TextFromImageUrl(url: string) = task {
             if isNull botOcr then

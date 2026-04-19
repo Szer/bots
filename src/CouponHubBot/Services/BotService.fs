@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.Runtime.ExceptionServices
 open System.Text.Json
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open Telegram.Bot.Types.Enums
@@ -16,7 +17,7 @@ open BotInfra
 
 type BotService(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    options: IOptions<BotConfiguration>,
     db: DbService,
     membership: TelegramMembershipService,
     couponFlow: CouponFlowHandler,
@@ -31,6 +32,7 @@ type BotService(
 
     let handleCommunityMessage (msg: Message) =
         task {
+            let botConfig = options.Value
             if msg.Chat <> null && msg.Chat.Id = botConfig.CommunityChatId then
                 // Only persist regular content messages, skip Telegram service/system messages
                 let isRegularContent =
@@ -66,6 +68,7 @@ type BotService(
 
     let handlePrivateMessage (msg: Message) =
         task {
+            let botConfig = options.Value
             use a =
                 botActivity
                     .StartActivity("handlePrivateMessage")
@@ -179,7 +182,7 @@ type BotService(
                 elif not (isNull update.Message) then
                     if update.Message.Chat <> null
                        && (update.Message.Chat.Type = ChatType.Group || update.Message.Chat.Type = ChatType.Supergroup)
-                       && update.Message.Chat.Id = botConfig.CommunityChatId then
+                       && update.Message.Chat.Id = options.Value.CommunityChatId then
                         do! handleCommunityMessage update.Message
                     do! handlePrivateMessage update.Message
                 else

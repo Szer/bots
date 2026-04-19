@@ -11,6 +11,7 @@ open Telegram.Bot.Polling
 open Telegram.Bot.Types
 open Telegram.Bot.Types.Enums
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Options
 open VahterBanBot
 open VahterBanBot.Cleanup
 open VahterBanBot.ML
@@ -123,28 +124,37 @@ let buildBotConf () =
       LlmChatDescriptions   = getSettingOr "CHAT_DESCRIPTIONS_JSON" "{}" |> fromJson
       BanExpiryDays         = getSettingOr "BAN_EXPIRY_DAYS" "7" |> int }
 
-// TODO: Replace mutable global with DI-registered BotConfiguration when codebase moves to class-based services.
-let mutable botConf = buildBotConf()
+let ocrConfigOf (c: BotConfiguration) =
+    { OcrEnabled          = c.OcrEnabled
+      OcrMaxFileSizeBytes = c.OcrMaxFileSizeBytes
+      AzureOcrEndpoint    = c.AzureOcrEndpoint
+      AzureOcrKey         = c.AzureOcrKey }
+
+let botConfOptions = LiveOptions(buildBotConf())
+let botOcrOptions  = LiveOptions(ocrConfigOf botConfOptions.Value)
 
 let reloadSettings () =
     dbSettings <- loadDbSettings()
-    botConf <- buildBotConf()
+    let fresh = buildBotConf()
+    botConfOptions.Set(fresh)
+    botOcrOptions.Set(ocrConfigOf fresh)
 
 let webhookCfg: WebhookConfig =
-    { BotToken = botConf.BotToken
-      SecretToken = botConf.SecretToken
-      TelegramApiBaseUrl = botConf.TelegramApiBaseUrl
+    let c = botConfOptions.Value
+    { BotToken = c.BotToken
+      SecretToken = c.SecretToken
+      TelegramApiBaseUrl = c.TelegramApiBaseUrl
       OtelServiceName = "vahter-bot"
       ActivitySourceName = botActivity.Name
       MeterName = "VahterBanBot.Metrics"
-      WebhookRoute = botConf.Route }
+      WebhookRoute = c.Route }
 
 let builder = WebApplication.CreateBuilder()
 
 WebhookHost.configureSharedServices webhookCfg builder
 
 %builder.Services
-    .AddSingleton(botConf)
+    .AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
     .AddSingleton<DbService>(fun sp ->
         DbService(connString, sp.GetRequiredService<TimeProvider>()))
     .AddSingleton<BotService>()
@@ -156,10 +166,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddHostedService<UpdateChatAdmins>()
 
 // OCR: register shared IBotOcr, then the VahterBanBot adapter that keeps the IComputerVision interface
-%builder.Services.AddSingleton<BotOcrConfig>(
-    { OcrEnabled = botConf.OcrEnabled
-      AzureOcrEndpoint = botConf.AzureOcrEndpoint
-      AzureOcrKey = botConf.AzureOcrKey })
+%builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
 %builder.Services.AddSingleton<IComputerVision, BotOcrComputerVision>()
 %builder.Services.AddHttpClient<ILlmTriage, AzureLlmTriage>()
@@ -167,7 +174,8 @@ WebhookHost.configureSharedServices webhookCfg builder
 let app = builder.Build()
 
 // Ensure bot user record exists in DB (result not needed -- identity comes from BotConfiguration.BotActor)
-(app.Services.GetRequiredService<DbService>().UpsertUser(botConf.BotUserId, Some botConf.BotUserName)).Result |> ignore
+let startupBotConf = botConfOptions.Value
+(app.Services.GetRequiredService<DbService>().UpsertUser(startupBotConf.BotUserId, Some startupBotConf.BotUserName)).Result |> ignore
 
 // Readiness check for ML model (used by startupProbe)
 %app.MapGet("/ready", Func<HttpContext, IResult>(fun ctx ->
@@ -224,7 +232,7 @@ WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
 let server = app.RunAsync()
 
 // Dev mode only
-if botConf.UsePolling then
+if botConfOptions.Value.UsePolling then
     let telegramClient = app.Services.GetRequiredService<ITelegramBotClient>()
     let pollingHandler = {
         new IUpdateHandler with

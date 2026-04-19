@@ -3,6 +3,7 @@ namespace CouponHubBot.Services
 open System
 open System.Collections.Generic
 open System.Runtime.ExceptionServices
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open Telegram.Bot.Types.Enums
@@ -14,7 +15,7 @@ open BotInfra
 
 type CallbackHandler(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    options: IOptions<BotConfiguration>,
     db: DbService,
     membership: TelegramMembershipService,
     couponFlow: CouponFlowHandler,
@@ -245,7 +246,7 @@ type CallbackHandler(
                         let idStr = baseData.Substring("void:".Length)
                         match BotHelpers.parseInt idStr with
                         | Some couponId ->
-                            let isAdmin = botConfig.FeedbackAdminIds |> Array.contains user.id
+                            let isAdmin = options.Value.FeedbackAdminIds |> Array.contains user.id
                             do! commandHandler.HandleVoid user cq.Message.Chat.Id couponId isAdmin deleteOnSuccess (Some cq.Message)
                         | None -> ()
                     elif isPrivateChat && hasData && cq.Data = "myAdded" then

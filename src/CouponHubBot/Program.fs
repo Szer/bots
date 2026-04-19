@@ -6,6 +6,7 @@ open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
@@ -65,16 +66,26 @@ let buildBotConf () =
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int }
 
-let mutable botConf = buildBotConf()
+let ocrConfigOf (c: BotConfiguration) =
+    { OcrEnabled          = c.OcrEnabled
+      OcrMaxFileSizeBytes = c.OcrMaxFileSizeBytes
+      AzureOcrEndpoint    = c.AzureOcrEndpoint
+      AzureOcrKey         = c.AzureOcrKey }
+
+let botConfOptions = LiveOptions(buildBotConf())
+let botOcrOptions  = LiveOptions(ocrConfigOf botConfOptions.Value)
 
 let reloadSettings () =
     dbSettings <- loadDbSettings()
-    botConf <- buildBotConf()
+    let fresh = buildBotConf()
+    botConfOptions.Set(fresh)
+    botOcrOptions.Set(ocrConfigOf fresh)
 
 let webhookCfg: WebhookConfig =
-    { BotToken = botConf.BotToken
-      SecretToken = botConf.SecretToken
-      TelegramApiBaseUrl = botConf.TelegramApiBaseUrl
+    let c = botConfOptions.Value
+    { BotToken = c.BotToken
+      SecretToken = c.SecretToken
+      TelegramApiBaseUrl = c.TelegramApiBaseUrl
       OtelServiceName = "coupon-hub-bot"
       ActivitySourceName = botActivity.Name
       MeterName = "CouponHubBot.Metrics"
@@ -84,13 +95,10 @@ let builder = WebApplication.CreateBuilder()
 
 WebhookHost.configureSharedServices webhookCfg builder
 
-%builder.Services.AddSingleton(botConf)
+%builder.Services.AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
 
 // OCR: register shared IBotOcr
-%builder.Services.AddSingleton<BotOcrConfig>(
-    { OcrEnabled = botConf.OcrEnabled
-      AzureOcrEndpoint = botConf.AzureOcrEndpoint
-      AzureOcrKey = botConf.AzureOcrKey })
+%builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
 
 %builder.Services.AddHttpClient<GitHubService>()
@@ -103,8 +111,8 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<CommandHandler>()
     .AddSingleton<CallbackHandler>()
     .AddSingleton<DbService>(fun sp ->
-        let botConf = sp.GetRequiredService<BotConfiguration>()
-        DbService(connString, sp.GetRequiredService<TimeProvider>(), botConf.MaxTakenCoupons))
+        let opts = sp.GetRequiredService<IOptions<BotConfiguration>>()
+        DbService(connString, sp.GetRequiredService<TimeProvider>(), opts.Value.MaxTakenCoupons))
     .AddSingleton<TelegramMembershipService>()
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
@@ -119,8 +127,8 @@ let app = builder.Build()
 // Test-only hook to trigger reminder immediately
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
-        let botConf = ctx.RequestServices.GetRequiredService<BotConfiguration>()
-        if not botConf.TestMode then
+        let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+        if not opts.Value.TestMode then
             return Results.NotFound()
         else
             let runner = ctx.RequestServices.GetRequiredService<ReminderService>()

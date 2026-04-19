@@ -3,6 +3,7 @@ module VahterBanBot.Cleanup
 open System.Text
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open VahterBanBot.ML
@@ -16,7 +17,7 @@ open Microsoft.Extensions.Hosting
 type CleanupService(
     logger: ILogger<CleanupService>,
     telegramClient: ITelegramBotClient,
-    botConf: BotConfiguration,
+    botConf: IOptions<BotConfiguration>,
     ml: MachineLearning,
     db: DbService
 ) =
@@ -38,14 +39,14 @@ type CleanupService(
             %sb.AppendLine $"Expired {failedPosts.Length} failed callback posts"
 
         // Expire old Detected Spam callbacks and delete their messages from channel
-        let! oldDetectedSpam = db.GetOldCallbacksInChannel(botConf.DetectedSpamCleanupAge, botConf.DetectedSpamChannelId)
+        let! oldDetectedSpam = db.GetOldCallbacksInChannel(botConf.Value.DetectedSpamCleanupAge, botConf.Value.DetectedSpamChannelId)
         let mutable deletedFromChannel = 0
         for callback in oldDetectedSpam do
             match callback.action_message_id with
             | Some msgId ->
                 try
                     do! telegramClient.DeleteMessage(
-                        ChatId(botConf.DetectedSpamChannelId),
+                        ChatId(botConf.Value.DetectedSpamChannelId),
                         msgId
                     )
                     deletedFromChannel <- deletedFromChannel + 1
@@ -57,14 +58,14 @@ type CleanupService(
             %sb.AppendLine $"Expired {oldDetectedSpam.Length} old detected spam callbacks ({deletedFromChannel} messages deleted from channel)"
 
         // Expire any remaining orphaned callbacks
-        let! orphaned = db.ExpireOrphanedCallbacks(botConf.CleanupOldLimit)
+        let! orphaned = db.ExpireOrphanedCallbacks(botConf.Value.CleanupOldLimit)
         if orphaned > 0 then
             %sb.AppendLine $"Expired {orphaned} orphaned callbacks"
 
         let msg = sb.ToString()
         if msg.Length > 0 then
             do! telegramClient.SendMessage(
-                    chatId = ChatId(botConf.AllLogsChannelId),
+                    chatId = ChatId(botConf.Value.AllLogsChannelId),
                     text = msg
                 ) |> taskIgnore
             logger.LogInformation msg
@@ -76,12 +77,12 @@ type CleanupService(
         let sb = StringBuilder()
 
         // Vahter action stats (new system)
-        let! actionStats = db.GetVahterActionStats(Some botConf.CleanupInterval)
+        let! actionStats = db.GetVahterActionStats(Some botConf.Value.CleanupInterval)
         %sb.AppendLine(string actionStats)
 
         let msg = sb.ToString()
         do! telegramClient.SendMessage(
-                chatId = ChatId(botConf.AllLogsChannelId),
+                chatId = ChatId(botConf.Value.AllLogsChannelId),
                 text = msg
             ) |> taskIgnore
         logger.LogInformation msg
@@ -101,10 +102,10 @@ type CleanupService(
     }
     
     let runSchedulerLoop (ct: CancellationToken) = task {
-        logger.LogInformation("Scheduler service started (pod: {PodId}, check interval: {Interval})", podId, botConf.CleanupCheckInterval)
+        logger.LogInformation("Scheduler service started (pod: {PodId}, check interval: {Interval})", podId, botConf.Value.CleanupCheckInterval)
         
         // Use PeriodicTimer for async-friendly scheduling
-        use timer = new PeriodicTimer(botConf.CleanupCheckInterval)
+        use timer = new PeriodicTimer(botConf.Value.CleanupCheckInterval)
         
         // Initial check after a short delay (don't run immediately on startup)
         let! _ = Task.Delay(TimeSpan.FromSeconds 30L, ct)
@@ -112,11 +113,11 @@ type CleanupService(
         while not ct.IsCancellationRequested do
             try
                 // Check scheduled jobs
-                do! tryRunJob "daily_cleanup" (TimeSpan.FromHours botConf.CleanupScheduledHour) runCleanup
-                do! tryRunJob "daily_stats" (TimeSpan.FromHours botConf.StatsScheduledHour) runStats
+                do! tryRunJob "daily_cleanup" (TimeSpan.FromHours botConf.Value.CleanupScheduledHour) runCleanup
+                do! tryRunJob "daily_stats" (TimeSpan.FromHours botConf.Value.StatsScheduledHour) runStats
 
-                if botConf.MlEnabled then
-                    do! tryRunJob "daily_ml_retrain" botConf.MlRetrainScheduledTime (fun () -> ml.RetrainAndSave())
+                if botConf.Value.MlEnabled then
+                    do! tryRunJob "daily_ml_retrain" botConf.Value.MlRetrainScheduledTime (fun () -> ml.RetrainAndSave())
 
                 // Check if another pod retrained a newer model (all pods)
                 do! ml.TryReloadIfNewer()
@@ -133,7 +134,7 @@ type CleanupService(
 
     interface IHostedService with
         member this.StartAsync _ =
-            if not botConf.IgnoreSideEffects then
+            if not botConf.Value.IgnoreSideEffects then
                 cts <- new CancellationTokenSource()
                 backgroundTask <- Task.Factory.StartNew((fun () -> runSchedulerLoop cts.Token), TaskCreationOptions.LongRunning).Unwrap()
             Task.CompletedTask

@@ -8,13 +8,14 @@ open CouponHubBot.Utils
 open BotInfra
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types.Enums
 open Telegram.Bot.Types
 
 type TelegramMembershipService(
     botClient: ITelegramBotClient,
-    botConfig: CouponHubBot.BotConfiguration,
+    options: IOptions<CouponHubBot.BotConfiguration>,
     logger: ILogger<TelegramMembershipService>,
     time: TimeProvider
 ) =
@@ -38,7 +39,7 @@ type TelegramMembershipService(
         use span =
             botActivity
                 .StartActivity("onChatMemberUpdated")
-        if update.Chat <> null && update.Chat.Id = botConfig.CommunityChatId && update.NewChatMember <> null then
+        if update.Chat <> null && update.Chat.Id = options.Value.CommunityChatId && update.NewChatMember <> null then
             let uid = update.NewChatMember.User.Id
             let isMember = statusIsMember update.NewChatMember.Status
             cache[uid] <- (isMember, time.GetUtcNow().UtcDateTime)
@@ -52,7 +53,7 @@ type TelegramMembershipService(
             | true, (isMember, cachedAt) when isFresh cachedAt -> return isMember
             | _ ->
                 try
-                    let! cm = botClient.GetChatMember(botConfig.CommunityChatId, userId)
+                    let! cm = botClient.GetChatMember(options.Value.CommunityChatId, userId)
                     let isMember = statusIsMember cm.Status
                     cache[userId] <- (isMember, time.GetUtcNow().UtcDateTime)
                     return isMember

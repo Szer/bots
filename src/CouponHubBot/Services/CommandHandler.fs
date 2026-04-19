@@ -3,6 +3,7 @@ namespace CouponHubBot.Services
 open System
 open System.Collections.Generic
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
 open Telegram.Bot.Types.ReplyMarkups
@@ -13,7 +14,7 @@ open BotInfra
 
 type CommandHandler(
     botClient: ITelegramBotClient,
-    botConfig: BotConfiguration,
+    options: IOptions<BotConfiguration>,
     db: DbService,
     notifications: TelegramNotificationService,
     couponFlow: CouponFlowHandler,
@@ -24,7 +25,7 @@ type CommandHandler(
 
     let handleDebug (userId: int64) (chatId: int64) (couponId: int) =
         task {
-            if botConfig.FeedbackAdminIds |> Array.contains userId then
+            if options.Value.FeedbackAdminIds |> Array.contains userId then
                 let! rows = db.GetCouponEventHistory(couponId)
                 if rows.Length = 0 then
                     do! sendText chatId $"Нет событий для купона #{couponId}"
@@ -73,7 +74,7 @@ type CommandHandler(
             match! db.TryTakeCoupon(couponId, taker.id) with
             | LimitReached ->
                 do!
-                    let n = botConfig.MaxTakenCoupons
+                    let n = options.Value.MaxTakenCoupons
                     let couponWord = Utils.RussianPlural.choose n "купона" "купонов" "купонов"
                     sendText chatId
                         $"Нельзя взять больше {n} {couponWord} одновременно. Сначала верни или отметь использованным один из купонов."
@@ -156,7 +157,7 @@ type CommandHandler(
                     |> taskIgnore
             else
                 // Clamp to Telegram's media group limit of 10; always show at least 1 coupon when there are taken coupons.
-                let maxShown = max 1 (min botConfig.MaxTakenCoupons 10)
+                let maxShown = max 1 (min options.Value.MaxTakenCoupons 10)
                 let shown = taken |> Array.truncate maxShown
 
                 // 1) Photo(s) — SendPhoto for single item, SendMediaGroup for 2–10 (Telegram requires 2–10 items in a media group)
@@ -287,7 +288,7 @@ type CommandHandler(
 
     let handleFeedback (user: DbUser) (chatId: int64) =
         task {
-            if botConfig.FeedbackAdminIds.Length = 0 then
+            if options.Value.FeedbackAdminIds.Length = 0 then
                 do! sendText chatId "Фидбэк пока не настроен (нет админов)."
             else
                 do! db.SetPendingFeedback(user.id)
@@ -382,7 +383,7 @@ type CommandHandler(
                 recordCommand "void"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId ->
-                    let isAdmin = botConfig.FeedbackAdminIds |> Array.contains msg.From.Id
+                    let isAdmin = options.Value.FeedbackAdminIds |> Array.contains msg.From.Id
                     do! handleVoid user msg.Chat.Id couponId isAdmin false None
                 | None -> do! sendText msg.Chat.Id "Формат: /void <id>"
             | t when not (isNull t) && t.StartsWith("/debug ") ->
