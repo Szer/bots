@@ -108,6 +108,44 @@ type ReactionSpamTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
+    let ``Reaction-spam auto-ban does NOT wipe Detected Spam cards`` () = task {
+        // Reaction-spam ban is always automatic (Actor.Bot). With the fix, TotalBanByReaction
+        // no longer sweeps existing callback messages — they remain as audit trail and age
+        // out via DetectedSpamCleanupAge in Cleanup.runCleanup.
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+
+        // 1 ML-detected spam → DeleteSpam posts a Detected Spam card with NotASpam button
+        let spam = Tg.quickMsg(chat = chat, text = "2222222", from = user)
+        let! _ = fixture.SendMessage spam
+
+        let! callbackId = fixture.GetCallbackId spam.Message "NotASpam"
+
+        do! fixture.ClearFakeCalls()
+
+        // 5 reactions → TotalBanByReaction(Actor.Bot)
+        for i in 1..5 do
+            let! resp =
+                Tg.quickReaction(chat, 600 + i, user)
+                |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! isBanned = fixture.UserBannedByBot user.Id
+        Assert.True(isBanned, "User should be banned after reaction spam")
+
+        // The Detected Spam card must not have been deleted from the channel
+        let! delCalls = fixture.GetFakeCalls("deleteMessage")
+        let detectedSpamId = fixture.DetectedSpamChannel.Id
+        let detectedSpamDeletes =
+            delCalls |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{detectedSpamId}")
+        Assert.Equal(0, detectedSpamDeletes.Length)
+
+        // The callback must still be active (no CallbackExpired event)
+        let! expired = fixture.HasCallbackExpired callbackId
+        Assert.False(expired, "Callback should remain active after reaction-spam auto-ban")
+    }
+
+    [<Fact>]
     let ``Reactions in non-monitored chat are ignored`` () = task {
         // Reactions in a random chat should not trigger ban
         let user = Tg.user()

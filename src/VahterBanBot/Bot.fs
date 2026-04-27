@@ -333,26 +333,32 @@ type BotService(
             return allUserMessages.Length
         }
 
-        // Clean up ALL callbacks for this user (they may have multiple spam messages)
-        // This ensures empty inbox when user is banned
+        // Clean up callbacks for this user only on manual bans — gives the vahter an empty inbox.
+        // For auto-bans (ML/LLM/Bot) we leave the cards in Detected Spam as an audit trail; they
+        // age out via DetectedSpamCleanupAge in Cleanup.runCleanup and don't race with concurrent
+        // DeleteSpam posts from parallel webhooks for the same spammer.
         let cleanupCallbacksTask = task {
-            let! userCallbacks = db.GetActiveCallbacksByUserId(msg.SenderId)
-            logger.LogInformation($"Cleaning up {userCallbacks.Length} callbacks for banned user {msg.SenderId}")
+            match actor with
+            | Actor.User _ ->
+                let! userCallbacks = db.GetActiveCallbacksByUserId(msg.SenderId)
+                logger.LogInformation($"Cleaning up {userCallbacks.Length} callbacks for banned user {msg.SenderId}")
 
-            do!
-                userCallbacks
-                |> Seq.map (fun callback -> task {
-                    // Delete message from action channel
-                    match callback.action_message_id with
-                    | Some msgId ->
-                        do! botClient.DeleteMessage(ChatId(callback.action_channel_id), msgId)
-                            |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
-                    | None -> ()
-                    // Expire callback
-                    do! db.ExpireCallback(callback.id)
-                })
-                |> Task.WhenAll
-                |> taskIgnore
+                do!
+                    userCallbacks
+                    |> Seq.map (fun callback -> task {
+                        // Delete message from action channel
+                        match callback.action_message_id with
+                        | Some msgId ->
+                            do! botClient.DeleteMessage(ChatId(callback.action_channel_id), msgId)
+                                |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
+                        | None -> ()
+                        // Expire callback
+                        do! db.ExpireCallback(callback.id)
+                    })
+                    |> Task.WhenAll
+                    |> taskIgnore
+            | Actor.Bot _ | Actor.ML | Actor.LLM _ ->
+                ()
         }
 
         // try ban user in all monitored chats
@@ -623,29 +629,12 @@ type BotService(
             return allUserMessages.Length
         }
 
-        // Clean up ALL callbacks for this user
-        let cleanupCallbacksTask = task {
-            let! userCallbacks = db.GetActiveCallbacksByUserId(targetUser.Id)
-            logger.LogInformation($"Cleaning up {userCallbacks.Length} callbacks for banned reaction spammer {targetUser.Id}")
-
-            do!
-                userCallbacks
-                |> Seq.map (fun callback -> task {
-                    match callback.action_message_id with
-                    | Some msgId ->
-                        do! botClient.DeleteMessage(ChatId(callback.action_channel_id), msgId)
-                            |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
-                    | None -> ()
-                    do! db.ExpireCallback(callback.id)
-                })
-                |> Task.WhenAll
-                |> taskIgnore
-        }
+        // Reaction-spam ban is always automatic (Actor.Bot) — leave existing Detected Spam cards
+        // as audit trail; they age out via DetectedSpamCleanupAge in Cleanup.runCleanup.
 
         // ban user in all monitored chats
         let! banResults = this.BanInAllChats(targetUser.Id)
         let! deletedUserMessages = deletedUserMessagesTask
-        do! cleanupCallbacksTask
 
         // Record the auto-deletion and ban events (cross-stream, not atomic — see totalBan comment)
         do! db.RecordBotAutoDeleted(reaction.Chat.Id, reaction.MessageId, targetUser.Id, ReactionSpam {| reactionCount = targetUser.ReactionCount |})

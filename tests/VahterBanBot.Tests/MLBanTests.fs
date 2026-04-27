@@ -659,6 +659,71 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
     }
 
     [<Fact>]
+    let ``Auto-ban via ML does NOT wipe Detected Spam cards`` () = task {
+        // Regression: TotalBan.cleanupCallbacksTask used to sweep every active callback for the
+        // user when auto-ban fires, racing concurrent DeleteSpam posts and producing a visible
+        // gap between AllLogs and Detected Spam. With the fix, auto-bans (Actor.ML/LLM/Bot)
+        // leave cards in place so they remain as audit trail and age out via cleanup.
+        let user = Tg.user()
+        let spam = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "66666666", from = user)
+
+        // 3 spam messages — each posts a Detected Spam card; social score = -3 > -4, no ban yet
+        for _ in 1..3 do
+            let! _ = fixture.SendMessage spam
+            ()
+
+        let! userBannedYet = fixture.UserBannedByBot user.Id
+        Assert.False(userBannedYet, "User should not be auto-banned after 3 spam messages")
+
+        do! fixture.ClearFakeCalls()
+
+        // 4th spam → social score -4 ≤ threshold -4.0 → CheckAndAutoBan fires TotalBan(Actor.ML)
+        let! _ = fixture.SendMessage spam
+
+        let! userBanned = fixture.UserBannedByBot user.Id
+        Assert.True(userBanned, "User should be auto-banned after 4 spam messages")
+
+        // No deleteMessage calls to Detected Spam channel — cards must stay for audit trail
+        let! delCalls = fixture.GetFakeCalls("deleteMessage")
+        let detectedSpamId = fixture.DetectedSpamChannel.Id
+        let detectedSpamDeletes =
+            delCalls |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{detectedSpamId}")
+        Assert.Equal(0, detectedSpamDeletes.Length)
+    }
+
+    [<Fact>]
+    let ``Manual /ban DOES wipe Detected Spam cards`` () = task {
+        // Vahter explicitly chose to ban — clearing their pending review queue is desired.
+        // This locks in the Actor.User branch of TotalBan.cleanupCallbacksTask.
+        let user = Tg.user()
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "2222222", from = user)
+        let! _ = fixture.SendMessage msgUpdate
+
+        // Sanity: a NotASpam callback exists for this message in the Detected Spam channel
+        let! callbackId = fixture.GetCallbackId msgUpdate.Message "NotASpam"
+
+        do! fixture.ClearFakeCalls()
+
+        // Vahter replies /ban → TotalBan(Actor.User) → sweep
+        let! banResp =
+            Tg.replyMsg(msgUpdate.Message, "/ban", fixture.Vahters[0])
+            |> fixture.SendMessage
+        Assert.Equal(System.Net.HttpStatusCode.OK, banResp.StatusCode)
+
+        // The card's message in Detected Spam channel was deleted
+        let! delCalls = fixture.GetFakeCalls("deleteMessage")
+        let detectedSpamId = fixture.DetectedSpamChannel.Id
+        let detectedSpamDeletes =
+            delCalls |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{detectedSpamId}")
+        Assert.True(detectedSpamDeletes.Length >= 1,
+                    $"Expected at least one deleteMessage to Detected Spam channel, got {detectedSpamDeletes.Length}")
+
+        // And the callback was expired in the DB
+        let! expired = fixture.HasCallbackExpired callbackId
+        Assert.True(expired, "Callback should be expired after manual /ban")
+    }
+
+    [<Fact>]
     let ``Expired ban does not suppress messages`` () = task {
         let user = Tg.user()
         let spam = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "66666666", from = user)
