@@ -61,6 +61,17 @@ module private VahterTestConfig =
           WebhookRoute = "/bot"
           AppEnvVars = envVars }
 
+/// Path to the pre-trained ML model fixture committed to the repo.
+/// On CI, this file MUST exist or the test run aborts immediately.
+/// Locally, if missing, the first ML test run trains via the prod pipeline and writes the file.
+let mlModelFixturePath =
+    Path.Combine(CommonDirectoryPath.GetCallerFileDirectory().DirectoryPath, "ml-model.bin")
+
+let private isCi =
+    let v = Environment.GetEnvironmentVariable "CI"
+    not (String.IsNullOrEmpty v)
+    && (v.Equals("true", StringComparison.OrdinalIgnoreCase) || v = "1")
+
 [<AbstractClass>]
 type VahterTestContainers(mlEnabled: bool) =
     inherit BotContainerBase(VahterTestConfig.makeConfig mlEnabled)
@@ -507,16 +518,108 @@ ON CONFLICT (key) DO UPDATE SET value = @value
         resp.EnsureSuccessStatusCode() |> ignore
     }
 
+/// Polls `/ready` until the bot reports its ML model is loaded or trained.
+/// Preload path: ready in <1s. Fresh-train path (first local run): up to ~3 minutes.
+let private waitForReady (http: HttpClient) (timeout: TimeSpan) : Task<unit> = task {
+    let pollInterval = TimeSpan.FromMilliseconds 500.0
+    let deadline = DateTime.UtcNow.Add timeout
+    let mutable ready = false
+    while not ready && DateTime.UtcNow < deadline do
+        try
+            let! resp = http.GetAsync("/ready")
+            if resp.IsSuccessStatusCode then
+                ready <- true
+            else
+                do! Task.Delay pollInterval
+        with _ ->
+            do! Task.Delay pollInterval
+    if not ready then
+        failwithf "Bot /ready did not return 200 within %A — ML model failed to train or load" timeout
+}
+
 type MlEnabledVahterTestContainers() =
     inherit VahterTestContainers(mlEnabled = true)
+
+    override this.SeedDatabase(connString: string) =
+        // F# disallows `base` references inside computation expressions, so kick off the base
+        // call eagerly and await its hot Task inside the CE.
+        let baseSeed = base.SeedDatabase(connString)
+        task {
+            do! baseSeed
+
+            // Preload the pre-trained ML model fixture so the bot's StartAsync skips training.
+            // SDCA training is non-deterministic across CPU architectures (Windows/x86_64 vs
+            // Linux/ARM64) — vectorized FP arithmetic differs in reduction order, and SGD
+            // compounds tiny per-step deltas into large weight differences. Pinning a model
+            // binary keeps test scoring stable across platforms.
+            //
+            // CI: file MUST exist; missing file aborts the test run.
+            // Local: file optional. If absent, bot trains via prod pipeline; AfterStart
+            //   then extracts the trained bytes back to disk so the developer can commit.
+            let fixtureExists = File.Exists mlModelFixturePath
+            if not fixtureExists && isCi then
+                failwithf
+                    "ML model fixture missing at %s. \
+                     CI cannot train the model deterministically (SDCA differs across CPU architectures). \
+                     Run the test suite locally once to generate the fixture, then commit ml-model.bin."
+                    mlModelFixturePath
+            if fixtureExists then
+                use conn = new NpgsqlConnection(connString)
+                do! conn.OpenAsync()
+                let! bytes = File.ReadAllBytesAsync mlModelFixturePath
+                let! _ =
+                    conn.ExecuteAsync(
+                        "INSERT INTO ml_trained_model(id, model_data, created_at) \
+                         VALUES (1, @data, now()) \
+                         ON CONFLICT (id) DO UPDATE SET model_data = EXCLUDED.model_data, created_at = EXCLUDED.created_at",
+                        {| data = bytes |})
+                ()
+        }
+
+    override this.AfterStart() =
+        task {
+            do! waitForReady this.BotHttp (TimeSpan.FromMinutes 3.0)
+
+            // Local-dev convenience: if no fixture file existed at seed time, the bot just trained
+            // a fresh model. Extract its bytes from DB and write them to ml-model.bin so the next
+            // run uses the fast preload path AND so the developer can commit the binary for CI.
+            if not (File.Exists mlModelFixturePath) then
+                use conn = new NpgsqlConnection(this.DbConnectionString)
+                do! conn.OpenAsync()
+                use cmd = new NpgsqlCommand("SELECT model_data FROM ml_trained_model WHERE id = 1", conn)
+                use! reader = cmd.ExecuteReaderAsync()
+                let! hasRow = reader.ReadAsync()
+                if not hasRow then
+                    failwith "Expected ml_trained_model row after /ready=200 but found none"
+                let bytes = reader.GetFieldValue<byte[]>(0)
+                do! File.WriteAllBytesAsync(mlModelFixturePath, bytes)
+                Console.Error.WriteLine
+                    (sprintf "[ml-fixture] Wrote freshly trained model to %s (%d bytes). \
+                              Commit this file so CI can reuse it." mlModelFixturePath bytes.Length)
+        } :> Task
+
+/// Variant that DELIBERATELY skips fixture preload to exercise the production training pipeline
+/// end-to-end. Used by MLTrainingPipelineTests as a smoke test that training still produces a
+/// usable model (the most important property of the bot — autonomous spam detection).
+type MlTrainingFromScratchTestContainers() =
+    inherit VahterTestContainers(mlEnabled = true)
+
+    override this.AfterStart() =
+        task {
+            // Same /ready wait, but never extract bytes — we don't want a throwaway fresh-train
+            // model to overwrite the curated ml-model.bin fixture.
+            do! waitForReady this.BotHttp (TimeSpan.FromMinutes 3.0)
+        } :> Task
 
 type MlDisabledVahterTestContainers() =
     inherit VahterTestContainers(mlEnabled = false)
 
-// workaround to wait for ML to be ready
+// Kept as a no-op so existing test classes can keep `IClassFixture<MlAwaitFixture>` unchanged.
+// The actual readiness wait now lives in MlEnabledVahterTestContainers.AfterStart, which runs
+// once per assembly fixture instead of once per class — and uses /ready polling instead of a
+// blind 10-second sleep.
 type MlAwaitFixture() =
     interface IAsyncLifetime with
-        // we assume 5 seconds is enough for model to train. Could be flaky
-        member this.InitializeAsync() = ValueTask(Task.Delay 10000)
+        member this.InitializeAsync() = ValueTask()
     interface IAsyncDisposable with
         member this.DisposeAsync() = ValueTask()

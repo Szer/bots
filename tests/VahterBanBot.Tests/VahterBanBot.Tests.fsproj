@@ -9,12 +9,14 @@
 
     <ItemGroup>
         <Content Include="test_seed.sql" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="ml-model.bin" Condition="Exists('ml-model.bin')" />
         <Compile Include="ContainerTestBase.fs" />
         <Compile Include="BaseTests.fs" />
         <Compile Include="MessageTests.fs" />
         <Compile Include="EntitiesScanTests.fs" />
         <Compile Include="MLBanTests.fs" />
         <Compile Include="MLScoreDeterminismTests.fs" />
+        <Compile Include="MLTrainingPipelineTests.fs" />
         <Compile Include="BanTests.fs" />
         <Compile Include="ChannelSenderTests.fs" />
         <Compile Include="ReactionSpamTests.fs" />
