@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0.102-noble AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.107-noble AS build
 
 ### workaround for testcontainers resource reaper issue
 ARG RESOURCE_REAPER_SESSION_ID="00000000-0000-0000-0000-000000000000"
@@ -18,7 +18,7 @@ COPY src/BotInfra/ src/BotInfra/
 COPY src/${BOT_PROJECT}/ src/${BOT_PROJECT}/
 RUN dotnet publish src/${BOT_PROJECT}/${BOT_PROJECT}.fsproj -c Release -o /publish
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0.2-noble AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.7-noble AS runtime
 ARG BOT_PROJECT
 ENV BOT_DLL=${BOT_PROJECT}.dll
 RUN apt-get update \

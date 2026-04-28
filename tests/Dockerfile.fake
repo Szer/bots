@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/dotnet/sdk:10.0.102 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0.107 AS build
 WORKDIR /src
 
 ARG FORCE_REBUILD=0
@@ -11,7 +11,7 @@ RUN dotnet restore tests/${FAKE_PROJECT}/${FAKE_PROJECT}.fsproj
 COPY tests/${FAKE_PROJECT}/ tests/${FAKE_PROJECT}/
 RUN dotnet publish tests/${FAKE_PROJECT}/${FAKE_PROJECT}.fsproj -c Release -o /publish
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0.2 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0.7 AS runtime
 ARG FAKE_PROJECT
 ARG FAKE_PORT=8080
 ENV FAKE_DLL=${FAKE_PROJECT}.dll
