@@ -99,6 +99,11 @@ type BotContainerBase(config: BotContainerConfig) =
     abstract SeedDatabase: connString: string -> Task
     default _.SeedDatabase(_) = Task.CompletedTask
 
+    /// Override to run additional setup after the bot container is started and HTTP clients are ready.
+    /// Intended for readiness-probe polling and post-startup data extraction.
+    abstract AfterStart: unit -> Task
+    default _.AfterStart() = Task.CompletedTask
+
     interface IAsyncLifetime with
         member this.InitializeAsync() =
             ValueTask(task {
@@ -142,6 +147,8 @@ type BotContainerBase(config: BotContainerConfig) =
                 if config.OcrEnabled then
                     fakeAzureHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{fakeAzureContainer.GetMappedPublicPort(8081)}"))
                     fakeAzureHttp.Timeout <- TimeSpan.FromSeconds(5.0)
+
+                do! this.AfterStart()
             } :> Task)
 
     interface IAsyncDisposable with

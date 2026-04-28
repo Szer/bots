@@ -4,19 +4,26 @@ open Xunit
 open VahterBanBot.Tests.ContainerTestBase
 open BotTestInfra
 
-/// Asserts exact ML scores for known texts to catch non-determinism in the training pipeline.
-/// If this test fails, it means something changed the ML model output — likely:
-///   - test_seed.sql was modified (different training data)
-///   - ML training parameters changed
-///   - training data ordering became non-deterministic again
+/// Asserts ML scores for known texts against the pre-trained fixture model.
+///
+/// The bot loads `tests/VahterBanBot.Tests/ml-model.bin` instead of training from scratch
+/// (see ContainerTestBase.SeedDatabase). This eliminates SDCA's cross-architecture training
+/// nondeterminism — scoring against a fixed model is a single sparse dot product whose
+/// FP noise is bounded by a few ULPs even when SIMD reduction order differs between
+/// Windows/x86_64 and Linux/ARM64.
+///
+/// If this test fails, the fixture model and code disagree. Causes:
+///   - ml-model.bin was regenerated but expected values weren't updated
+///   - test_seed.sql changed in a way that changes the model semantics
+///   - someone trained on a different ML_SEED / training params and re-committed the binary
 ///
 /// Scores are raw SDCA logistic regression values (unbounded, not calibrated [0,1]).
 /// ML_SPAM_THRESHOLD = 1.0 (score >= 1.0 → detected spam, auto-deleted)
 /// ML_WARNING_THRESHOLD = 0.0 (score >= 0.0 and < 1.0 → potential spam, LLM triage)
 /// Score < 0.0 → ham, ignored by ML pipeline.
 ///
-/// Expected values were captured from a deterministic run with ML_SEED=42
-/// and staggered seed timestamps (each row +1 second).
+/// Tolerance: 4 decimal places (~1e-4). Tight enough to catch a model swap; loose enough
+/// to absorb cross-arch FP noise in the prediction dot product.
 type MLScoreDeterminismTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwaitFixture) =
 
     [<Theory>]
@@ -48,8 +55,8 @@ type MLScoreDeterminismTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwai
         | Some actual ->
             let ctx = TestContext.Current
             ctx.TestOutputHelper.WriteLine($"ML score for \"{text}\": {actual}")
-            // Exact match (10 decimal places) — any drift means the model changed.
-            Assert.Equal(expectedScore, actual, 10)
+            // 4 decimal places: catches model swap, tolerates cross-arch FP noise in dot product.
+            Assert.Equal(expectedScore, actual, 4)
         | None ->
             Assert.Fail($"No MlScoredMessage event found for \"{text}\"")
     }

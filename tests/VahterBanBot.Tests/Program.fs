@@ -47,4 +47,5 @@ type AlphabeticalTestCollectionOrderer() =
 [<assembly: TestCollectionOrdererAttribute(typeof<AlphabeticalTestCollectionOrderer>)>]
 [<assembly: AssemblyFixture(typeof<MlDisabledVahterTestContainers>)>]
 [<assembly: AssemblyFixture(typeof<MlEnabledVahterTestContainers>)>]
+[<assembly: AssemblyFixture(typeof<MlTrainingFromScratchTestContainers>)>]
 do ()
