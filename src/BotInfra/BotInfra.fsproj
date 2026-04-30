@@ -9,6 +9,7 @@
     <Compile Include="Time.fs" />
     <Compile Include="TelegramHelpers.fs" />
     <Compile Include="JsonSetup.fs" />
+    <Compile Include="EventStore.fs" />
     <Compile Include="AzureOcr.fs" />
     <Compile Include="LiveOptions.fs" />
     <Compile Include="OcrService.fs" />
