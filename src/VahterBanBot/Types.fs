@@ -11,18 +11,11 @@ open Utils
 open BotInfra
 
 // ---------------------------------------------------------------------------
-// Event sourcing — raw DB row and typed event DUs
+// Event sourcing — typed event DUs
+//
+// `RawEvent` and `ConcurrencyConflict` live in `BotInfra.EventStore` and are
+// pulled in via `open BotInfra` above.
 // ---------------------------------------------------------------------------
-
-[<CLIMutable>]
-type RawEvent =
-    { stream_id:      string
-      stream_version: int
-      event_type:     string
-      data:           string   // JSONB stored as text by Dapper
-      created_at:     DateTime }
-
-type ConcurrencyConflict = ConcurrencyConflict
 
 // ---------------------------------------------------------------------------
 // Shared value types

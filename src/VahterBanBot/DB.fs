@@ -26,110 +26,9 @@ type SpamOrHamDb =
       custom_emoji_count: int
       created_at: DateTime }
 
-// ---------------------------------------------------------------------------
-// Private event-store helpers (SRTP inline functions can't be class members)
-// ---------------------------------------------------------------------------
-module private EventStore =
-
-    /// Deserializes data JSON → DU event.
-    let deserializeEvent<'Event> (raw: RawEvent) : 'Event =
-        JsonSerializer.Deserialize<'Event>(raw.data, options = eventJsonOpts)
-
-    /// SRTP helper — folds raw events into aggregate state using Fold/Zero from the state type.
-    let inline foldEvents<'Event, 'State
-        when 'State : (static member Zero : 'State)
-        and  'State : (static member Fold : 'State * 'Event -> 'State)>
-        (rawEvents: RawEvent list) : 'State =
-        let fold s e = 'State.Fold(s, e)
-        rawEvents |> List.map deserializeEvent<'Event> |> List.fold fold 'State.Zero
-
-    /// Reads all events for a stream; returns (events, currentVersion) where
-    /// currentVersion = 0 means the stream does not exist yet.
-    let readStream (connString: string) (streamId: string) : Task<RawEvent list * int> =
-        task {
-            use conn = new NpgsqlConnection(connString)
-            //language=postgresql
-            let sql =
-                """
-SELECT stream_id, stream_version, event_type, data::TEXT AS data, created_at
-FROM event
-WHERE stream_id = @streamId
-ORDER BY stream_version
-                """
-            let! rows = conn.QueryAsync<RawEvent>(sql, {| streamId = streamId |})
-            let events = List.ofSeq rows
-            let version = events |> List.tryLast |> Option.map (fun e -> e.stream_version) |> Option.defaultValue 0
-            return events, version
-        }
-
-    /// Tries to append events to a stream at the expected version.
-    /// Serializes DU events to JSON internally — callers pass typed events, not RawEvents.
-    /// Returns Ok () on success, Error ConcurrencyConflict if stream_version already exists.
-    let tryAppend<'Event> (connString: string) (streamId: string) (expectedVersion: int) (events: 'Event list) : Task<Result<unit, ConcurrencyConflict>> =
-        task {
-            if events.IsEmpty then return Ok ()
-            else
-            use conn = new NpgsqlConnection(connString)
-            do! conn.OpenAsync()
-            use! tx = conn.BeginTransactionAsync()
-            //language=postgresql
-            let sql =
-                """
-INSERT INTO event(stream_id, stream_version, data)
-VALUES (@stream_id, @stream_version, @data::JSONB)
-ON CONFLICT (stream_id, stream_version) DO NOTHING
-RETURNING id
-                """
-            let mutable insertedCount = 0
-            for (i, e) in events |> List.indexed do
-                let data = JsonSerializer.Serialize<'Event>(e, eventJsonOpts)
-                let! rows = conn.QueryAsync<int64>(sql, {| stream_id = streamId; stream_version = expectedVersion + i + 1; data = data |})
-                insertedCount <- insertedCount + Seq.length rows
-            if insertedCount < events.Length then
-                do! tx.RollbackAsync()
-                return Error ConcurrencyConflict
-            else
-                do! tx.CommitAsync()
-                return Ok ()
-        }
-
-    /// Optimistic-concurrency transact loop.
-    /// Reads stream → folds events into state → calls decider → appends.
-    /// Retries on ConcurrencyConflict. Never recurses — uses a while loop (task{} is hot/eager).
-    /// Returns the new events and the final aggregate state.
-    let transact
-        (connString:  string)
-        (fold:        'State -> 'Event -> 'State)
-        (initial:     'State)
-        (decider:     'State -> 'Event list)
-        (streamId:    string)
-        : Task<'Event list * 'State> =
-        task {
-            let mutable result = ValueNone
-            while result.IsNone do
-                let! (rawEvents, version) = readStream connString streamId
-                let state     = rawEvents |> List.map deserializeEvent<'Event> |> List.fold fold initial
-                let newEvents = decider state
-                if newEvents.IsEmpty then
-                    result <- ValueSome ([], state)
-                else
-                    match! tryAppend connString streamId version newEvents with
-                    | Ok _                    ->
-                        let finalState = newEvents |> List.fold fold state
-                        result <- ValueSome (newEvents, finalState)
-                    | Error ConcurrencyConflict -> ()   // re-read, re-decide
-            return result.Value
-        }
-
-    /// SRTP wrapper — resolves Fold/Zero from the state type at compile time.
-    let inline appendEvent (connString: string) (streamId: string) (decider: 'State -> 'Event list) : Task<'Event list * 'State>
-        when 'State : (static member Zero : 'State)
-        and  'State : (static member Fold : 'State * 'Event -> 'State) =
-        let fold s e = 'State.Fold(s, e)
-        transact connString fold 'State.Zero decider streamId
-
 type DbService(connString: string, timeProvider: TimeProvider) =
     let utcNow () = timeProvider.GetUtcNow().UtcDateTime
+    let store = EventStore(connString, "event", eventJsonOpts)
 
     // -----------------------------------------------------------------------
     // Private helpers (called by multiple public members)
@@ -137,7 +36,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordUsernameChanged (userId: int64) (username: string option) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"user:{userId}" (fun state ->
+            let! _ = EventStore.appendEvent store $"user:{userId}" (fun state ->
                 if state.Username = username then []
                 else [ UsernameChanged {| userId = userId; username = username |} ])
             return ()
@@ -145,7 +44,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordUserReaction (userId: int64) (username: string option) (reactionIncrement: int) : Task<User> =
         task {
-            let! (_, state) = EventStore.appendEvent connString $"user:{userId}" (fun state ->
+            let! (_, state) = EventStore.appendEvent store $"user:{userId}" (fun state ->
                 let usernameEvt =
                     if state.Username = username then []
                     else [ UsernameChanged {| userId = userId; username = username |} ]
@@ -155,7 +54,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordUserBannedImpl (userId: int64) (actor: Actor) (chatId: int64 option) (messageId: int option) (messageText: string option) (banExpiryDays: int) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"user:{userId}" (fun (state: User) ->
+            let! _ = EventStore.appendEvent store $"user:{userId}" (fun (state: User) ->
                 if state.IsBanned(banExpiryDays, utcNow()) then []   // idempotent — already banned
                 else [ UserBanned {| userId = userId; bannedBy = None; actor = Some actor
                                      chatId = chatId; messageId = messageId
@@ -165,7 +64,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordMessageReceived (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"message:{chatId}:{messageId}" (fun state ->
+            let! _ = EventStore.appendEvent store $"message:{chatId}:{messageId}" (fun state ->
                 if state.Received then []
                 else [ MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |} ])
             return ()
@@ -173,7 +72,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordMessageEdited (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"message:{chatId}:{messageId}" (fun (_: Message) ->
+            let! _ = EventStore.appendEvent store $"message:{chatId}:{messageId}" (fun (_: Message) ->
                 [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |} ])
             return ()
         }
@@ -182,14 +81,14 @@ type DbService(connString: string, timeProvider: TimeProvider) =
         (vahterId: int64) (actionType: VahterAction) (targetUserId: int64)
         (chatId: int64) (messageId: int) : Task<bool> =
         task {
-            let! (_, state) = EventStore.appendEvent connString $"moderation:{chatId}:{messageId}" (fun (_: Moderation) ->
+            let! (_, state) = EventStore.appendEvent store $"moderation:{chatId}:{messageId}" (fun (_: Moderation) ->
                 [ VahterActed {| vahterId = vahterId; actionType = actionType; targetUserId = targetUserId; chatId = chatId; messageId = messageId |} ])
             return state.VahterActedCount <= 1
         }
 
     let expireCallbackImpl (callbackId: Guid) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"callback:{callbackId}" (fun (state: Callback) ->
+            let! _ = EventStore.appendEvent store $"callback:{callbackId}" (fun (state: Callback) ->
                 if state.IsTerminal then []
                 else [ CallbackExpired ])
             return ()
@@ -201,7 +100,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     member _.UpsertUser(userId: int64, username: string option) : Task<User> =
         task {
-            let! (_, state) = EventStore.appendEvent connString $"user:{userId}" (fun (state: User) ->
+            let! (_, state) = EventStore.appendEvent store $"user:{userId}" (fun (state: User) ->
                 if state.Username = username then []
                 else [ UsernameChanged {| userId = userId; username = username |} ])
             return { state with Id = userId }
@@ -224,7 +123,7 @@ type DbService(connString: string, timeProvider: TimeProvider) =
     /// Records a UserUnbanned event with the new Actor format.
     member _.RecordUserUnbanned(userId: int64, actor: Actor) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"user:{userId}" (fun (state: User) ->
+            let! _ = EventStore.appendEvent store $"user:{userId}" (fun (state: User) ->
                 if state.Banned.IsNone then []
                 else [ UserUnbanned {| userId = userId; unbannedBy = None; actor = Some actor |} ])
             return ()
@@ -232,21 +131,10 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     member _.GetUserById(userId: int64) : Task<User option> =
         task {
-            use conn = new NpgsqlConnection(connString)
-
-            //language=postgresql
-            let sql =
-                """
-SELECT stream_id, stream_version, event_type, data::TEXT AS data, created_at
-FROM event
-WHERE stream_id = 'user:' || @userId
-ORDER BY stream_version
-                """
-            let! rows = conn.QueryAsync<RawEvent>(sql, {| userId = userId |})
-            let events = List.ofSeq rows
-            if events.IsEmpty then return None
+            let! events = store.GetEventsForStream<UserEvent>($"user:{userId}")
+            if events.Length = 0 then return None
             else
-                let state : User = EventStore.foldEvents<UserEvent, User> events
+                let state = (User.Zero, events) ||> Array.fold (fun s e -> User.Fold(s, e))
                 return Some { state with Id = userId }
         }
 
@@ -292,7 +180,7 @@ WHERE event_type = 'MessageReceived'
     /// Records a MessageMarkedHam event. Latest Spam/Ham decision wins.
     member _.RecordMessageMarkedHam(chatId: int64, messageId: int, text: string, markedBy: int64 option) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"message:{chatId}:{messageId}" (fun state ->
+            let! _ = EventStore.appendEvent store $"message:{chatId}:{messageId}" (fun state ->
                 if state.Classification = SpamClassification.Ham then []   // already ham
                 else [ MessageMarkedHam {| chatId = chatId; messageId = messageId; text = text; markedBy = markedBy |} ])
             return ()
@@ -301,7 +189,7 @@ WHERE event_type = 'MessageReceived'
     /// Records a MessageMarkedSpam event. Latest Spam/Ham decision wins.
     member _.RecordMessageMarkedSpam(chatId: int64, messageId: int, markedBy: int64 option) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"message:{chatId}:{messageId}" (fun state ->
+            let! _ = EventStore.appendEvent store $"message:{chatId}:{messageId}" (fun state ->
                 if state.Classification = SpamClassification.Spam then []  // already spam
                 else [ MessageMarkedSpam {| chatId = chatId; messageId = messageId; markedBy = markedBy |} ])
             return ()
@@ -395,7 +283,7 @@ FROM expanded;
     /// Records a BotAutoDeleted event. NOT idempotent — each call adds an event.
     member _.RecordBotAutoDeleted(chatId: int64, messageId: int, userId: int64, reason: AutoDeleteReason) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"moderation:{chatId}:{messageId}" (fun (_: Moderation) ->
+            let! _ = EventStore.appendEvent store $"moderation:{chatId}:{messageId}" (fun (_: Moderation) ->
                 [ BotAutoDeleted {| chatId = chatId; messageId = messageId; userId = userId; reason = reason |} ])
             return ()
         }
@@ -403,7 +291,7 @@ FROM expanded;
     /// Records an MlScoredMessage event for observability and determinism testing.
     member _.RecordMlScoredMessage(chatId: int64, messageId: int, score: float, isSpam: bool) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"detection:{chatId}:{messageId}" (fun (_: Detection) ->
+            let! _ = EventStore.appendEvent store $"detection:{chatId}:{messageId}" (fun (_: Detection) ->
                 [ MlScoredMessage {| chatId = chatId; messageId = messageId; score = score; isSpam = isSpam |} ])
             return ()
         }
@@ -414,7 +302,7 @@ FROM expanded;
          promptTokens: int, completionTokens: int, latencyMs: int,
          modelName: string option, promptHash: string option) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"detection:{chatId}:{messageId}" (fun (_: Detection) ->
+            let! _ = EventStore.appendEvent store $"detection:{chatId}:{messageId}" (fun (_: Detection) ->
                 [ LlmClassified {| chatId = chatId; messageId = messageId; verdict = verdict
                                    promptTokens = promptTokens; completionTokens = completionTokens; latencyMs = latencyMs
                                    modelName = modelName; promptHash = promptHash |} ])
@@ -429,7 +317,7 @@ FROM expanded;
     member _.RecordCallbackCreated(callbackId: Guid, data: CallbackMessage, targetUserId: int64, channelId: int64) : Task<unit> =
         task {
             let serializedData = serializeCallbackData data
-            let! _ = EventStore.appendEvent connString $"callback:{callbackId}" (fun (_: Callback) ->
+            let! _ = EventStore.appendEvent store $"callback:{callbackId}" (fun (_: Callback) ->
                 [ CallbackCreated {| data = serializedData; targetUserId = targetUserId; actionChannelId = channelId |} ])
             return ()
         }
@@ -437,7 +325,7 @@ FROM expanded;
     /// Records the action message ID after posting to channel.
     member _.RecordCallbackMessagePosted(callbackId: Guid, messageId: int) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent connString $"callback:{callbackId}" (fun (state: Callback) ->
+            let! _ = EventStore.appendEvent store $"callback:{callbackId}" (fun (state: Callback) ->
                 if state.IsTerminal || state.ActionMessageId.IsSome then []
                 else [ CallbackMessagePosted {| actionMessageId = messageId |} ])
             return ()
@@ -447,7 +335,7 @@ FROM expanded;
     /// Returns Some aggregate state if resolved, None if already terminal.
     member _.ResolveCallback(callbackId: Guid) : Task<Callback option> =
         task {
-            let! (events, state) = EventStore.appendEvent connString $"callback:{callbackId}" (fun (state: Callback) ->
+            let! (events, state) = EventStore.appendEvent store $"callback:{callbackId}" (fun (state: Callback) ->
                 if state.IsTerminal || state.Data.IsNone then []
                 else [ CallbackResolved ])
             return if events.IsEmpty then None else Some state
