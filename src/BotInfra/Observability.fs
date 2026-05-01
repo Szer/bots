@@ -44,19 +44,26 @@ module Observability =
                                 let host = uri.Host
                                 let methodName = req.Method.Method
                                 if host = "api.telegram.org" then
-                                    // Two URL shapes, both contain the bot token:
-                                    //   /bot<TOKEN>/<methodName>           — bot API call
+                                    // Telegram URLs embed the bot token in the path. Known shapes:
+                                    //   /bot<TOKEN>/<methodName>           — API call
                                     //   /file/bot<TOKEN>/<filePath...>     — file download
-                                    // Be conservative: if segment[0] doesn't start with "bot",
-                                    // emit a generic name rather than leak the token.
+                                    // Span *names* are very visible (and frequently shared in
+                                    // screenshots), so be defensive against future URL shapes:
+                                    // a Telegram bot token always contains ':' and no legitimate
+                                    // API path segment does — treat any ':'-bearing segment as
+                                    // a token and skip it. If the path also contains a "file"
+                                    // segment, the call is a file download; otherwise pick the
+                                    // first non-token segment as the method name.
                                     let segs = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
+                                    let nonTokenSegs = segs |> Array.filter (fun s -> not (s.Contains(':')))
                                     let displayName =
-                                        if segs.Length >= 2 && segs[0].StartsWith("bot") then
-                                            $"tg:{segs[1]}"
-                                        elif segs.Length >= 1 && segs[0] = "file" then
+                                        if Array.contains "file" nonTokenSegs then
                                             "tg:fileDownload"
                                         else
-                                            "tg:?"
+                                            nonTokenSegs
+                                            |> Array.tryHead
+                                            |> Option.map (fun m -> $"tg:{m}")
+                                            |> Option.defaultValue "tg:?"
                                     activity.DisplayName <- displayName
                                 elif host.EndsWith("cognitiveservices.azure.com") then
                                     activity.DisplayName <- $"azure-ocr {methodName}"
