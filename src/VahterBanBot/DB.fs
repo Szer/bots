@@ -64,9 +64,23 @@ type DbService(connString: string, timeProvider: TimeProvider) =
 
     let recordMessageReceived (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
-            let! _ = EventStore.appendEvent store $"message:{chatId}:{messageId}" (fun state ->
-                if state.Received then []
-                else [ MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |} ])
+            let! _ = EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
+                if state.Received then [], None
+                else
+                    let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |}
+                    let projection =
+                        match text with
+                        | Some t when not (String.IsNullOrEmpty t) ->
+                            Some (fun (conn: NpgsqlConnection) (tx: NpgsqlTransaction) ->
+                                let sql =
+                                    """
+INSERT INTO user_msg_text_index (user_id, msg_text_md5)
+VALUES (@userId, md5(@text))
+ON CONFLICT DO NOTHING
+                                    """
+                                conn.ExecuteAsync(sql, {| userId = userId; text = t |}, tx) :> Task)
+                        | _ -> None
+                    [ evt ], projection)
             return ()
         }
 
@@ -202,10 +216,9 @@ WHERE event_type = 'MessageReceived'
             //language=postgresql
             let sql =
                 """
-SELECT COUNT(DISTINCT msg_text_md5)::INT
-FROM event
-WHERE event_type = 'MessageReceived'
-  AND (data->>'userId')::BIGINT = @userId
+SELECT COUNT(*)::INT
+FROM user_msg_text_index
+WHERE user_id = @userId
                 """
 
             let! result = conn.QuerySingleAsync<int>(sql, {| userId = userId |})

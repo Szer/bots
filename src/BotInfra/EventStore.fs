@@ -261,3 +261,14 @@ module EventStore =
              and 'State : (static member Fold : 'State * 'TEvent -> 'State) =
         let fold s e = 'State.Fold(s, e)
         store.FoldEvents<'TEvent, 'State>(fold, 'State.Zero, streamId)
+
+    /// Equivalent to `appendEvent`, but the decider also returns an optional
+    /// projection writer that runs in the same TX as the event inserts.
+    let inline appendEventWithProjection
+            (store: EventStore) (streamId: string)
+            (decider: 'State -> 'TEvent list * (NpgsqlConnection -> NpgsqlTransaction -> Task) option)
+            : Task<'TEvent list * 'State>
+            when 'State : (static member Zero : 'State)
+             and 'State : (static member Fold : 'State * 'TEvent -> 'State) =
+        let fold s e = 'State.Fold(s, e)
+        store.TransactWithProjection(fold, 'State.Zero, decider, streamId)
