@@ -37,7 +37,24 @@ module Observability =
         %services.AddOpenTelemetry()
             .WithTracing(fun builder ->
                 %builder
-                    .AddHttpClientInstrumentation()
+                    .AddHttpClientInstrumentation(fun opts ->
+                        opts.EnrichWithHttpRequestMessage <- fun activity req ->
+                            let uri = req.RequestUri
+                            if not (isNull uri) then
+                                let host = uri.Host
+                                let methodName = req.Method.Method
+                                if host = "api.telegram.org" then
+                                    // /bot<TOKEN>/<methodName> — segment[1] is the API method
+                                    let segs = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
+                                    let tgMethod = if segs.Length >= 2 then segs[1] else "?"
+                                    activity.DisplayName <- $"tg:{tgMethod}"
+                                elif host.EndsWith("cognitiveservices.azure.com") then
+                                    activity.DisplayName <- $"azure-ocr {methodName}"
+                                elif host.EndsWith("openai.azure.com") then
+                                    activity.DisplayName <- $"azure-openai {methodName}"
+                                else
+                                    activity.DisplayName <- $"{methodName} {host}"
+                    )
                     .AddAspNetCoreInstrumentation()
                     .AddNpgsql()
                     .ConfigureResource(fun res ->

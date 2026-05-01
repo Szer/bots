@@ -509,10 +509,12 @@ type BotService(
                 do! this.TotalBan(msg, actor)
                 let logStr = $"Auto-banned user {prependUsername msg.SenderUsername} ({msg.SenderId}) due to the low social score {socialScore}"
                 logger.LogInformation logStr
-                do! botClient.SendMessage(
+                fireAndForget logger "autoBanLogPost" (fun () ->
+                    botClient.SendMessage(
                         chatId = ChatId(botConfig.Value.AllLogsChannelId),
                         text = logStr
-                    ) |> taskIgnore
+                    ) :> Task
+                )
                 return true
             else
                 return false
@@ -533,25 +535,34 @@ type BotService(
             |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
         do! db.RecordBotAutoDeleted(msg.ChatId, msg.MessageId, msg.SenderId, reason)
 
-        // 2. Post to detected spam channel with "NOT a spam" override button
+        // 2. Post to detected spam channel with "NOT a spam" override button.
+        // RecordCallbackCreated runs synchronously so a button click is always routable;
+        // the channel post + RecordCallbackMessagePosted run in background. The cleanup
+        // path tolerates action_message_id = NULL, so the brief race window is safe.
         let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
         let callbackId = Guid.NewGuid()
         do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.DetectedSpamChannelId)
         let markup = InlineKeyboardMarkup [
             InlineKeyboardButton.WithCallbackData("✅ NOT a spam", string callbackId)
         ]
-        let! sent = botClient.SendMessage(
-            chatId = ChatId(botConfig.Value.DetectedSpamChannelId),
-            text = logMsg,
-            replyMarkup = markup
+        fireAndForget logger "detectedSpamChannelPost" (fun () ->
+            task {
+                let! sent = botClient.SendMessage(
+                    chatId = ChatId(botConfig.Value.DetectedSpamChannelId),
+                    text = logMsg,
+                    replyMarkup = markup
+                )
+                do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
+            } :> Task
         )
-        do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
 
         // 3. All logs channel (readonly, no buttons)
-        do! botClient.SendMessage(
+        fireAndForget logger "allLogsChannelPost" (fun () ->
+            botClient.SendMessage(
                 chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg
-            ) |> taskIgnore
+            ) :> Task
+        )
         logger.LogInformation logMsg
 
         // 4. Karma check + autoban
