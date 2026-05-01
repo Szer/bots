@@ -44,10 +44,20 @@ module Observability =
                                 let host = uri.Host
                                 let methodName = req.Method.Method
                                 if host = "api.telegram.org" then
-                                    // /bot<TOKEN>/<methodName> — segment[1] is the API method
+                                    // Two URL shapes, both contain the bot token:
+                                    //   /bot<TOKEN>/<methodName>           — bot API call
+                                    //   /file/bot<TOKEN>/<filePath...>     — file download
+                                    // Be conservative: if segment[0] doesn't start with "bot",
+                                    // emit a generic name rather than leak the token.
                                     let segs = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries)
-                                    let tgMethod = if segs.Length >= 2 then segs[1] else "?"
-                                    activity.DisplayName <- $"tg:{tgMethod}"
+                                    let displayName =
+                                        if segs.Length >= 2 && segs[0].StartsWith("bot") then
+                                            $"tg:{segs[1]}"
+                                        elif segs.Length >= 1 && segs[0] = "file" then
+                                            "tg:fileDownload"
+                                        else
+                                            "tg:?"
+                                    activity.DisplayName <- displayName
                                 elif host.EndsWith("cognitiveservices.azure.com") then
                                     activity.DisplayName <- $"azure-ocr {methodName}"
                                 elif host.EndsWith("openai.azure.com") then
