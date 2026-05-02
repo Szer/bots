@@ -134,13 +134,14 @@ jobs:
           --body "Automated sync from monorepo commit ${GITHUB_SHA}.")
         echo "Created: $NEW_PR_URL"
 
-        # Close previous sync PRs (keep only the new one)
+        # Close previous sync PRs (keep only the new one).
+        # Note: gh's --head flag requires an exact branch name, so filter by prefix in jq.
         gh pr list \
           --repo fsharplang-ru/vahter-bot \
           --state open \
-          --head "sync/" \
+          --limit 100 \
           --json number,headRefName \
-          --jq ".[] | select(.headRefName != \"$BRANCH\") | .number" \
+          --jq ".[] | select(.headRefName | startswith(\"sync/monorepo-\")) | select(.headRefName != \"$BRANCH\") | .number" \
         | while read -r old_pr; do
             echo "Closing old sync PR #${old_pr}"
             gh pr close "$old_pr" \
