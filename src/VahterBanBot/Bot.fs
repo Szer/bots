@@ -737,6 +737,19 @@ type BotService(
     }
 
     member private this.ProcessMessage(msg: TgMessage) = task {
+        // Records the message exactly once, with whatever enrichment finished
+        // by the time we call it. Each branch below calls this at the right
+        // point so the persisted text matches the text we classified on, and
+        // CheckAndAutoBan / GetUserStatsByLastNMessages see the current msg
+        // before any ban-side-effects fire.
+        let mutable recorded = false
+        let recordMsg () = task {
+            if not recorded then
+                recorded <- true
+                if msg.IsEdit then do! db.EditMessage(msg)
+                else do! db.InsertMessage(msg)
+        }
+
         let containsInvisibleMention =
             // Define all zero-width and whitespace-like characters to check
             let zeroWidthChars =
@@ -787,6 +800,7 @@ type BotService(
                     && msg.ExternalReply.Photo.Length > 0))
 
         if containsInvisibleMention then
+            do! recordMsg()
             do! this.DeleteSpam(msg, botConfig.Value.BotActor, InvisibleMention)
 
         elif botConfig.Value.MlEnabled && (msg.Text <> null || hasPendingAzureOcr) then
@@ -828,6 +842,7 @@ type BotService(
                     logger.LogInformation(
                         "Pre-OCR short-circuit: classified message {MessageId} as spam from text alone (score={Score:F3}); skipping Azure OCR",
                         msg.MessageId, score)
+                    do! recordMsg()
                     let reason = MlSpam {| score = score |}
                     if botConfig.Value.MlSpamDeletionEnabled then
                         do! this.DeleteSpam(msg, Actor.ML, reason)
@@ -843,6 +858,7 @@ type BotService(
                     do! this.TryEnrichWithForwardedPhotoOcr(msg)
                     do! this.TryEnrichWithOcr(msg)
                     %mlActivity.SetTag("postOcrTextLength", if isNull msg.Text then 0 else msg.Text.Length)
+                    do! recordMsg()
                     let! autoVerdict = this.GetAutoVerdict(msg, usrMsgCount)
                     match autoVerdict with
                     | Some (AutoVerdict.Spam (score, actor)) ->
@@ -857,6 +873,10 @@ type BotService(
                         do! this.ReportPotentialSpam(msg, MlSpam {| score = score |})
                     | Some (AutoVerdict.NotSpam _) | None ->
                         ()
+
+        // Catch-all: every message that reached ProcessMessage must be recorded.
+        // Idempotent — already-recorded branches above no-op here.
+        do! recordMsg()
     }
 
     member private this.JustMessage(msg: TgMessage) = task {
@@ -866,15 +886,14 @@ type BotService(
                 .SetTag("fromUserId", msg.SenderId)
                 .SetTag("fromUsername", msg.SenderUsername)
 
-        // Record message first so it's available for ban operations (e.g. totalBan → getUserMessages)
-        if msg.IsEdit then
-            do! db.EditMessage(msg)
-        else
-            do! db.InsertMessage(msg)
-
         // check if user got auto-banned already
         let! user = db.GetUserById(msg.SenderId)
         if user |> Option.exists (fun u -> u.IsBanned(botConfig.Value.BanExpiryDays, utcNow())) then
+            // already-banned path: record (with whatever text OnUpdate-time enrichment
+            // produced — Azure OCR is deferred and won't run for banned users) and delete.
+            if msg.IsEdit then do! db.EditMessage(msg)
+            else do! db.InsertMessage(msg)
+
             // just delete message and move on
             let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned"
             logger.LogInformation logMsg

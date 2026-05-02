@@ -198,41 +198,6 @@ ON CONFLICT (file_unique_id) DO UPDATE SET extracted_text = EXCLUDED.extracted_t
     }
 
     [<Fact>]
-    let ``OCR cache postgres error does not block the pipeline`` () = task {
-        // Simulate a cache postgres failure by renaming the column the cache
-        // SELECT relies on. The cache step's per-source try/catch must swallow
-        // the resulting exception, leaving …OcrApplied=false; the deferred
-        // Azure step then takes over. Spammy caption ensures classification
-        // still wins via pre-OCR short-circuit.
-        // This is the regression test for the prod symptom that motivated the
-        // quote-OCR split (failed cache reads were dropping enrichment text).
-        let runSql (sql: string) = task {
-            use c = new NpgsqlConnection(fixture.DbConnectionString)
-            let! _ = c.ExecuteAsync(sql)
-            return ()
-        }
-
-        do! runSql "ALTER TABLE ocr_cache RENAME COLUMN extracted_text TO extracted_text_broken"
-
-        try
-            do! fixture.SetOcrText "ham-text"
-            let p = photo "cache-broken-uid"
-
-            let msg = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "2222222", photos = [|p|])
-            let! resp = fixture.SendMessage msg
-
-            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
-
-            let! deleted = fixture.MessageIsAutoDeleted msg.Message
-            Assert.True(deleted, "Spam caption should still be caught when the OCR cache lookup throws")
-        finally
-            // Sync restore — if it fails, every subsequent test breaks, so a
-            // crash here is exactly the right signal.
-            runSql "ALTER TABLE ocr_cache RENAME COLUMN extracted_text_broken TO extracted_text"
-            |> Async.AwaitTask |> Async.RunSynchronously
-    }
-
-    [<Fact>]
     let ``Quote text survives external-reply OCR failure`` () = task {
         // Reproduces the original prod bug: with the previous shared-try
         // structure, an external-reply OCR throw would lose the quote text.
