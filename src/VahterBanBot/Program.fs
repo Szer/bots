@@ -16,6 +16,7 @@ open VahterBanBot
 open VahterBanBot.Cleanup
 open VahterBanBot.ML
 open VahterBanBot.ComputerVision
+open VahterBanBot.OcrCache
 open VahterBanBot.LlmTriage
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
@@ -157,6 +158,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
     .AddSingleton<DbService>(fun sp ->
         DbService(connString, sp.GetRequiredService<TimeProvider>()))
+    .AddSingleton<IOcrCache>(fun _ -> OcrCacheRepository(connString) :> IOcrCache)
     .AddSingleton<BotService>()
     // MachineLearning must start before CleanupService (loads model from DB on startup)
     .AddSingleton<MachineLearning>()

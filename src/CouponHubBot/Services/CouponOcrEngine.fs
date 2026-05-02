@@ -374,12 +374,14 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
-            let! ocrText =
+            let! ocrAnalysis =
                 try
-                    azureTextOcr.TextFromImageBytes(imageBytes)
+                    azureTextOcr.AnalyzeImageBytes(imageBytes)
                 with ex ->
                     logger.LogWarning(ex, "Azure text OCR failed")
-                    Task.FromResult<string>(null)
+                    Task.FromResult((null: OcrAnalysis | null))
+
+            let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
 
             let couponValue, minCheck, validFrom, validTo =
                 if String.IsNullOrWhiteSpace ocrText then

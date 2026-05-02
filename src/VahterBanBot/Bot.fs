@@ -205,6 +205,7 @@ type BotService(
     db: DbService,
     ml: MachineLearning,
     computerVision: IComputerVision,
+    ocrCache: VahterBanBot.OcrCache.IOcrCache,
     llmTriage: ILlmTriage,
     logger: ILogger<BotService>,
     timeProvider: TimeProvider
@@ -929,7 +930,29 @@ type BotService(
     // Private members — OCR enrichment
     // -----------------------------------------------------------------------
 
-    member private _.OcrPhotos(photos: PhotoSize array, messageId: int) = task {
+    member private this.OcrFresh(largestPhoto: PhotoSize, fileUniqueId: string) = task {
+        let! file = botClient.GetFile(largestPhoto.FileId)
+
+        if String.IsNullOrWhiteSpace file.FilePath then
+            logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
+            return None
+        else
+            let apiBase = if isNull botConfig.Value.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.Value.TelegramApiBaseUrl
+            let fileUrl = $"{apiBase}/file/bot{botConfig.Value.BotToken}/{file.FilePath}"
+            let! analysis = computerVision.AnalyzeImageUrl fileUrl
+            match analysis with
+            | null ->
+                // Azure failed (network / non-2xx / disabled). Don't cache failures.
+                return None
+            | a ->
+                if not (String.IsNullOrWhiteSpace fileUniqueId) then
+                    try do! ocrCache.Save(fileUniqueId, a.RawJson, a.Text)
+                    with ex -> logger.LogWarning(ex, "Failed to save OCR cache for {FileUniqueId}", fileUniqueId)
+                if String.IsNullOrWhiteSpace a.Text then return None
+                else return Some a.Text
+    }
+
+    member private this.OcrPhotos(photos: PhotoSize array, messageId: int) = task {
         let candidatePhotos =
             photos
             |> Array.filter (fun p ->
@@ -944,20 +967,26 @@ type BotService(
             return None
         else
             let largestPhoto = selectLargestPhoto candidatePhotos
+            let fileUniqueId = largestPhoto.FileUniqueId
 
-            let! file = botClient.GetFile(largestPhoto.FileId)
+            let activity = Activity.Current
+            if not (isNull activity) && not (String.IsNullOrWhiteSpace fileUniqueId) then
+                %activity.SetTag("ocr.fileUniqueId", fileUniqueId)
 
-            if String.IsNullOrWhiteSpace file.FilePath then
-                logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
-                return None
+            // Defensive: real Telegram payloads always include FileUniqueId, but if it's
+            // missing we just bypass the cache rather than poisoning it with an empty key.
+            if String.IsNullOrWhiteSpace fileUniqueId then
+                return! this.OcrFresh(largestPhoto, null)
             else
-                let apiBase = if isNull botConfig.Value.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.Value.TelegramApiBaseUrl
-                let fileUrl = $"{apiBase}/file/bot{botConfig.Value.BotToken}/{file.FilePath}"
-                let! ocrText = computerVision.TextFromImageUrl fileUrl
-                if String.IsNullOrWhiteSpace ocrText then
-                    return None
-                else
-                    return Some ocrText
+                let! cached = ocrCache.TryGetText(fileUniqueId)
+                match cached with
+                | Some cachedText ->
+                    if not (isNull activity) then %activity.SetTag("ocr.cacheHit", true)
+                    if String.IsNullOrWhiteSpace cachedText then return None
+                    else return Some cachedText
+                | None ->
+                    if not (isNull activity) then %activity.SetTag("ocr.cacheHit", false)
+                    return! this.OcrFresh(largestPhoto, fileUniqueId)
     }
 
     member private this.TryEnrichWithForwardedContent(msg: TgMessage) = task {
