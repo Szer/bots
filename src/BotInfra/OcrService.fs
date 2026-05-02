@@ -7,10 +7,18 @@ open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 
+/// Result of an Azure Computer Vision OCR call. RawJson is the full Azure response
+/// body (preserved so callers can mine other fields later or cache it as-is). Text
+/// is the extracted text per AzureOcr.extractTextFromAzureResponse, possibly null
+/// when the image legitimately contains no readable text.
+type OcrAnalysis =
+    { RawJson: string
+      Text: string }
+
 /// Shared OCR service backed by Azure Computer Vision.
 [<AllowNullLiteral>]
 type IBotOcr =
-    abstract member TextFromImageBytes: imageBytes: ReadOnlyMemory<byte> -> Task<string>
+    abstract member AnalyzeImageBytes: imageBytes: ReadOnlyMemory<byte> -> Task<OcrAnalysis | null>
 
 /// Configuration for the shared OCR service. Bots populate from their own config records.
 type BotOcrConfig =
@@ -42,17 +50,17 @@ type AzureBotOcr(httpClient: HttpClient, options: IOptions<BotOcrConfig>, logger
         b.Uri.ToString()
 
     interface IBotOcr with
-        member _.TextFromImageBytes(imageBytes: ReadOnlyMemory<byte>) =
+        member _.AnalyzeImageBytes(imageBytes: ReadOnlyMemory<byte>) =
             task {
                 let config = options.Value
                 if not config.OcrEnabled then
                     if not warnedDisabled then
                         logger.LogWarning("OCR is disabled (OCR_ENABLED setting is false); Azure OCR call skipped")
                         warnedDisabled <- true
-                    return null
+                    return (null: OcrAnalysis | null)
                 elif String.IsNullOrWhiteSpace config.AzureOcrEndpoint || String.IsNullOrWhiteSpace config.AzureOcrKey then
                     logger.LogWarning("OCR is enabled but Azure configuration is missing")
-                    return null
+                    return (null: OcrAnalysis | null)
                 else
                     // reset the once-flag so a later toggle back to disabled will warn again
                     warnedDisabled <- false
@@ -78,11 +86,11 @@ type AzureBotOcr(httpClient: HttpClient, options: IOptions<BotOcrConfig>, logger
                             let text = AzureOcr.extractTextFromAzureResponse responseContent
                             if isNull text then
                                 logger.LogWarning("Couldn't extract text from Azure OCR response: {Body}", responseContent)
-                            return text
+                            return { RawJson = responseContent; Text = text }
                         else
                             logger.LogWarning("Azure OCR returned status {Status}. Response: {Body}", response.StatusCode, responseContent)
-                            return null
+                            return (null: OcrAnalysis | null)
                     with ex ->
                         logger.LogError(ex, "Failed to extract text via Azure OCR")
-                        return null
+                        return (null: OcrAnalysis | null)
             }
