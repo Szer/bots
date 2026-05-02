@@ -145,6 +145,23 @@ type VahterTestContainers(mlEnabled: bool) =
         this.SetAzureOcrResponse(200, ocrJson) |> Async.AwaitTask |> Async.RunSynchronously
     }
 
+    /// Counts calls the bot has made to Azure Computer Vision's `/computervision/` endpoint
+    /// (i.e. real OCR analyze calls; Azure OpenAI / LLM calls go through `/openai/` and are
+    /// excluded). Used to verify cache hit/miss behavior in OCR cache tests.
+    member this.GetAzureOcrAnalyzeCallCount() = task {
+        if not this.OcrEnabled then
+            return 0
+        else
+            let! resp = this.FakeAzureHttp.GetAsync("/test/calls")
+            resp.EnsureSuccessStatusCode() |> ignore
+            let! json = resp.Content.ReadAsStringAsync()
+            use doc = JsonDocument.Parse(json)
+            return
+                doc.RootElement.EnumerateArray()
+                |> Seq.filter (fun el -> el.GetProperty("url").GetString().StartsWith("/computervision/"))
+                |> Seq.length
+    }
+
     member this.SendMessage(update: Update) = task {
         let json = JsonSerializer.Serialize(update, options = telegramJsonOptions)
         return! this.SendMessage(json)

@@ -23,6 +23,7 @@
         <Compile Include="PingTests.fs" />
         <Compile Include="EventSerializationTests.fs" />
         <Compile Include="LlmTriageTests.fs" />
+        <Compile Include="OcrCacheTests.fs" />
         <Compile Include="CleanupTests.fs" />
         <Compile Include="Program.fs"/>
     </ItemGroup>
