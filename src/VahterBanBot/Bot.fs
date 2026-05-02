@@ -683,6 +683,29 @@ type BotService(
     // Private members — ML / LLM auto-verdict
     // -----------------------------------------------------------------------
 
+    /// Fast text-only ML check used to short-circuit before Azure OCR.
+    /// Returns Some score when ML alone is confident the message is spam
+    /// (records the ML score so callers don't double-record). Returns None
+    /// for null text, low ML score, warning band, or old-user immunity —
+    /// in which case the caller should run Azure OCR for any cache misses
+    /// and then call GetAutoVerdict for the full verdict.
+    member private _.PreOcrMlCheck(msg: TgMessage, usrMsgCount: int) = task {
+        if isNull msg.Text then return None
+        else
+        match ml.Predict(msg.Text, usrMsgCount, msg.Entities) with
+        | None -> return None
+        | Some prediction ->
+            // Old-user immunity: defer to GetAutoVerdict so the
+            // "ML god shows mercy" log fires there exactly once.
+            if prediction.Score > 0f && usrMsgCount >= botConfig.Value.MlOldUserMsgCount then
+                return None
+            elif prediction.Score >= botConfig.Value.MlSpamThreshold then
+                do! db.RecordMlScoredMessage(msg.ChatId, msg.MessageId, float prediction.Score, true)
+                return Some (float prediction.Score)
+            else
+                return None
+    }
+
     /// Runs ML prediction + optional LLM triage, returns verdict.
     member private _.GetAutoVerdict(msg: TgMessage, usrMsgCount: int) = task {
         match ml.Predict(msg.Text, usrMsgCount, msg.Entities) with
@@ -714,6 +737,19 @@ type BotService(
     }
 
     member private this.ProcessMessage(msg: TgMessage) = task {
+        // Records the message exactly once, with whatever enrichment finished
+        // by the time we call it. Each branch below calls this at the right
+        // point so the persisted text matches the text we classified on, and
+        // CheckAndAutoBan / GetUserStatsByLastNMessages see the current msg
+        // before any ban-side-effects fire.
+        let mutable recorded = false
+        let recordMsg () = task {
+            if not recorded then
+                recorded <- true
+                if msg.IsEdit then do! db.EditMessage(msg)
+                else do! db.InsertMessage(msg)
+        }
+
         let containsInvisibleMention =
             // Define all zero-width and whitespace-like characters to check
             let zeroWidthChars =
@@ -749,10 +785,25 @@ type BotService(
                 entities |> Array.exists (checkEntity text)
             | _ -> false
 
+        // Azure OCR is now deferred — if the cache step left any photo source
+        // un-applied, classification still has work to do even when msg.Text
+        // is null at this point (it might become non-null after Azure runs).
+        let hasPendingAzureOcr =
+            botConfig.Value.OcrEnabled
+            && ((not msg.OwnPhotoOcrApplied
+                 && not (isNull msg.Photos)
+                 && msg.Photos.Length > 0)
+                || (botConfig.Value.ForwardSpamDetectionEnabled
+                    && not msg.ExternalReplyPhotoOcrApplied
+                    && not (isNull msg.ExternalReply)
+                    && not (isNull msg.ExternalReply.Photo)
+                    && msg.ExternalReply.Photo.Length > 0))
+
         if containsInvisibleMention then
+            do! recordMsg()
             do! this.DeleteSpam(msg, botConfig.Value.BotActor, InvisibleMention)
 
-        elif botConfig.Value.MlEnabled && msg.Text <> null then
+        elif botConfig.Value.MlEnabled && (msg.Text <> null || hasPendingAzureOcr) then
             use mlActivity = botActivity.StartActivity("mlPrediction")
 
             let shouldBeSkipped =
@@ -770,7 +821,7 @@ type BotService(
                 else
 
                 match botConfig.Value.MlStopWordsInChats.TryGetValue msg.ChatId with
-                | true, stopWords ->
+                | true, stopWords when not (isNull msg.Text) ->
                     stopWords
                     |> Seq.exists (fun sw -> msg.Text.Contains(sw, StringComparison.OrdinalIgnoreCase))
                 | _ -> false
@@ -779,20 +830,53 @@ type BotService(
             if not shouldBeSkipped then
                 let! usrMsgCount = db.CountUniqueUserMsg(msg.SenderId)
 
-                let! autoVerdict = this.GetAutoVerdict(msg, usrMsgCount)
-                match autoVerdict with
-                | Some (AutoVerdict.Spam (score, actor)) ->
+                %mlActivity.SetTag("preOcrTextLength", if isNull msg.Text then 0 else msg.Text.Length)
+                %mlActivity.SetTag("ownPhotoOcrAppliedBeforeCheck", msg.OwnPhotoOcrApplied)
+                %mlActivity.SetTag("externalReplyPhotoOcrAppliedBeforeCheck", msg.ExternalReplyPhotoOcrApplied)
+
+                let! confidentSpam = this.PreOcrMlCheck(msg, usrMsgCount)
+                match confidentSpam with
+                | Some score ->
                     %mlActivity.SetTag("spamScoreMl", score)
+                    %mlActivity.SetTag("preOcrShortCircuit", true)
+                    logger.LogInformation(
+                        "Pre-OCR short-circuit: classified message {MessageId} as spam from text alone (score={Score:F3}); skipping Azure OCR",
+                        msg.MessageId, score)
+                    do! recordMsg()
                     let reason = MlSpam {| score = score |}
                     if botConfig.Value.MlSpamDeletionEnabled then
-                        do! this.DeleteSpam(msg, actor, reason)
+                        do! this.DeleteSpam(msg, Actor.ML, reason)
                     else
                         do! this.ReportPotentialSpam(msg, reason)
-                | Some (AutoVerdict.Uncertain score) ->
-                    %mlActivity.SetTag("spamScoreMl", score)
-                    do! this.ReportPotentialSpam(msg, MlSpam {| score = score |})
-                | Some (AutoVerdict.NotSpam _) | None ->
-                    ()
+                | None ->
+                    %mlActivity.SetTag("preOcrShortCircuit", false)
+                    // Text alone wasn't enough — pay for Azure OCR on the
+                    // cache misses, then re-classify with ML+LLM. Both
+                    // enrichment calls are no-ops when their flag is set
+                    // and they swallow their own exceptions, so OCR
+                    // failures never block the ML classifier from running.
+                    do! this.TryEnrichWithForwardedPhotoOcr(msg)
+                    do! this.TryEnrichWithOcr(msg)
+                    %mlActivity.SetTag("postOcrTextLength", if isNull msg.Text then 0 else msg.Text.Length)
+                    do! recordMsg()
+                    let! autoVerdict = this.GetAutoVerdict(msg, usrMsgCount)
+                    match autoVerdict with
+                    | Some (AutoVerdict.Spam (score, actor)) ->
+                        %mlActivity.SetTag("spamScoreMl", score)
+                        let reason = MlSpam {| score = score |}
+                        if botConfig.Value.MlSpamDeletionEnabled then
+                            do! this.DeleteSpam(msg, actor, reason)
+                        else
+                            do! this.ReportPotentialSpam(msg, reason)
+                    | Some (AutoVerdict.Uncertain score) ->
+                        %mlActivity.SetTag("spamScoreMl", score)
+                        do! this.ReportPotentialSpam(msg, MlSpam {| score = score |})
+                    | Some (AutoVerdict.NotSpam _) | None ->
+                        ()
+
+        // Catch-all: every message that reached ProcessMessage must be recorded.
+        // Idempotent — already-recorded branches above no-op here.
+        do! recordMsg()
     }
 
     member private this.JustMessage(msg: TgMessage) = task {
@@ -802,15 +886,14 @@ type BotService(
                 .SetTag("fromUserId", msg.SenderId)
                 .SetTag("fromUsername", msg.SenderUsername)
 
-        // Record message first so it's available for ban operations (e.g. totalBan → getUserMessages)
-        if msg.IsEdit then
-            do! db.EditMessage(msg)
-        else
-            do! db.InsertMessage(msg)
-
         // check if user got auto-banned already
         let! user = db.GetUserById(msg.SenderId)
         if user |> Option.exists (fun u -> u.IsBanned(botConfig.Value.BanExpiryDays, utcNow())) then
+            // already-banned path: record (with whatever text OnUpdate-time enrichment
+            // produced — Azure OCR is deferred and won't run for banned users) and delete.
+            if msg.IsEdit then do! db.EditMessage(msg)
+            else do! db.InsertMessage(msg)
+
             // just delete message and move on
             let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned"
             logger.LogInformation logMsg
@@ -952,98 +1035,161 @@ type BotService(
                 else return Some a.Text
     }
 
-    member private this.OcrPhotos(photos: PhotoSize array, messageId: int) = task {
-        let candidatePhotos =
+    member private _.SelectOcrPhoto(photos: PhotoSize array) =
+        let candidates =
             photos
             |> Array.filter (fun p ->
                 let size = int64 p.FileSize
                 size = 0L || size <= botConfig.Value.OcrMaxFileSizeBytes)
+        if candidates.Length = 0 then None
+        else Some (selectLargestPhoto candidates)
 
-        if candidatePhotos.Length = 0 then
+    /// Cache-only OCR lookup. Returns:
+    ///   None       — no candidate photo, no fileUniqueId, or cache miss
+    ///   Some text  — cache hit. Text may be empty, meaning "OCR'd before, no text"
+    member private this.OcrLookupCache(photos: PhotoSize array) = task {
+        match this.SelectOcrPhoto(photos) with
+        | None -> return None
+        | Some largestPhoto ->
+            let fileUniqueId = largestPhoto.FileUniqueId
+            if String.IsNullOrWhiteSpace fileUniqueId then return None
+            else
+                let activity = Activity.Current
+                if not (isNull activity) then
+                    %activity.SetTag("ocr.fileUniqueId", fileUniqueId)
+                return! ocrCache.TryGetText(fileUniqueId)
+    }
+
+    /// Azure-only OCR. Caller is expected to have checked the cache.
+    /// OcrFresh still saves to cache on success (and tolerates empty fileUniqueId).
+    member private this.OcrPhotosFresh(photos: PhotoSize array, messageId: int) = task {
+        match this.SelectOcrPhoto(photos) with
+        | None ->
             logger.LogWarning(
                 "No photos under OCR limit of {LimitBytes} bytes for message {MessageId}",
                 botConfig.Value.OcrMaxFileSizeBytes,
                 messageId)
             return None
+        | Some largestPhoto ->
+            return! this.OcrFresh(largestPhoto, largestPhoto.FileUniqueId)
+    }
+
+    /// Cheap, synchronous, no I/O. Safe to call at the top of OnUpdate.
+    member private _.TryEnrichWithForwardedQuoteText(msg: TgMessage) =
+        if botConfig.Value.ForwardSpamDetectionEnabled
+           && isMessageFromAllowedChats botConfig.Value msg
+           && not (isNull msg.Quote)
+           && not (String.IsNullOrWhiteSpace msg.Quote.Text) then
+            use activity = botActivity.StartActivity("forwardedQuoteEnrichment")
+            msg.PrependText(msg.Quote.Text)
+            %activity.SetTag("quoteTextLength", msg.Quote.Text.Length)
+
+    /// Cache-only OCR enrichment for any photos on the message — both the
+    /// message's own photos and external-reply quote photos. No Azure calls.
+    /// On a hit, marks the corresponding `…OcrApplied` flag so the deferred
+    /// Azure step skips that source. On any error (e.g. postgres outage on
+    /// the cache table) the flag stays false so the deferred step can retry.
+    member private this.TryEnrichOcrFromCache(msg: TgMessage) = task {
+        if not botConfig.Value.OcrEnabled then ()
+        elif not (isMessageFromAllowedChats botConfig.Value msg) then ()
         else
-            let largestPhoto = selectLargestPhoto candidatePhotos
-            let fileUniqueId = largestPhoto.FileUniqueId
+            use activity = botActivity.StartActivity("ocrCacheLookup")
 
-            let activity = Activity.Current
-            if not (isNull activity) && not (String.IsNullOrWhiteSpace fileUniqueId) then
-                %activity.SetTag("ocr.fileUniqueId", fileUniqueId)
-
-            // Defensive: real Telegram payloads always include FileUniqueId, but if it's
-            // missing we just bypass the cache rather than poisoning it with an empty key.
-            if String.IsNullOrWhiteSpace fileUniqueId then
-                return! this.OcrFresh(largestPhoto, null)
-            else
-                let! cached = ocrCache.TryGetText(fileUniqueId)
-                match cached with
-                | Some cachedText ->
-                    if not (isNull activity) then %activity.SetTag("ocr.cacheHit", true)
-                    if String.IsNullOrWhiteSpace cachedText then return None
-                    else return Some cachedText
-                | None ->
-                    if not (isNull activity) then %activity.SetTag("ocr.cacheHit", false)
-                    return! this.OcrFresh(largestPhoto, fileUniqueId)
-    }
-
-    member private this.TryEnrichWithForwardedContent(msg: TgMessage) = task {
-        if botConfig.Value.ForwardSpamDetectionEnabled && isMessageFromAllowedChats botConfig.Value msg then
-            use activity = botActivity.StartActivity("forwardedContentEnrichment")
-            try
-                let mutable forwardedText: string = null
-
-                if not (isNull msg.Quote)
-                   && not (String.IsNullOrWhiteSpace msg.Quote.Text) then
-                    forwardedText <- msg.Quote.Text
-                    %activity.SetTag("quoteTextLength", msg.Quote.Text.Length)
-
-                if botConfig.Value.OcrEnabled
-                   && not (isNull msg.ExternalReply)
-                   && not (isNull msg.ExternalReply.Photo)
-                   && msg.ExternalReply.Photo.Length > 0 then
-                    let! ocrText = this.OcrPhotos(msg.ExternalReply.Photo, msg.MessageId)
-                    match ocrText with
+            // External-reply quote photo (prepend, to match the order produced
+            // by the previous TryEnrichWithForwardedContent: quote + ocr).
+            if botConfig.Value.ForwardSpamDetectionEnabled
+               && not (isNull msg.ExternalReply)
+               && not (isNull msg.ExternalReply.Photo)
+               && msg.ExternalReply.Photo.Length > 0 then
+                %activity.SetTag("externalReplyCacheLookup", true)
+                try
+                    let! cached = this.OcrLookupCache(msg.ExternalReply.Photo)
+                    match cached with
                     | Some text ->
-                        forwardedText <-
-                            if isNull forwardedText then text
-                            else $"{forwardedText}\n{text}"
-                        %activity.SetTag("externalReplyOcrLength", text.Length)
-                    | None -> ()
+                        if not (String.IsNullOrWhiteSpace text) then
+                            msg.PrependText(text)
+                            %activity.SetTag("externalReplyCacheHit", "text")
+                            %activity.SetTag("externalReplyCacheTextLength", text.Length)
+                        else
+                            %activity.SetTag("externalReplyCacheHit", "empty")
+                        msg.ExternalReplyPhotoOcrApplied <- true
+                    | None ->
+                        %activity.SetTag("externalReplyCacheHit", "miss")
+                with ex ->
+                    logger.LogWarning(ex, "OCR cache lookup failed for external-reply photo on message {MessageId}; will fall back to Azure", msg.MessageId)
+                    %activity.SetTag("externalReplyCacheHit", "error")
 
-                if not (String.IsNullOrWhiteSpace forwardedText) then
-                    msg.PrependText(forwardedText)
-                    logger.LogDebug(
-                        "Enriched message {MessageId} with forwarded content of length {ForwardedLength}",
-                        msg.MessageId,
-                        forwardedText.Length
-                    )
-                    %activity.SetTag("enrichedTextLength", msg.Text.Length)
-            with ex ->
-                logger.LogError(ex, "Failed to process forwarded content for message {MessageId}", msg.MessageId)
+            // Message's own photos (append).
+            if not (isNull msg.Photos) && msg.Photos.Length > 0 then
+                %activity.SetTag("ownPhotoCacheLookup", true)
+                try
+                    let! cached = this.OcrLookupCache(msg.Photos)
+                    match cached with
+                    | Some text ->
+                        if not (String.IsNullOrWhiteSpace text) then
+                            msg.AppendText(text)
+                            %activity.SetTag("ownPhotoCacheHit", "text")
+                            %activity.SetTag("ownPhotoCacheTextLength", text.Length)
+                        else
+                            %activity.SetTag("ownPhotoCacheHit", "empty")
+                        msg.OwnPhotoOcrApplied <- true
+                    | None ->
+                        %activity.SetTag("ownPhotoCacheHit", "miss")
+                with ex ->
+                    logger.LogWarning(ex, "OCR cache lookup failed for own photo on message {MessageId}; will fall back to Azure", msg.MessageId)
+                    %activity.SetTag("ownPhotoCacheHit", "error")
     }
 
+    /// Azure-only fallback for external-reply quote photos. Runs only when the
+    /// cache step left ExternalReplyPhotoOcrApplied=false (cache miss). Errors
+    /// are caught and logged — they MUST NOT block the pipeline; the ML
+    /// classifier still runs on whatever text was assembled by other steps.
+    member private this.TryEnrichWithForwardedPhotoOcr(msg: TgMessage) = task {
+        if msg.ExternalReplyPhotoOcrApplied then ()
+        elif botConfig.Value.ForwardSpamDetectionEnabled
+             && botConfig.Value.OcrEnabled
+             && isMessageFromAllowedChats botConfig.Value msg
+             && not (isNull msg.ExternalReply)
+             && not (isNull msg.ExternalReply.Photo)
+             && msg.ExternalReply.Photo.Length > 0 then
+            use activity = botActivity.StartActivity("forwardedPhotoOcrEnrichment")
+            try
+                let! ocrText = this.OcrPhotosFresh(msg.ExternalReply.Photo, msg.MessageId)
+                match ocrText with
+                | Some text ->
+                    msg.PrependText(text)
+                    %activity.SetTag("externalReplyOcrOutcome", "text")
+                    %activity.SetTag("externalReplyOcrLength", text.Length)
+                | None ->
+                    %activity.SetTag("externalReplyOcrOutcome", "empty")
+            with ex ->
+                logger.LogError(ex, "Azure OCR failed for external-reply photo on message {MessageId}; continuing classification with text-only ML", msg.MessageId)
+                %activity.SetTag("externalReplyOcrOutcome", "error")
+            msg.ExternalReplyPhotoOcrApplied <- true
+    }
+
+    /// Azure-only OCR for the message's own photos. Same invariants as
+    /// TryEnrichWithForwardedPhotoOcr — guarded on OwnPhotoOcrApplied,
+    /// errors never block the pipeline.
     member private this.TryEnrichWithOcr(msg: TgMessage) = task {
-        if botConfig.Value.OcrEnabled
-           && not (isNull msg.Photos) && msg.Photos.Length > 0
-           && isMessageFromAllowedChats botConfig.Value msg then
+        if msg.OwnPhotoOcrApplied then ()
+        elif botConfig.Value.OcrEnabled
+             && not (isNull msg.Photos) && msg.Photos.Length > 0
+             && isMessageFromAllowedChats botConfig.Value msg then
             use activity = botActivity.StartActivity("ocrEnrichment")
             try
-                let! ocrResult = this.OcrPhotos(msg.Photos, msg.MessageId)
+                let! ocrResult = this.OcrPhotosFresh(msg.Photos, msg.MessageId)
                 match ocrResult with
                 | Some ocrText ->
                     msg.AppendText(ocrText)
-                    logger.LogDebug (
-                        "Enriched message {MessageId} with OCR text of length {OcrTextLength}",
-                        msg.MessageId,
-                        ocrText.Length
-                    )
+                    %activity.SetTag("ocrOutcome", "text")
                     %activity.SetTag("ocrTextLength", ocrText.Length)
-                | None -> ()
+                | None ->
+                    %activity.SetTag("ocrOutcome", "empty")
             with ex ->
-                logger.LogError(ex, "Failed to process OCR for message {MessageId}", msg.MessageId)
+                logger.LogError(ex, "Azure OCR failed for message {MessageId}; continuing classification with text-only ML", msg.MessageId)
+                %activity.SetTag("ocrOutcome", "error")
+            msg.OwnPhotoOcrApplied <- true
     }
 
     member private _.TryEnrichWithInlineKeyboardText(msg: TgMessage) = task {
@@ -1312,9 +1458,9 @@ type BotService(
         elif update.EditedOrMessage <> null then
             let isEdit = update.EditedMessage <> null
             let msg = TgMessage.Create(update.EditedOrMessage, isEdit = isEdit)
-            do! this.TryEnrichWithForwardedContent(msg)
-            do! this.TryEnrichWithOcr(msg)
+            this.TryEnrichWithForwardedQuoteText(msg)
             do! this.TryEnrichWithInlineKeyboardText(msg)
+            do! this.TryEnrichOcrFromCache(msg)
             do! this.OnMessage(msg)
         elif update.ChatMember <> null || update.MyChatMember <> null then
             // expected update type, nothing to do

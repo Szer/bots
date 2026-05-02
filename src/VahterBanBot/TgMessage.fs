@@ -14,9 +14,23 @@ open BotInfra.TelegramHelpers
 type TgMessage private (raw: Message, isEdit: bool) =
     let mutable prefixText: string = null
     let mutable suffixText: string = null
+    let mutable ownPhotoOcrApplied: bool = false
+    let mutable externalReplyPhotoOcrApplied: bool = false
 
     /// Whether this message is an edit of a previously sent message.
     member _.IsEdit = isEdit
+
+    /// True once OCR for the message's own photos is resolved — cache hit
+    /// (text or empty), Azure attempt (success or failure), or initial state
+    /// where there are no photos. Tells the deferred Azure step to skip.
+    member _.OwnPhotoOcrApplied
+        with get () = ownPhotoOcrApplied
+        and  set v  = ownPhotoOcrApplied <- v
+
+    /// Same for the external-reply quote photos.
+    member _.ExternalReplyPhotoOcrApplied
+        with get () = externalReplyPhotoOcrApplied
+        and  set v  = externalReplyPhotoOcrApplied <- v
 
     // ── Sender resolution ──────────────────────────────────────────
 
