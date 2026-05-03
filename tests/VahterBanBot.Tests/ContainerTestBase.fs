@@ -618,8 +618,24 @@ type MlEnabledVahterTestContainers() =
 /// Variant that DELIBERATELY skips fixture preload to exercise the production training pipeline
 /// end-to-end. Used by MLTrainingPipelineTests as a smoke test that training still produces a
 /// usable model (the most important property of the bot — autonomous spam detection).
+///
+/// Also enables ML_REPEAT_COUNT_ENABLED=true so the smoke test exercises the
+/// repeat-count feature path through training AND inference. The non-FF path
+/// is the production default and is implicitly covered by every other ML test.
 type MlTrainingFromScratchTestContainers() =
     inherit VahterTestContainers(mlEnabled = true)
+
+    override this.SeedDatabase(connString: string) =
+        let baseSeed = base.SeedDatabase(connString)
+        task {
+            do! baseSeed
+            use conn = new NpgsqlConnection(connString)
+            do! conn.OpenAsync()
+            do! conn.ExecuteAsync(
+                    "INSERT INTO bot_setting(key,value,type,feature_group) \
+                     VALUES('ML_REPEAT_COUNT_ENABLED','true','FEATURE_FLAG','ML')")
+                :> Task
+        }
 
     override this.AfterStart() =
         task {
