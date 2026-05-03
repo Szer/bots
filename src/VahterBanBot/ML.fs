@@ -23,6 +23,11 @@ type SpamOrHam =
       spam: bool
       lessThanNMessagesF: single
       moreThanNEmojisF: single
+      /// log1p(text_repeat_count). Only consumed by the pipeline when
+      /// MlRepeatCountEnabled was true at training time; otherwise the
+      /// trained pipeline doesn't reference this column and the value
+      /// is ignored.
+      repeatCountF: single
       weight: single
       createdAt: DateTime }
 
@@ -105,7 +110,10 @@ type MachineLearning(
                   createdAt = x.created_at
                   weight = w
                   moreThanNEmojisF = if x.custom_emoji_count > botConf.Value.MlCustomEmojiThreshold then 1.0f else 0.0f
-                  lessThanNMessagesF = if x.less_than_n_messages then 1.0f else 0.0f }
+                  lessThanNMessagesF = if x.less_than_n_messages then 1.0f else 0.0f
+                  // log1p compresses the long tail (max ~200 → ~5.3) so SDCA
+                  // doesn't over-weight a single very-repeated campaign.
+                  repeatCountF = single (Math.Log(1.0 + float x.text_repeat_count)) }
             )
             |> fun x ->
                 if botConf.Value.MlTrainRandomSortData then
@@ -117,10 +125,17 @@ type MachineLearning(
         let trainingData = trainTestSplit.TrainSet
         let testData = trainTestSplit.TestSet
         
+        let featureColumns =
+            [|
+                "TextFeaturized"
+                "lessThanNMessagesF"
+                "moreThanNEmojisF"
+                if botConf.Value.MlRepeatCountEnabled then "repeatCountF"
+            |]
         let featurePipeline =
             mlContext.Transforms.Text
                 .FeaturizeText(outputColumnName = "TextFeaturized", inputColumnName = "text")
-                .Append(mlContext.Transforms.Concatenate(outputColumnName = "Features", inputColumnNames = [|"TextFeaturized"; "lessThanNMessagesF"; "moreThanNEmojisF"|]))
+                .Append(mlContext.Transforms.Concatenate(outputColumnName = "Features", inputColumnNames = featureColumns))
 
         let dataProcessPipeline =
             let options = SdcaLogisticRegressionBinaryTrainer.Options(
@@ -179,7 +194,7 @@ type MachineLearning(
     // if ML is ready (either disabled or model is trained)
     member _.IsReady = not botConf.Value.MlEnabled || predictionEngine.IsSome
 
-    member _.Predict(text: string, userMsgCount: int, entities: MessageEntity array) =
+    member _.Predict(text: string, userMsgCount: int, entities: MessageEntity array, repeatCount: int) =
         try
             match predictionEngine with
             | Some predictionEngine ->
@@ -189,12 +204,13 @@ type MachineLearning(
                     |> Option.defaultValue [||]
                     |> Seq.filter (fun x -> x.Type = MessageEntityType.CustomEmoji)
                     |> Seq.length
-                
+
                 predictionEngine.Predict
                     { text = text
                       spam = false
                       lessThanNMessagesF = if userMsgCount < botConf.Value.MlTrainCriticalMsgCount then 1.0f else 0.0f
                       moreThanNEmojisF = if emojiCount > botConf.Value.MlCustomEmojiThreshold then 1.0f else 0.0f
+                      repeatCountF = single (Math.Log(1.0 + float repeatCount))
                       weight = 1.0f
                       createdAt = timeProvider.GetUtcNow().UtcDateTime }
                 |> Some
