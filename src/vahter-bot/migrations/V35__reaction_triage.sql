@@ -19,7 +19,5 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
      'When true, LLM verdict acts autonomously (UNSURE falls through to vahter). When false (shadow mode), LLM runs but verdict is recorded only — vahter always decides.'),
     ('LLM_REACTION_TRIAGE_SHADOW_DISABLE', 'false', 'FEATURE_FLAG', 'REACTION_SPAM',
      'Escape hatch: if true, skip the LLM call entirely (do not even shadow). Normally false.'),
-    ('LLM_REACTION_DEPLOYMENT', '', 'FREE_FORM', 'REACTION_SPAM',
-     'Azure OpenAI deployment for vision-enabled reaction triage. Blank means reuse AZURE_OPENAI_DEPLOYMENT.'),
     ('REACTION_NOT_SPAM_COOLDOWN_DAYS', '30', 'FREE_FORM', 'REACTION_SPAM',
      'Days after vahter/LLM verdict NOT_SPAM before re-triaging the same user.');

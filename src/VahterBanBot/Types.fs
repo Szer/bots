@@ -322,8 +322,6 @@ type BotConfiguration =
       LlmReactionTriageAutoAct: bool
       /// Escape hatch: if true, skip the LLM call entirely (do not even shadow). Normally false.
       LlmReactionTriageShadowDisable: bool
-      /// Azure OpenAI deployment for vision triage; if blank, reuse AzureOpenAiDeployment.
-      LlmReactionDeployment: string
       /// Days after vahter/LLM verdict NOT_SPAM before re-triaging the same user.
       ReactionNotSpamCooldownDays: int
       /// Bans older than this many days are considered expired. Default: 7.

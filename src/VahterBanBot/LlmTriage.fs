@@ -236,9 +236,7 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
         |> Convert.ToHexString
         |> _.ToLower()
 
-    let modelName =
-        let configured = botConf.Value.LlmReactionDeployment
-        if String.IsNullOrWhiteSpace configured then botConf.Value.AzureOpenAiDeployment else configured
+    let modelName = botConf.Value.AzureOpenAiDeployment
 
     let formatDossier (d: ReactionTriageDossier) =
         let username = d.Username |> Option.map (fun u -> $"@{u}") |> Option.defaultValue "(none)"

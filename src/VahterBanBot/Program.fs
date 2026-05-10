@@ -127,7 +127,6 @@ let buildBotConf () =
       // Reaction-spam triage (vision LLM)
       LlmReactionTriageAutoAct       = getSettingOr "LLM_REACTION_TRIAGE_AUTO_ACT" "false" |> bool.Parse
       LlmReactionTriageShadowDisable = getSettingOr "LLM_REACTION_TRIAGE_SHADOW_DISABLE" "false" |> bool.Parse
-      LlmReactionDeployment          = getSettingOr "LLM_REACTION_DEPLOYMENT" ""
       ReactionNotSpamCooldownDays    = getSettingOr "REACTION_NOT_SPAM_COOLDOWN_DAYS" "30" |> int
       BanExpiryDays         = getSettingOr "BAN_EXPIRY_DAYS" "7" |> int }
 
