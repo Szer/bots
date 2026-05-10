@@ -294,6 +294,9 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         do! fixture.ClearFakeCalls()
         do! tripThreshold fixture userWithHandle 14000
 
+        // Match the alert by its @handle (which the new layout *does* show) rather than the
+        // numeric user_id (which is intentionally absent for users with a handle — the @mention
+        // already carries the identity).
         let! sendCalls = fixture.GetFakeCalls("sendMessage")
         let potentialSpamId = fixture.PotentialSpamChannel.Id
         let alertsForWithHandle =
@@ -301,7 +304,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{potentialSpamId}"
                 && c.Body.Contains "Reaction-spam triage"
-                && c.Body.Contains (string userWithHandle.Id))
+                && c.Body.Contains $"@{userWithHandle.Username}")
         Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
         let withHandleBody = alertsForWithHandle[0].Body
         Assert.Contains("\"parse_mode\":\"HTML\"", withHandleBody)
