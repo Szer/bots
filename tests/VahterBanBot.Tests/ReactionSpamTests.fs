@@ -246,37 +246,69 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
-    let ``Alert renders a clickable tg://user link and stays under the photo-caption cap`` () = task {
-        // Regression locks for two prod bugs caught on the first real reaction-spammer:
-        //   (a) the suspect name was plain text, so vahter couldn't tap to open the profile —
-        //       essential because empty bio reported by the bot doesn't mean empty bio for
-        //       humans (privacy settings differ between bots and users).
-        //   (b) the 10-event dossier + spam-signals footer overflowed Telegram's 1024-char
-        //       caption limit, truncating the bottom of the alert mid-sentence.
+    let ``Suspect with username renders as handle mention; suspect without username renders as tg-user link`` () = task {
+        // The vahter alert needs to surface a clickable profile so the vahter can read the bio
+        // themselves — bots can't see bios for privacy-strict users, humans can. Two paths:
+        //   (a) Username present → "@handle" (Telegram auto-renders mention as a profile link;
+        //       no HTML <a> needed, also no need to expose the numeric user_id).
+        //   (b) Username missing → "<a href='tg://user?id=…'>Display Name</a>" (only way to
+        //       make a no-handle account clickable).
+        let userWithHandle = Tg.user(username = $"svetla_{System.Guid.NewGuid().ToString().[..7]}")
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture userWithHandle 14000
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let alertsForWithHandle =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage"
+                && c.Body.Contains (string userWithHandle.Id))
+        Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
+        let withHandleBody = alertsForWithHandle[0].Body
+        Assert.Contains("\"parse_mode\":\"HTML\"", withHandleBody)
+        Assert.Contains($"@{userWithHandle.Username}", withHandleBody)
+        Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
+
+        // Now the no-username path: must fall back to an HTML profile link
+        let userNoHandle = Tg.user()  // Tg.user() defaults username to null
+        Assert.Null(userNoHandle.Username)
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture userNoHandle 15000
+
+        let! sendCalls2 = fixture.GetFakeCalls("sendMessage")
+        let alertsForNoHandle =
+            sendCalls2
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage"
+                && c.Body.Contains (string userNoHandle.Id))
+        Assert.True(alertsForNoHandle.Length >= 1, "Expected interactive alert for user without handle")
+        let noHandleBody = alertsForNoHandle[0].Body
+        Assert.Contains($"tg://user?id={userNoHandle.Id}", noHandleBody)
+    }
+
+    [<Fact>]
+    let ``Originating chat is shown as chat username, never as numeric chat_id`` () = task {
+        // The numeric chat id "[chat -1001685850502]" is useless for vahters — they want to
+        // see which monitored chat tripped the threshold. Look it up via ChatsToMonitor.
         let user = Tg.user()
         do! fixture.ClearFakeCalls()
-        do! tripThreshold fixture user 14000
+        do! tripThreshold fixture user 16000
 
         let! sendCalls = fixture.GetFakeCalls("sendMessage")
         let potentialSpamId = fixture.PotentialSpamChannel.Id
         let interactive =
             sendCalls
             |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
-        Assert.True(interactive.Length >= 1, "Expected an interactive alert in PotentialSpamChannel")
-
+        Assert.True(interactive.Length >= 1)
         let body = interactive[0].Body
 
-        // (a) the suspect line is an HTML link with tg://user?id=…
-        Assert.Contains($"tg://user?id={user.Id}", body)
-        Assert.Contains("\"parse_mode\":\"HTML\"", body)
-
-        // (b) the alert fits in the photo-caption cap (1024 chars). We only assert it for the
-        // text content extracted from the JSON body's "text" field — JSON envelope overhead
-        // isn't relevant. Approximation: the rendered text shouldn't exceed ~1000 chars even
-        // with all 10 events; check that the assembled message JSON is well under the limit.
-        Assert.True(
-            body.Length < 4000,
-            $"Alert body should be comfortably under Telegram limits, got {body.Length} chars")
+        let originatingChat = fixture.ChatsToMonitor[0]   // tripThreshold uses ChatsToMonitor[0]
+        Assert.Contains($"@{originatingChat.Username}", body)
+        // The literal numeric form "[chat -666]" must NOT appear in the alert body
+        Assert.DoesNotContain($"[chat {originatingChat.Id}]", body)
     }
 
     [<Fact>]

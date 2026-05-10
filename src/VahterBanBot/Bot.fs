@@ -725,30 +725,35 @@ type BotService(
     }
 
     /// Posts the admin alert with full dossier + photo + 3 callback buttons (BAN / SPAM / NOT SPAM).
-    /// Uses HTML so the suspect's display name is a clickable `tg://user?id=…` link — vahters need
-    /// to open the profile and read the bio themselves (especially when it's privacy-strict to the
-    /// bot but visible to humans).
+    /// Uses HTML parse mode. When the suspect has a username, write @username — Telegram
+    /// auto-renders that as a clickable profile mention with no `<a>` tag needed. For users
+    /// without a username we fall back to an explicit `tg://user?id=…` link.
     member private _.PostReactionTriageAlert(dossier: ReactionTriageDossier, llmVerdict: string option, llmReason: string option, annotationLine: string) = task {
         let htmlEscape (s: string) =
             if isNull s then ""
             else s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
 
-        // Short, human-readable chat label using ChatsToMonitor config; falls back to the
-        // numeric id when the chat isn't in our config (e.g. a chat someone left mid-event).
+        // Short, human-readable chat label using ChatsToMonitor config. Prepends "@" so
+        // Telegram auto-links public chats. For private chats (no real @username), it still
+        // reads as "@projectName" and matches the convention from existing log messages.
+        // Falls back to the numeric id when the chat isn't in our config.
         let chatLabel (chatId: int64) =
             botConfig.Value.ChatsToMonitor
             |> Seq.tryFind (fun kv -> kv.Value = chatId)
-            |> Option.map (fun kv -> kv.Key)
+            |> Option.map (fun kv -> prependUsername kv.Key)
             |> Option.defaultValue (string chatId)
 
+        // Suspect rendering:
+        //  - username present → "@handle"  (Telegram renders this as a clickable profile mention)
+        //  - username missing → "<a href='tg://user?id=…'>Display Name</a>"  (only path that links to a
+        //    profile when there's no public handle)
         let suspectLink =
-            let name = htmlEscape dossier.DisplayName
-            let displayed = if String.IsNullOrWhiteSpace name then "(no name)" else name
-            sprintf "<a href=\"tg://user?id=%d\">%s</a>" dossier.UserId displayed
-        let handlePart =
             match dossier.Username with
-            | Some u -> $" @{htmlEscape u}"
-            | None   -> ""
+            | Some u -> $"@{htmlEscape u}"
+            | None ->
+                let name = htmlEscape dossier.DisplayName
+                let displayed = if String.IsNullOrWhiteSpace name then "(no name)" else name
+                sprintf "<a href=\"tg://user?id=%d\">%s</a>" dossier.UserId displayed
         let firstSeen =
             match dossier.FirstSeenAt with
             | Some t ->
@@ -778,13 +783,13 @@ type BotService(
 
         let header =
             sprintf
-                "🚨 <b>Reaction-spam triage</b>\n%s\n\n<b>Suspect:</b> %s%s\n<b>ID:</b> %d · <b>First seen:</b> %s · <b>Msgs across chats:</b> %d\n\n<b>Bio:</b> %s\n\n<b>Recent activity:</b>\n%s\n\n<b>Originating chat:</b> %s"
+                "🚨 <b>Reaction-spam triage</b>\n%s\n\n<b>Suspect:</b> %s\n<b>First seen:</b> %s · <b>Msgs across chats:</b> %d\n\n<b>Bio:</b> %s\n\n<b>Recent activity:</b>\n%s\n\n<b>Originating chat:</b> %s"
                 (htmlEscape annotationLine)
-                suspectLink handlePart
-                dossier.UserId firstSeen dossier.TotalMessagesAcrossChats
+                suspectLink
+                firstSeen dossier.TotalMessagesAcrossChats
                 bioLine
                 eventLines
-                (chatLabel dossier.OriginatingChatId |> htmlEscape)
+                (chatLabel dossier.OriginatingChatId)
 
         let banId      = Guid.NewGuid()
         let spamId     = Guid.NewGuid()
