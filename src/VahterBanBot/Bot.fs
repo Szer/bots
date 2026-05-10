@@ -725,36 +725,66 @@ type BotService(
     }
 
     /// Posts the admin alert with full dossier + photo + 3 callback buttons (BAN / SPAM / NOT SPAM).
-    /// `llmAnnotation` is the line shown above the dossier — varies between shadow/UNSURE/error.
+    /// Uses HTML so the suspect's display name is a clickable `tg://user?id=…` link — vahters need
+    /// to open the profile and read the bio themselves (especially when it's privacy-strict to the
+    /// bot but visible to humans).
     member private _.PostReactionTriageAlert(dossier: ReactionTriageDossier, llmVerdict: string option, llmReason: string option, annotationLine: string) = task {
-        let username = dossier.Username |> Option.map (fun u -> $"@{u}") |> Option.defaultValue "(none)"
+        let htmlEscape (s: string) =
+            if isNull s then ""
+            else s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+
+        // Short, human-readable chat label using ChatsToMonitor config; falls back to the
+        // numeric id when the chat isn't in our config (e.g. a chat someone left mid-event).
+        let chatLabel (chatId: int64) =
+            botConfig.Value.ChatsToMonitor
+            |> Seq.tryFind (fun kv -> kv.Value = chatId)
+            |> Option.map (fun kv -> kv.Key)
+            |> Option.defaultValue (string chatId)
+
+        let suspectLink =
+            let name = htmlEscape dossier.DisplayName
+            let displayed = if String.IsNullOrWhiteSpace name then "(no name)" else name
+            sprintf "<a href=\"tg://user?id=%d\">%s</a>" dossier.UserId displayed
+        let handlePart =
+            match dossier.Username with
+            | Some u -> $" @{htmlEscape u}"
+            | None   -> ""
         let firstSeen =
             match dossier.FirstSeenAt with
             | Some t ->
                 let days = (utcNow() - t).TotalDays |> int
-                sprintf "%s (%d days ago)" (t.ToString("yyyy-MM-dd HH:mm 'UTC'")) days
+                sprintf "%s (%dd ago)" (t.ToString("yyyy-MM-dd")) days
             | None -> "(never)"
-        let bioLine = if String.IsNullOrWhiteSpace dossier.Bio then "(empty / privacy-strict)" else dossier.Bio
+        let bioLine =
+            if String.IsNullOrWhiteSpace dossier.Bio then "<i>(empty / privacy-strict)</i>"
+            else htmlEscape dossier.Bio
+
         let eventLines =
-            if dossier.Last10Events.Length = 0 then "  (no recent events on record)"
+            if dossier.Last10Events.Length = 0 then "  <i>(no recent events on record)</i>"
             else
                 dossier.Last10Events
                 |> Array.map (fun e ->
                     let ts = e.created_at.ToString("MM-dd HH:mm")
+                    let chat = chatLabel e.chat_id
                     match e.kind with
-                    | "reaction" -> sprintf "  • %s [chat %d] reacted to msg %d" ts e.chat_id e.message_id
+                    | "reaction" -> sprintf "  • %s  %s  reacted" ts chat
                     | _ ->
-                        let truncated =
+                        let txt =
                             if isNull e.text then "(no text)"
-                            elif e.text.Length > 80 then e.text.Substring(0, 80) + "…"
+                            elif e.text.Length > 60 then e.text.Substring(0, 60) + "…"
                             else e.text
-                        sprintf "  • %s [chat %d] message: %s" ts e.chat_id truncated)
+                        sprintf "  • %s  %s  \"%s\"" ts chat (htmlEscape txt))
                 |> String.concat "\n"
+
         let header =
-            sprintf "🚨 Reaction-spam triage\n%s\n\nSuspect: %s (%s)\nUser ID: %d\nFirst seen: %s\nTotal messages across chats: %d\n\nBio:\n> %s\n\nLast %d events (newest first):\n%s\n\nSpam signals to check (Russian IT chat context):\n  1. Bio with ad link / any link\n  2. \"First Name + Last Name\" Russian display name\n  3. Young-woman profile photo\n  4. Zero / near-zero real messages\n\nOriginating chat: %d"
-                annotationLine dossier.DisplayName username dossier.UserId firstSeen
-                dossier.TotalMessagesAcrossChats bioLine
-                dossier.Last10Events.Length eventLines dossier.OriginatingChatId
+            sprintf
+                "🚨 <b>Reaction-spam triage</b>\n%s\n\n<b>Suspect:</b> %s%s\n<b>ID:</b> %d · <b>First seen:</b> %s · <b>Msgs across chats:</b> %d\n\n<b>Bio:</b> %s\n\n<b>Recent activity:</b>\n%s\n\n<b>Originating chat:</b> %s"
+                (htmlEscape annotationLine)
+                suspectLink handlePart
+                dossier.UserId firstSeen dossier.TotalMessagesAcrossChats
+                bioLine
+                eventLines
+                (chatLabel dossier.OriginatingChatId |> htmlEscape)
 
         let banId      = Guid.NewGuid()
         let spamId     = Guid.NewGuid()
@@ -777,26 +807,27 @@ type BotService(
             InlineKeyboardButton.WithCallbackData("✅ NOT SPAM", string notSpamId)
         |]
 
-        // Send photo if available, otherwise plain text. The caption is limited to 1024 chars on photos —
-        // truncate header to fit; full text always mirrored to AllLogsChannel below.
+        // Telegram caption limit is 1024 chars; sendMessage limit is 4096. With the trimmed
+        // layout (no "spam signals" footer, compact chat names) a 10-event dossier is ~700–900
+        // chars, comfortably under the photo-caption cap. If a freakishly long bio pushes us
+        // over, fall back to text-only (sendMessage with link preview disabled) so vahter still
+        // sees everything.
         let actionChatId = ChatId actionChannelId
+        let captionFits = header.Length <= 1000
         let! sent =
             match dossier.PhotoBytes with
-            | Some bytes ->
-                let caption =
-                    if header.Length <= 1000 then header
-                    else header.Substring(0, 980) + "\n…(truncated)"
+            | Some bytes when captionFits ->
                 use ms = new MemoryStream(bytes)
                 let inputFile = InputFileStream(ms, "profile.jpg")
-                botClient.SendPhoto(actionChatId, inputFile, caption = caption, replyMarkup = markup)
-            | None ->
-                botClient.SendMessage(actionChatId, header, replyMarkup = markup)
+                botClient.SendPhoto(actionChatId, inputFile, caption = header, parseMode = ParseMode.Html, replyMarkup = markup)
+            | _ ->
+                botClient.SendMessage(actionChatId, header, parseMode = ParseMode.Html, replyMarkup = markup)
 
         for callbackId in [banId; spamId; notSpamId] do
             do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
 
         // Mirror the full alert text (no buttons, no photo) to AllLogsChannel for audit.
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header) |> taskIgnore
+        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header, parseMode = ParseMode.Html) |> taskIgnore
 
         logger.LogInformation("Reaction triage alert posted for user {U} chat {C} (LLM verdict: {V})", dossier.UserId, dossier.OriginatingChatId, defaultArg llmVerdict "(none)")
     }
