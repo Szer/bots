@@ -648,7 +648,10 @@ type BotService(
     }
 
     /// BAN verdict action: clean up reactions everywhere, delete user's messages, ban in all chats.
-    member private this.ReactionAct_Ban(triggeringChatId: int64, triggeringMessageId: int, targetUser: User) = task {
+    /// `actor` is whoever triggered the ban — Actor.LLM in autonomous mode, Actor.User when a
+    /// vahter clicked the button. The actor flows into the UserBanned event so analytics /
+    /// stats queries can attribute the kill correctly.
+    member private this.ReactionAct_Ban(triggeringChatId: int64, triggeringMessageId: int, targetUser: User, actor: Actor) = task {
         let! removedReactions = this.RemoveRecordedReactions(targetUser.Id, None)
 
         // delete all recorded messages from user in all chats
@@ -669,14 +672,13 @@ type BotService(
 
         // Record auto-deletion and ban events (cross-stream, not atomic — see totalBan comment)
         do! db.RecordBotAutoDeleted(triggeringChatId, triggeringMessageId, targetUser.Id, AutoDeleteReason.ReactionSpam {| reactionCount = targetUser.ReactionCount |})
-        let actor = botConfig.Value.BotActor
         do! db.RecordUserBannedNoMessage(targetUser.Id, actor, triggeringChatId, triggeringMessageId, botConfig.Value.BanExpiryDays)
         bannedUsersCounter.Add(1L, tagsForVahter actor)
 
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let allChatsOk = banResults |> Array.forall Result.isOk
         let logMsgBuilder = StringBuilder()
-        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id})"
+        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {actor.DisplayName}"
         %logMsgBuilder.AppendLine $" — removed {removedReactions} reactions, deleted {allUserMessages.Length} messages, banned in all chats"
         if not allChatsOk then
             %logMsgBuilder.AppendLine "Ban results:"
@@ -839,7 +841,7 @@ type BotService(
         if goAutonomous then
             let actor = Actor.LLM {| modelName = (Option.get llmResult).ModelName; promptHash = (Option.get llmResult).PromptHash |}
             match (Option.get llmResult).Verdict with
-            | LlmReactionVerdict.Ban     -> do! this.ReactionAct_Ban(reaction.Chat.Id, reaction.MessageId, targetUser)
+            | LlmReactionVerdict.Ban     -> do! this.ReactionAct_Ban(reaction.Chat.Id, reaction.MessageId, targetUser, actor)
             | LlmReactionVerdict.Spam    -> let! _ = this.ReactionAct_Spam(reaction.Chat.Id, targetUser.Id) in ()
             | LlmReactionVerdict.NotSpam -> do! this.ReactionAct_NotSpam(targetUser.Id, actor)
             | LlmReactionVerdict.Unsure
@@ -1537,46 +1539,34 @@ type BotService(
                 logger.LogInformation $"Action already recorded for message {tgMsg.MessageId} in chat {tgMsg.ChatId}"
                 do! answer "Already handled by another vahter"
 
+        // Reaction-triage callbacks don't go through TryRecordVahterAction — that helper
+        // dedups via the moderation:{chatId}:{messageId} stream, but a reaction-spam trip
+        // has no specific spam message (messageId=0 collides across users in the same chat).
+        // Click serialization is already provided upstream by ResolveCallback, so dedup here
+        // is unnecessary.
         | ReactionBan ctx ->
             %onCallbackActivity.SetTag("type", "ReactionBan")
-            // Reaction-triage actions dedup on (vahter, ReactionTriageBan, userId, chatId, 0)
-            // chatId+0 because there's no specific spam message — only the threshold-trip event
-            let! actionRecorded = db.TryRecordVahterAction(
-                                    vahter.Id, ReactionTriageBan, ctx.userId, ctx.chatId, 0)
-            if actionRecorded then
-                let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
-                // Synthesize a User aggregate to feed ReactionAct_Ban
+            let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
+            let! u = task {
                 match! db.GetUserById(ctx.userId) with
-                | Some u -> do! this.ReactionAct_Ban(ctx.chatId, 0, u)
-                | None ->
-                    let u = { User.Zero with Id = ctx.userId }
-                    do! this.ReactionAct_Ban(ctx.chatId, 0, u)
-                do! answer "Banned 🚫"
-            else
-                do! answer "Already handled"
+                | Some u -> return u
+                | None   -> return { User.Zero with Id = ctx.userId }
+            }
+            do! this.ReactionAct_Ban(ctx.chatId, 0, u, actor)
+            do! answer "Banned 🚫"
             do! cleanupActionMessage()
 
         | ReactionSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionSpam")
-            let! actionRecorded = db.TryRecordVahterAction(
-                                    vahter.Id, ReactionTriageSpam, ctx.userId, ctx.chatId, 0)
-            if actionRecorded then
-                let! _ = this.ReactionAct_Spam(ctx.chatId, ctx.userId)
-                do! answer "Reactions removed ⚠️"
-            else
-                do! answer "Already handled"
+            let! _ = this.ReactionAct_Spam(ctx.chatId, ctx.userId)
+            do! answer "Reactions removed ⚠️"
             do! cleanupActionMessage()
 
         | ReactionNotSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionNotSpam")
-            let! actionRecorded = db.TryRecordVahterAction(
-                                    vahter.Id, ReactionTriageNotSpam, ctx.userId, ctx.chatId, 0)
-            if actionRecorded then
-                let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
-                do! this.ReactionAct_NotSpam(ctx.userId, actor)
-                do! answer "Cooldown set ✅"
-            else
-                do! answer "Already handled"
+            let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
+            do! this.ReactionAct_NotSpam(ctx.userId, actor)
+            do! answer "Cooldown set ✅"
             do! cleanupActionMessage()
 
         // For non-reaction (message-context) callbacks, fall through to the same cleanup as before.
