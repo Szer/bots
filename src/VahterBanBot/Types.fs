@@ -90,9 +90,11 @@ type UserEvent =
     | UsernameChanged              of {| userId: int64; username: string option |}
     | UserBanned                   of {| userId: int64; bannedBy: BannedBy option; actor: Actor option; chatId: int64 option; messageId: int option; messageText: string option; bannedAt: DateTime |}
     | UserUnbanned                 of {| userId: int64; unbannedBy: int64 option; actor: Actor option |}
-    /// Records a user adding/removing reactions on a specific message. `chatId` and `messageId`
-    /// are option to stay backward compatible with pre-2026-05 events that didn't carry them.
-    | UserReactionRecorded         of {| userId: int64; chatId: int64 option; messageId: int option; delta: int |}
+    /// Records a user adding/removing reactions on a specific message. `chatId`, `messageId`
+    /// and `emoji` are option to stay backward compatible with earlier events that didn't carry them.
+    /// `emoji` is the joined emoji string of the user's NewReaction set (e.g. "🔥❤️"), useful for
+    /// vahters reading the dossier — knowing which emoji was used helps spot patterns.
+    | UserReactionRecorded         of {| userId: int64; chatId: int64 option; messageId: int option; emoji: string option; delta: int |}
     /// Reaction-spam triage verdict NOT_SPAM — sets a cooldown so a legit lurker doesn't
     /// keep re-triggering the pipeline. Set by LLM (autonomous mode) or by a vahter button.
     | ReactionTriageNotSpamSet     of {| userId: int64; until: DateTime; actor: Actor |}

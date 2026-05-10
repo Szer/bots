@@ -25,6 +25,7 @@ type DossierEvent =
       message_id: int
       kind: string          // "message" or "reaction"
       text: string          // message text (NULL for reaction)
+      emoji: string         // joined emoji string for reaction events (NULL for message)
       created_at: DateTime }
 
 /// Lightweight DTO for cached user profile (photo + bio).
@@ -58,13 +59,13 @@ type DbService(connString: string, timeProvider: TimeProvider) =
             return ()
         }
 
-    let recordUserReaction (userId: int64) (username: string option) (chatId: int64) (messageId: int) (reactionIncrement: int) : Task<User> =
+    let recordUserReaction (userId: int64) (username: string option) (chatId: int64) (messageId: int) (emoji: string option) (reactionIncrement: int) : Task<User> =
         task {
             let! (_, state) = EventStore.appendEvent store $"user:{userId}" (fun state ->
                 let usernameEvt =
                     if state.Username = username then []
                     else [ UsernameChanged {| userId = userId; username = username |} ]
-                usernameEvt @ [ UserReactionRecorded {| userId = userId; chatId = Some chatId; messageId = Some messageId; delta = reactionIncrement |} ])
+                usernameEvt @ [ UserReactionRecorded {| userId = userId; chatId = Some chatId; messageId = Some messageId; emoji = emoji; delta = reactionIncrement |} ])
             return state
         }
 
@@ -143,9 +144,9 @@ ON CONFLICT DO NOTHING
             return { state with Id = userId }
         }
 
-    member _.UpsertUserAndIncrementReactions(userId: int64, username: string option, chatId: int64, messageId: int, reactionIncrement: int) : Task<User> =
+    member _.UpsertUserAndIncrementReactions(userId: int64, username: string option, chatId: int64, messageId: int, emoji: string option, reactionIncrement: int) : Task<User> =
         task {
-            let! state = recordUserReaction userId username chatId messageId reactionIncrement
+            let! state = recordUserReaction userId username chatId messageId emoji reactionIncrement
             return { state with Id = userId }
         }
 
@@ -477,6 +478,7 @@ WHERE event_type = 'UserReactionRecorded'
         (data->>'messageId')::INT  AS message_id,
         'message'                  AS kind,
         data->>'text'              AS text,
+        NULL                       AS emoji,
         created_at
     FROM event
     WHERE event_type = 'MessageReceived'
@@ -489,6 +491,7 @@ UNION ALL
         COALESCE((data->>'messageId')::INT, 0::INT)   AS message_id,
         'reaction'                                    AS kind,
         NULL                                          AS text,
+        data->>'emoji'                                AS emoji,
         created_at
     FROM event
     WHERE event_type = 'UserReactionRecorded'

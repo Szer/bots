@@ -108,6 +108,17 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // No cooldown should be set for a ban
         let! cooldown = fixture.HasReactionCooldown user.Id
         Assert.False(cooldown, "BAN must not set a cooldown — the user is banned")
+
+        // Audit message must be posted to AllLogs naming the vahter who decided
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let banAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage BAN"
+                && c.Body.Contains $"@{vahter.Username}")
+        Assert.True(banAuditLogs.Length >= 1, "AllLogs should record the BAN action with the vahter's name")
     }
 
     [<Fact>]
@@ -153,15 +164,30 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.False(bannedByBot, "SPAM must not ban (bot case)")
         let! cooldown = fixture.HasReactionCooldown user.Id
         Assert.False(cooldown, "SPAM must not set a NOT_SPAM cooldown — only NOT_SPAM does")
+
+        // Audit message must be posted to AllLogs naming the vahter and the originating chat
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let originatingChat = fixture.ChatsToMonitor[0]
+        let spamAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage SPAM"
+                && c.Body.Contains $"@{vahter.Username}"
+                && c.Body.Contains $"@{originatingChat.Username}")
+        Assert.True(spamAuditLogs.Length >= 1, "AllLogs should record the SPAM action with the vahter's name and originating chat")
     }
 
     [<Fact>]
-    let ``Vahter clicks NOT SPAM → cooldown set with Actor.User, no ban`` () = task {
+    let ``Vahter clicks NOT SPAM → cooldown set with Actor.User, no ban, audit logged`` () = task {
         let vahter = fixture.Vahters[0]
         do! seedVahterInDb fixture vahter
 
         let user = Tg.user()
         do! tripThreshold fixture user 3000
+
+        do! fixture.ClearFakeCalls()
 
         let! notSpamId = fixture.GetReactionCallbackId(user.Id, "ReactionNotSpam")
         let! resp = fixture.ClickCallback(notSpamId, vahter)
@@ -173,6 +199,17 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // Cooldown actor must be the vahter, not the bot — analytics rely on this attribution.
         let! cooldownActor = fixture.TryGetReactionCooldownActorCase user.Id
         Assert.Equal(Some "User", cooldownActor)
+
+        // Audit message must be posted to AllLogs naming the vahter
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let notSpamAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage NOT SPAM"
+                && c.Body.Contains $"@{vahter.Username}")
+        Assert.True(notSpamAuditLogs.Length >= 1, "AllLogs should record the NOT SPAM action with the vahter's name")
 
         let! isBanned = fixture.UserBanned user.Id
         Assert.False(isBanned, "NOT SPAM must not ban")
@@ -287,6 +324,38 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.True(alertsForNoHandle.Length >= 1, "Expected interactive alert for user without handle")
         let noHandleBody = alertsForNoHandle[0].Body
         Assert.Contains($"tg://user?id={userNoHandle.Id}", noHandleBody)
+    }
+
+    [<Fact>]
+    let ``Reaction emoji is recorded and shown in the dossier "reacted X" line`` () = task {
+        // Vahter request: it's useful to see WHICH emoji the user reacted with — repeating
+        // 🔥 on random messages is a stronger spam signal than alternating ❤️/👍 etc.
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+
+        do! fixture.ClearFakeCalls()
+
+        // Use a non-default emoji so the alert clearly shows it (default in Tg.quickReaction is 👍)
+        let fireEmoji = "\U0001F525"  // 🔥
+        for i in 1..5 do
+            let! resp =
+                Tg.quickReaction(chat, 17000 + i, user, emoji = fireEmoji)
+                |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1, "Expected an interactive alert in PotentialSpamChannel")
+
+        let body = interactive[0].Body
+        // The alert dossier must contain at least one "reacted 🔥" line; 🔥 is the
+        // JSON-escaped surrogate pair for 🔥.
+        Assert.True(
+            body.Contains "reacted \\uD83D\\uDD25" || body.Contains "reacted 🔥",
+            $"Dossier should show the actual emoji used; body did not contain 'reacted 🔥'")
     }
 
     [<Fact>]
