@@ -652,7 +652,7 @@ type BotService(
             |> Option.defaultValue (string chatId)
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let logMsg =
-            $"⚠️ Reaction-triage SPAM on {sanitizedUsername} ({targetUser.Id}) in {chatLabel} by {actor.DisplayName} — restricted reactions, removed {removed} existing"
+            $"⚠️ Reaction-triage SPAM on {sanitizedUsername} ({targetUser.Id}) in {chatLabel} by {prependUsername actor.DisplayName} — restricted reactions, removed {removed} existing"
         do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
         logger.LogInformation logMsg
         return removed
@@ -689,7 +689,7 @@ type BotService(
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let allChatsOk = banResults |> Array.forall Result.isOk
         let logMsgBuilder = StringBuilder()
-        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {actor.DisplayName}"
+        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName}"
         %logMsgBuilder.AppendLine $" — removed {removedReactions} reactions, deleted {allUserMessages.Length} messages, banned in all chats"
         if not allChatsOk then
             %logMsgBuilder.AppendLine "Ban results:"
@@ -711,7 +711,7 @@ type BotService(
 
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let logMsg =
-            $"✅ Reaction-triage NOT SPAM on {sanitizedUsername} ({targetUser.Id}) by {actor.DisplayName} — cooldown for {cooldownDays}d, no destructive action"
+            $"✅ Reaction-triage NOT SPAM on {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName} — cooldown for {cooldownDays}d, no destructive action"
         do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
         logger.LogInformation logMsg
     }
@@ -787,7 +787,11 @@ type BotService(
                 dossier.Last10Events
                 |> Array.map (fun e ->
                     let ts = e.created_at.ToString("MM-dd HH:mm")
-                    let chat = chatLabel e.chat_id
+                    // Old reaction events (pre-PR) lack chatId and surface here as chat_id = 0.
+                    // Don't fake a real chat — say "(unknown)" so the dossier doesn't lie.
+                    let chat =
+                        if e.chat_id = 0L then "<i>(unknown)</i>"
+                        else chatLabel e.chat_id
                     match e.kind with
                     | "reaction" ->
                         let emojiPart =

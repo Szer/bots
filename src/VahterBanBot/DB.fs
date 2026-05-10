@@ -467,6 +467,8 @@ WHERE event_type = 'UserReactionRecorded'
         }
 
     /// Returns the user's last `n` events (mix of MessageReceived and UserReactionRecorded), newest first.
+    /// Old reaction events (pre-PR) without chatId surface with chat_id = 0; renderer treats that as
+    /// "(unknown chat)" rather than inventing a fake one.
     member _.GetRecentDossierEvents(userId: int64, n: int) : Task<DossierEvent array> =
         task {
             use conn = new NpgsqlConnection(connString)

@@ -307,7 +307,13 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
                 && c.Body.Contains $"@{userWithHandle.Username}")
         Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
         let withHandleBody = alertsForWithHandle[0].Body
-        Assert.Contains("\"parse_mode\":\"HTML\"", withHandleBody)
+        // Telegram.Bot 22.x serializes ParseMode via .NET enum name → "Html"; Telegram
+        // accepts case-insensitively. Tolerate either casing so the test isn't tied to
+        // the SDK's enum serialization style.
+        Assert.True(
+            withHandleBody.Contains "\"parse_mode\":\"HTML\""
+            || withHandleBody.Contains "\"parse_mode\":\"Html\"",
+            "Alert must be sent with parse_mode=HTML")
         Assert.Contains($"@{userWithHandle.Username}", withHandleBody)
         Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
 
@@ -359,6 +365,39 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.True(
             body.Contains "reacted \\uD83D\\uDD25" || body.Contains "reacted 🔥",
             $"Dossier should show the actual emoji used; body did not contain 'reacted 🔥'")
+    }
+
+    [<Fact>]
+    let ``Pre-PR reactions (no chatId recorded) render as (unknown), not as fake chat 0`` () = task {
+        // Backward-compat: events recorded before this PR have no chatId/messageId/emoji.
+        // We must not invent a "chat 0" label that pretends to be a real chat.
+        let user = Tg.user()
+
+        // Synthesize an old-shape reaction event directly in the DB (bypassing the bot).
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        let insertSql =
+            "INSERT INTO event(stream_id, stream_version, data) VALUES " +
+            "('user:' || @userId, " +
+            " (SELECT COALESCE(MAX(stream_version), 0) + 1 FROM event WHERE stream_id = 'user:' || @userId), " +
+            " jsonb_build_object('Case','UserReactionRecorded','userId',@userId,'delta',1))"
+        let! _ = Dapper.SqlMapper.ExecuteAsync(conn, insertSql, {| userId = user.Id |})
+
+        // Now trip the threshold so the alert is built with that old event present in the dossier.
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture user 19000
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1)
+        let body = interactive[0].Body
+
+        // The dossier must NOT contain a bullet line with "0  reacted" — chat id 0 is not a real chat.
+        Assert.DoesNotContain("  0  reacted", body)
+        // It SHOULD contain an honest "(unknown)" marker (HTML-escaped <i>)
+        Assert.Contains("(unknown)", body)
     }
 
     [<Fact>]
