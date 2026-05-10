@@ -764,9 +764,12 @@ type BotService(
               chatId     = dossier.OriginatingChatId
               llmVerdict = llmVerdict
               llmReason  = llmReason }
-        do! db.RecordCallbackCreated(banId,     CallbackMessage.ReactionBan ctx,     dossier.UserId, botConfig.Value.AllLogsChannelId)
-        do! db.RecordCallbackCreated(spamId,    CallbackMessage.ReactionSpam ctx,    dossier.UserId, botConfig.Value.AllLogsChannelId)
-        do! db.RecordCallbackCreated(notSpamId, CallbackMessage.ReactionNotSpam ctx, dossier.UserId, botConfig.Value.AllLogsChannelId)
+        // Callbacks route to PotentialSpamChannel — the "zero-inbox" actionable channel.
+        // AllLogsChannel gets a non-interactive mirror further down for audit trail.
+        let actionChannelId = botConfig.Value.PotentialSpamChannelId
+        do! db.RecordCallbackCreated(banId,     CallbackMessage.ReactionBan ctx,     dossier.UserId, actionChannelId)
+        do! db.RecordCallbackCreated(spamId,    CallbackMessage.ReactionSpam ctx,    dossier.UserId, actionChannelId)
+        do! db.RecordCallbackCreated(notSpamId, CallbackMessage.ReactionNotSpam ctx, dossier.UserId, actionChannelId)
 
         let markup = InlineKeyboardMarkup [|
             InlineKeyboardButton.WithCallbackData("🚫 BAN",      string banId)
@@ -775,8 +778,8 @@ type BotService(
         |]
 
         // Send photo if available, otherwise plain text. The caption is limited to 1024 chars on photos —
-        // truncate header to fit, append "(see full alert in logs)" if needed; full text always logged.
-        let alertChatId = ChatId botConfig.Value.AllLogsChannelId
+        // truncate header to fit; full text always mirrored to AllLogsChannel below.
+        let actionChatId = ChatId actionChannelId
         let! sent =
             match dossier.PhotoBytes with
             | Some bytes ->
@@ -785,12 +788,15 @@ type BotService(
                     else header.Substring(0, 980) + "\n…(truncated)"
                 use ms = new MemoryStream(bytes)
                 let inputFile = InputFileStream(ms, "profile.jpg")
-                botClient.SendPhoto(alertChatId, inputFile, caption = caption, replyMarkup = markup)
+                botClient.SendPhoto(actionChatId, inputFile, caption = caption, replyMarkup = markup)
             | None ->
-                botClient.SendMessage(alertChatId, header, replyMarkup = markup)
+                botClient.SendMessage(actionChatId, header, replyMarkup = markup)
 
         for callbackId in [banId; spamId; notSpamId] do
             do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
+
+        // Mirror the full alert text (no buttons, no photo) to AllLogsChannel for audit.
+        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header) |> taskIgnore
 
         logger.LogInformation("Reaction triage alert posted for user {U} chat {C} (LLM verdict: {V})", dossier.UserId, dossier.OriginatingChatId, defaultArg llmVerdict "(none)")
     }
