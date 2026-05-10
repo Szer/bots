@@ -208,29 +208,41 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
-    let ``Admin alert annotates the LLM verdict shown to vahters (shadow mode)`` () = task {
-        // Shadow value of the LLM must be visible to humans — that's the entire point of the
-        // shadow mode rollout: vahters sanity-check the model before we promote it to autonomous.
+    let ``Admin alert posted to Potential Spam channel (interactive) and mirrored to All Logs (audit)`` () = task {
+        // Routing matters: PotentialSpamChannel is the zero-inbox actionable channel where
+        // vahters click buttons; AllLogsChannel is read-only persistent audit. Both must see
+        // the alert, but only PotentialSpamChannel gets the interactive copy.
         let user = Tg.user()
         do! fixture.ClearFakeCalls()
         do! tripThreshold fixture user 13000
 
-        // Alert is sent as a photo OR a plain message to AllLogsChannel. The fake getUserProfilePhotos
-        // returns no photos, so the alert is a sendMessage to the logs channel containing the dossier.
+        // The interactive alert is sent as sendMessage (no profile photo on fake-tg) to
+        // PotentialSpamChannel.
         let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
         let allLogsId = fixture.AllLogsChannel.Id
-        let alertCalls =
+
+        let interactiveAlerts =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactiveAlerts.Length >= 1, "Expected interactive alert in PotentialSpamChannel")
+        Assert.True(interactiveAlerts[0].Body.Contains "inline_keyboard", "PotentialSpamChannel alert must carry the 3 callback buttons")
+
+        let auditAlerts =
             sendCalls
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{allLogsId}"
                 && c.Body.Contains "Reaction-spam triage")
-        Assert.True(alertCalls.Length >= 1, "Expected at least one reaction-triage admin alert in AllLogsChannel")
+        Assert.True(auditAlerts.Length >= 1, "Expected audit mirror in AllLogsChannel")
+        Assert.False(auditAlerts[0].Body.Contains "inline_keyboard", "AllLogsChannel mirror must NOT carry buttons (read-only audit)")
 
-        // The LLM annotation line must reference the verdict the LLM returned
-        let annotatedAlerts =
-            alertCalls
-            |> Array.filter (fun c -> c.Body.Contains "LLM (shadow) said:" || c.Body.Contains "UNSURE")
-        Assert.True(annotatedAlerts.Length >= 1, "Alert should annotate the shadow LLM verdict so vahter can compare")
+        // The LLM annotation line must reference the verdict the LLM returned — that's
+        // the load-bearing purpose of shadow mode.
+        Assert.True(
+            interactiveAlerts[0].Body.Contains "LLM (shadow) said:" || interactiveAlerts[0].Body.Contains "UNSURE",
+            "Alert should annotate the shadow LLM verdict so vahter can compare")
     }
 
     [<Fact>]
