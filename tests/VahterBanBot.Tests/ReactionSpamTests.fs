@@ -108,6 +108,17 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // No cooldown should be set for a ban
         let! cooldown = fixture.HasReactionCooldown user.Id
         Assert.False(cooldown, "BAN must not set a cooldown — the user is banned")
+
+        // Audit message must be posted to AllLogs naming the vahter who decided
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let banAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage BAN"
+                && c.Body.Contains $"@{vahter.Username}")
+        Assert.True(banAuditLogs.Length >= 1, "AllLogs should record the BAN action with the vahter's name")
     }
 
     [<Fact>]
@@ -153,15 +164,30 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.False(bannedByBot, "SPAM must not ban (bot case)")
         let! cooldown = fixture.HasReactionCooldown user.Id
         Assert.False(cooldown, "SPAM must not set a NOT_SPAM cooldown — only NOT_SPAM does")
+
+        // Audit message must be posted to AllLogs naming the vahter and the originating chat
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let originatingChat = fixture.ChatsToMonitor[0]
+        let spamAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage SPAM"
+                && c.Body.Contains $"@{vahter.Username}"
+                && c.Body.Contains $"@{originatingChat.Username}")
+        Assert.True(spamAuditLogs.Length >= 1, "AllLogs should record the SPAM action with the vahter's name and originating chat")
     }
 
     [<Fact>]
-    let ``Vahter clicks NOT SPAM → cooldown set with Actor.User, no ban`` () = task {
+    let ``Vahter clicks NOT SPAM → cooldown set with Actor.User, no ban, audit logged`` () = task {
         let vahter = fixture.Vahters[0]
         do! seedVahterInDb fixture vahter
 
         let user = Tg.user()
         do! tripThreshold fixture user 3000
+
+        do! fixture.ClearFakeCalls()
 
         let! notSpamId = fixture.GetReactionCallbackId(user.Id, "ReactionNotSpam")
         let! resp = fixture.ClickCallback(notSpamId, vahter)
@@ -173,6 +199,17 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // Cooldown actor must be the vahter, not the bot — analytics rely on this attribution.
         let! cooldownActor = fixture.TryGetReactionCooldownActorCase user.Id
         Assert.Equal(Some "User", cooldownActor)
+
+        // Audit message must be posted to AllLogs naming the vahter
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let notSpamAuditLogs =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-triage NOT SPAM"
+                && c.Body.Contains $"@{vahter.Username}")
+        Assert.True(notSpamAuditLogs.Length >= 1, "AllLogs should record the NOT SPAM action with the vahter's name")
 
         let! isBanned = fixture.UserBanned user.Id
         Assert.False(isBanned, "NOT SPAM must not ban")
@@ -243,6 +280,146 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.True(
             interactiveAlerts[0].Body.Contains "LLM (shadow) said:" || interactiveAlerts[0].Body.Contains "UNSURE",
             "Alert should annotate the shadow LLM verdict so vahter can compare")
+    }
+
+    [<Fact>]
+    let ``Suspect with username renders as handle mention; suspect without username renders as tg-user link`` () = task {
+        // The vahter alert needs to surface a clickable profile so the vahter can read the bio
+        // themselves — bots can't see bios for privacy-strict users, humans can. Two paths:
+        //   (a) Username present → "@handle" (Telegram auto-renders mention as a profile link;
+        //       no HTML <a> needed, also no need to expose the numeric user_id).
+        //   (b) Username missing → "<a href='tg://user?id=…'>Display Name</a>" (only way to
+        //       make a no-handle account clickable).
+        let userWithHandle = Tg.user(username = $"svetla_{System.Guid.NewGuid().ToString().[..7]}")
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture userWithHandle 14000
+
+        // Match the alert by its @handle (which the new layout *does* show) rather than the
+        // numeric user_id (which is intentionally absent for users with a handle — the @mention
+        // already carries the identity).
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let alertsForWithHandle =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage"
+                && c.Body.Contains $"@{userWithHandle.Username}")
+        Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
+        let withHandleBody = alertsForWithHandle[0].Body
+        // Telegram.Bot 22.x serializes ParseMode via .NET enum name → "Html"; Telegram
+        // accepts case-insensitively. Tolerate either casing so the test isn't tied to
+        // the SDK's enum serialization style.
+        Assert.True(
+            withHandleBody.Contains "\"parse_mode\":\"HTML\""
+            || withHandleBody.Contains "\"parse_mode\":\"Html\"",
+            "Alert must be sent with parse_mode=HTML")
+        Assert.Contains($"@{userWithHandle.Username}", withHandleBody)
+        Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
+
+        // Now the no-username path: must fall back to an HTML profile link
+        let userNoHandle = Tg.user()  // Tg.user() defaults username to null
+        Assert.Null(userNoHandle.Username)
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture userNoHandle 15000
+
+        let! sendCalls2 = fixture.GetFakeCalls("sendMessage")
+        let alertsForNoHandle =
+            sendCalls2
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage"
+                && c.Body.Contains (string userNoHandle.Id))
+        Assert.True(alertsForNoHandle.Length >= 1, "Expected interactive alert for user without handle")
+        let noHandleBody = alertsForNoHandle[0].Body
+        Assert.Contains($"tg://user?id={userNoHandle.Id}", noHandleBody)
+    }
+
+    [<Fact>]
+    let ``Reaction emoji is recorded and shown in the dossier "reacted X" line`` () = task {
+        // Vahter request: it's useful to see WHICH emoji the user reacted with — repeating
+        // 🔥 on random messages is a stronger spam signal than alternating ❤️/👍 etc.
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+
+        do! fixture.ClearFakeCalls()
+
+        // Use a non-default emoji so the alert clearly shows it (default in Tg.quickReaction is 👍)
+        let fireEmoji = "\U0001F525"  // 🔥
+        for i in 1..5 do
+            let! resp =
+                Tg.quickReaction(chat, 17000 + i, user, emoji = fireEmoji)
+                |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1, "Expected an interactive alert in PotentialSpamChannel")
+
+        let body = interactive[0].Body
+        // The alert dossier must contain at least one "reacted 🔥" line; 🔥 is the
+        // JSON-escaped surrogate pair for 🔥.
+        Assert.True(
+            body.Contains "reacted \\uD83D\\uDD25" || body.Contains "reacted 🔥",
+            $"Dossier should show the actual emoji used; body did not contain 'reacted 🔥'")
+    }
+
+    [<Fact>]
+    let ``Pre-PR reactions (no chatId recorded) render as (unknown), not as fake chat 0`` () = task {
+        // Backward-compat: events recorded before this PR have no chatId/messageId/emoji.
+        // We must not invent a "chat 0" label that pretends to be a real chat.
+        let user = Tg.user()
+
+        // Synthesize an old-shape reaction event directly in the DB (bypassing the bot).
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        let insertSql =
+            "INSERT INTO event(stream_id, stream_version, data) VALUES " +
+            "('user:' || @userId, " +
+            " (SELECT COALESCE(MAX(stream_version), 0) + 1 FROM event WHERE stream_id = 'user:' || @userId), " +
+            " jsonb_build_object('Case','UserReactionRecorded','userId',@userId,'delta',1))"
+        let! _ = Dapper.SqlMapper.ExecuteAsync(conn, insertSql, {| userId = user.Id |})
+
+        // Now trip the threshold so the alert is built with that old event present in the dossier.
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture user 19000
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1)
+        let body = interactive[0].Body
+
+        // The dossier must NOT contain a bullet line with "0  reacted" — chat id 0 is not a real chat.
+        Assert.DoesNotContain("  0  reacted", body)
+        // It SHOULD contain an honest "(unknown)" marker (HTML-escaped <i>)
+        Assert.Contains("(unknown)", body)
+    }
+
+    [<Fact>]
+    let ``Originating chat is shown as chat username, never as numeric chat_id`` () = task {
+        // The numeric chat id "[chat -1001685850502]" is useless for vahters — they want to
+        // see which monitored chat tripped the threshold. Look it up via ChatsToMonitor.
+        let user = Tg.user()
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture user 16000
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1)
+        let body = interactive[0].Body
+
+        let originatingChat = fixture.ChatsToMonitor[0]   // tripThreshold uses ChatsToMonitor[0]
+        Assert.Contains($"@{originatingChat.Username}", body)
+        // The literal numeric form "[chat -666]" must NOT appear in the alert body
+        Assert.DoesNotContain($"[chat {originatingChat.Id}]", body)
     }
 
     [<Fact>]

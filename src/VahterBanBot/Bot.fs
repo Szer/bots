@@ -636,14 +636,25 @@ type BotService(
 
     /// SPAM verdict action: restrict future reactions in this chat + remove existing ones.
     /// Restriction comes first so the spammer can't immediately re-react during the deletion loop.
-    member private this.ReactionAct_Spam(chatId: int64, userId: int64) = task {
+    /// `actor` flows into the AllLogs audit message so vahters can see who decided.
+    member private this.ReactionAct_Spam(chatId: int64, targetUser: User, actor: Actor) = task {
         try
             let perms = ChatPermissions(CanReactToMessages = false)
-            do! botClient.RestrictChatMember(ChatId chatId, userId, perms)
+            do! botClient.RestrictChatMember(ChatId chatId, targetUser.Id, perms)
         with e ->
-            logger.LogWarning(e, "RestrictChatMember(can_react=false) failed for user {U} in chat {C}", userId, chatId)
-        let! removed = this.RemoveRecordedReactions(userId, Some chatId)
-        logger.LogInformation("Reaction triage SPAM: restricted reactions and removed {N} for user {U} in chat {C}", removed, userId, chatId)
+            logger.LogWarning(e, "RestrictChatMember(can_react=false) failed for user {U} in chat {C}", targetUser.Id, chatId)
+        let! removed = this.RemoveRecordedReactions(targetUser.Id, Some chatId)
+
+        let chatLabel =
+            botConfig.Value.ChatsToMonitor
+            |> Seq.tryFind (fun kv -> kv.Value = chatId)
+            |> Option.map (fun kv -> prependUsername kv.Key)
+            |> Option.defaultValue (string chatId)
+        let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
+        let logMsg =
+            $"⚠️ Reaction-triage SPAM on {sanitizedUsername} ({targetUser.Id}) in {chatLabel} by {prependUsername actor.DisplayName} — restricted reactions, removed {removed} existing"
+        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
+        logger.LogInformation logMsg
         return removed
     }
 
@@ -678,7 +689,7 @@ type BotService(
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let allChatsOk = banResults |> Array.forall Result.isOk
         let logMsgBuilder = StringBuilder()
-        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {actor.DisplayName}"
+        %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName}"
         %logMsgBuilder.AppendLine $" — removed {removedReactions} reactions, deleted {allUserMessages.Length} messages, banned in all chats"
         if not allChatsOk then
             %logMsgBuilder.AppendLine "Ban results:"
@@ -692,11 +703,17 @@ type BotService(
     }
 
     /// NOT_SPAM verdict action: just set the cooldown — no destructive operation.
-    member private _.ReactionAct_NotSpam(userId: int64, actor: Actor) = task {
+    /// `actor` flows into the AllLogs audit message so vahters can see who decided.
+    member private _.ReactionAct_NotSpam(targetUser: User, actor: Actor) = task {
         let cooldownDays = botConfig.Value.ReactionNotSpamCooldownDays
         let until = utcNow().AddDays(float cooldownDays)
-        do! db.RecordReactionTriageNotSpam(userId, until, actor)
-        logger.LogInformation("Reaction triage NOT_SPAM: set cooldown until {U} for user {Id}", until, userId)
+        do! db.RecordReactionTriageNotSpam(targetUser.Id, until, actor)
+
+        let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
+        let logMsg =
+            $"✅ Reaction-triage NOT SPAM on {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName} — cooldown for {cooldownDays}d, no destructive action"
+        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
+        logger.LogInformation logMsg
     }
 
     /// Builds the dossier shown to both the LLM and (in shadow / UNSURE) the vahter.
@@ -725,36 +742,79 @@ type BotService(
     }
 
     /// Posts the admin alert with full dossier + photo + 3 callback buttons (BAN / SPAM / NOT SPAM).
-    /// `llmAnnotation` is the line shown above the dossier — varies between shadow/UNSURE/error.
+    /// Uses HTML parse mode. When the suspect has a username, write @username — Telegram
+    /// auto-renders that as a clickable profile mention with no `<a>` tag needed. For users
+    /// without a username we fall back to an explicit `tg://user?id=…` link.
     member private _.PostReactionTriageAlert(dossier: ReactionTriageDossier, llmVerdict: string option, llmReason: string option, annotationLine: string) = task {
-        let username = dossier.Username |> Option.map (fun u -> $"@{u}") |> Option.defaultValue "(none)"
+        let htmlEscape (s: string) =
+            if isNull s then ""
+            else s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+
+        // Short, human-readable chat label using ChatsToMonitor config. Prepends "@" so
+        // Telegram auto-links public chats. For private chats (no real @username), it still
+        // reads as "@projectName" and matches the convention from existing log messages.
+        // Falls back to the numeric id when the chat isn't in our config.
+        let chatLabel (chatId: int64) =
+            botConfig.Value.ChatsToMonitor
+            |> Seq.tryFind (fun kv -> kv.Value = chatId)
+            |> Option.map (fun kv -> prependUsername kv.Key)
+            |> Option.defaultValue (string chatId)
+
+        // Suspect rendering:
+        //  - username present → "@handle"  (Telegram renders this as a clickable profile mention)
+        //  - username missing → "<a href='tg://user?id=…'>Display Name</a>"  (only path that links to a
+        //    profile when there's no public handle)
+        let suspectLink =
+            match dossier.Username with
+            | Some u -> $"@{htmlEscape u}"
+            | None ->
+                let name = htmlEscape dossier.DisplayName
+                let displayed = if String.IsNullOrWhiteSpace name then "(no name)" else name
+                sprintf "<a href=\"tg://user?id=%d\">%s</a>" dossier.UserId displayed
         let firstSeen =
             match dossier.FirstSeenAt with
             | Some t ->
                 let days = (utcNow() - t).TotalDays |> int
-                sprintf "%s (%d days ago)" (t.ToString("yyyy-MM-dd HH:mm 'UTC'")) days
+                sprintf "%s (%dd ago)" (t.ToString("yyyy-MM-dd")) days
             | None -> "(never)"
-        let bioLine = if String.IsNullOrWhiteSpace dossier.Bio then "(empty / privacy-strict)" else dossier.Bio
+        let bioLine =
+            if String.IsNullOrWhiteSpace dossier.Bio then "<i>(empty / privacy-strict)</i>"
+            else htmlEscape dossier.Bio
+
         let eventLines =
-            if dossier.Last10Events.Length = 0 then "  (no recent events on record)"
+            if dossier.Last10Events.Length = 0 then "  <i>(no recent events on record)</i>"
             else
                 dossier.Last10Events
                 |> Array.map (fun e ->
                     let ts = e.created_at.ToString("MM-dd HH:mm")
+                    // Old reaction events (pre-PR) lack chatId and surface here as chat_id = 0.
+                    // Don't fake a real chat — say "(unknown)" so the dossier doesn't lie.
+                    let chat =
+                        if e.chat_id = 0L then "<i>(unknown)</i>"
+                        else chatLabel e.chat_id
                     match e.kind with
-                    | "reaction" -> sprintf "  • %s [chat %d] reacted to msg %d" ts e.chat_id e.message_id
+                    | "reaction" ->
+                        let emojiPart =
+                            if isNull e.emoji || e.emoji = "" then ""
+                            else " " + htmlEscape e.emoji
+                        sprintf "  • %s  %s  reacted%s" ts chat emojiPart
                     | _ ->
-                        let truncated =
+                        let txt =
                             if isNull e.text then "(no text)"
-                            elif e.text.Length > 80 then e.text.Substring(0, 80) + "…"
+                            elif e.text.Length > 60 then e.text.Substring(0, 60) + "…"
                             else e.text
-                        sprintf "  • %s [chat %d] message: %s" ts e.chat_id truncated)
+                        sprintf "  • %s  %s  \"%s\"" ts chat (htmlEscape txt))
                 |> String.concat "\n"
+
         let header =
-            sprintf "🚨 Reaction-spam triage\n%s\n\nSuspect: %s (%s)\nUser ID: %d\nFirst seen: %s\nTotal messages across chats: %d\n\nBio:\n> %s\n\nLast %d events (newest first):\n%s\n\nSpam signals to check (Russian IT chat context):\n  1. Bio with ad link / any link\n  2. \"First Name + Last Name\" Russian display name\n  3. Young-woman profile photo\n  4. Zero / near-zero real messages\n\nOriginating chat: %d"
-                annotationLine dossier.DisplayName username dossier.UserId firstSeen
-                dossier.TotalMessagesAcrossChats bioLine
-                dossier.Last10Events.Length eventLines dossier.OriginatingChatId
+            sprintf
+                "🚨 <b>Reaction-spam triage</b>\n%s\n\n<b>Suspect:</b> %s\n<b>First seen:</b> %s · <b>Msgs across chats:</b> %d\n\n<b>Bio:</b> %s\n\n<b>Recent activity:</b>\n%s\n\n<b>Originating chat:</b> %s"
+                (htmlEscape annotationLine)
+                suspectLink
+                firstSeen dossier.TotalMessagesAcrossChats
+                bioLine
+                eventLines
+                (chatLabel dossier.OriginatingChatId)
 
         let banId      = Guid.NewGuid()
         let spamId     = Guid.NewGuid()
@@ -777,26 +837,27 @@ type BotService(
             InlineKeyboardButton.WithCallbackData("✅ NOT SPAM", string notSpamId)
         |]
 
-        // Send photo if available, otherwise plain text. The caption is limited to 1024 chars on photos —
-        // truncate header to fit; full text always mirrored to AllLogsChannel below.
+        // Telegram caption limit is 1024 chars; sendMessage limit is 4096. With the trimmed
+        // layout (no "spam signals" footer, compact chat names) a 10-event dossier is ~700–900
+        // chars, comfortably under the photo-caption cap. If a freakishly long bio pushes us
+        // over, fall back to text-only (sendMessage with link preview disabled) so vahter still
+        // sees everything.
         let actionChatId = ChatId actionChannelId
+        let captionFits = header.Length <= 1000
         let! sent =
             match dossier.PhotoBytes with
-            | Some bytes ->
-                let caption =
-                    if header.Length <= 1000 then header
-                    else header.Substring(0, 980) + "\n…(truncated)"
+            | Some bytes when captionFits ->
                 use ms = new MemoryStream(bytes)
                 let inputFile = InputFileStream(ms, "profile.jpg")
-                botClient.SendPhoto(actionChatId, inputFile, caption = caption, replyMarkup = markup)
-            | None ->
-                botClient.SendMessage(actionChatId, header, replyMarkup = markup)
+                botClient.SendPhoto(actionChatId, inputFile, caption = header, parseMode = ParseMode.Html, replyMarkup = markup)
+            | _ ->
+                botClient.SendMessage(actionChatId, header, parseMode = ParseMode.Html, replyMarkup = markup)
 
         for callbackId in [banId; spamId; notSpamId] do
             do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
 
         // Mirror the full alert text (no buttons, no photo) to AllLogsChannel for audit.
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header) |> taskIgnore
+        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header, parseMode = ParseMode.Html) |> taskIgnore
 
         logger.LogInformation("Reaction triage alert posted for user {U} chat {C} (LLM verdict: {V})", dossier.UserId, dossier.OriginatingChatId, defaultArg llmVerdict "(none)")
     }
@@ -848,8 +909,8 @@ type BotService(
             let actor = Actor.LLM {| modelName = (Option.get llmResult).ModelName; promptHash = (Option.get llmResult).PromptHash |}
             match (Option.get llmResult).Verdict with
             | LlmReactionVerdict.Ban     -> do! this.ReactionAct_Ban(reaction.Chat.Id, reaction.MessageId, targetUser, actor)
-            | LlmReactionVerdict.Spam    -> let! _ = this.ReactionAct_Spam(reaction.Chat.Id, targetUser.Id) in ()
-            | LlmReactionVerdict.NotSpam -> do! this.ReactionAct_NotSpam(targetUser.Id, actor)
+            | LlmReactionVerdict.Spam    -> let! _ = this.ReactionAct_Spam(reaction.Chat.Id, targetUser, actor) in ()
+            | LlmReactionVerdict.NotSpam -> do! this.ReactionAct_NotSpam(targetUser, actor)
             | LlmReactionVerdict.Unsure
             | LlmReactionVerdict.Error   -> ()  // unreachable per goAutonomous guard
         else
@@ -1564,14 +1625,25 @@ type BotService(
 
         | ReactionSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionSpam")
-            let! _ = this.ReactionAct_Spam(ctx.chatId, ctx.userId)
+            let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
+            let! target = task {
+                match! db.GetUserById(ctx.userId) with
+                | Some u -> return u
+                | None   -> return { User.Zero with Id = ctx.userId }
+            }
+            let! _ = this.ReactionAct_Spam(ctx.chatId, target, actor)
             do! answer "Reactions removed ⚠️"
             do! cleanupActionMessage()
 
         | ReactionNotSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionNotSpam")
             let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
-            do! this.ReactionAct_NotSpam(ctx.userId, actor)
+            let! target = task {
+                match! db.GetUserById(ctx.userId) with
+                | Some u -> return u
+                | None   -> return { User.Zero with Id = ctx.userId }
+            }
+            do! this.ReactionAct_NotSpam(target, actor)
             do! answer "Cooldown set ✅"
             do! cleanupActionMessage()
 
@@ -1650,10 +1722,24 @@ type BotService(
 
             // Only process if reactions were added (not removed)
             if added > 0 then
+                // Extract the joined emoji string from NewReaction for the dossier display.
+                // Premium custom emojis don't render as plain text — fall back to a tag.
+                let emojiStr =
+                    if isNull reaction.NewReaction then None
+                    else
+                        let parts =
+                            reaction.NewReaction
+                            |> Array.choose (fun r ->
+                                match r with
+                                | :? ReactionTypeEmoji as e       -> Option.ofObj e.Emoji
+                                | :? ReactionTypeCustomEmoji as _ -> Some "[custom]"
+                                | _                                -> None)
+                        if parts.Length = 0 then None else Some (String.Concat parts)
+
                 // Upsert user and increment reaction count atomically (records chatId/messageId
-                // so we can later DeleteMessageReaction per-target)
+                // and the emoji so the vahter alert dossier can show what they reacted with)
                 let! updatedUser =
-                    db.UpsertUserAndIncrementReactions(reaction.User.Id, Option.ofObj reaction.User.Username, reaction.Chat.Id, reaction.MessageId, added)
+                    db.UpsertUserAndIncrementReactions(reaction.User.Id, Option.ofObj reaction.User.Username, reaction.Chat.Id, reaction.MessageId, emojiStr, added)
 
                 %activity.SetTag("totalReactionCount", updatedUser.ReactionCount)
 

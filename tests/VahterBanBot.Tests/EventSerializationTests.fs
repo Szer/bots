@@ -139,8 +139,8 @@ let ``New Actor.ML UserBanned folds correctly`` () =
     | other -> Assert.Fail $"Expected Actor.ML but got {other}"
 
 [<Fact>]
-let ``Old UserReactionRecorded without chatId/messageId deserializes with None`` () =
-    // Pre-2026-05 events lack chatId/messageId. They must still parse so old streams remain readable.
+let ``Old UserReactionRecorded without chatId/messageId/emoji deserializes with None`` () =
+    // Pre-PR events lack chatId/messageId/emoji. They must still parse so old streams remain readable.
     let json =
         """{"Case":"UserReactionRecorded","userId":42,"delta":1}"""
     let event = JsonSerializer.Deserialize<UserEvent>(json, eventJsonOpts)
@@ -150,18 +150,20 @@ let ``Old UserReactionRecorded without chatId/messageId deserializes with None``
         Assert.Equal(1, e.delta)
         Assert.Equal(None, e.chatId)
         Assert.Equal(None, e.messageId)
+        Assert.Equal(None, e.emoji)
     | other -> Assert.Fail $"Expected UserReactionRecorded but got {other}"
 
 [<Fact>]
-let ``New UserReactionRecorded with chatId/messageId round-trips`` () =
+let ``New UserReactionRecorded with chatId/messageId/emoji round-trips`` () =
     let original =
-        UserReactionRecorded {| userId = 42L; chatId = Some 123L; messageId = Some 7; delta = 1 |}
+        UserReactionRecorded {| userId = 42L; chatId = Some 123L; messageId = Some 7; emoji = Some "🔥"; delta = 1 |}
     let json = JsonSerializer.Serialize(original, eventJsonOpts)
     let roundtripped = JsonSerializer.Deserialize<UserEvent>(json, eventJsonOpts)
     match roundtripped with
     | UserReactionRecorded e ->
         Assert.Equal(Some 123L, e.chatId)
         Assert.Equal(Some 7, e.messageId)
+        Assert.Equal(Some "🔥", e.emoji)
         Assert.Equal(1, e.delta)
     | other -> Assert.Fail $"Expected UserReactionRecorded but got {other}"
 
