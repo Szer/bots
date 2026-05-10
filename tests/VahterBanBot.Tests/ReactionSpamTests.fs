@@ -32,6 +32,15 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
     }
 
+    /// OnCallback bails with "you are not in DB" if the clicker has no event-store record yet.
+    /// Tests for vahter button clicks need to seed the vahter first — easiest path is to send
+    /// a normal message from them, which records UsernameChanged on user:{vahterId}.
+    let seedVahterInDb (fixture: MlEnabledVahterTestContainers) (vahter: TgUser) = task {
+        let chat = fixture.ChatsToMonitor[0]
+        let! resp = Tg.quickMsg(chat = chat, from = vahter) |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+    }
+
     [<Fact>]
     let ``Shadow mode: threshold trip records LLM verdict + posts admin alert without auto-banning`` () = task {
         // Default fixture has LLM_REACTION_TRIAGE_AUTO_ACT=false → shadow mode.
@@ -64,11 +73,13 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
     [<Fact>]
     let ``Vahter clicks BAN → user banned, no cooldown set`` () = task {
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
         let user = Tg.user()
         do! tripThreshold fixture user 2000
 
         let! banId = fixture.GetReactionCallbackId(user.Id, "ReactionBan")
-        let vahter = fixture.Vahters[0]
         let! resp = fixture.ClickCallback(banId, vahter)
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -78,11 +89,13 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
     [<Fact>]
     let ``Vahter clicks NOT SPAM → cooldown set, no ban`` () = task {
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
         let user = Tg.user()
         do! tripThreshold fixture user 3000
 
         let! notSpamId = fixture.GetReactionCallbackId(user.Id, "ReactionNotSpam")
-        let vahter = fixture.Vahters[0]
         let! resp = fixture.ClickCallback(notSpamId, vahter)
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -95,12 +108,14 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
     [<Fact>]
     let ``Cooldown short-circuits: subsequent reactions don't re-trigger triage`` () = task {
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
         let user = Tg.user()
         do! tripThreshold fixture user 4000
 
         // First trip → NOT_SPAM click → cooldown event
         let! notSpamId = fixture.GetReactionCallbackId(user.Id, "ReactionNotSpam")
-        let vahter = fixture.Vahters[0]
         let! _ = fixture.ClickCallback(notSpamId, vahter)
         let! cooldownSet = fixture.HasReactionCooldown user.Id
         Assert.True(cooldownSet)
