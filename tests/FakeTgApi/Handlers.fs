@@ -117,6 +117,18 @@ module Handlers =
             $"""{{"status":"{normalized}","user":{{"id":{userId},"is_bot":false,"first_name":"x"}}}}"""
         respondJson ctx 200 (okResult resultJson)
 
+    let private handleGetUserProfilePhotos ctx =
+        // Tests don't depend on actual profile photos — the reaction-triage classifier
+        // tolerates None (privacy-strict users), and the fake LLM routes by request body keywords.
+        respondJson ctx 200 (okResult """{"total_count":0,"photos":[]}""")
+
+    let private handleGetChat ctx (body: string) =
+        // Minimal ChatFullInfo. No `bio` field — empty bio in dossier.
+        let chatId = parseChatId body
+        let resultJson =
+            $"""{{"id":{chatId},"type":"private","accent_color_id":0,"max_reaction_count":11}}"""
+        respondJson ctx 200 (okResult resultJson)
+
     let private handleGetFile ctx (body: string) =
         let fileId =
             try
@@ -159,6 +171,10 @@ module Handlers =
             do! handleSimpleOk ctx
         | "getChatMember"    -> do! handleGetChatMember ctx body
         | "getFile"          -> do! handleGetFile ctx body
+        | "getUserProfilePhotos" -> do! handleGetUserProfilePhotos ctx
+        | "getChat"          -> do! handleGetChat ctx body
+        | "deleteMessageReaction" | "deleteAllMessageReactions" ->
+            do! handleSimpleOk ctx
         | "getChatAdministrators" -> do! handleGetChatAdministrators ctx
         | "editMessageReplyMarkup" | "editMessageText" ->
             do! handleMessageWithChatAndId ctx body
