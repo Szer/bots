@@ -456,6 +456,21 @@ WHERE stream_id = 'user:' || @userId
         return count > 0
     }
 
+    /// Returns the Actor.Case ("User" | "Bot" | "ML" | "LLM") on the latest cooldown event for this user.
+    member this.TryGetReactionCooldownActorCase(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql = """
+SELECT data->'actor'->>'Case' FROM event
+WHERE stream_id = 'user:' || @userId
+  AND event_type = 'ReactionTriageNotSpamSet'
+ORDER BY id DESC
+LIMIT 1
+        """
+        let! values = conn.QueryAsync<string>(sql, {| userId = userId |})
+        return values |> Seq.tryHead
+    }
+
     member this.GetUserReactionCount(userId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql

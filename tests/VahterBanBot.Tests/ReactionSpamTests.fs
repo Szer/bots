@@ -72,23 +72,91 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
-    let ``Vahter clicks BAN → user banned, no cooldown set`` () = task {
+    let ``Vahter clicks BAN → user banned with Actor.User (not Bot), DeleteMessageReaction called`` () = task {
+        // Regression lock: ReactionAct_Ban used to hardcode Actor.Bot, so a vahter click was
+        // attributed to the bot. The dedup also used to collide on moderation:{chatId}:0
+        // across users, so this whole flow silently no-op'd on the second test of the run.
         let vahter = fixture.Vahters[0]
         do! seedVahterInDb fixture vahter
 
         let user = Tg.user()
         do! tripThreshold fixture user 2000
 
+        do! fixture.ClearFakeCalls()
+
         let! banId = fixture.GetReactionCallbackId(user.Id, "ReactionBan")
         let! resp = fixture.ClickCallback(banId, vahter)
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
-        let! isBanned = fixture.UserBanned user.Id
-        Assert.True(isBanned, "BAN button should ban the user")
+        // Actor on the UserBanned event must be the vahter, not the bot
+        let! bannedByVahter = fixture.UserBanned user.Id
+        Assert.True(bannedByVahter, "BAN must record Actor.User (vahter), so UserBanned (vahter-case query) returns true")
+
+        let! bannedByBot = fixture.UserBannedByBot user.Id
+        Assert.False(bannedByBot, "Vahter-initiated BAN must NOT be recorded as Actor.Bot")
+
+        // The 5 reactions recorded by tripThreshold must each get a DeleteMessageReaction call
+        // (chat_id + message_id + user_id targeting the suspect)
+        let! drCalls = fixture.GetFakeCalls("deleteMessageReaction")
+        let targeted =
+            drCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"user_id\":{user.Id}"
+                && c.Body.Contains $"\"chat_id\":{fixture.ChatsToMonitor[0].Id}")
+        Assert.True(targeted.Length >= 5, $"Expected ≥5 DeleteMessageReaction calls for user {user.Id}, got {targeted.Length}")
+
+        // No cooldown should be set for a ban
+        let! cooldown = fixture.HasReactionCooldown user.Id
+        Assert.False(cooldown, "BAN must not set a cooldown — the user is banned")
     }
 
     [<Fact>]
-    let ``Vahter clicks NOT SPAM → cooldown set, no ban`` () = task {
+    let ``Vahter clicks SPAM → reactions removed in originating chat + can_react_to_messages restricted, no ban`` () = task {
+        // SPAM verdict happy path was uncovered. Validates: (a) RestrictChatMember called with
+        // can_react_to_messages=false, (b) DeleteMessageReaction called only for the originating
+        // chat, (c) no UserBanned event, (d) no cooldown event.
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
+        let user = Tg.user()
+        do! tripThreshold fixture user 2500
+
+        do! fixture.ClearFakeCalls()
+
+        let! spamId = fixture.GetReactionCallbackId(user.Id, "ReactionSpam")
+        let! resp = fixture.ClickCallback(spamId, vahter)
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        // restrictChatMember called with can_react_to_messages=false targeting the suspect
+        let! restrictCalls = fixture.GetFakeCalls("restrictChatMember")
+        let restrictForUser =
+            restrictCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"user_id\":{user.Id}"
+                && c.Body.Contains "\"can_react_to_messages\":false")
+        Assert.True(restrictForUser.Length >= 1, $"Expected at least one restrictChatMember(can_react_to_messages=false) for user {user.Id}, got {restrictForUser.Length}")
+
+        // DeleteMessageReaction targets only the originating chat
+        let originatingChatId = fixture.ChatsToMonitor[0].Id
+        let! drCalls = fixture.GetFakeCalls("deleteMessageReaction")
+        let inOriginating =
+            drCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"user_id\":{user.Id}"
+                && c.Body.Contains $"\"chat_id\":{originatingChatId}")
+        Assert.True(inOriginating.Length >= 5, $"Expected ≥5 DeleteMessageReaction for user {user.Id} in chat {originatingChatId}, got {inOriginating.Length}")
+
+        // Must NOT be banned and must NOT have a cooldown
+        let! isBanned = fixture.UserBanned user.Id
+        Assert.False(isBanned, "SPAM must not ban")
+        let! bannedByBot = fixture.UserBannedByBot user.Id
+        Assert.False(bannedByBot, "SPAM must not ban (bot case)")
+        let! cooldown = fixture.HasReactionCooldown user.Id
+        Assert.False(cooldown, "SPAM must not set a NOT_SPAM cooldown — only NOT_SPAM does")
+    }
+
+    [<Fact>]
+    let ``Vahter clicks NOT SPAM → cooldown set with Actor.User, no ban`` () = task {
         let vahter = fixture.Vahters[0]
         do! seedVahterInDb fixture vahter
 
@@ -102,8 +170,67 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let! cooldownSet = fixture.HasReactionCooldown user.Id
         Assert.True(cooldownSet, "NOT SPAM button should set the cooldown")
 
+        // Cooldown actor must be the vahter, not the bot — analytics rely on this attribution.
+        let! cooldownActor = fixture.TryGetReactionCooldownActorCase user.Id
+        Assert.Equal(Some "User", cooldownActor)
+
         let! isBanned = fixture.UserBanned user.Id
         Assert.False(isBanned, "NOT SPAM must not ban")
+    }
+
+    [<Fact>]
+    let ``Two users tripping in the same chat get independent callbacks and independent ban actions`` () = task {
+        // Regression lock: the dedup used to key on moderation:{chatId}:messageId=0, so the
+        // SECOND user tripping in the same chat would silently no-op on click (the helper saw
+        // the first user's record and returned actionRecorded=false). This test would have
+        // failed on `bannedB` before that fix.
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
+        let userA = Tg.user()
+        let userB = Tg.user()
+        do! tripThreshold fixture userA 11000
+        do! tripThreshold fixture userB 12000
+
+        // Each user got their own 3 callbacks
+        let! banA = fixture.GetReactionCallbackId(userA.Id, "ReactionBan")
+        let! banB = fixture.GetReactionCallbackId(userB.Id, "ReactionBan")
+        Assert.NotEqual(banA, banB)
+
+        // Click BAN on A, then BAN on B — both must take effect independently
+        let! _ = fixture.ClickCallback(banA, vahter)
+        let! _ = fixture.ClickCallback(banB, vahter)
+
+        let! aBanned = fixture.UserBanned userA.Id
+        Assert.True(aBanned, "User A should be banned after vahter clicked BAN(A)")
+        let! bBanned = fixture.UserBanned userB.Id
+        Assert.True(bBanned, "User B should also be banned — second click in same chat must not be deduped against first")
+    }
+
+    [<Fact>]
+    let ``Admin alert annotates the LLM verdict shown to vahters (shadow mode)`` () = task {
+        // Shadow value of the LLM must be visible to humans — that's the entire point of the
+        // shadow mode rollout: vahters sanity-check the model before we promote it to autonomous.
+        let user = Tg.user()
+        do! fixture.ClearFakeCalls()
+        do! tripThreshold fixture user 13000
+
+        // Alert is sent as a photo OR a plain message to AllLogsChannel. The fake getUserProfilePhotos
+        // returns no photos, so the alert is a sendMessage to the logs channel containing the dossier.
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let allLogsId = fixture.AllLogsChannel.Id
+        let alertCalls =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{allLogsId}"
+                && c.Body.Contains "Reaction-spam triage")
+        Assert.True(alertCalls.Length >= 1, "Expected at least one reaction-triage admin alert in AllLogsChannel")
+
+        // The LLM annotation line must reference the verdict the LLM returned
+        let annotatedAlerts =
+            alertCalls
+            |> Array.filter (fun c -> c.Body.Contains "LLM (shadow) said:" || c.Body.Contains "UNSURE")
+        Assert.True(annotatedAlerts.Length >= 1, "Alert should annotate the shadow LLM verdict so vahter can compare")
     }
 
     [<Fact>]
