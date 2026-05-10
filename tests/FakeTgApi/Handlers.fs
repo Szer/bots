@@ -66,15 +66,17 @@ module Handlers =
     let private handleSendMessage ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        let msgId = Store.allocMessageId()
         let resultJson =
-            $"""{{"message_id":1,"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"}}"""
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleSendPhoto ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        let msgId = Store.allocMessageId()
         let resultJson =
-            $"""{{"message_id":1,"date":{now},"chat":{{"id":{chatId},"type":"private"}},"caption":"ok"}}"""
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"caption":"ok"}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleSendMediaGroup ctx body =
@@ -87,16 +89,18 @@ module Handlers =
             with _ -> 1
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         let msgs =
-            [| for i in 1 .. count do
-                   $"""{{"message_id":{i},"date":{now},"chat":{{"id":{chatId},"type":"private"}}}}""" |]
+            [| for _ in 1 .. count do
+                   let msgId = Store.allocMessageId()
+                   $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}}}}""" |]
             |> String.concat ","
         respondJson ctx 200 (okResult $"[{msgs}]")
 
     let private handleForwardMessage ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        let msgId = Store.allocMessageId()
         let resultJson =
-            $"""{{"message_id":1,"date":{now},"chat":{{"id":{chatId},"type":"private"}}}}"""
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}}}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleGetChatMember ctx (body: string) =
