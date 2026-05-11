@@ -335,6 +335,57 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
+    let ``First click wins: clicking any reaction-triage button sweeps all sibling alerts for same user`` () = task {
+        // Real prod scenario that prompted this fix: a spammer keeps reacting past the
+        // threshold, generating multiple alerts in PotentialSpamChannel (one per trip). A
+        // vahter clicks BAN on one — the OTHER alerts must not stay clickable, otherwise a
+        // second vahter could disagree on a leftover button after the suspect is already banned.
+        let vahter = fixture.Vahters[0]
+        do! seedVahterInDb fixture vahter
+
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+
+        // 6 reactions with min_msgs=3, max_reactions=5 → trips fire on reaction #5 and #6
+        // (count keeps climbing past the threshold). Two alerts × 3 buttons = 6 callbacks.
+        for i in 1..6 do
+            let! resp = Tg.quickReaction(chat, 30000 + i, user) |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let countActiveSql =
+            "SELECT COUNT(*)::INT FROM event e " +
+            "WHERE e.event_type = 'CallbackCreated' " +
+            "  AND (e.data->>'targetUserId')::BIGINT = @userId " +
+            "  AND (e.data->>'data')::JSONB ->> 'Case' IN ('ReactionBan','ReactionSpam','ReactionNotSpam') " +
+            "  AND NOT EXISTS (SELECT 1 FROM event e2 WHERE e2.stream_id = e.stream_id AND e2.event_type IN ('CallbackResolved','CallbackExpired'))"
+
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        let! activeBefore = Dapper.SqlMapper.QuerySingleAsync<int>(conn, countActiveSql, {| userId = user.Id |})
+        Assert.True(activeBefore >= 6, $"Setup expected ≥6 active reaction-triage callbacks (2+ alerts × 3 buttons), got {activeBefore}")
+
+        do! fixture.ClearFakeCalls()
+
+        // Click BAN on (any) one of the alerts — GetReactionCallbackId returns the most recent.
+        let! banId = fixture.GetReactionCallbackId(user.Id, "ReactionBan")
+        let! resp = fixture.ClickCallback(banId, vahter)
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        // After the click, ALL reaction-triage callbacks for this user must be terminal —
+        // the other alerts' buttons are no longer clickable.
+        let! activeAfter = Dapper.SqlMapper.QuerySingleAsync<int>(conn, countActiveSql, {| userId = user.Id |})
+        Assert.Equal(0, activeAfter)
+
+        // And the alert messages in PotentialSpamChannel must have been deleted from the
+        // channel (one delete per unique alert message_id).
+        let! delCalls = fixture.GetFakeCalls("deleteMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let alertDeletes =
+            delCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}")
+        Assert.True(alertDeletes.Length >= 2, $"Expected at least 2 alert deletes from PotentialSpamChannel, got {alertDeletes.Length}")
+    }
+
+    [<Fact>]
     let ``Reaction emoji is recorded and shown in the dossier "reacted X" line`` () = task {
         // Vahter request: it's useful to see WHICH emoji the user reacted with — repeating
         // 🔥 on random messages is a stronger spam signal than alternating ❤️/👍 etc.

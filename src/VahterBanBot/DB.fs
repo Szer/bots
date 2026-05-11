@@ -542,6 +542,39 @@ LIMIT @n
     member _.ExpireCallback(callbackId: Guid) : Task<unit> =
         expireCallbackImpl callbackId
 
+    /// Gets all active reaction-triage callbacks for a user (BAN/SPAM/NOT_SPAM variants only).
+    /// Used when one vahter resolves a reaction-spammer so the other alerts/buttons for the
+    /// SAME user get cleaned up — first-click-wins, no race for other vahters to disagree.
+    member _.GetActiveReactionTriageCallbacksByUserId(userId: int64) : Task<ActiveCallbackInfo array> =
+        task {
+            use conn = new NpgsqlConnection(connString)
+
+            //language=postgresql
+            let sql =
+                """
+SELECT
+    REPLACE(e.stream_id, 'callback:', '')::UUID AS id,
+    (e.data->>'actionChannelId')::BIGINT AS action_channel_id,
+    (SELECT (e3.data->>'actionMessageId')::INT
+     FROM event e3
+     WHERE e3.stream_id = e.stream_id
+       AND e3.event_type = 'CallbackMessagePosted'
+     LIMIT 1) AS action_message_id
+FROM event e
+WHERE e.event_type = 'CallbackCreated'
+  AND (e.data->>'targetUserId')::BIGINT = @userId
+  AND (e.data->>'data')::JSONB ->> 'Case' IN ('ReactionBan', 'ReactionSpam', 'ReactionNotSpam')
+  AND NOT EXISTS (
+      SELECT 1 FROM event e2
+      WHERE e2.stream_id = e.stream_id
+        AND e2.event_type IN ('CallbackResolved', 'CallbackExpired')
+  )
+                """
+
+            let! result = conn.QueryAsync<ActiveCallbackInfo>(sql, {| userId = userId |})
+            return Array.ofSeq result
+        }
+
     /// Gets all active (non-terminal) callbacks for a user.
     member _.GetActiveCallbacksByUserId(userId: int64) : Task<ActiveCallbackInfo array> =
         task {

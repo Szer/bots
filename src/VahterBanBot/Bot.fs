@@ -716,6 +716,42 @@ type BotService(
         logger.LogInformation logMsg
     }
 
+    /// First-click-wins for reaction triage: when one vahter resolves a suspect, sweep ALL
+    /// other reaction-triage alerts for the same user (deduped by alert message_id) so a
+    /// second vahter can't disagree on a leftover button. Mirrors the cleanupCallbacksTask
+    /// pattern in TotalBan, scoped to reaction-triage callbacks only (Detected-Spam cards
+    /// from ML auto-bans aren't ours to delete).
+    member private _.CleanupReactionTriageCallbacksForUser(userId: int64) = task {
+        let! callbacks = db.GetActiveReactionTriageCallbacksByUserId(userId)
+        if callbacks.Length > 0 then
+            logger.LogInformation($"Reaction triage: cleaning up {callbacks.Length} sibling callbacks for user {userId}")
+
+            // Delete each unique alert message from the action channel exactly once.
+            // (Each alert posts 3 callbacks sharing one message_id; we only want one
+            // delete call per alert.)
+            let uniqueMessages =
+                callbacks
+                |> Array.choose (fun c ->
+                    match c.action_message_id with
+                    | Some msgId -> Some (c.action_channel_id, msgId)
+                    | None       -> None)
+                |> Array.distinct
+
+            do!
+                uniqueMessages
+                |> Seq.map (fun (chId, msgId) -> task {
+                    do! botClient.DeleteMessage(ChatId chId, msgId)
+                        |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete reaction-triage alert {msgId} in chat {chId}", e))
+                })
+                |> Task.WhenAll
+                |> taskIgnore
+
+            // Expire every callback (channel-delete is best-effort; DB state is authoritative
+            // for "first click wins" — subsequent clicks will resolve to "already processed").
+            for callback in callbacks do
+                do! db.ExpireCallback(callback.id)
+    }
+
     /// Builds the dossier shown to both the LLM and (in shadow / UNSURE) the vahter.
     /// Privacy-strict users return None photo and empty bio — both downstream consumers handle that.
     member private _.BuildReactionTriageDossier(reaction: MessageReactionUpdated, targetUser: User) = task {
@@ -1612,6 +1648,10 @@ type BotService(
         // has no specific spam message (messageId=0 collides across users in the same chat).
         // Click serialization is already provided upstream by ResolveCallback, so dedup here
         // is unnecessary.
+        // Reaction-triage branches use CleanupReactionTriageCallbacksForUser instead of the
+        // per-alert cleanupActionMessage(): the same suspect can trip the threshold in N chats
+        // and end up with N alerts × 3 buttons. First click wins — all leftover alerts for the
+        // same user get swept (including the current alert's two siblings).
         | ReactionBan ctx ->
             %onCallbackActivity.SetTag("type", "ReactionBan")
             let actor = Actor.User {| userId = vahter.Id; username = vahter.Username |}
@@ -1622,7 +1662,7 @@ type BotService(
             }
             do! this.ReactionAct_Ban(ctx.chatId, 0, u, actor)
             do! answer "Banned 🚫"
-            do! cleanupActionMessage()
+            do! this.CleanupReactionTriageCallbacksForUser(ctx.userId)
 
         | ReactionSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionSpam")
@@ -1634,7 +1674,7 @@ type BotService(
             }
             let! _ = this.ReactionAct_Spam(ctx.chatId, target, actor)
             do! answer "Reactions removed ⚠️"
-            do! cleanupActionMessage()
+            do! this.CleanupReactionTriageCallbacksForUser(ctx.userId)
 
         | ReactionNotSpam ctx ->
             %onCallbackActivity.SetTag("type", "ReactionNotSpam")
@@ -1646,7 +1686,7 @@ type BotService(
             }
             do! this.ReactionAct_NotSpam(target, actor)
             do! answer "Cooldown set ✅"
-            do! cleanupActionMessage()
+            do! this.CleanupReactionTriageCallbacksForUser(ctx.userId)
 
         // For non-reaction (message-context) callbacks, fall through to the same cleanup as before.
         match callbackData with
