@@ -286,17 +286,14 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     let ``Suspect with username renders as handle mention; suspect without username renders as tg-user link`` () = task {
         // The vahter alert needs to surface a clickable profile so the vahter can read the bio
         // themselves — bots can't see bios for privacy-strict users, humans can. Two paths:
-        //   (a) Username present → "@handle" (Telegram auto-renders mention as a profile link;
-        //       no HTML <a> needed, also no need to expose the numeric user_id).
-        //   (b) Username missing → "<a href='tg://user?id=…'>Display Name</a>" (only way to
-        //       make a no-handle account clickable).
+        //   (a) Username present → "@handle (user_id)"  (Telegram auto-links the @handle;
+        //       numeric id in parens is for vahters who grep logs / event streams).
+        //   (b) Username missing → "<a href='tg://user?id=…'>Display Name</a> (user_id)"  (only
+        //       way to make a no-handle account clickable; id still in parens for copy-paste).
         let userWithHandle = Tg.user(username = $"svetla_{System.Guid.NewGuid().ToString().[..7]}")
         do! fixture.ClearFakeCalls()
         do! tripThreshold fixture userWithHandle 14000
 
-        // Match the alert by its @handle (which the new layout *does* show) rather than the
-        // numeric user_id (which is intentionally absent for users with a handle — the @mention
-        // already carries the identity).
         let! sendCalls = fixture.GetFakeCalls("sendMessage")
         let potentialSpamId = fixture.PotentialSpamChannel.Id
         let alertsForWithHandle =
@@ -314,7 +311,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             withHandleBody.Contains "\"parse_mode\":\"HTML\""
             || withHandleBody.Contains "\"parse_mode\":\"Html\"",
             "Alert must be sent with parse_mode=HTML")
-        Assert.Contains($"@{userWithHandle.Username}", withHandleBody)
+        Assert.Contains($"@{userWithHandle.Username} ({userWithHandle.Id})", withHandleBody)
         Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
 
         // Now the no-username path: must fall back to an HTML profile link
@@ -333,6 +330,8 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.True(alertsForNoHandle.Length >= 1, "Expected interactive alert for user without handle")
         let noHandleBody = alertsForNoHandle[0].Body
         Assert.Contains($"tg://user?id={userNoHandle.Id}", noHandleBody)
+        // No-handle case also gets the id in parens after the link text
+        Assert.Contains($"({userNoHandle.Id})", noHandleBody)
     }
 
     [<Fact>]
@@ -401,9 +400,10 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
-    let ``Originating chat is shown as chat username, never as numeric chat_id`` () = task {
-        // The numeric chat id "[chat -1001685850502]" is useless for vahters — they want to
-        // see which monitored chat tripped the threshold. Look it up via ChatsToMonitor.
+    let ``Originating chat is shown as chat username with id in parens`` () = task {
+        // Bare "[chat -1001685850502]" is useless — vahters want to see which monitored chat
+        // tripped the threshold. But the numeric id is still needed for SQL/event-stream
+        // lookups, so render both: "@chatname (chat_id)".
         let user = Tg.user()
         do! fixture.ClearFakeCalls()
         do! tripThreshold fixture user 16000
@@ -417,8 +417,8 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let body = interactive[0].Body
 
         let originatingChat = fixture.ChatsToMonitor[0]   // tripThreshold uses ChatsToMonitor[0]
-        Assert.Contains($"@{originatingChat.Username}", body)
-        // The literal numeric form "[chat -666]" must NOT appear in the alert body
+        Assert.Contains($"@{originatingChat.Username} ({originatingChat.Id})", body)
+        // The literal numeric-only "[chat -666]" form must NOT appear (we use @name (id) instead)
         Assert.DoesNotContain($"[chat {originatingChat.Id}]", body)
     }
 
