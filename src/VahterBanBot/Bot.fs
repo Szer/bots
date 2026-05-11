@@ -648,8 +648,8 @@ type BotService(
         let chatLabel =
             botConfig.Value.ChatsToMonitor
             |> Seq.tryFind (fun kv -> kv.Value = chatId)
-            |> Option.map (fun kv -> prependUsername kv.Key)
-            |> Option.defaultValue (string chatId)
+            |> Option.map (fun kv -> sprintf "%s (%d)" (prependUsername kv.Key) chatId)
+            |> Option.defaultValue (sprintf "(unknown chat %d)" chatId)
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let logMsg =
             $"⚠️ Reaction-triage SPAM on {sanitizedUsername} ({targetUser.Id}) in {chatLabel} by {prependUsername actor.DisplayName} — restricted reactions, removed {removed} existing"
@@ -751,26 +751,27 @@ type BotService(
             else s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
 
         // Short, human-readable chat label using ChatsToMonitor config. Prepends "@" so
-        // Telegram auto-links public chats. For private chats (no real @username), it still
-        // reads as "@projectName" and matches the convention from existing log messages.
-        // Falls back to the numeric id when the chat isn't in our config.
+        // Telegram auto-links public chats; appends the numeric id in parens so vahters
+        // can copy-paste it for SQL/event-stream lookups. Falls back to "(unknown)" when
+        // the chat isn't in our config (e.g. legacy events without chatId).
         let chatLabel (chatId: int64) =
             botConfig.Value.ChatsToMonitor
             |> Seq.tryFind (fun kv -> kv.Value = chatId)
-            |> Option.map (fun kv -> prependUsername kv.Key)
-            |> Option.defaultValue (string chatId)
+            |> Option.map (fun kv -> sprintf "%s (%d)" (prependUsername kv.Key) chatId)
+            |> Option.defaultValue (sprintf "(unknown chat %d)" chatId)
 
-        // Suspect rendering:
-        //  - username present → "@handle"  (Telegram renders this as a clickable profile mention)
-        //  - username missing → "<a href='tg://user?id=…'>Display Name</a>"  (only path that links to a
-        //    profile when there's no public handle)
+        // Suspect rendering — always include the numeric user id in parens so vahters
+        // can grep logs / event streams / DB by it:
+        //  - username present → "@handle (id)"  (Telegram auto-links the @handle)
+        //  - username missing → "<a href='tg://user?id=…'>Display Name</a> (id)"  (only path that
+        //    links to a profile when there's no public handle)
         let suspectLink =
             match dossier.Username with
-            | Some u -> $"@{htmlEscape u}"
+            | Some u -> sprintf "@%s (%d)" (htmlEscape u) dossier.UserId
             | None ->
                 let name = htmlEscape dossier.DisplayName
                 let displayed = if String.IsNullOrWhiteSpace name then "(no name)" else name
-                sprintf "<a href=\"tg://user?id=%d\">%s</a>" dossier.UserId displayed
+                sprintf "<a href=\"tg://user?id=%d\">%s</a> (%d)" dossier.UserId displayed dossier.UserId
         let firstSeen =
             match dossier.FirstSeenAt with
             | Some t ->
