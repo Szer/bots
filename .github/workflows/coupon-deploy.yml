@@ -5,8 +5,11 @@ on:
     branches: [ "main" ]
     paths:
       - 'src/BotInfra/**'
+      - '!src/BotInfra/**/*.md'
       - 'src/CouponHubBot/**'
+      - '!src/CouponHubBot/**/*.md'
       - 'src/coupon-hub-bot/**'
+      - '!src/coupon-hub-bot/**/*.md'
       - 'src/Dockerfile.bot'
       - 'tests/CouponHubBot.Tests/**'
       - 'tests/CouponHubBot.Ocr.Tests/**'
