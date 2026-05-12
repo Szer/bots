@@ -5,8 +5,10 @@ This monorepo runs three "agentic" GitHub Actions that delegate decisions to an 
 | Agent | Workflow | Trigger | Scope | Effort | Sandbox |
 |-------|----------|---------|-------|--------|---------|
 | **SRE** | `.github/workflows/sre.yml` | `issues: labeled` (`deploy-failure`) | All bots in this monorepo | `high` | `workspace-write` |
-| **Project** | `.github/workflows/project.yml` | Daily cron `37 4 * * *` + manual | CouponHubBot only | `minimal` | `read-only` |
-| **Product** | `.github/workflows/product.yml` | Cron `15 10 * * 2,5` + manual | CouponHubBot only | `medium` | `read-only` |
+| **Project** | `.github/workflows/project.yml` | Daily cron `37 4 * * *` + manual | CouponHubBot only | `minimal` | `workspace-write` |
+| **Product** | `.github/workflows/product.yml` | Cron `15 10 * * 2,5` + manual | CouponHubBot only | `medium` | `workspace-write` |
+
+All three agents use `workspace-write` even though project/product never modify the repo. Codex's `read-only` sandbox **disables network access**, which would kill the agents' ability to call `gh issue ...` and `curl http://*.internal/...`. The blast radius of `workspace-write` is bounded by each workflow's `permissions:` block — for project/product, `contents: read` blocks any push to the repo even though the agent can write inside `$GITHUB_WORKSPACE`.
 
 Prompts live in `.github/prompts/{sre,project,product}.md`. Each is loaded verbatim into the agent's system prompt at run time alongside any inline data (metrics snapshot, product data report, issue body reference).
 
