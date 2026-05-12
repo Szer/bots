@@ -42,9 +42,9 @@ The agents authenticate with a single API key from a Microsoft Foundry AIService
 | Item | Value |
 |---|---|
 | Secret `AZURE_OPENAI_API_KEY` | primary access key of the Foundry resource |
-| Variable `AZURE_OPENAI_BASE_URL` | `https://<resource>.cognitiveservices.azure.com/openai/v1` — **no `/responses` suffix** (Codex appends it via `wire_api = "responses"`) |
+| Variable `AZURE_OPENAI_BASE_URL` | `https://<resource>.cognitiveservices.azure.com/openai/v1` — **no `/responses` suffix**. Each workflow appends `/responses` when passing it to the action's `responses-api-endpoint` input. |
 
-Each workflow writes a `~/.codex/config.toml` at runtime pointing at the Foundry endpoint, then calls `openai/codex-action@v1`. The model deployment name in Foundry must match `gpt-5-mini` exactly.
+Each workflow calls `openai/codex-action@v1` directly with three inputs that wire it to Foundry: `openai-api-key`, `responses-api-endpoint`, and `model: gpt-5-mini`. The action runs its own local `@openai/codex-responses-api-proxy` and writes its own Codex config — **do not manually write `~/.codex/config.toml`** or set `codex-home` when using the action; that path collides with the proxy's generated config and produces a `duplicate key` TOML error on first run. The deployment name in Foundry must match `gpt-5-mini` exactly.
 
 ## Labels used by the agents
 

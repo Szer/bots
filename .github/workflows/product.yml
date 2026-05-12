@@ -86,20 +86,6 @@ jobs:
         echo "Created issue #${ISSUE_NUMBER}"
         echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
-    - name: Write Codex Azure config
-      run: |
-        mkdir -p "$HOME/.codex"
-        cat > "$HOME/.codex/config.toml" <<EOF
-        model = "gpt-5-mini"
-        model_provider = "azure"
-
-        [model_providers.azure]
-        name = "Azure OpenAI"
-        base_url = "${{ vars.AZURE_OPENAI_BASE_URL }}"
-        env_key = "OPENAI_API_KEY"
-        wire_api = "responses"
-        EOF
-
     - name: Load agent prompt and product data
       run: |
         {
@@ -119,7 +105,8 @@ jobs:
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        codex-home: /home/runner/.codex
+        responses-api-endpoint: ${{ vars.AZURE_OPENAI_BASE_URL }}/responses
+        model: gpt-5-mini
         sandbox: read-only
         safety-strategy: drop-sudo
         effort: medium
