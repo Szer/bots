@@ -100,7 +100,7 @@ jobs:
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ vars.AZURE_OPENAI_BASE_URL }}/responses
+        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
         model: gpt-5-mini
         sandbox: read-only
         safety-strategy: drop-sudo

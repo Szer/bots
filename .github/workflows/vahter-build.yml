@@ -11,17 +11,4 @@ jobs:
     with:
       test-command: >-
         dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
-      paths-filter: |
-        relevant:
-          - 'src/BotInfra/**'
-          - '!src/BotInfra/**/*.md'
-          - 'src/VahterBanBot/**'
-          - '!src/VahterBanBot/**/*.md'
-          - 'src/Dockerfile.bot'
-          - 'tests/VahterBanBot.Tests/**'
-          - 'tests/BotTestInfra/**'
-          - 'tests/FakeTgApi/**'
-          - 'tests/FakeAzureOcrApi/**'
-          - 'Directory.Build.props'
-          - 'Directory.Packages.props'
-          - 'global.json'
+      bot-paths-regex: '^(src/(BotInfra|VahterBanBot)/|src/Dockerfile\.bot$|tests/(VahterBanBot\.Tests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'

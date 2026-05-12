@@ -7,17 +7,20 @@ on:
         required: true
         type: string
         description: "dotnet test command(s) to run"
-      paths-filter:
+      bot-paths-regex:
         required: false
         type: string
         default: ""
         description: |
-          Optional dorny/paths-filter YAML defining which files are relevant to
-          this bot. If provided and the PR touches none of them, the build
-          steps are skipped — but the job still completes successfully so the
-          required `build / build` status check reports for every PR (avoids
-          the GitHub auto-merge deadlock when path filters skip the workflow).
-          Has no effect on workflow_dispatch — manual triggers always run.
+          Optional ERE regex matching files relevant to this bot. When set and
+          the PR's non-doc changes don't match it, build steps are skipped —
+          the job still completes so the required `build / build` status check
+          reports for every PR (avoids the auto-merge deadlock when path
+          filtering would otherwise hide the workflow).
+
+          Doc-detection (markdown or any `docs/` directory) is hardcoded; the
+          regex narrows further to per-bot relevance. Manual triggers always
+          run the full build regardless.
 
 jobs:
   build:
@@ -26,27 +29,50 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Detect relevant changes
-      id: filter
-      if: github.event_name == 'pull_request' && inputs.paths-filter != ''
-      uses: dorny/paths-filter@v3
-      with:
-        filters: ${{ inputs.paths-filter }}
-
     - name: Decide whether to run build
       id: should-run
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BOT_PATHS_REGEX: ${{ inputs.bot-paths-regex }}
       run: |
         if [ "${{ github.event_name }}" != "pull_request" ]; then
-          echo "Non-PR trigger (${{ github.event_name }}) — running build"
+          echo "Non-PR trigger (${{ github.event_name }}) — running full build"
           echo "yes=true" >> "$GITHUB_OUTPUT"
-        elif [ -z "${{ inputs.paths-filter }}" ]; then
-          echo "No paths-filter provided — running build"
+          exit 0
+        fi
+        if [ -z "$BOT_PATHS_REGEX" ]; then
+          echo "No bot-paths-regex provided — running full build"
           echo "yes=true" >> "$GITHUB_OUTPUT"
-        elif [ "${{ steps.filter.outputs.relevant }}" = "true" ]; then
-          echo "Relevant changes detected — running build"
+          exit 0
+        fi
+
+        CHANGED=$(gh pr view "${{ github.event.pull_request.number }}" \
+          --repo "$GITHUB_REPOSITORY" \
+          --json files --jq '.files[].path')
+
+        echo "Changed files in PR:"
+        printf '  %s\n' $CHANGED
+
+        # Strip doc-only files (markdown or anything under a docs/ dir)
+        NON_DOC=$(echo "$CHANGED" | grep -vE '(\.md$|/docs/)' || true)
+
+        if [ -z "$NON_DOC" ]; then
+          echo "All changes are doc-only — skipping build steps"
+          echo "yes=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Non-doc files:"
+        printf '  %s\n' $NON_DOC
+
+        RELEVANT=$(echo "$NON_DOC" | grep -E "$BOT_PATHS_REGEX" || true)
+
+        if [ -n "$RELEVANT" ]; then
+          echo "Bot-relevant non-doc changes:"
+          printf '  %s\n' $RELEVANT
           echo "yes=true" >> "$GITHUB_OUTPUT"
         else
-          echo "No relevant changes — skipping build steps (job still reports success)"
+          echo "No bot-relevant non-doc changes — skipping build steps"
           echo "yes=false" >> "$GITHUB_OUTPUT"
         fi
 
