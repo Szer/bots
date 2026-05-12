@@ -41,6 +41,7 @@ jobs:
         sandbox: workspace-write
         safety-strategy: drop-sudo
         effort: high
+        codex-args: '--config sandbox_workspace_write.network_access=true'
         prompt: |
           <instructions>
           ${{ env.AGENT_PROMPT }}
