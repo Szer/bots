@@ -9,8 +9,11 @@ on:
     branches: [ "main" ]
     paths:
       - 'src/BotInfra/**'
+      - '!src/BotInfra/**/*.md'
       - 'src/VahterBanBot/**'
+      - '!src/VahterBanBot/**/*.md'
       - 'src/vahter-bot/**'
+      - '!src/vahter-bot/**/*.md'
       - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
       - 'tests/BotTestInfra/**'
