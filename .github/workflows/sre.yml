@@ -1,0 +1,71 @@
+name: SRE Incident Response
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  investigate:
+    if: github.event.label.name == 'deploy-failure'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Write Codex Azure config
+      run: |
+        mkdir -p "$HOME/.codex"
+        cat > "$HOME/.codex/config.toml" <<EOF
+        model = "gpt-5-mini"
+        model_provider = "azure"
+
+        [model_providers.azure]
+        name = "Azure OpenAI"
+        base_url = "${{ vars.AZURE_OPENAI_BASE_URL }}"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
+        EOF
+
+    - name: Read SRE agent prompt
+      run: |
+        {
+          echo "AGENT_PROMPT<<PROMPT_EOF"
+          cat .github/prompts/sre.md
+          echo "PROMPT_EOF"
+        } >> "$GITHUB_ENV"
+
+    - name: Run SRE agent
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        codex-home: /home/runner/.codex
+        sandbox: workspace-write
+        safety-strategy: drop-sudo
+        effort: high
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          A deploy pipeline has failed. The deploy-failure issue is #${{ github.event.issue.number }}.
+          Read the issue body with `gh issue view ${{ github.event.issue.number }}` — it contains Bot, ArgoCD app, Container label, GHCR image, Commit, and Workflow run URL. Use those values throughout the runbook in place of placeholders.
+          Investigate following the runbook.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true

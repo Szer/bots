@@ -1,0 +1,146 @@
+name: Daily Project Assessment
+
+on:
+  schedule:
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Close stale orchestration issues
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue list --repo "${{ github.repository }}" --label "project" --state open \
+          --json number,title \
+          --jq '.[] | select(.title | test("project assessment \\d{4}-\\d{2}-\\d{2}"; "i")) | .number' \
+        | while read -r NUM; do
+          echo "Closing stale orchestration issue #${NUM}"
+          gh issue close "$NUM" --repo "${{ github.repository }}" \
+            --comment "**Auto-closed by cleanup.** Agent did not close this issue in time." \
+            || echo "WARNING: Failed to close orchestration issue #${NUM}, continuing"
+        done
+
+  project:
+    needs: cleanup
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Gather metrics snapshot
+      run: |
+        chmod +x scripts/gather-metrics.sh
+        ./scripts/gather-metrics.sh > /tmp/metrics-report.md
+      env:
+        PROMETHEUS_URL: http://prometheus.internal:9090
+        LOKI_URL: http://loki.internal
+        ARGOCD_URL: http://argo.internal
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        ARGOCD_APP_NAME: coupon-bot
+        CONTAINER_NAME: coupon-bot
+
+    - name: Create orchestration issue
+      id: create-issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        DATE=$(date -u +%Y-%m-%d)
+        REPORT=$(cat /tmp/metrics-report.md)
+
+        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
+          --title "Daily project assessment ${DATE}" \
+          --label "project" \
+          --body "## Daily Project Assessment — ${DATE}
+
+        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        ---
+
+        ${REPORT}")
+
+        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
+        if [ -z "$ISSUE_NUMBER" ]; then
+          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
+          exit 1
+        fi
+        echo "Created issue #${ISSUE_NUMBER}"
+        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+
+    - name: Write Codex Azure config
+      run: |
+        mkdir -p "$HOME/.codex"
+        cat > "$HOME/.codex/config.toml" <<EOF
+        model = "gpt-5-mini"
+        model_provider = "azure"
+
+        [model_providers.azure]
+        name = "Azure OpenAI"
+        base_url = "${{ vars.AZURE_OPENAI_BASE_URL }}"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
+        EOF
+
+    - name: Load agent prompt and metrics
+      run: |
+        {
+          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
+          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
+          cat .github/prompts/project.md
+          echo "${PROMPT_DELIM}"
+        } >> "$GITHUB_ENV"
+        {
+          METRICS_DELIM="METRICS_EOF_$(openssl rand -hex 16)"
+          echo "METRICS_REPORT<<${METRICS_DELIM}"
+          cat /tmp/metrics-report.md
+          echo "${METRICS_DELIM}"
+        } >> "$GITHUB_ENV"
+
+    - name: Run project agent
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        codex-home: /home/runner/.codex
+        sandbox: read-only
+        safety-strategy: drop-sudo
+        effort: minimal
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          <metrics-snapshot>
+          ${{ env.METRICS_REPORT }}
+          </metrics-snapshot>
+
+          You have been triggered for the daily project assessment.
+          The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+    - name: Close orchestration issue
+      if: always() && steps.create-issue.outputs.issue_number
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
+          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true

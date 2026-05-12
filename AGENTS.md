@@ -93,6 +93,12 @@ scripts/
 - Post-deploy verification checks ArgoCD sync, pod health, Loki errors, and Prometheus 5xx rate
 - VahterBanBot upstream sync: creates PRs to `fsharplang-ru/vahter-bot` mirror repo
 
+## Agentic Workflows
+
+- Three GPT-5-mini agents run via `openai/codex-action@v1` on Microsoft Foundry — SRE (`sre.yml`), Project (`project.yml`), Product (`product.yml`). See `src/CouponHubBot/docs/PROJECT-AGENT.md` for the full design.
+- **SRE coverage is automatic for every bot** that uses `_bot-deploy.yml`. When `verify-deploy.sh` fails the reusable workflow opens a `deploy-failure` issue with bot identity in the body; the SRE agent reads it and acts. Opt-out by passing `sre-enabled: false` to `_bot-deploy.yml`.
+- Project and Product agents are coupon-only for now. Both rely on `AZURE_OPENAI_API_KEY` (secret) + `AZURE_OPENAI_BASE_URL` (var, base URL only — no `/responses` suffix).
+
 ## Code Review Rules
 
 Focus on: bugs, security, F# convention violations, missing validation, missing tests.
