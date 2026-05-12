@@ -12,18 +12,4 @@ jobs:
       test-command: |
         dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
-      paths-filter: |
-        relevant:
-          - 'src/BotInfra/**'
-          - '!src/BotInfra/**/*.md'
-          - 'src/CouponHubBot/**'
-          - '!src/CouponHubBot/**/*.md'
-          - 'src/Dockerfile.bot'
-          - 'tests/CouponHubBot.Tests/**'
-          - 'tests/CouponHubBot.Ocr.Tests/**'
-          - 'tests/BotTestInfra/**'
-          - 'tests/FakeTgApi/**'
-          - 'tests/FakeAzureOcrApi/**'
-          - 'Directory.Build.props'
-          - 'Directory.Packages.props'
-          - 'global.json'
+      bot-paths-regex: '^(src/(BotInfra|CouponHubBot)/|src/Dockerfile\.bot$|tests/(CouponHubBot\.Tests|CouponHubBot\.Ocr\.Tests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'
