@@ -1,0 +1,150 @@
+name: Product Analysis
+
+on:
+  schedule:
+    - cron: '15 10 * * 2,5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Close stale product orchestration issues
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue list \
+          --repo "${{ github.repository }}" \
+          --label "product" \
+          --state open \
+          --json number,title \
+          --jq '.[] | select(.title | test("Product analysis \\d{4}-\\d{2}-\\d{2}"; "i")) | .number' \
+        | while read -r NUM; do
+          echo "Closing stale product orchestration issue #${NUM}"
+          gh issue close "$NUM" --repo "${{ github.repository }}" \
+            --comment "**Auto-closed by cleanup.** Product agent did not close this issue in time." \
+            || echo "WARNING: Failed to close orchestration issue #${NUM}, continuing"
+        done
+
+  product-analysis:
+    needs: cleanup
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Install PostgreSQL client
+      run: sudo apt-get install -y postgresql-client
+
+    - name: Gather product data
+      run: |
+        chmod +x scripts/gather-product-data.sh
+        ./scripts/gather-product-data.sh > /tmp/product-report.md
+      env:
+        PROMETHEUS_URL: http://prometheus.internal:9090
+        LOKI_URL: http://loki.internal
+        CONTAINER_NAME: coupon-bot
+        DATABASE_URL: postgresql://${{ secrets.DB_PROD_USERNAME }}:${{ secrets.DB_PROD_PASSWORD }}@${{ secrets.DB_PROD_HOST }}/coupon_hub_bot
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create orchestration issue
+      id: create-issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        DATE=$(date -u +%Y-%m-%d)
+        REPORT=$(cat /tmp/product-report.md)
+
+        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
+          --title "Product analysis ${DATE}" \
+          --label "product" \
+          --body "## Product Analysis — ${DATE}
+
+        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        ---
+
+        ${REPORT}")
+
+        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
+        if [ -z "$ISSUE_NUMBER" ]; then
+          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
+          exit 1
+        fi
+        echo "Created issue #${ISSUE_NUMBER}"
+        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+
+    - name: Write Codex Azure config
+      run: |
+        mkdir -p "$HOME/.codex"
+        cat > "$HOME/.codex/config.toml" <<EOF
+        model = "gpt-5-mini"
+        model_provider = "azure"
+
+        [model_providers.azure]
+        name = "Azure OpenAI"
+        base_url = "${{ vars.AZURE_OPENAI_BASE_URL }}"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
+        EOF
+
+    - name: Load agent prompt and product data
+      run: |
+        {
+          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
+          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
+          cat .github/prompts/product.md
+          echo "${PROMPT_DELIM}"
+        } >> "$GITHUB_ENV"
+        {
+          REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
+          echo "PRODUCT_REPORT<<${REPORT_DELIM}"
+          cat /tmp/product-report.md
+          echo "${REPORT_DELIM}"
+        } >> "$GITHUB_ENV"
+
+    - name: Run product agent
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        codex-home: /home/runner/.codex
+        sandbox: read-only
+        safety-strategy: drop-sudo
+        effort: medium
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          <product-data-report>
+          ${{ env.PRODUCT_REPORT }}
+          </product-data-report>
+
+          You have been triggered for the scheduled product analysis (runs Tuesday and Friday).
+          The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Close orchestration issue
+      if: always() && steps.create-issue.outputs.issue_number
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
+          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true

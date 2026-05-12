@@ -31,6 +31,10 @@ on:
       readiness-grace-period:
         type: string
         default: "180"
+      sre-enabled:
+        type: boolean
+        default: true
+        description: "Open a deploy-failure issue (wakes the SRE agent) when verify-deploy fails"
     secrets:
       WIREGUARD_CONFIG:
         required: true
@@ -158,3 +162,30 @@ jobs:
     - name: Disconnect VPN
       if: always()
       run: sudo wg-quick down wg0 || true
+
+  notify-failure:
+    needs: [deploy, verify-deploy]
+    if: ${{ failure() && inputs.sre-enabled }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+    - name: Create deploy-failure issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        SHORT_SHA="${GITHUB_SHA::7}"
+        gh issue create \
+          --repo "$GITHUB_REPOSITORY" \
+          --title "Deploy failure: ${{ inputs.argocd-app-name }} (${SHORT_SHA})" \
+          --label "deploy-failure" \
+          --body "## Deploy Failure
+
+        **Bot:** ${{ inputs.argocd-app-name }}
+        **ArgoCD app:** ${{ inputs.argocd-app-name }}
+        **Container label:** ${{ inputs.container-name }}
+        **GHCR image:** ${{ inputs.docker-image }}
+        **Commit:** ${{ github.sha }}
+        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        Follow the runbook in \`.github/prompts/sre.md\`. Identify which \`verify-deploy.sh\` phase failed from the run logs above."
