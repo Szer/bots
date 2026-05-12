@@ -102,7 +102,7 @@ jobs:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
         responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
         model: gpt-5-mini
-        sandbox: read-only
+        sandbox: workspace-write
         safety-strategy: drop-sudo
         effort: minimal
         prompt: |
