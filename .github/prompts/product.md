@@ -74,16 +74,21 @@ Always close the original `user-feedback` issue after triage.
 
 1. **Search before creating** — check existing open issues first.
 2. **Always use appropriate labels**: `bug` or `feature-request`, plus `priority-high` (severe bugs affecting all users), `priority-medium` (default), or `priority-low` (nice-to-have).
-3. **Create with template**:
+3. **Create with template** (heredoc — `--body "..."` breaks on backticks because bash command-substitutes them):
    ```bash
-   gh issue create --label "bug" --label "priority-medium" --title "Brief title" --body "## Problem
+   cat > /tmp/issue-body.md << 'BODY'
+   ## Problem
    [description]
 
    ## Evidence
    [user feedback refs, metric values, chat message quotes]
 
    ## Expected Behavior
-   [what should happen]"
+   [what should happen]
+   BODY
+
+   gh issue create --label "bug" --label "priority-medium" \
+     --title "Brief title" --body-file /tmp/issue-body.md
    ```
 4. **Quality over quantity** — only create issues for real, evidence-backed problems.
 5. **Never assign** issues to anyone.
@@ -109,8 +114,11 @@ Always close the original `user-feedback` issue after triage.
 
 Post a summary comment on the orchestration issue. The workflow closes it automatically.
 
+Use a heredoc with `--body-file`, **not** `--body "..."` — your summary will contain inline backticks (chat-message quotes, label names, file refs) and bash command-substitutes backticks inside double quotes, mangling the comment and failing with "Permission denied" / "command not found":
+
 ```bash
-gh issue comment ISSUE_NUMBER --body "## Product Analysis Summary
+cat > /tmp/summary.md << 'BODY'
+## Product Analysis Summary
 
 ### Data Reviewed
 - Usage metrics: [brief summary]
@@ -125,5 +133,8 @@ gh issue comment ISSUE_NUMBER --body "## Product Analysis Summary
 - [Trends worth monitoring]
 
 ---
-*Product analysis by product agent*"
+*Product analysis by product agent*
+BODY
+
+gh issue comment ISSUE_NUMBER --body-file /tmp/summary.md
 ```
