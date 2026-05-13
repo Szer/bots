@@ -418,6 +418,38 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
     }
 
     [<Fact>]
+    let ``Recent activity reaction lines deep-link to the source message`` () = task {
+        // Vahters want to jump straight to the message a suspect reacted to ("оценить
+        // обстановку"), not only see the chat name. Each reaction line in the dossier must
+        // wrap "reacted" in an <a href> pointing to that specific message.
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+        do! fixture.ClearFakeCalls()
+
+        let msgIdBase = 18000
+        for i in 1..5 do
+            let! resp = Tg.quickReaction(chat, msgIdBase + i, user) |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let interactive =
+            sendCalls
+            |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{potentialSpamId}" && c.Body.Contains "Reaction-spam triage")
+        Assert.True(interactive.Length >= 1, "Expected an interactive alert in PotentialSpamChannel")
+        let body = interactive[0].Body
+
+        // Fixture chat "pro.hell" (id -666) sits above the supergroup threshold, so the
+        // link uses the public-username form: https://t.me/{username}/{msgId}. At least
+        // one of the 5 reacted-to messages must surface as a deep-link in the dossier
+        // (only the top-10 most recent events are rendered, so all 5 are guaranteed here).
+        let hasAnyMessageLink =
+            [ msgIdBase + 1 .. msgIdBase + 5 ]
+            |> List.exists (fun mid -> body.Contains $"https://t.me/{chat.Username}/{mid}")
+        Assert.True(hasAnyMessageLink, $"Dossier should deep-link a reacted-to message; body: {body}")
+    }
+
+    [<Fact>]
     let ``Pre-PR reactions (no chatId recorded) render as (unknown), not as fake chat 0`` () = task {
         // Backward-compat: events recorded before this PR have no chatId/messageId/emoji.
         // We must not invent a "chat 0" label that pretends to be a real chat.
