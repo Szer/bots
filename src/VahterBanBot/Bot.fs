@@ -796,6 +796,23 @@ type BotService(
             |> Option.map (fun kv -> sprintf "%s (%d)" (prependUsername kv.Key) chatId)
             |> Option.defaultValue (sprintf "(unknown chat %d)" chatId)
 
+        // Deep-link to a specific message inside a monitored chat. Telegram has two URL
+        // shapes; both open the message in-app:
+        //  - private supergroups (chatId ≤ -1e12) → https://t.me/c/{internal}/{msg}, where
+        //    `internal = -chatId - 1e12`. Only works for members — fine for vahters.
+        //  - other monitored chats → https://t.me/{username}/{msg}, using the ChatsToMonitor
+        //    key as the public username (production keys are the chats' real @handles).
+        // Returns None when we can't build a link (legacy events with chat_id = 0, or chats
+        // outside our config).
+        let messageLink (chatId: int64) (messageId: int) =
+            if chatId = 0L || messageId = 0 then None
+            elif chatId <= -1000000000000L then
+                Some (sprintf "https://t.me/c/%d/%d" (-chatId - 1000000000000L) messageId)
+            else
+                botConfig.Value.ChatsToMonitor
+                |> Seq.tryFind (fun kv -> kv.Value = chatId)
+                |> Option.map (fun kv -> sprintf "https://t.me/%s/%d" kv.Key messageId)
+
         // Suspect rendering — always include the numeric user id in parens so vahters
         // can grep logs / event streams / DB by it:
         //  - username present → "@handle (id)"  (Telegram auto-links the @handle)
@@ -834,7 +851,15 @@ type BotService(
                         let emojiPart =
                             if isNull e.emoji || e.emoji = "" then ""
                             else " " + htmlEscape e.emoji
-                        sprintf "  • %s  %s  reacted%s" ts chat emojiPart
+                        // Append a small jump-arrow link to the reacted-to message so vahters can
+                        // open it and assess context ("оценить обстановку"). Kept as a trailing
+                        // glyph (rather than wrapping "reacted") to leave the "reacted <emoji>"
+                        // adjacency intact for grep/audit.
+                        let jumpLink =
+                            match messageLink e.chat_id e.message_id with
+                            | Some url -> sprintf " <a href=\"%s\">↗</a>" url
+                            | None -> ""
+                        sprintf "  • %s  %s  reacted%s%s" ts chat emojiPart jumpLink
                     | _ ->
                         let txt =
                             if isNull e.text then "(no text)"
