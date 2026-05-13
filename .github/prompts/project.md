@@ -79,16 +79,21 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
 2. **Bump if exists** — if a similar issue is open, add a comment: `**Project assessment bump (YYYY-MM-DD)** This issue is still relevant. [updated context]`. Add `project` label if missing.
 3. **Always use `--label "project"`** when creating issues.
 4. **Assign priority labels**: `priority-medium` (bugs, security, performance, significant debt) or `priority-low` (nice-to-have). Never use `priority-high`. Add `infra` label for issues that can't be fixed in this repo.
-5. **Create with template**:
+5. **Create with template** (heredoc — `--body "..."` breaks on backticks because bash command-substitutes them):
    ```bash
-   gh issue create --label "project" --label "priority-medium" --title "Brief title" --body "## Problem
+   cat > /tmp/issue-body.md << 'BODY'
+   ## Problem
    [description]
 
    ## Evidence
    [code locations, metric values, log entries]
 
    ## Suggested Approach
-   [how to fix]"
+   [how to fix]
+   BODY
+
+   gh issue create --label "project" --label "priority-medium" \
+     --title "Brief title" --body-file /tmp/issue-body.md
    ```
 6. **Close if resolved** — verify the fix exists in `main` before closing:
    ```bash
@@ -103,8 +108,11 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
 
 Post a summary comment on the orchestration issue. The workflow closes it automatically.
 
+Use a heredoc with `--body-file`, **not** `--body "..."` — your summary will contain inline backticks (file paths, label names, code refs) and bash command-substitutes backticks inside double quotes, mangling the comment and failing with "Permission denied" / "command not found":
+
 ```bash
-gh issue comment ISSUE_NUMBER --body "## Project Assessment Summary (YYYY-MM-DD)
+cat > /tmp/summary.md << 'BODY'
+## Project Assessment Summary (YYYY-MM-DD)
 
 ### Metrics Overview
 - Pods healthy: vahter-bot yes/no, coupon-bot yes/no
@@ -117,5 +125,8 @@ gh issue comment ISSUE_NUMBER --body "## Project Assessment Summary (YYYY-MM-DD)
 - Issues closed as resolved: N (#X)
 
 ### Key Observations
-- [Notable findings, even if no issue was created]"
+- [Notable findings, even if no issue was created]
+BODY
+
+gh issue comment ISSUE_NUMBER --body-file /tmp/summary.md
 ```
