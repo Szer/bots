@@ -3,6 +3,7 @@ namespace CouponHubBot.Services
 open System
 open System.Collections.Concurrent
 open System.Collections.Generic
+open System.Diagnostics
 open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
@@ -452,9 +453,12 @@ type CouponFlowHandler(
     /// 2s HTTP timeout (configured on the OCR HttpClient), one retry on
     /// transient network failures. All writes are conditional on status='pending'
     /// so a late OCR finish after finalize's claim is a safe no-op.
-    member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) : Task =
+    member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) (parent: ActivityContext option) : Task =
         task {
-            use a = botActivity.StartActivity("batchOcrItem")
+            use a =
+                match parent with
+                | Some ctx -> botActivity.StartActivity("batchOcrItem", ActivityKind.Internal, ctx)
+                | None -> botActivity.StartActivity("batchOcrItem")
             if not (isNull a) then
                 %a.SetTag("batchId", batchId)
                 %a.SetTag("itemId", itemId)
@@ -682,7 +686,7 @@ type CouponFlowHandler(
                 // serialize behind the lock — exactly one batch survives. A
                 // concurrent /add command also serialises (its
                 // AbandonOpenBatchesExcept takes the same lock).
-                let! batchId, isNew, abandoned =
+                let! batchId, isNew, abandoned, ttlReaped =
                     db.CreateBatchAtomically(user.id, mediaGroupId, chatId)
 
                 if isNew then
@@ -691,6 +695,10 @@ type CouponFlowHandler(
                     Metrics.batchAbandonedTotal.Add(
                         int64 abandoned.Length,
                         KeyValuePair("reason", box "supersede_album"))
+                if ttlReaped > 0 then
+                    Metrics.batchAbandonedTotal.Add(
+                        int64 ttlReaped,
+                        KeyValuePair("reason", box "ttl"))
 
                 for stale in abandoned do
                     if stale.bulk_message_id.HasValue then
@@ -728,7 +736,14 @@ type CouponFlowHandler(
                     return true
                 | Some itemId ->
                     // Fire-and-forget OCR. DB is the channel back to FinalizeBatch.
-                    Task.Run(fun () -> this.OcrItem batchId itemId photoFileId) |> ignore
+                    // Capture the current activity context BEFORE Task.Run so the
+                    // batchOcrItem span links to handleAlbumPhoto in OTEL traces —
+                    // AsyncLocal propagation through Task.Run is unreliable for
+                    // fire-and-forget once the parent activity is disposed.
+                    let parentCtx =
+                        if isNull Activity.Current then None
+                        else Some Activity.Current.Context
+                    Task.Run(fun () -> this.OcrItem batchId itemId photoFileId parentCtx) |> ignore
 
                     let debounceMs = botOptions.Value.BatchDebounceMs
                     batchDebounce.Schedule(

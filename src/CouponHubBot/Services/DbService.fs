@@ -979,7 +979,7 @@ WHERE (status = 'open'
        OR (status = 'awaiting_user' AND bulk_message_id IS NULL))
   AND updated_at < (@now_utc - interval '1 hour');
 """
-            let! _ = conn.ExecuteAsync(reapSql, {| now_utc = utcNow () |}, tx)
+            let! reapedCount = conn.ExecuteAsync(reapSql, {| now_utc = utcNow () |}, tx)
 
             //language=postgresql
             let insertSql =
@@ -1016,7 +1016,7 @@ RETURNING *;
                         tx)
                 let abandoned = abandonedRows |> Seq.toArray
                 do! tx.CommitAsync()
-                return newId.Value, true, abandoned
+                return newId.Value, true, abandoned, reapedCount
             else
                 //language=postgresql
                 let findSql =
@@ -1034,7 +1034,7 @@ LIMIT 1;
                         {| user_id = userId; media_group_id = mediaGroupId |},
                         tx)
                 do! tx.CommitAsync()
-                return existingId, false, [||]
+                return existingId, false, [||], reapedCount
         }
 
     /// Deletes all of the user's active batches except `exceptId` (if provided).

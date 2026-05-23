@@ -61,7 +61,5 @@ module Metrics =
     let batchCancelTotal = meter.CreateCounter<int64>("couponhubbot_batch_cancel_total")
 
     /// 1 per active batch that was abandoned without the user clicking confirm/cancel.
-    /// Tag: reason ∈ {supersede_album, command}.
-    /// (TTL reaps are not yet counted here — would need a return value from
-    /// CreateBatchAtomically's housekeeping DELETE.)
+    /// Tag: reason ∈ {supersede_album, command, ttl}.
     let batchAbandonedTotal = meter.CreateCounter<int64>("couponhubbot_batch_abandoned_total")
