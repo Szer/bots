@@ -162,6 +162,24 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
                 failwith $"Timeout: Azure OCR call count is {count}, expected ≥{expected} after {timeoutMs}ms"
         }
 
+    /// Wait for the bulk-confirm sendMessage to actually land in the fake-tg call log.
+    /// `waitForBatchStatus "awaiting_user"` is satisfied the moment FinalizeBatch flips
+    /// the row's status — but the SendMessage that produces the bulk-confirm call
+    /// happens a few async steps LATER inside the same FinalizeBatch task. Polling
+    /// the DB status returns too early, so we poll the fake-tg log directly here.
+    let waitForBulkConfirmCall (userId: int64) (timeoutMs: int) =
+        task {
+            let sw = Diagnostics.Stopwatch.StartNew()
+            let mutable found = false
+            while sw.ElapsedMilliseconds < int64 timeoutMs && not found do
+                let! calls = fixture.GetFakeCalls("sendMessage")
+                let bulks = bulkConfirmCalls calls userId
+                found <- bulks.Length > 0
+                if not found then do! Task.Delay pollIntervalMs
+            if not found then
+                failwith $"Timeout: no bulk-confirm sendMessage for user {userId} after {timeoutMs}ms"
+        }
+
     // ── Happy path ──────────────────────────────────────────────────────
 
     [<Fact>]
@@ -197,6 +215,9 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
 
             do! advancePastDebounce ()
             do! waitForBatchStatus batchId "awaiting_user" 5000
+            // Status flips BEFORE the bulk-confirm sendMessage in FinalizeBatch — wait
+            // for the actual call to land before asserting on it.
+            do! waitForBulkConfirmCall user.Id 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let placeholders = placeholderCalls calls user.Id
@@ -244,6 +265,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
 
             do! advancePastDebounce ()
             do! waitForBatchStatus batchId "awaiting_user" 5000
+            do! waitForBulkConfirmCall user.Id 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let bulkConfirms = bulkConfirmCalls calls user.Id
@@ -318,6 +340,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             // FinalizeBatch is fast (a few DB writes + sendMessage) so it wins.
             do! advancePastDebounce ()
             do! waitForBatchStatus batchId "awaiting_user" 5000
+            do! waitForBulkConfirmCall user.Id 5000
 
             let! statusAfterClaim =
                 fixture.QuerySingle<string>(
