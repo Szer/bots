@@ -21,6 +21,7 @@
     <Compile Include="BatchDuplicateTests.fs" />
     <Compile Include="BatchNudgeTests.fs" />
     <Compile Include="BatchRecoveryTests.fs" />
+    <Compile Include="BatchResilienceTests.fs" />
     <Compile Include="CouponTests.fs" />
     <Compile Include="ReminderTests.fs" />
     <Compile Include="ChatMonitoringTests.fs" />
