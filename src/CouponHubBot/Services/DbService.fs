@@ -949,12 +949,34 @@ RETURNING id;
             // separate DB), so the user_id keyspace is unambiguous.
             let! _ = conn.ExecuteAsync("SELECT pg_advisory_xact_lock(@u)", {| u = userId |}, tx)
 
-            // Housekeeping: reap stale 'open' batches (any user) before competing for a new slot.
+            // A new album supersedes any single-photo wizard in progress. Doing
+            // the wipe inside this transaction (under the advisory lock) means
+            // a concurrent /add command cannot leave its UpsertPendingAddFlow
+            // row standing alongside the freshly-created batch — either /add
+            // wins the lock first (and album then wipes it) or album wins first
+            // (and /add's later AbandonOpenBatchesExcept, also lock-protected,
+            // kills the batch the user just abandoned by typing /add).
+            let! _ =
+                conn.ExecuteAsync(
+                    "DELETE FROM pending_add WHERE user_id = @u",
+                    {| u = userId |},
+                    tx)
+
+            // Housekeeping: reap stale rows (any user) before competing for a new slot.
+            //   - 'open' batches > 1h old: the user never finished uploading and we
+            //     never finalized. Fair to delete.
+            //   - 'awaiting_user' batches > 1h old with bulk_message_id IS NULL:
+            //     the bot crashed between TryFlipBatchToAwaiting and the SendMessage
+            //     that delivers the bulk-confirm UI. The user has no message to
+            //     interact with, so this row leaks forever otherwise — recovery
+            //     skips awaiting_user, and only the user uploading another album
+            //     would abandon it.
             //language=postgresql
             let reapSql =
                 """
 DELETE FROM pending_add_batch
-WHERE status = 'open'
+WHERE (status = 'open'
+       OR (status = 'awaiting_user' AND bulk_message_id IS NULL))
   AND updated_at < (@now_utc - interval '1 hour');
 """
             let! _ = conn.ExecuteAsync(reapSql, {| now_utc = utcNow () |}, tx)
@@ -1017,9 +1039,17 @@ LIMIT 1;
 
     /// Deletes all of the user's active batches except `exceptId` (if provided).
     /// Returns the deleted rows so the caller can edit their bulk-confirm messages.
+    ///
+    /// Takes the per-user advisory lock so this serialises with
+    /// CreateBatchAtomically. Without that, a command like `/add` arriving
+    /// concurrently with an album webhook can interleave: /add sees no batch
+    /// to abandon and inserts pending_add; the album webhook then commits a
+    /// fresh batch; user ends up in BOTH flows simultaneously.
     member _.AbandonOpenBatchesExcept(userId: int64, exceptId: int64 option) =
         task {
             use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+            let! _ = conn.ExecuteAsync("SELECT pg_advisory_xact_lock(@u)", {| u = userId |}, tx)
             //language=postgresql
             let sql =
                 """
@@ -1033,17 +1063,25 @@ RETURNING *;
                 match exceptId with
                 | Some v -> Nullable v
                 | None -> Nullable()
-            let! rows = conn.QueryAsync<PendingAddBatch>(sql, {| user_id = userId; except_id = exceptParam |})
-            return rows |> Seq.toArray
+            let! rows = conn.QueryAsync<PendingAddBatch>(sql, {| user_id = userId; except_id = exceptParam |}, tx)
+            let arr = rows |> Seq.toArray
+            do! tx.CommitAsync()
+            return arr
         }
 
+    /// Sets bulk_message_id on a batch row. Returns true if the row was found
+    /// and updated; false if the row no longer exists (the batch was abandoned
+    /// during the SendMessage RPC that produced this messageId). Callers MUST
+    /// inspect the result — on false, the just-sent message is an orphan and
+    /// should be deleted to avoid a "Получил, обрабатываю купоны..." or
+    /// bulk-confirm message lingering in the user's chat with no batch behind it.
     member _.SetBatchBulkMessageId(batchId: int64, messageId: int) =
         task {
             use! conn = openConn()
             //language=postgresql
             let sql = "UPDATE pending_add_batch SET bulk_message_id = @msg_id, updated_at = @now_utc WHERE id = @id;"
-            let! _ = conn.ExecuteAsync(sql, {| id = batchId; msg_id = messageId; now_utc = utcNow () |})
-            return ()
+            let! affected = conn.ExecuteAsync(sql, {| id = batchId; msg_id = messageId; now_utc = utcNow () |})
+            return affected > 0
         }
 
     member _.ClearBatch(batchId: int64) =

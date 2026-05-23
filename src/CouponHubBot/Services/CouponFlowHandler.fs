@@ -538,7 +538,15 @@ type CouponFlowHandler(
                         ChatId batch.bulk_chat_id,
                         text,
                         replyMarkup = kb)
-                do! db.SetBatchBulkMessageId(batchId, sent.MessageId)
+                let! linked = db.SetBatchBulkMessageId(batchId, sent.MessageId)
+                if not linked then
+                    // Batch was abandoned between the SendMessage above and now —
+                    // the bulk-confirm message we just sent has no batch to act on.
+                    // If the user clicks confirm/cancel, they'll get "уже устарел".
+                    // Delete the now-pointless message so it doesn't dangle.
+                    try
+                        do! botClient.DeleteMessage(ChatId batch.bulk_chat_id, sent.MessageId)
+                    with _ -> ()
 
                 let needsInput = items |> Array.filter (fun i -> i.status = "needs_input")
                 for item in needsInput do
@@ -571,16 +579,15 @@ type CouponFlowHandler(
             match BotHelpers.getLargestPhotoFileId msg with
             | None -> return false
             | Some photoFileId ->
-                // A new album supersedes any single-photo wizard in progress.
-                do! db.ClearPendingAddFlow user.id
-
                 let chatId = msg.Chat.Id
                 // CreateBatchAtomically holds a per-user advisory lock for the
-                // duration of the transaction, so the "insert new batch + abandon
-                // other active batches" sequence is atomic per user. Two truly-
-                // simultaneous album webhooks (different media_group_ids) from
-                // the same user will now serialize behind the lock — exactly one
-                // batch survives, the other is abandoned.
+                // duration of the transaction, so the "wipe single-photo wizard
+                // + insert new batch + abandon other active batches" sequence
+                // is atomic per user. Two truly-simultaneous album webhooks
+                // (different media_group_ids) from the same user will now
+                // serialize behind the lock — exactly one batch survives. A
+                // concurrent /add command also serialises (its
+                // AbandonOpenBatchesExcept takes the same lock).
                 let! batchId, isNew, abandoned =
                     db.CreateBatchAtomically(user.id, mediaGroupId, chatId)
 
@@ -600,7 +607,15 @@ type CouponFlowHandler(
                             botClient.SendMessage(
                                 ChatId chatId,
                                 "Получил, обрабатываю купоны, подожди немного…")
-                        do! db.SetBatchBulkMessageId(batchId, placeholder.MessageId)
+                        let! linked = db.SetBatchBulkMessageId(batchId, placeholder.MessageId)
+                        if not linked then
+                            // Batch was abandoned (by /add, /my, or a fresh album
+                            // for a different media_group_id) during the
+                            // SendMessage RPC. The placeholder we just sent is an
+                            // orphan — clean it up so it doesn't sit in chat.
+                            try
+                                do! botClient.DeleteMessage(ChatId chatId, placeholder.MessageId)
+                            with _ -> ()
                     with ex ->
                         logger.LogWarning(ex, "Failed to send album placeholder for batch {BatchId}", batchId)
 
