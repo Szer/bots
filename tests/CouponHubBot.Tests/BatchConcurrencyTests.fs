@@ -47,8 +47,9 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
             do! waitForItemCount fixture batchId 3 10000
             do! waitForAllItemsTerminal fixture batchId 15000
 
-            // Only one batch was created — concurrent CreateOrFindBatch races
-            // are resolved by the ON CONFLICT/UNIQUE partial index.
+            // Only one batch was created — concurrent CreateBatchAtomically races
+            // for the same media_group_id are resolved by ON CONFLICT on the
+            // UNIQUE partial index (user_id, media_group_id) WHERE status active.
             let! batchCount =
                 fixture.QuerySingle<int64>(
                     "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u",
@@ -115,18 +116,43 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
             Assert.Equal(1L, countB)
         }
 
-    // NOTE: a "two truly-concurrent albums (different mgid) from same user"
-    // test used to live here but was removed. The bot's HandleAlbumPhoto has
-    // a known race: both webhooks call CreateOrFindBatch (each succeeds with
-    // its own mgid, isNew=true), then both call AbandonOpenBatchesExcept,
-    // and each deletes the other's batch — leaving the user with zero
-    // batches. The bug is rare in practice (Telegram serializes webhooks
-    // per chat, so two arrivals in the same millisecond doesn't happen on
-    // real traffic), but it's still incorrect. Sequential supersede is
-    // covered exhaustively by BatchStateMachineTests; a follow-up should
-    // serialize AbandonOpenBatchesExcept per user (e.g. SELECT FOR UPDATE
-    // on a per-user advisory key) and add a test for the truly-concurrent
-    // case here.
+    [<Fact>]
+    let ``Two truly-concurrent albums (different mgid) from same user: exactly one survives`` () =
+        task {
+            do! setupBatchTest ()
+            let user = Tg.user(id = 7320L, username = "two_albums_same", firstName = "TwoAlb")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let mgidA = $"mg-2alb-A-{DateTime.UtcNow.Ticks}"
+            let mgidB = $"mg-2alb-B-{DateTime.UtcNow.Ticks + 1L}"
+            do! fixture.SetTelegramFile("2a-A-1", readImageBytes goodFile)
+            do! fixture.SetTelegramFile("2a-B-1", readImageBytes goodFile)
+            do! fixture.SetAzureOcrResponse(200, readAzureCacheJson goodFile)
+
+            // Send both concurrently — different connections, sub-ms arrival in
+            // the bot. Before the per-user advisory lock in CreateBatchAtomically,
+            // both webhooks would race through "create batch + abandon others"
+            // and each would delete the other's batch, leaving zero batches.
+            // With the lock, exactly one survives (the second to enter the lock).
+            let tasks = [
+                fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgidA, fileId = "2a-A-1"))
+                fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgidB, fileId = "2a-B-1"))
+            ]
+            let! _ = Task.WhenAll(tasks)
+            do! Task.Delay 500
+
+            let! totalCount =
+                fixture.QuerySingle<int64>(
+                    "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u",
+                    {| u = user.Id |})
+            Assert.Equal(1L, totalCount)
+
+            let! activeBatchCount =
+                fixture.QuerySingle<int64>(
+                    "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u AND status IN ('open','awaiting_user')",
+                    {| u = user.Id |})
+            Assert.Equal(1L, activeBatchCount)
+        }
 
     [<Fact>]
     let ``Album of 10 (stress): all 10 items processed, single batch, single bulk-confirm`` () =

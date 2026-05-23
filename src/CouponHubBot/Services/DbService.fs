@@ -921,15 +921,35 @@ RETURNING id;
 
     // ── Album upload batches ─────────────────────────────────────────────
 
-    /// Atomic create-or-find: if no active batch exists for (user, media_group_id),
-    /// inserts one and returns (id, isNew=true). Otherwise returns the existing one
-    /// with isNew=false. Also reaps stale 'open' batches (>1h) opportunistically.
-    member _.CreateOrFindBatch(userId: int64, mediaGroupId: string, chatId: int64) =
+    /// Atomic per-user "create-or-find batch + abandon any other active batches"
+    /// sequence. Both DB writes happen in one transaction guarded by a per-user
+    /// advisory lock so concurrent webhooks from the same user can't both create
+    /// a batch and then each abandon the other (the bug we hit when two
+    /// truly-simultaneous webhooks landed within the same millisecond).
+    ///
+    /// Returns:
+    ///   batchId   — the batch row for (user, media_group_id) — newly inserted or
+    ///               reused.
+    ///   isNew     — true if we just inserted; false if an active batch with the
+    ///               same media_group_id already existed (e.g. subsequent photos
+    ///               of the same album).
+    ///   abandoned — the rows DELETEd for this user's OTHER active media_group_ids
+    ///               (always empty when isNew = false). The caller iterates this
+    ///               to edit each old batch's bulk-confirm message.
+    ///
+    /// Also reaps stale 'open' batches (>1h old) opportunistically.
+    member _.CreateBatchAtomically(userId: int64, mediaGroupId: string, chatId: int64) =
         task {
             use! conn = openConn()
             use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
 
-            // Housekeeping: reap stale 'open' batches before competing for a new slot.
+            // Per-user serialization. pg_advisory_xact_lock(bigint) auto-releases
+            // on commit/rollback. Concurrent webhooks for OTHER users don't block.
+            // No other code path in the bot uses advisory locks (vahter-bot is a
+            // separate DB), so the user_id keyspace is unambiguous.
+            let! _ = conn.ExecuteAsync("SELECT pg_advisory_xact_lock(@u)", {| u = userId |}, tx)
+
+            // Housekeeping: reap stale 'open' batches (any user) before competing for a new slot.
             //language=postgresql
             let reapSql =
                 """
@@ -955,8 +975,26 @@ RETURNING id;
                     tx)
 
             if newId.HasValue then
+                // New batch — abandon any other active batches for this user
+                // (different media_group_id). The advisory lock guarantees no
+                // other webhook for this user is between create and abandon.
+                //language=postgresql
+                let abandonSql =
+                    """
+DELETE FROM pending_add_batch
+WHERE user_id = @user_id
+  AND status IN ('open', 'awaiting_user')
+  AND id <> @except_id
+RETURNING *;
+"""
+                let! abandonedRows =
+                    conn.QueryAsync<PendingAddBatch>(
+                        abandonSql,
+                        {| user_id = userId; except_id = newId.Value |},
+                        tx)
+                let abandoned = abandonedRows |> Seq.toArray
                 do! tx.CommitAsync()
-                return newId.Value, true
+                return newId.Value, true, abandoned
             else
                 //language=postgresql
                 let findSql =
@@ -974,7 +1012,7 @@ LIMIT 1;
                         {| user_id = userId; media_group_id = mediaGroupId |},
                         tx)
                 do! tx.CommitAsync()
-                return existingId, false
+                return existingId, false, [||]
         }
 
     /// Deletes all of the user's active batches except `exceptId` (if provided).

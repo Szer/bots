@@ -575,21 +575,26 @@ type CouponFlowHandler(
                 do! db.ClearPendingAddFlow user.id
 
                 let chatId = msg.Chat.Id
-                let! batchId, isNew = db.CreateOrFindBatch(user.id, mediaGroupId, chatId)
+                // CreateBatchAtomically holds a per-user advisory lock for the
+                // duration of the transaction, so the "insert new batch + abandon
+                // other active batches" sequence is atomic per user. Two truly-
+                // simultaneous album webhooks (different media_group_ids) from
+                // the same user will now serialize behind the lock — exactly one
+                // batch survives, the other is abandoned.
+                let! batchId, isNew, abandoned =
+                    db.CreateBatchAtomically(user.id, mediaGroupId, chatId)
+
+                for stale in abandoned do
+                    if stale.bulk_message_id.HasValue then
+                        try
+                            do! botClient.EditMessageText(
+                                    ChatId stale.bulk_chat_id,
+                                    stale.bulk_message_id.Value,
+                                    "Отменено: пришёл новый альбом.")
+                                |> taskIgnore
+                        with _ -> ()
 
                 if isNew then
-                    // Cancel any other in-flight batch the user might have (different media_group_id).
-                    let! abandoned = db.AbandonOpenBatchesExcept(user.id, Some batchId)
-                    for stale in abandoned do
-                        if stale.bulk_message_id.HasValue then
-                            try
-                                do! botClient.EditMessageText(
-                                        ChatId stale.bulk_chat_id,
-                                        stale.bulk_message_id.Value,
-                                        "Отменено: пришёл новый альбом.")
-                                    |> taskIgnore
-                            with _ -> ()
-
                     try
                         let! placeholder =
                             botClient.SendMessage(
