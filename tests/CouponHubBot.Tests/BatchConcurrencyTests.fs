@@ -534,24 +534,23 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
             // Give album time to reach the advisory_xact_lock call.
             do! Task.Delay 300
 
-            // Fire /add. With today's code: runs unimpeded since
-            // AbandonOpenBatchesExcept and UpsertPendingAddFlow don't take the
-            // lock — /add finishes inserting pending_add while album is still
-            // parked. With a fix that has /add also acquire the per-user lock,
-            // /add would block here.
-            let! _ = fixture.SendUpdate(Tg.dmMessage("/add", user))
+            // Fire /add WITHOUT awaiting — after the fix that has /add take
+            // the same per-user advisory lock, /add's webhook handler ALSO
+            // blocks. Awaiting SendUpdate here would deadlock the test
+            // (HttpClient times out at 15s waiting for the webhook to return).
+            // Buffer the task and await it after we release the lock.
+            let addTask = fixture.SendUpdate(Tg.dmMessage("/add", user))
 
-            // Give /add enough time to do its work (or to demonstrably block).
-            // 500ms >> any DB op; if /add hasn't created a pending_add row by
-            // now, it's because it's blocked behind the advisory lock (which
-            // means the fix is in).
+            // Give /add time to reach its AbandonOpenBatchesExcept call (which
+            // now also queues on the advisory lock).
             do! Task.Delay 500
 
-            // Release the lock — album resumes; any blocked /add also resumes.
+            // Release the lock — both album and /add resume, racing for the lock.
             do! blockerTx.CommitAsync()
             do! blockerConn.CloseAsync()
 
             let! _ = albumTask
+            let! _ = addTask
             do! Task.Delay 500
 
             let! activeBatchCount =
