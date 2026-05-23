@@ -4,6 +4,7 @@ open System
 open System.Net
 open System.Text
 open System.Text.Json
+open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 
 module Handlers =
@@ -163,6 +164,14 @@ module Handlers =
         Console.WriteLine($"FAKE TG IN  {methodName} {url} bodyLen={len}")
         Store.logCall methodName url body
 
+        // Optional artificial delay (race-test control). Applied AFTER the call is
+        // logged so concurrent observers see the call has arrived even while
+        // we're sleeping. 0 (the default) skips Task.Delay entirely.
+        match Store.methodDelays.TryGetValue methodName with
+        | true, delayMs when delayMs > 0 ->
+            do! Task.Delay delayMs
+        | _ -> ()
+
         match methodName with
         | m when Store.methodErrors.TryGetValue(m) |> fst ->
             do! handleSimulatedError ctx
@@ -281,6 +290,23 @@ module Handlers =
                     do! respondJson ctx 200 (okResult "true")
                 else
                     Store.methodErrors.TryRemove(payload.methodName) |> ignore
+                    do! respondJson ctx 200 (okResult "true")
+            with _ ->
+                do! respondJson ctx 400 (okResult "false")
+        }
+
+    let setMethodDelay (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload = JsonSerializer.Deserialize<MethodDelayMock>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                if Object.ReferenceEquals(payload, null) || String.IsNullOrWhiteSpace payload.methodName then
+                    do! respondJson ctx 400 (okResult "false")
+                elif payload.delayMs > 0 then
+                    Store.methodDelays[payload.methodName] <- payload.delayMs
+                    do! respondJson ctx 200 (okResult "true")
+                else
+                    Store.methodDelays.TryRemove(payload.methodName) |> ignore
                     do! respondJson ctx 200 (okResult "true")
             with _ ->
                 do! respondJson ctx 400 (okResult "false")

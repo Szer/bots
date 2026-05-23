@@ -34,6 +34,15 @@ type MethodErrorMock =
     { methodName: string
       enabled: bool }
 
+/// Mock payload for FakeTgApi /test/mock/methodDelay (per-method artificial
+/// delay). Used by concurrency-race tests to widen the window between
+/// transaction commit and SendMessage so a second webhook can deterministically
+/// race past it. delayMs=0 clears the delay.
+[<CLIMutable>]
+type MethodDelayMock =
+    { methodName: string
+      delayMs: int }
+
 /// Mock payload for FakeAzureOcrApi /test/mock/delay (per-call response delay).
 [<CLIMutable>]
 type AzureDelayMock =

@@ -296,26 +296,49 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! waitForItemCount fixture batchId 2 5000
             do! waitForAllItemsTerminal fixture batchId 10000
 
-            // Fire debounce again → finalize re-runs, batch is again awaiting_user.
+            // Fire debounce again → finalize re-runs.
             do! advancePastDebounce fixture
-
-            // The batch should still be in 'awaiting_user' (TryFlipBatchToAwaiting
-            // is idempotent — returns false if already there, but ClaimPending
-            // + Render + DeleteMessage + SendMessage still produce a fresh
-            // bulk-confirm message). At minimum: a second bulk-confirm sendMessage
-            // should land within a few seconds.
             do! Task.Delay 500
+
+            // CURRENT BEHAVIOR (documenting the UX gap):
+            // FinalizeBatch's first step is TryFlipBatchToAwaiting, which
+            // updates WHERE status='open'. The batch is already 'awaiting_user'
+            // from the first finalize, so this UPDATE matches 0 rows and
+            // returns false → FinalizeBatch early-returns without re-rendering
+            // the bulk-confirm message. The user's chat still shows
+            // "Подтвердить 1 купонов" even though 2 items now sit in
+            // status='ok'.
+            //
+            // The leaked late item IS silently included when the user clicks
+            // confirm — BulkBatchConfirm reads all items with status='ok' from
+            // DB, not the snapshot rendered into the message. So the user is
+            // told "1" but gets "2" coupons on confirm. UX surprise but no
+            // data loss.
+            //
+            // If finalize is changed to re-render on late stragglers, tighten
+            // these assertions to (== 2, == 2) — that's the more honest UX.
             let! calls = fixture.GetFakeCalls("sendMessage")
             let bulks = bulkConfirmCalls calls user.Id
-            // Hard to assert exactly 2 since the second finalize's behavior depends
-            // on TryFlipBatchToAwaiting returning false (no-op) vs. true (full
-            // re-finalize). The plan permits either reading — the important
-            // invariant is that batch state stays consistent.
-            Assert.True(bulks.Length >= 1, $"Expected ≥1 bulk-confirm; got {bulks.Length}")
+            Assert.Equal(1, bulks.Length)
 
             let! itemCount =
                 fixture.QuerySingle<int64>(
                     "SELECT COUNT(*)::bigint FROM pending_add_batch_item WHERE batch_id=@b",
                     {| b = batchId |})
             Assert.Equal(2L, itemCount)
+
+            // Confirm DOES include both items in the actual coupon insert,
+            // proving the leaked-but-silently-included UX gap.
+            let! _ = fixture.SendUpdate(Tg.dmCallback($"addflow:bulk:confirm:{batchId}", user))
+            do! waitForBatchCleared fixture batchId 5000
+            let! couponCount =
+                fixture.QuerySingle<int64>(
+                    "SELECT COUNT(*)::bigint FROM coupon WHERE owner_id=@u",
+                    {| u = user.Id |})
+            // 1 coupon, not 2, because both items share the SAME barcode (goodFile)
+            // and coupon_barcode_active_uniq (V13) dedupes on confirm. The straggler
+            // is marked 'failed' as DuplicateBarcode. But it WAS attempted — the
+            // confirm loop included it. If the two items had different barcodes,
+            // both would have been inserted despite the message saying "1".
+            Assert.Equal(1L, couponCount)
         }

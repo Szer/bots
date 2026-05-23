@@ -249,6 +249,19 @@ type BotContainerBase(config: BotContainerConfig) =
             resp.EnsureSuccessStatusCode() |> ignore
         }
 
+    /// Forces FakeTgApi to artificially delay every call to `methodName` by
+    /// `delayMs` milliseconds. Used by concurrency-race tests to deterministically
+    /// reproduce timing-dependent bugs: by widening the window between a
+    /// transaction commit and the next network call, a second concurrent
+    /// webhook can be made to win the lock-acquisition race every single run.
+    /// Pass `delayMs = 0` to clear.
+    member _.SetFakeTgMethodDelay(methodName: string, delayMs: int) =
+        task {
+            let payload: MethodDelayMock = { methodName = methodName; delayMs = delayMs }
+            let! resp = fakeTgHttp.PostAsJsonAsync("/test/mock/methodDelay", payload)
+            resp.EnsureSuccessStatusCode() |> ignore
+        }
+
     member _.CheckMethodErrorActive(methodName: string) =
         task {
             use content = new StringContent("{}", Encoding.UTF8, "application/json")
