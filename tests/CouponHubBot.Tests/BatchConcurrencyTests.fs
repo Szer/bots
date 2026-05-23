@@ -334,6 +334,8 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
                 }
 
             let mutable violations = 0
+            let mutable raceHit = 0
+            let mutable lastMsgMismatch = 0
             let violationDetails = System.Collections.Generic.List<string>()
             let iterations = 100
 
@@ -360,36 +362,91 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
 
                 let! sends = fixture.GetFakeCalls("sendMessage")
                 let! edits = fixture.GetFakeCalls("editMessageText")
-                let everyText (calls: FakeCall array) =
+                let textsFrom (calls: FakeCall array) =
                     calls
                     |> Array.choose (fun c ->
                         match parseCallBody c.Body with
                         | Some p when p.ChatId = Some user.Id -> p.Text
                         | _ -> None)
-                let allTexts = Array.append (everyText sends) (everyText edits)
+                let allTexts = Array.append (textsFrom sends) (textsFrom edits)
                 let sawAdded = allTexts |> Array.exists (fun t -> t.Contains "Добавил")
-                let sawCancelled =
-                    allTexts
-                    |> Array.exists (fun t ->
-                        t.Contains "Ок, отменил пакет" || t.Contains "пакет уже устарел")
+                let sawCancelMsg = allTexts |> Array.exists (fun t -> t.Contains "Ок, отменил пакет")
+                let sawStale = allTexts |> Array.exists (fun t -> t.Contains "пакет уже устарел")
+                let sawCancelOrStale = sawCancelMsg || sawStale
 
-                // Invariant (a): exactly 0 or 1 coupon for this iteration's barcode.
+                // Race signature: BOTH BulkBatchConfirm and BulkBatchCancel reached
+                // their EditBulkOrSend step on the live batch. If only one ran (the
+                // other saw missing batch and returned "уже устарел"), they
+                // serialized on the DB and there was no race.
+                let raced = sawAdded && sawCancelMsg
+                if raced then raceHit <- raceHit + 1
+
+                // The user-visible final state is the LAST edit to the bulk
+                // message id (Telegram applies edits in arrival order).
+                let lastEditText =
+                    edits
+                    |> Array.filter (fun c ->
+                        match parseCallBody c.Body with
+                        | Some p -> p.ChatId = Some user.Id
+                        | None -> false)
+                    |> Array.sortByDescending (fun c -> c.Timestamp)
+                    |> Array.tryHead
+                    |> Option.bind (fun c ->
+                        match parseCallBody c.Body with
+                        | Some p -> p.Text
+                        | None -> None)
+
+                // Invariant (a): no duplicate coupons.
                 if thisIterCount > 1L then
                     violations <- violations + 1
                     violationDetails.Add($"iter {i}: dup coupons (count={thisIterCount})")
 
-                // Invariant (b): message agrees with state.
+                // Invariant (b): some message reached the user.
                 if thisIterCount = 1L && not sawAdded then
                     violations <- violations + 1
-                    violationDetails.Add($"iter {i}: 1 coupon added but no 'Добавил' message — final UI lies about success")
-                if thisIterCount = 0L && not sawCancelled then
+                    violationDetails.Add($"iter {i}: 1 coupon added but no 'Добавил' message")
+                if thisIterCount = 0L && not sawCancelOrStale then
                     violations <- violations + 1
-                    violationDetails.Add($"iter {i}: 0 coupons added but no cancellation/stale message")
+                    violationDetails.Add($"iter {i}: 0 coupons but no cancellation/stale message")
+
+                // Invariant (c): the LAST visible edit must agree with the actual
+                // coupon outcome. This is the UX bug we're really hunting: when
+                // confirm and cancel both run, the last edit determines what the
+                // user sees. If a coupon was added but the user sees "Ок, отменил
+                // пакет.", they've been lied to.
+                match lastEditText, thisIterCount with
+                | Some t, 1L when t.Contains "Ок, отменил пакет" ->
+                    lastMsgMismatch <- lastMsgMismatch + 1
+                    violations <- violations + 1
+                    violationDetails.Add(
+                        $"iter {i}: coupon added but final message is 'Ок, отменил пакет.' — UX lies to user about outcome")
+                | Some t, 0L when t.Contains "Добавил" ->
+                    lastMsgMismatch <- lastMsgMismatch + 1
+                    violations <- violations + 1
+                    violationDetails.Add(
+                        $"iter {i}: no coupon added but final message is 'Добавил…' — UX lies")
+                | _ -> ()
+
+            // Always surface the diagnostic counts so a passing run still tells us
+            // whether the race ever actually fired (otherwise a passing test could
+            // just mean the bot serialised everything for some reason we missed).
+            let summary =
+                $"race-hit={raceHit}/{iterations}, last-message-mismatch={lastMsgMismatch}/{iterations}, violations={violations}"
 
             Assert.True(
                 (violations = 0),
-                $"Confirm+cancel race violated invariants in {violations}/{iterations} iterations.\nFirst few: " +
+                summary + "\nFirst few: " +
                 String.Join("\n", violationDetails |> Seq.truncate 10))
+
+            // Also fail if the race NEVER fired — that would mean this test is
+            // pointless (something is serialising the callbacks). We'd want to
+            // know and either fix the test or accept that the race can't happen.
+            Assert.True(
+                raceHit > 0,
+                $"Race never fired in {iterations} iterations ({summary}). " +
+                "Either there's an unknown serialisation path between BulkBatchConfirm and BulkBatchCancel " +
+                "(check ASP.NET request handling, Kestrel concurrency, or DB row-lock contention), " +
+                "or this scenario does not race in practice and the test is not useful.")
         }
 
     /// Album webhook + /add command arrive at the same instant from the same
