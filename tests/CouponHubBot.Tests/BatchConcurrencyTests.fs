@@ -387,7 +387,7 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
                     violationDetails.Add($"iter {i}: 0 coupons added but no cancellation/stale message")
 
             Assert.True(
-                violations = 0,
+                (violations = 0),
                 $"Confirm+cancel race violated invariants in {violations}/{iterations} iterations.\nFirst few: " +
                 String.Join("\n", violationDetails |> Seq.truncate 10))
         }
