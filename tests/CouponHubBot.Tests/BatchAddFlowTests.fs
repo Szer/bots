@@ -11,8 +11,10 @@ open Xunit
 open FakeCallHelpers
 
 /// Tests for album-upload batch flow (V16 / pending_add_batch).
-/// The fixture seeds BATCH_DEBOUNCE_MS=200 so each test only needs ~400ms
-/// after the last photo to observe the finalize handler's output.
+/// The fixture seeds BATCH_DEBOUNCE_MS=500 so each test needs ~1000ms
+/// after the last photo to observe the finalize handler's output. (500ms
+/// debounce gives the in-process OCR retry path enough room to finish on
+/// CI before finalize claims pending items as timeout.)
 type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
 
     let solutionDirPath = CommonDirectoryPath.GetSolutionDirectory().DirectoryPath
@@ -141,7 +143,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
                 ()
 
             // Wait past debounce + render.
-            do! Task.Delay 600
+            do! Task.Delay 1000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let placeholders = placeholderCalls calls user.Id
@@ -155,8 +157,12 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             Assert.True(deletes.Length >= 1, $"Expected ≥1 deleteMessage; got {deletes.Length}")
 
             // Bulk-confirm message should advertise 3 items (each photo's barcode is unique
-            // because ZXing decodes from real image bytes per fileId).
-            Assert.Contains("Подтвердить 3 купонов", bulkConfirms[0].Body)
+            // because ZXing decodes from real image bytes per fileId). findCallWithText
+            // parses the JSON body and unescapes Cyrillic — Assert.Contains on the raw
+            // body would search for literal Cyrillic in a string of \uXXXX escapes.
+            Assert.True(
+                findCallWithText calls user.Id "Подтвердить 3 купонов",
+                "Expected bulk-confirm text 'Подтвердить 3 купонов' in sendMessage calls")
 
             // Capture the batch id from DB so we can invoke confirm.
             let! batchId = fixture.QuerySingle<int64>("SELECT id FROM pending_add_batch WHERE user_id=@u", {| u = user.Id |})
@@ -186,12 +192,14 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! setupGoodOcr fid fn
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = fid))
-            do! Task.Delay 400
+            do! Task.Delay 1000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let bulkConfirms = bulkConfirmCalls calls user.Id
             Assert.Equal(1, bulkConfirms.Length)
-            Assert.Contains("Подтвердить 1", bulkConfirms[0].Body)
+            Assert.True(
+                findCallWithText calls user.Id "Подтвердить 1",
+                "Expected bulk-confirm text 'Подтвердить 1' in sendMessage calls")
 
             let! batchId = fixture.QuerySingle<int64>("SELECT id FROM pending_add_batch WHERE user_id=@u", {| u = user.Id |})
             let! _ = fixture.SendUpdate(Tg.dmCallback($"addflow:bulk:confirm:{batchId}", user))
@@ -216,13 +224,14 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let fid = "race-fast-1"
             let fn = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
             do! setupGoodOcr fid fn
-            do! fixture.SetAzureOcrDelay(50) // ≪ 200ms debounce
+            do! fixture.SetAzureOcrDelay(50) // ≪ 500ms debounce
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = fid))
-            do! Task.Delay 600
+            do! Task.Delay 1000
 
+            // `status` is in both pending_add_batch_item AND pending_add_batch — qualify it.
             let! statuses = fixture.QuerySingle<string>(
-                                "SELECT string_agg(status, ',' ORDER BY seq) FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
+                                "SELECT string_agg(i.status, ',' ORDER BY i.seq) FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
                                 {| u = user.Id |})
             Assert.Equal("ok", statuses)
         }
@@ -242,11 +251,11 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let fn = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
             do! setupGoodOcr fid fn
             // OCR delay > debounce: by the time finalize fires, OCR has not yet committed.
-            do! fixture.SetAzureOcrDelay(800)
+            do! fixture.SetAzureOcrDelay(1500)
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = fid))
-            // Wait past debounce (200ms) but before OCR (800ms).
-            do! Task.Delay 400
+            // Wait past debounce (500ms) but before OCR (1500ms).
+            do! Task.Delay 1000
 
             let! statusAfterClaim = fixture.QuerySingle<string>(
                                         "SELECT i.status FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
@@ -266,8 +275,10 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             Assert.True(findCallWithText calls user.Id "не успел обработаться",
                         "Expected per-photo reply with the 'timeout' reason text")
 
-            // Wait for the late OCR to land. It MUST NOT clobber the timeout status.
-            do! Task.Delay 700
+            // Wait for the late OCR to land (1500ms total since photo; we've already
+            // waited 1000ms, so 800ms more brings us past OCR completion + buffer).
+            // It MUST NOT clobber the timeout status.
+            do! Task.Delay 800
 
             let! statusAfterLateOcr = fixture.QuerySingle<string>(
                                           "SELECT i.status FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
@@ -334,7 +345,12 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             |])
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = fid))
-            do! Task.Delay 600
+            // Wait must leave room for: photo write → OcrItem starts (~5ms) →
+            // first attempt errors (~10ms) → Task.Delay 100 between attempts →
+            // second attempt succeeds (~50ms) — and crucially BEFORE finalize
+            // fires (debounce = 500ms) so the OCR result lands while the item
+            // is still 'pending' (not yet claimed as 'timeout').
+            do! Task.Delay 1000
 
             let! status = fixture.QuerySingle<string>(
                               "SELECT i.status FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
@@ -365,7 +381,11 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.SetAzureOcrErrorMode("network")
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = fid))
-            do! Task.Delay 600
+            // Same reasoning as the previous test: both attempts must fail
+            // (writing 'OCR failed') before finalize fires at 500ms, otherwise
+            // finalize claims the item as 'timeout' and the late OCR write
+            // no-ops at the status='pending' guard.
+            do! Task.Delay 1000
 
             let! note = fixture.QuerySingle<string>(
                             "SELECT i.failure_note FROM pending_add_batch_item i JOIN pending_add_batch b ON b.id=i.batch_id WHERE b.user_id=@u",
