@@ -87,6 +87,87 @@ INTERACTIONS_7D=$(echo "$INTERACTIONS_7D_JSON" | jq -r '[.data.result[].value[1]
 INTERACTIONS_PREV_JSON=$(prom_query "sum(increase(couponhubbot_command_total[14d])) - sum(increase(couponhubbot_command_total[7d])) + sum(increase(couponhubbot_callback_total[14d])) - sum(increase(couponhubbot_callback_total[7d]))")
 INTERACTIONS_PREV=$(echo "$INTERACTIONS_PREV_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
 
+# ─── Album batch flow (Prometheus, 7 days) ───────────────────────────────────
+# Counters and histogram emitted by CouponFlowHandler / CallbackHandler.
+# These map the feature's funnel:
+#   open → OCR per item → finalize → confirm/cancel
+# `fallback` finalize outcomes are an alarm signal (bug or upstream outage).
+
+log "Querying album batch flow metrics..."
+
+# Batches opened
+BATCHES_OPENED_JSON=$(prom_query "sum(increase(couponhubbot_batch_created_total[7d]))")
+BATCHES_OPENED=$(echo "$BATCHES_OPENED_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+
+# Finalize outcomes (ok vs fallback)
+BATCH_FIN_JSON=$(prom_query "sum by (outcome)(increase(couponhubbot_batch_finalized_total[7d]))")
+BATCH_FIN_TABLE=$(echo "$BATCH_FIN_JSON" | jq -r '
+    [.data.result[] | {outcome: .metric.outcome, count: (.value[1] | tonumber | floor)}]
+    | sort_by(-.count)
+    | .[] | "| \(.outcome) | \(.count) |"
+' 2>/dev/null || true)
+[ -z "$BATCH_FIN_TABLE" ] && BATCH_FIN_TABLE="| (no data) | - |"
+
+# Album size — avg, median, p90 from histogram
+BATCH_SIZE_AVG_JSON=$(prom_query "sum(increase(couponhubbot_batch_size_sum[7d])) / sum(increase(couponhubbot_batch_size_count[7d]))")
+BATCH_SIZE_AVG=$(echo "$BATCH_SIZE_AVG_JSON" | jq -r '[.data.result[].value[1] | tonumber] | add // 0 | . * 100 | floor | . / 100' 2>/dev/null || echo "0")
+
+BATCH_SIZE_P50_JSON=$(prom_query "histogram_quantile(0.5, sum by (le)(rate(couponhubbot_batch_size_bucket[7d])))")
+BATCH_SIZE_P50=$(echo "$BATCH_SIZE_P50_JSON" | jq -r '[.data.result[].value[1] | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+
+BATCH_SIZE_P90_JSON=$(prom_query "histogram_quantile(0.9, sum by (le)(rate(couponhubbot_batch_size_bucket[7d])))")
+BATCH_SIZE_P90=$(echo "$BATCH_SIZE_P90_JSON" | jq -r '[.data.result[].value[1] | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+
+# Per-item OCR outcomes
+BATCH_ITEM_JSON=$(prom_query "sum by (outcome, failure_note)(increase(couponhubbot_batch_item_outcome_total[7d]))")
+BATCH_ITEM_TABLE=$(echo "$BATCH_ITEM_JSON" | jq -r '
+    [.data.result[] | {outcome: .metric.outcome, note: (.metric.failure_note // "-"), count: (.value[1] | tonumber | floor)}]
+    | sort_by(-.count)
+    | .[] | "| \(.outcome) | \(.note) | \(.count) |"
+' 2>/dev/null || true)
+[ -z "$BATCH_ITEM_TABLE" ] && BATCH_ITEM_TABLE="| (no data) | - | - |"
+
+# Confirm / cancel decisions
+BATCH_CONFIRM_JSON=$(prom_query "sum(increase(couponhubbot_batch_confirm_total[7d]))")
+BATCH_CONFIRM=$(echo "$BATCH_CONFIRM_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+
+BATCH_CANCEL_JSON=$(prom_query "sum by (had_ok_items)(increase(couponhubbot_batch_cancel_total[7d]))")
+BATCH_CANCEL_TABLE=$(echo "$BATCH_CANCEL_JSON" | jq -r '
+    [.data.result[] | {had_ok: .metric.had_ok_items, count: (.value[1] | tonumber | floor)}]
+    | sort_by(-.count)
+    | .[] | "| \(.had_ok) | \(.count) |"
+' 2>/dev/null || true)
+[ -z "$BATCH_CANCEL_TABLE" ] && BATCH_CANCEL_TABLE="| (no data) | - |"
+
+BATCH_ADDED_JSON=$(prom_query "sum(increase(couponhubbot_batch_added_total[7d]))")
+BATCH_ADDED=$(echo "$BATCH_ADDED_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+
+BATCH_SKIPPED_JSON=$(prom_query "sum by (reason)(increase(couponhubbot_batch_skipped_total[7d]))")
+BATCH_SKIPPED_TABLE=$(echo "$BATCH_SKIPPED_JSON" | jq -r '
+    [.data.result[] | {reason: .metric.reason, count: (.value[1] | tonumber | floor)}]
+    | sort_by(-.count)
+    | .[] | "| \(.reason) | \(.count) |"
+' 2>/dev/null || true)
+[ -z "$BATCH_SKIPPED_TABLE" ] && BATCH_SKIPPED_TABLE="| (no skips) | - |"
+
+# Abandonment reasons
+BATCH_ABANDON_JSON=$(prom_query "sum by (reason)(increase(couponhubbot_batch_abandoned_total[7d]))")
+BATCH_ABANDON_TABLE=$(echo "$BATCH_ABANDON_JSON" | jq -r '
+    [.data.result[] | {reason: .metric.reason, count: (.value[1] | tonumber | floor)}]
+    | sort_by(-.count)
+    | .[] | "| \(.reason) | \(.count) |"
+' 2>/dev/null || true)
+[ -z "$BATCH_ABANDON_TABLE" ] && BATCH_ABANDON_TABLE="| (none) | - |"
+
+# Currently-stuck batches (snapshot; expected to be 0 most of the time)
+BATCHES_STUCK=$(db_query "
+    SELECT COUNT(*)
+    FROM pending_add_batch
+    WHERE status = 'awaiting_user'
+      AND updated_at < NOW() - INTERVAL '1 hour';
+")
+[ -z "$BATCHES_STUCK" ] && BATCHES_STUCK="0"
+
 # ─── Chat message themes (PostgreSQL) ────────────────────────────────────────
 
 log "Querying chat messages..."
@@ -251,6 +332,59 @@ ${CMD_7D}
 | Action | Count |
 |--------|-------|
 ${CB_7D}
+
+## Album Batch Flow (7-day)
+
+### Funnel
+
+| Stage | Value |
+|-------|-------|
+| Batches opened | ${BATCHES_OPENED} |
+| Confirm clicks | ${BATCH_CONFIRM} |
+| Coupons added (sum across confirms) | ${BATCH_ADDED} |
+| Stuck batches RIGHT NOW (status=awaiting_user, >1h old) | ${BATCHES_STUCK} |
+
+### Finalize outcomes
+Non-zero \`fallback\` means FinalizeBatch's render/send pipeline threw and the user got the generic error message — investigate logs.
+
+| Outcome | Count |
+|---------|-------|
+${BATCH_FIN_TABLE}
+
+### Album size
+
+| Metric | Value |
+|--------|-------|
+| Avg items/batch | ${BATCH_SIZE_AVG} |
+| Median | ${BATCH_SIZE_P50} |
+| p90 | ${BATCH_SIZE_P90} |
+
+### Per-item OCR outcomes
+Counts each photo's OCR result. \`partial\` = barcode decoded but Azure failed to extract value/min/date (Azure upstream issue).
+
+| Outcome | Failure note | Count |
+|---------|--------------|-------|
+${BATCH_ITEM_TABLE}
+
+### Cancel decisions
+\`had_ok_items=true\` means the user cancelled a batch they could have confirmed — UX signal.
+
+| had_ok_items | Count |
+|--------------|-------|
+${BATCH_CANCEL_TABLE}
+
+### Skipped on confirm (duplicates / expired)
+
+| Reason | Count |
+|--------|-------|
+${BATCH_SKIPPED_TABLE}
+
+### Abandoned batches
+Active batches that were dropped without user confirm/cancel (new album superseded, or user ran a command).
+
+| Reason | Count |
+|--------|-------|
+${BATCH_ABANDON_TABLE}
 
 ## Community Chat Activity (7-day)
 
