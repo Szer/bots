@@ -187,6 +187,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7001L, username = "album_happy", firstName = "Album")
@@ -248,6 +249,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7002L, username = "album_one", firstName = "Solo")
@@ -288,6 +290,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7010L, username = "race_fast", firstName = "Fast")
@@ -319,6 +322,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7011L, username = "race_slow", firstName = "Slow")
@@ -387,6 +391,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7020L, username = "fast_webhook", firstName = "Webhook")
@@ -414,6 +419,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
             do! fixture.ClearAzureOcrCalls()
 
@@ -457,6 +463,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
             do! fixture.ClearAzureOcrCalls()
 
@@ -502,6 +509,7 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
             do! resetOcrFakes ()
 
             let user = Tg.user(id = 7040L, username = "cmd_cancel", firstName = "Cmd")
