@@ -68,7 +68,8 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(
-                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)",
+                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type, feature_group = EXCLUDED.feature_group",
                         {| k = key; v = value; t = typ; g = group |})
                     :> Task
 
