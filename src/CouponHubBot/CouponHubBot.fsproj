@@ -11,9 +11,11 @@
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />
     <Compile Include="Services/BotHelpers.fs" />
+    <Compile Include="Services/BatchDebounce.fs" />
     <Compile Include="Services/CouponFlowHandler.fs" />
     <Compile Include="Services/CommandHandler.fs" />
     <Compile Include="Services/CallbackHandler.fs" />
+    <Compile Include="Services/BatchRecoveryService.fs" />
     <Compile Include="Services/BotService.fs" />
     <Compile Include="Services/BotCommandsSetup.fs" />
     <Compile Include="Program.fs" />
@@ -23,6 +25,8 @@
     <PackageReference Include="SixLabors.ImageSharp" />
     <PackageReference Include="ZXing.Net" />
     <PackageReference Include="ZXing.Net.Bindings.ImageSharp.V3" />
+    <!-- FakeTimeProvider for the test-only /test/clock/advance endpoint. Stable, ~30KB. -->
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
   </ItemGroup>
 
   <ItemGroup>

@@ -64,10 +64,17 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
                 "GITHUB_REPO",             "",                     "FREE_FORM", "CORE"
                 "TEST_MODE",               "true",                 "FEATURE_FLAG", "CORE"
                 "MAX_TAKEN_COUPONS",       "4",                    "FREE_FORM", "CORE"
+                // With TestMode the bot uses FakeTimeProvider, so this debounce timer
+                // does NOT fire on its own — tests call fixture.AdvanceBotClock to fire
+                // it deterministically. 30s is just a defensive fallback: if the
+                // FakeTimeProvider wiring breaks, batch tests still fail fast (and
+                // loudly) instead of hanging.
+                "BATCH_DEBOUNCE_MS",       "30000",                "FREE_FORM", "BATCH"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(
-                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)",
+                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type, feature_group = EXCLUDED.feature_group",
                         {| k = key; v = value; t = typ; g = group |})
                     :> Task
 
@@ -129,6 +136,18 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
             use conn = new NpgsqlConnection(adminConnectionString)
             do! conn.OpenAsync()
             do! conn.ExecuteAsync("TRUNCATE user_feedback CASCADE") :> Task
+        }
+
+    /// Wipes both pending_add_batch and pending_add_batch_item (CASCADE).
+    /// Use in batch-test setup so prior tests' leftover batches don't appear
+    /// in global queries (e.g. COUNT(*) FROM pending_add_batch). Also defangs
+    /// any leftover BatchDebounce timers: when they fire for a since-truncated
+    /// batch, TryFlipBatchToAwaiting returns false and FinalizeBatch is a no-op.
+    member _.TruncateBatches() =
+        task {
+            use conn = new NpgsqlConnection(adminConnectionString)
+            do! conn.OpenAsync()
+            do! conn.ExecuteAsync("TRUNCATE pending_add_batch CASCADE") :> Task
         }
 
 type DefaultCouponHubTestContainers() =

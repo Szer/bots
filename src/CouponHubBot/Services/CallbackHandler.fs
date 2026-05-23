@@ -25,7 +25,106 @@ type CallbackHandler(
     let sendText = BotHelpers.sendText botClient
     let ensureCommunityMember = BotHelpers.ensureCommunityMember membership sendText
 
-    member _.HandleCallbackQuery (cq: CallbackQuery) =
+    member private _.EditBulkOrSend (batch: PendingAddBatch) (text: string) =
+        task {
+            if batch.bulk_message_id.HasValue then
+                try
+                    do!
+                        botClient.EditMessageText(
+                            ChatId batch.bulk_chat_id,
+                            batch.bulk_message_id.Value,
+                            text)
+                        |> taskIgnore
+                with _ ->
+                    do! sendText batch.bulk_chat_id text
+            else
+                do! sendText batch.bulk_chat_id text
+        }
+
+    member private this.BulkBatchCancel (batch: PendingAddBatch) =
+        task {
+            do! db.ClearBatch batch.id
+            do! this.EditBulkOrSend batch "Ок, отменил пакет."
+        }
+
+    member private this.BulkBatchConfirm (user: DbUser) (batch: PendingAddBatch) =
+        task {
+            let! items = db.GetBatchItems batch.id
+            let okItems = items |> Array.filter (fun i -> i.status = "ok")
+            let insertedIds = ResizeArray<int>()
+            let skippedNotes = ResizeArray<string>()
+
+            for item in okItems do
+                let vf =
+                    if item.valid_from.HasValue then Some item.valid_from.Value
+                    else None
+                let! result =
+                    db.TryAddCoupon(
+                        user.id,
+                        item.photo_file_id,
+                        item.value.Value,
+                        item.min_check.Value,
+                        item.expires_at.Value,
+                        item.barcode_text,
+                        ?validFrom = vf)
+                match result with
+                | AddCouponResult.Added c ->
+                    insertedIds.Add c.id
+                    do! db.MarkBatchItemInserted(item.id, c.id)
+                | AddCouponResult.Expired ->
+                    skippedNotes.Add "истёкший купон"
+                    do! db.MarkBatchItemFailed(item.id, "expired")
+                | AddCouponResult.DuplicatePhoto existingId ->
+                    skippedNotes.Add $"дубликат фото (ID:{existingId})"
+                    do! db.MarkBatchItemFailed(item.id, $"dup_photo:{existingId}")
+                | AddCouponResult.DuplicateBarcode existingId ->
+                    skippedNotes.Add $"дубликат штрихкода (ID:{existingId})"
+                    do! db.MarkBatchItemFailed(item.id, $"dup_barcode:{existingId}")
+
+            do! db.ClearBatch batch.id
+
+            let summary =
+                let addedPart =
+                    if insertedIds.Count = 0 then "Ничего не добавил."
+                    else
+                        let ids = insertedIds |> Seq.map string |> String.concat ", "
+                        $"Добавил {insertedIds.Count} купона: ID:{ids}."
+                let skipPart =
+                    if skippedNotes.Count = 0 then ""
+                    else
+                        let notes = skippedNotes |> String.concat "; "
+                        $" {skippedNotes.Count} пропустил: {notes}."
+                addedPart + skipPart
+
+            do! this.EditBulkOrSend batch summary
+        }
+
+    member private this.HandleBulkCallback (user: DbUser) (cq: CallbackQuery) =
+        task {
+            Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "addflow_bulk"))
+            Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box cq.Data))
+
+            // parts: [| "addflow"; "bulk"; "confirm" | "cancel"; "<batchId>" |]
+            let parts = cq.Data.Split(':', StringSplitOptions.RemoveEmptyEntries)
+            if parts.Length < 4 then
+                do! sendText cq.Message.Chat.Id "Не понял действие."
+            else
+                match Int64.TryParse(parts[3]) with
+                | false, _ ->
+                    do! sendText cq.Message.Chat.Id "Не понял идентификатор пакета."
+                | true, batchId ->
+                    let! batchOpt = db.GetBatchById batchId
+                    match batchOpt with
+                    | Some batch when batch.user_id = user.id && batch.status = "awaiting_user" ->
+                        match parts[2] with
+                        | "cancel" -> do! this.BulkBatchCancel batch
+                        | "confirm" -> do! this.BulkBatchConfirm user batch
+                        | _ -> do! sendText cq.Message.Chat.Id "Не понял действие."
+                    | _ ->
+                        do! sendText cq.Message.Chat.Id "Этот пакет уже устарел, отправь альбом заново."
+        }
+
+    member this.HandleCallbackQuery (cq: CallbackQuery) =
         task {
             use a = botActivity.StartActivity("handleCallbackQuery")
             %a.SetTag("callbackQueryId", cq.Id)
@@ -59,6 +158,8 @@ type CallbackHandler(
                             do! commandHandler.HandleTake user cq.Message.Chat.Id couponId
                         | None ->
                             ()
+                    elif isPrivateChat && hasData && cq.Data.StartsWith("addflow:bulk:") then
+                        do! this.HandleBulkCallback user cq
                     elif isPrivateChat && hasData && cq.Data.StartsWith("addflow:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "addflow"))
                         Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box cq.Data))

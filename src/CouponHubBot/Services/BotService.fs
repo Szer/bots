@@ -102,6 +102,11 @@ type BotService(
                     if msg.Text <> "/add" && msg.Text <> "/a" then
                         do! db.ClearPendingAddFlow(user.id)
 
+                    // Any command also cancels any in-flight album batch.
+                    // No bulk-message edit here — the command's response is feedback enough.
+                    let! _ = db.AbandonOpenBatchesExcept(user.id, None)
+                    ()
+
                 // Handle add wizard steps for non-command messages (photo / free-form inputs).
                 // Important: if /feedback consumes this message, do NOT run /add implicit flow.
                 let mutable handledAddFlow = false
@@ -150,8 +155,15 @@ type BotService(
                         do! sendText msg.Chat.Id "Спасибо! Сообщение отправлено авторам."
                         handledAddFlow <- true
                     else
-                        let! handled = couponFlow.TryHandleWizardMessage user msg
-                        handledAddFlow <- handled
+                        // Album uploads (MediaGroupId set on every photo of the album)
+                        // route through the batch flow, not the single-photo wizard.
+                        if not (isNull msg.MediaGroupId)
+                           && msg.Photo <> null && msg.Photo.Length > 0 then
+                            let! handled = couponFlow.HandleAlbumPhoto user msg
+                            handledAddFlow <- handled
+                        else
+                            let! handled = couponFlow.TryHandleWizardMessage user msg
+                            handledAddFlow <- handled
 
                 if handledAddFlow then
                     ()

@@ -219,6 +219,17 @@ let addWizardConfirmKeyboard () =
     }
     |> InlineKeyboardMarkup
 
+let addBatchConfirmKeyboard (batchId: int64) (okCount: int) =
+    if okCount = 0 then
+        seq { seq { InlineKeyboardButton.WithCallbackData("↩️ Отменить", $"addflow:bulk:cancel:{batchId}") } }
+        |> InlineKeyboardMarkup
+    else
+        seq {
+            seq { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {okCount} купонов", $"addflow:bulk:confirm:{batchId}") }
+            seq { InlineKeyboardButton.WithCallbackData("↩️ Отменить", $"addflow:bulk:cancel:{batchId}") }
+        }
+        |> InlineKeyboardMarkup
+
 /// Клавиатура для сообщения «Ты взял купон»: при успешном used/return сообщение удаляем.
 let singleTakenKeyboard (c: Coupon) =
     seq {

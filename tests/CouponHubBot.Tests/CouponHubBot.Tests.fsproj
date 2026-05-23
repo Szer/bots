@@ -10,8 +10,18 @@
   <ItemGroup>
     <Compile Include="ContainerTestBase.fs" />
     <Compile Include="FakeCallHelpers.fs" />
+    <Compile Include="BatchTestHelpers.fs" />
     <Compile Include="MembershipTests.fs" />
     <Compile Include="OcrAddFlowTests.fs" />
+    <Compile Include="BatchAddFlowTests.fs" />
+    <Compile Include="BatchSkipAndWarnTests.fs" />
+    <Compile Include="BatchStateMachineTests.fs" />
+    <Compile Include="BatchConcurrencyTests.fs" />
+    <Compile Include="BatchTtlTests.fs" />
+    <Compile Include="BatchDuplicateTests.fs" />
+    <Compile Include="BatchNudgeTests.fs" />
+    <Compile Include="BatchRecoveryTests.fs" />
+    <Compile Include="BatchResilienceTests.fs" />
     <Compile Include="CouponTests.fs" />
     <Compile Include="ReminderTests.fs" />
     <Compile Include="ChatMonitoringTests.fs" />

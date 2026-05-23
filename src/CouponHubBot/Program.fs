@@ -7,6 +7,7 @@ open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
+open Microsoft.Extensions.Time.Testing
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
@@ -64,7 +65,8 @@ let buildBotConf () =
       GitHubToken = getEnvOr "GITHUB_TOKEN" ""
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/coupon-bot")
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
-      MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int }
+      MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
+      BatchDebounceMs = getSettingOr "BATCH_DEBOUNCE_MS" "5000" |> int }
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
@@ -97,9 +99,31 @@ WebhookHost.configureSharedServices webhookCfg builder
 
 %builder.Services.AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
 
-// OCR: register shared IBotOcr
+// In TestMode, replace the shared TimeProvider with a FakeTimeProvider so the
+// /test/clock/advance endpoint can fire BatchDebounce timers deterministically
+// without making tests wait on real wall clock. Initial time is taken from
+// BOT_FIXED_UTC_NOW (same env var the production FixedTimeProvider reads), so
+// existing time-sensitive tests keep their fixed-clock semantics.
+// Note: WebhookHost.configureSharedServices already registered TimeProvider.
+// AddSingleton with the same service type overwrites for the last registration.
+if botConfOptions.Value.TestMode then
+    let initial =
+        match Environment.GetEnvironmentVariable Time.FixedUtcNowEnvVar with
+        | null | "" -> DateTimeOffset.UtcNow
+        | raw ->
+            DateTimeOffset.Parse(
+                raw,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal ||| DateTimeStyles.AdjustToUniversal)
+    let fake = FakeTimeProvider(initial)
+    %builder.Services.AddSingleton<FakeTimeProvider>(fake)
+    %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
+
+// OCR: register shared IBotOcr with a 2s per-attempt HTTP timeout so the batch
+// flow can safely render results at debounce time without awaiting in-flight calls.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
+%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>(fun c ->
+    c.Timeout <- TimeSpan.FromSeconds 2.)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()
@@ -108,6 +132,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .Services
     .AddSingleton<BotService>()
     .AddSingleton<CouponFlowHandler>()
+    .AddSingleton<BatchDebounce>()
     .AddSingleton<CommandHandler>()
     .AddSingleton<CallbackHandler>()
     .AddSingleton<DbService>(fun sp ->
@@ -117,12 +142,36 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
     .AddHostedService<BotCommandsSetupService>()
+    .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
 
 let app = builder.Build()
 
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
+
+// Test-only hook to advance the FakeTimeProvider, deterministically firing any
+// pending TimeProvider-driven timers (notably BatchDebounce). Query: ?ms=N
+// (default 1000). 404 outside TestMode; 400 if FakeTimeProvider wasn't registered.
+%app.MapPost("/test/clock/advance", Func<HttpContext, Task<IResult>>(fun ctx ->
+    task {
+        let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+        if not opts.Value.TestMode then
+            return Results.NotFound()
+        else
+            let fake = ctx.RequestServices.GetService<FakeTimeProvider>()
+            if isNull (box fake) then
+                return Results.BadRequest({| error = "FakeTimeProvider not registered" |})
+            else
+                let ms =
+                    if ctx.Request.Query.ContainsKey "ms" then
+                        match Int32.TryParse(string ctx.Request.Query["ms"]) with
+                        | true, v -> v
+                        | _ -> 1000
+                    else 1000
+                fake.Advance(TimeSpan.FromMilliseconds(float ms))
+                return Results.Json({| ok = true; advancedMs = ms |})
+    }))
 
 // Test-only hook to trigger reminder immediately
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
