@@ -43,12 +43,18 @@ type CallbackHandler(
 
     member private this.BulkBatchCancel (batch: PendingAddBatch) =
         task {
+            let! items = db.GetBatchItems batch.id
+            let hadOkItems = items |> Array.exists (fun i -> i.status = "ok")
+            Metrics.batchCancelTotal.Add(
+                1L,
+                KeyValuePair("had_ok_items", box (if hadOkItems then "true" else "false")))
             do! db.ClearBatch batch.id
             do! this.EditBulkOrSend batch "Ок, отменил пакет."
         }
 
     member private this.BulkBatchConfirm (user: DbUser) (batch: PendingAddBatch) =
         task {
+            Metrics.batchConfirmTotal.Add(1L)
             let! items = db.GetBatchItems batch.id
             let okItems = items |> Array.filter (fun i -> i.status = "ok")
             let insertedIds = ResizeArray<int>()
@@ -70,15 +76,19 @@ type CallbackHandler(
                 match result with
                 | AddCouponResult.Added c ->
                     insertedIds.Add c.id
+                    Metrics.batchAddedTotal.Add(1L)
                     do! db.MarkBatchItemInserted(item.id, c.id)
                 | AddCouponResult.Expired ->
                     skippedNotes.Add "истёкший купон"
+                    Metrics.batchSkippedTotal.Add(1L, KeyValuePair("reason", box "Expired"))
                     do! db.MarkBatchItemFailed(item.id, "expired")
                 | AddCouponResult.DuplicatePhoto existingId ->
                     skippedNotes.Add $"дубликат фото (ID:{existingId})"
+                    Metrics.batchSkippedTotal.Add(1L, KeyValuePair("reason", box "DuplicatePhoto"))
                     do! db.MarkBatchItemFailed(item.id, $"dup_photo:{existingId}")
                 | AddCouponResult.DuplicateBarcode existingId ->
                     skippedNotes.Add $"дубликат штрихкода (ID:{existingId})"
+                    Metrics.batchSkippedTotal.Add(1L, KeyValuePair("reason", box "DuplicateBarcode"))
                     do! db.MarkBatchItemFailed(item.id, $"dup_barcode:{existingId}")
 
             do! db.ClearBatch batch.id

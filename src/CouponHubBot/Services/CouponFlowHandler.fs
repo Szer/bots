@@ -2,6 +2,7 @@ namespace CouponHubBot.Services
 
 open System
 open System.Collections.Concurrent
+open System.Collections.Generic
 open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
@@ -453,26 +454,41 @@ type CouponFlowHandler(
     /// so a late OCR finish after finalize's claim is a safe no-op.
     member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) : Task =
         task {
-            try
-                use a = botActivity.StartActivity("batchOcrItem")
-                if not (isNull a) then
-                    %a.SetTag("batchId", batchId)
-                    %a.SetTag("itemId", itemId)
+            use a = botActivity.StartActivity("batchOcrItem")
+            if not (isNull a) then
+                %a.SetTag("batchId", batchId)
+                %a.SetTag("itemId", itemId)
 
+            let recordOk () =
+                if not (isNull a) then %a.SetTag("outcome", "ok")
+                Metrics.batchItemOutcomeTotal.Add(1L, KeyValuePair("outcome", box "ok"))
+            let writeNeedsInput note =
+                task {
+                    do! db.UpdateBatchItemNeedsInput(itemId, note)
+                    if not (isNull a) then
+                        %a.SetTag("outcome", "needs_input")
+                        %a.SetTag("failure_note", note)
+                    Metrics.batchItemOutcomeTotal.Add(
+                        1L,
+                        KeyValuePair("outcome", box "needs_input"),
+                        KeyValuePair("failure_note", box note))
+                }
+
+            try
                 let ocrConfig = ocrOptions.Value
 
                 if not ocrConfig.OcrEnabled then
-                    do! db.UpdateBatchItemNeedsInput(itemId, "OCR disabled")
+                    do! writeNeedsInput "OCR disabled"
                 else
                     let! file = botClient.GetFile(photoFileId)
                     if isNull file || String.IsNullOrWhiteSpace file.FilePath then
-                        do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                        do! writeNeedsInput "OCR failed"
                     else
                         use ms = new System.IO.MemoryStream()
                         do! botClient.DownloadFile(file.FilePath, ms)
                         let bytes = ms.ToArray()
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
-                            do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                            do! writeNeedsInput "OCR failed"
                         else
                             let attempt () = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
                             let! ocr =
@@ -500,7 +516,7 @@ type CouponFlowHandler(
                                 let note =
                                     if String.IsNullOrWhiteSpace ocr.barcode then "no barcode"
                                     else "partial"
-                                do! db.UpdateBatchItemNeedsInput(itemId, note)
+                                do! writeNeedsInput note
                             else
                                 let validFromNullable =
                                     if ocr.validFrom.HasValue then
@@ -515,11 +531,10 @@ type CouponFlowHandler(
                                         expiresNullable,
                                         ocr.barcode,
                                         validFromNullable)
-                                ()
+                                recordOk ()
             with ex ->
                 logger.LogWarning(ex, "OCR failed for batch {BatchId} item {ItemId}", batchId, itemId)
-                try
-                    do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                try do! writeNeedsInput "OCR failed"
                 with ex2 ->
                     logger.LogError(ex2, "Also failed to write OCR-failed status for item {ItemId}", itemId)
         } :> Task
@@ -558,27 +573,22 @@ type CouponFlowHandler(
     /// Happy path: render the bulk-confirm, replace the placeholder with a
     /// fresh notifying message, link it back to the batch, and emit per-photo
     /// replies for items needing user input.
-    member private this.RenderAndSendBulkConfirm (batchId: int64) : Task =
+    member private this.RenderAndSendBulkConfirm (batchId: int64) (batch: PendingAddBatch) (items: PendingAddBatchItem array) : Task =
         task {
-            let! batchOpt = db.GetBatchById batchId
-            match batchOpt with
-            | None -> ()
-            | Some batch ->
-                let! items = db.GetBatchItems batchId
-                let text, kb = this.RenderBulkConfirm batchId items
+            let text, kb = this.RenderBulkConfirm batchId items
 
-                // Replace the placeholder with a fresh send so the user gets a notification.
-                if batch.bulk_message_id.HasValue then
-                    do! tryDeleteMessage batch.bulk_chat_id batch.bulk_message_id.Value
+            // Replace the placeholder with a fresh send so the user gets a notification.
+            if batch.bulk_message_id.HasValue then
+                do! tryDeleteMessage batch.bulk_chat_id batch.bulk_message_id.Value
 
-                let! sent = botClient.SendMessage(ChatId batch.bulk_chat_id, text, replyMarkup = kb)
-                let! linked = db.SetBatchBulkMessageId(batchId, sent.MessageId)
-                if not linked then
-                    // Batch was abandoned between SendMessage and SetBatchBulkMessageId.
-                    // The bulk-confirm message has no batch to act on; delete the orphan.
-                    do! tryDeleteMessage batch.bulk_chat_id sent.MessageId
+            let! sent = botClient.SendMessage(ChatId batch.bulk_chat_id, text, replyMarkup = kb)
+            let! linked = db.SetBatchBulkMessageId(batchId, sent.MessageId)
+            if not linked then
+                // Batch was abandoned between SendMessage and SetBatchBulkMessageId.
+                // The bulk-confirm message has no batch to act on; delete the orphan.
+                do! tryDeleteMessage batch.bulk_chat_id sent.MessageId
 
-                do! this.SendPerPhotoReplies batch items
+            do! this.SendPerPhotoReplies batch items
         } :> Task
 
     /// Last-resort path when the render/send pipeline throws. Edits the
@@ -616,6 +626,9 @@ type CouponFlowHandler(
     /// Safe to call concurrently — TryFlipBatchToAwaiting enforces single-winner.
     member this.FinalizeBatch (batchId: int64) : Task =
         task {
+            use a = botActivity.StartActivity("finalizeBatch")
+            if not (isNull a) then %a.SetTag("batchId", batchId)
+
             let! won = db.TryFlipBatchToAwaiting batchId
             if not won then () else
 
@@ -623,11 +636,25 @@ type CouponFlowHandler(
             if claimedCount > 0 then
                 logger.LogInformation("Batch {BatchId}: {Count} item(s) timed out at finalize", batchId, claimedCount)
 
-            try
-                do! this.RenderAndSendBulkConfirm batchId
-            with ex ->
-                logger.LogError(ex, "FinalizeBatch crashed for batch {BatchId}; sending fallback", batchId)
-                do! this.SendFinalizeFallback batchId
+            let! batchOpt = db.GetBatchById batchId
+            match batchOpt with
+            | None -> ()
+            | Some batch ->
+                let! items = db.GetBatchItems batchId
+                let itemCount = items.Length
+                if not (isNull a) then %a.SetTag("itemCount", itemCount)
+
+                let mutable outcome = "ok"
+                try
+                    do! this.RenderAndSendBulkConfirm batchId batch items
+                with ex ->
+                    outcome <- "fallback"
+                    logger.LogError(ex, "FinalizeBatch crashed for batch {BatchId}; sending fallback", batchId)
+                    do! this.SendFinalizeFallback batchId
+
+                if not (isNull a) then %a.SetTag("outcome", outcome)
+                Metrics.batchFinalizedTotal.Add(1L, KeyValuePair("outcome", box outcome))
+                Metrics.batchSize.Record(itemCount, KeyValuePair("outcome", box outcome))
         } :> Task
 
     /// Webhook entry for an album photo. Fast path: DB upsert + placeholder
@@ -635,6 +662,11 @@ type CouponFlowHandler(
     /// quickly so Telegram can deliver the next album photo.
     member this.HandleAlbumPhoto (user: DbUser) (msg: Message) : Task<bool> =
         task {
+            use a = botActivity.StartActivity("handleAlbumPhoto")
+            if not (isNull a) then
+                %a.SetTag("userId", user.id)
+                %a.SetTag("chatId", msg.Chat.Id)
+
             let mediaGroupId = msg.MediaGroupId
             if String.IsNullOrWhiteSpace mediaGroupId then return false else
 
@@ -652,6 +684,13 @@ type CouponFlowHandler(
                 // AbandonOpenBatchesExcept takes the same lock).
                 let! batchId, isNew, abandoned =
                     db.CreateBatchAtomically(user.id, mediaGroupId, chatId)
+
+                if isNew then
+                    Metrics.batchCreatedTotal.Add(1L)
+                if abandoned.Length > 0 then
+                    Metrics.batchAbandonedTotal.Add(
+                        int64 abandoned.Length,
+                        KeyValuePair("reason", box "supersede_album"))
 
                 for stale in abandoned do
                     if stale.bulk_message_id.HasValue then

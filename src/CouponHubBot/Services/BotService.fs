@@ -1,6 +1,7 @@
 namespace CouponHubBot.Services
 
 open System
+open System.Collections.Generic
 open System.Diagnostics
 open System.Runtime.ExceptionServices
 open System.Text.Json
@@ -104,8 +105,11 @@ type BotService(
 
                     // Any command also cancels any in-flight album batch.
                     // No bulk-message edit here — the command's response is feedback enough.
-                    let! _ = db.AbandonOpenBatchesExcept(user.id, None)
-                    ()
+                    let! abandoned = db.AbandonOpenBatchesExcept(user.id, None)
+                    if abandoned.Length > 0 then
+                        Metrics.batchAbandonedTotal.Add(
+                            int64 abandoned.Length,
+                            KeyValuePair("reason", box "command"))
 
                 // Handle add wizard steps for non-command messages (photo / free-form inputs).
                 // Important: if /feedback consumes this message, do NOT run /add implicit flow.
