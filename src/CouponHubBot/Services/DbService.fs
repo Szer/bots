@@ -40,6 +40,33 @@ type PendingAddFlow =
       updated_at: DateTime }
 
 [<CLIMutable>]
+type PendingAddBatch =
+    { id: int64
+      user_id: int64
+      media_group_id: string
+      bulk_chat_id: int64
+      bulk_message_id: Nullable<int>
+      status: string
+      created_at: DateTime
+      updated_at: DateTime }
+
+[<CLIMutable>]
+type PendingAddBatchItem =
+    { id: int64
+      batch_id: int64
+      seq: int
+      photo_file_id: string
+      photo_message_id: int
+      status: string
+      value: Nullable<decimal>
+      min_check: Nullable<decimal>
+      expires_at: Nullable<DateOnly>
+      barcode_text: string | null
+      valid_from: Nullable<DateOnly>
+      failure_note: string | null
+      created_at: DateTime }
+
+[<CLIMutable>]
 type UserEventCount =
     { user_id: int64
       username: string | null
@@ -890,4 +917,302 @@ RETURNING id;
             let sql = "UPDATE user_feedback SET github_issue_number = @issue_number WHERE id = @id;"
             let! _ = conn.ExecuteAsync(sql, {| id = feedbackId; issue_number = issueNumber |})
             return ()
+        }
+
+    // ── Album upload batches ─────────────────────────────────────────────
+
+    /// Atomic create-or-find: if no active batch exists for (user, media_group_id),
+    /// inserts one and returns (id, isNew=true). Otherwise returns the existing one
+    /// with isNew=false. Also reaps stale 'open' batches (>1h) opportunistically.
+    member _.CreateOrFindBatch(userId: int64, mediaGroupId: string, chatId: int64) =
+        task {
+            use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+
+            // Housekeeping: reap stale 'open' batches before competing for a new slot.
+            //language=postgresql
+            let reapSql =
+                """
+DELETE FROM pending_add_batch
+WHERE status = 'open'
+  AND updated_at < (@now_utc - interval '1 hour');
+"""
+            let! _ = conn.ExecuteAsync(reapSql, {| now_utc = utcNow () |}, tx)
+
+            //language=postgresql
+            let insertSql =
+                """
+INSERT INTO pending_add_batch (user_id, media_group_id, bulk_chat_id)
+VALUES (@user_id, @media_group_id, @chat_id)
+ON CONFLICT (user_id, media_group_id) WHERE status IN ('open','awaiting_user')
+DO NOTHING
+RETURNING id;
+"""
+            let! newId =
+                conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
+                    insertSql,
+                    {| user_id = userId; media_group_id = mediaGroupId; chat_id = chatId |},
+                    tx)
+
+            if newId.HasValue then
+                do! tx.CommitAsync()
+                return newId.Value, true
+            else
+                //language=postgresql
+                let findSql =
+                    """
+SELECT id
+FROM pending_add_batch
+WHERE user_id = @user_id
+  AND media_group_id = @media_group_id
+  AND status IN ('open', 'awaiting_user')
+LIMIT 1;
+"""
+                let! existingId =
+                    conn.QuerySingleAsync<int64>(
+                        findSql,
+                        {| user_id = userId; media_group_id = mediaGroupId |},
+                        tx)
+                do! tx.CommitAsync()
+                return existingId, false
+        }
+
+    /// Deletes all of the user's active batches except `exceptId` (if provided).
+    /// Returns the deleted rows so the caller can edit their bulk-confirm messages.
+    member _.AbandonOpenBatchesExcept(userId: int64, exceptId: int64 option) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+DELETE FROM pending_add_batch
+WHERE user_id = @user_id
+  AND status IN ('open', 'awaiting_user')
+  AND (@except_id IS NULL OR id <> @except_id)
+RETURNING *;
+"""
+            let exceptParam =
+                match exceptId with
+                | Some v -> Nullable v
+                | None -> Nullable()
+            let! rows = conn.QueryAsync<PendingAddBatch>(sql, {| user_id = userId; except_id = exceptParam |})
+            return rows |> Seq.toArray
+        }
+
+    member _.SetBatchBulkMessageId(batchId: int64, messageId: int) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "UPDATE pending_add_batch SET bulk_message_id = @msg_id, updated_at = @now_utc WHERE id = @id;"
+            let! _ = conn.ExecuteAsync(sql, {| id = batchId; msg_id = messageId; now_utc = utcNow () |})
+            return ()
+        }
+
+    member _.ClearBatch(batchId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "DELETE FROM pending_add_batch WHERE id = @id;"
+            let! _ = conn.ExecuteAsync(sql, {| id = batchId |})
+            return ()
+        }
+
+    /// Atomic flip 'open' -> 'awaiting_user'. Returns true if THIS caller won the
+    /// flip (i.e. it's our job to render the bulk-confirm UI). Returns false if
+    /// another finalize handler beat us to it, or the batch was abandoned.
+    member _.TryFlipBatchToAwaiting(batchId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch
+SET status = 'awaiting_user', updated_at = @now_utc
+WHERE id = @id AND status = 'open'
+RETURNING id;
+"""
+            let! flipped =
+                conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
+                    sql,
+                    {| id = batchId; now_utc = utcNow () |})
+            return flipped.HasValue
+        }
+
+    /// Atomically reclassify any items still 'pending' at this instant as
+    /// 'needs_input' with reason 'timeout'. Returns the count for logging/metrics.
+    /// Late OCR writes will no-op because OCR's UPDATE is guarded WHERE status='pending'.
+    member _.ClaimPendingItemsAsTimeout(batchId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch_item
+SET status = 'needs_input', failure_note = 'timeout'
+WHERE batch_id = @batch_id AND status = 'pending'
+RETURNING id;
+"""
+            let! ids = conn.QueryAsync<int64>(sql, {| batch_id = batchId |})
+            return ids |> Seq.length
+        }
+
+    /// Inserts a new item under a batch. Locks the batch row to serialize seq
+    /// assignment under concurrent webhook arrivals for the same album. Returns
+    /// None on duplicate photo_file_id (Telegram redelivery) or on a closed/missing batch.
+    member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int) =
+        task {
+            use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+
+            //language=postgresql
+            let lockSql =
+                """
+SELECT id FROM pending_add_batch
+WHERE id = @id AND status IN ('open', 'awaiting_user')
+FOR UPDATE;
+"""
+            let! lockedId =
+                conn.QuerySingleOrDefaultAsync<Nullable<int64>>(lockSql, {| id = batchId |}, tx)
+            if not lockedId.HasValue then
+                do! tx.RollbackAsync()
+                return None
+            else
+                //language=postgresql
+                let insertSql =
+                    """
+INSERT INTO pending_add_batch_item (batch_id, seq, photo_file_id, photo_message_id, status)
+SELECT @batch_id,
+       COALESCE((SELECT MAX(seq) FROM pending_add_batch_item WHERE batch_id = @batch_id), 0) + 1,
+       @photo_file_id,
+       @photo_message_id,
+       'pending'
+ON CONFLICT (batch_id, photo_file_id) DO NOTHING
+RETURNING id;
+"""
+                let! newId =
+                    conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
+                        insertSql,
+                        {| batch_id = batchId
+                           photo_file_id = photoFileId
+                           photo_message_id = photoMessageId |},
+                        tx)
+                if newId.HasValue then
+                    // Bump batch updated_at so the TTL reaper doesn't pick it up mid-album.
+                    //language=postgresql
+                    let touchSql = "UPDATE pending_add_batch SET updated_at = @now_utc WHERE id = @id;"
+                    let! _ = conn.ExecuteAsync(touchSql, {| id = batchId; now_utc = utcNow () |}, tx)
+                    do! tx.CommitAsync()
+                    return Some newId.Value
+                else
+                    do! tx.RollbackAsync()
+                    return None
+        }
+
+    /// Conditional OCR-success write: only updates if the row is still 'pending'.
+    /// Returns true if the update landed (i.e. finalize hasn't already claimed it).
+    member _.UpdateBatchItemOcrOk(
+            itemId: int64,
+            value: Nullable<decimal>,
+            minCheck: Nullable<decimal>,
+            expiresAt: Nullable<DateOnly>,
+            barcodeText: string | null,
+            validFrom: Nullable<DateOnly>) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch_item
+SET status = 'ok',
+    value = @value,
+    min_check = @min_check,
+    expires_at = @expires_at,
+    barcode_text = @barcode_text,
+    valid_from = @valid_from
+WHERE id = @id AND status = 'pending';
+"""
+            let! affected =
+                conn.ExecuteAsync(
+                    sql,
+                    {| id = itemId
+                       value = value
+                       min_check = minCheck
+                       expires_at = expiresAt
+                       barcode_text = barcodeText
+                       valid_from = validFrom |})
+            return affected > 0
+        }
+
+    member _.UpdateBatchItemNeedsInput(itemId: int64, reason: string) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch_item
+SET status = 'needs_input', failure_note = @reason
+WHERE id = @id AND status = 'pending';
+"""
+            let! _ = conn.ExecuteAsync(sql, {| id = itemId; reason = reason |})
+            return ()
+        }
+
+    member _.MarkBatchItemInserted(itemId: int64, couponId: int) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch_item
+SET status = 'inserted', failure_note = @note
+WHERE id = @id;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| id = itemId; note = $"coupon_id={couponId}" |})
+            return ()
+        }
+
+    member _.MarkBatchItemFailed(itemId: int64, note: string) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch_item
+SET status = 'failed', failure_note = @note
+WHERE id = @id;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| id = itemId; note = note |})
+            return ()
+        }
+
+    member _.GetBatchById(batchId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT * FROM pending_add_batch WHERE id = @id;"
+            let! row = conn.QuerySingleOrDefaultAsync<PendingAddBatch>(sql, {| id = batchId |})
+            if obj.ReferenceEquals(row, null) then
+                return None
+            else
+                return Some row
+        }
+
+    member _.GetBatchItems(batchId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT * FROM pending_add_batch_item WHERE batch_id = @id ORDER BY seq;"
+            let! rows = conn.QueryAsync<PendingAddBatchItem>(sql, {| id = batchId |})
+            return rows |> Seq.toArray
+        }
+
+    /// Snapshot of all 'open' batches (incomplete at the time of bot startup).
+    /// Used by BatchRecoveryService to re-OCR pending items and re-arm finalize.
+    member _.GetOpenBatchesForRecovery() =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT * FROM pending_add_batch WHERE status = 'open' ORDER BY id;"
+            let! rows = conn.QueryAsync<PendingAddBatch>(sql)
+            return rows |> Seq.toArray
         }

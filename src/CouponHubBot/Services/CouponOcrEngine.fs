@@ -375,11 +375,21 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let barcode = tryDecodeBarcode imageBytes
 
             let! ocrAnalysis =
-                try
-                    azureTextOcr.AnalyzeImageBytes(imageBytes)
-                with ex ->
-                    logger.LogWarning(ex, "Azure text OCR failed")
-                    Task.FromResult((null: OcrAnalysis | null))
+                task {
+                    try
+                        return! azureTextOcr.AnalyzeImageBytes(imageBytes)
+                    with
+                    | :? System.OperationCanceledException as ex ->
+                        // Transient: surface so the batch flow can retry once.
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
+                        return Unchecked.defaultof<_>
+                    | :? System.Net.Http.HttpRequestException as ex ->
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
+                        return Unchecked.defaultof<_>
+                    | ex ->
+                        logger.LogWarning(ex, "Azure text OCR failed")
+                        return (null: OcrAnalysis | null)
+                }
 
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
 

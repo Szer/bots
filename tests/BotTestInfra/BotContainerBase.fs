@@ -264,3 +264,58 @@ type BotContainerBase(config: BotContainerConfig) =
             let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/response", payload)
             return ()
         }
+
+    member _.SetAzureOcrDelay(delayMs: int) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureDelayMock = { delayMs = delayMs }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/delay", payload)
+            return ()
+        }
+
+    member _.SetAzureOcrErrorMode(mode: string) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureErrorModeMock = { mode = mode }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/errorMode", payload)
+            return ()
+        }
+
+    member _.SetAzureOcrScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/script", payload)
+            return ()
+        }
+
+    member _.ClearAzureOcrCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! _ = fakeAzureHttp.DeleteAsync("/test/calls")
+            return ()
+        }
+
+    member _.GetAzureOcrCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
+            return resp
+        }
+
+    /// Stops and re-starts the bot app container, preserving postgres + fakes so
+    /// DB state survives. Used for restart-recovery tests.
+    member this.RestartBotApp() =
+        task {
+            do! botContainer.StopAsync()
+            do! botContainer.StartAsync()
+            botHttp.Dispose()
+            botHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{botContainer.GetMappedPublicPort(80)}"))
+            botHttp.Timeout <- TimeSpan.FromSeconds(15.0)
+            botHttp.DefaultRequestHeaders.Add("X-Telegram-Bot-Api-Secret-Token", config.SecretToken)
+        }

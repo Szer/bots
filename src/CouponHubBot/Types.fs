@@ -21,7 +21,8 @@ type BotConfiguration =
       GitHubToken: string
       GitHubRepo: string
       TestMode: bool
-      MaxTakenCoupons: int }
+      MaxTakenCoupons: int
+      BatchDebounceMs: int }
 
 [<CLIMutable>]
 type DbUser =

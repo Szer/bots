@@ -64,6 +64,7 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
                 "GITHUB_REPO",             "",                     "FREE_FORM", "CORE"
                 "TEST_MODE",               "true",                 "FEATURE_FLAG", "CORE"
                 "MAX_TAKEN_COUPONS",       "4",                    "FREE_FORM", "CORE"
+                "BATCH_DEBOUNCE_MS",       "200",                  "FREE_FORM", "BATCH"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

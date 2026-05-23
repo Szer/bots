@@ -1,10 +1,15 @@
 namespace CouponHubBot.Services
 
 open System
+open System.Collections.Concurrent
+open System.Net.Http
+open System.Threading
+open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
+open Telegram.Bot.Types.ReplyMarkups
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
@@ -13,13 +18,26 @@ open BotInfra
 
 type CouponFlowHandler(
     botClient: ITelegramBotClient,
+    botOptions: IOptions<BotConfiguration>,
     ocrOptions: IOptions<BotOcrConfig>,
     db: DbService,
     couponOcr: CouponOcrEngine,
+    batchDebounce: BatchDebounce,
     time: TimeProvider,
     logger: ILogger<CouponFlowHandler>
 ) =
     let sendText = BotHelpers.sendText botClient
+
+    // In-memory nudge throttles. Lost on restart — user may see one extra nudge,
+    // which is fine. Keyed by user id; the date is the last UTC day on which we nudged.
+    let nudgedAddCmdToday    = ConcurrentDictionary<int64, DateOnly>()
+    let nudgedAlbumToday     = ConcurrentDictionary<int64, DateOnly>()
+    let lastSinglePhotoAt    = ConcurrentDictionary<int64, DateTimeOffset>()
+
+    let addCmdNudgeLine =
+        "\n\n_(подсказка: можно просто прислать фото без команды /add)_"
+    let albumNudgeLine =
+        "\n\n_(подсказка: можно выделить несколько фото сразу и отправить альбомом)_"
 
     let buildConfirmTextAndKeyboard (value: decimal) (minCheck: decimal) (expiresAt: DateOnly) (barcodeText: string | null) (validFrom: DateOnly option) =
         let v = value.ToString("0.##")
@@ -49,7 +67,18 @@ type CouponFlowHandler(
                       valid_from = Nullable()
                       updated_at = time.GetUtcNow().UtcDateTime }
                 )
-            do! sendText chatId "Пришли фото купона (просто картинку)."
+            let today = DateOnly.FromDateTime(time.GetUtcNow().UtcDateTime)
+            let shouldNudge =
+                match nudgedAddCmdToday.TryGetValue user.id with
+                | true, d when d = today -> false
+                | _ -> true
+            let text =
+                if shouldNudge then
+                    nudgedAddCmdToday[user.id] <- today
+                    "Пришли фото купона (просто картинку)." + addCmdNudgeLine
+                else
+                    "Пришли фото купона (просто картинку)."
+            do! sendText chatId text
         }
 
     member _.HandleAddManual (user: DbUser) (msg: Message) =
@@ -97,6 +126,24 @@ type CouponFlowHandler(
 
     member _.HandleAddWizardPhoto (user: DbUser) (chatId: int64) (photoFileId: string) =
         task {
+            // Rapid-singles nudge: detect ≥2 single photos within 5s, hint album upload once per day.
+            let nowOffset = time.GetUtcNow()
+            let isRapid =
+                match lastSinglePhotoAt.TryGetValue user.id with
+                | true, prev -> (nowOffset - prev).TotalSeconds < 5.0
+                | _ -> false
+            lastSinglePhotoAt[user.id] <- nowOffset
+            let nudgeToday = DateOnly.FromDateTime(nowOffset.UtcDateTime)
+            let shouldAlbumNudge =
+                isRapid
+                && (match nudgedAlbumToday.TryGetValue user.id with
+                    | true, d when d = nudgeToday -> false
+                    | _ -> true)
+            if shouldAlbumNudge then nudgedAlbumToday[user.id] <- nudgeToday
+
+            if shouldAlbumNudge then
+                do! sendText chatId (albumNudgeLine.TrimStart())
+
             do! db.UpsertPendingAddFlow(
                     { user_id = user.id
                       stage = "awaiting_discount_choice"
@@ -354,4 +401,218 @@ type CouponFlowHandler(
                     return true
                 else
                     return false
+        }
+
+    // ── Album batch flow ────────────────────────────────────────────────
+
+    /// Format one OK item for the bulk-confirm message.
+    /// Mirrors the single-photo confirm text style.
+    member private _.FormatBatchItemLine (item: PendingAddBatchItem) : string =
+        let v = item.value.Value.ToString("0.##")
+        let mc = item.min_check.Value.ToString("0.##")
+        let d = BotHelpers.formatUiDate item.expires_at.Value
+        let bc = item.barcode_text
+        let bcSuffix =
+            if String.IsNullOrWhiteSpace bc then ""
+            else
+                let tail =
+                    if bc.Length >= 4 then bc.Substring(bc.Length - 4) else bc
+                $" ···{tail}"
+        $"• {v}€ из {mc}€, до {d}{bcSuffix}"
+
+    /// Builds the bulk-confirm message body + keyboard from the final batch snapshot.
+    member this.RenderBulkConfirm (batchId: int64) (items: PendingAddBatchItem array) : string * InlineKeyboardMarkup =
+        let okItems = items |> Array.filter (fun i -> i.status = "ok")
+        if okItems.Length = 0 then
+            "Не смог распознать ни одного купона.", BotHelpers.addBatchConfirmKeyboard batchId 0
+        else
+            let header = $"Подтвердить {okItems.Length} купонов:"
+            let lines = okItems |> Array.map this.FormatBatchItemLine
+            let body = String.concat "\n" lines
+            $"{header}\n{body}", BotHelpers.addBatchConfirmKeyboard batchId okItems.Length
+
+    /// Background OCR for one item. Fire-and-forget from the webhook handler.
+    /// 2s HTTP timeout (configured on the OCR HttpClient), one retry on
+    /// transient network failures. All writes are conditional on status='pending'
+    /// so a late OCR finish after finalize's claim is a safe no-op.
+    member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) : Task =
+        task {
+            try
+                use a = botActivity.StartActivity("batchOcrItem")
+                if not (isNull a) then
+                    %a.SetTag("batchId", batchId)
+                    %a.SetTag("itemId", itemId)
+
+                let ocrConfig = ocrOptions.Value
+
+                if not ocrConfig.OcrEnabled then
+                    do! db.UpdateBatchItemNeedsInput(itemId, "OCR disabled")
+                else
+                    let! file = botClient.GetFile(photoFileId)
+                    if isNull file || String.IsNullOrWhiteSpace file.FilePath then
+                        do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                    else
+                        use ms = new System.IO.MemoryStream()
+                        do! botClient.DownloadFile(file.FilePath, ms)
+                        let bytes = ms.ToArray()
+                        if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
+                            do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                        else
+                            let attempt () = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                            let! ocr =
+                                task {
+                                    try
+                                        return! attempt ()
+                                    with
+                                    | :? OperationCanceledException
+                                    | :? HttpRequestException as ex ->
+                                        logger.LogInformation(ex, "OCR transient failure for item {ItemId}, retrying once", itemId)
+                                        do! Task.Delay 100
+                                        return! attempt ()
+                                }
+
+                            if String.IsNullOrWhiteSpace ocr.barcode then
+                                do! db.UpdateBatchItemNeedsInput(itemId, "no barcode")
+                            else
+                                let validFromNullable =
+                                    if ocr.validFrom.HasValue then
+                                        Nullable(DateOnly.FromDateTime(ocr.validFrom.Value))
+                                    else Nullable()
+                                let expiresNullable =
+                                    if ocr.validTo.HasValue then
+                                        Nullable(DateOnly.FromDateTime(ocr.validTo.Value))
+                                    else Nullable()
+                                let! _ =
+                                    db.UpdateBatchItemOcrOk(
+                                        itemId,
+                                        ocr.couponValue,
+                                        ocr.minCheck,
+                                        expiresNullable,
+                                        ocr.barcode,
+                                        validFromNullable)
+                                ()
+            with ex ->
+                logger.LogWarning(ex, "OCR failed for batch {BatchId} item {ItemId}", batchId, itemId)
+                try
+                    do! db.UpdateBatchItemNeedsInput(itemId, "OCR failed")
+                with ex2 ->
+                    logger.LogError(ex2, "Also failed to write OCR-failed status for item {ItemId}", itemId)
+        } :> Task
+
+    /// Per-failed-photo reply text, varied by failure reason.
+    member private _.NeedsInputReplyText (failureNote: string | null) : string =
+        match failureNote with
+        | null -> "Не смог распознать этот купон. Пришли его отдельно."
+        | s when s = "timeout" -> "Этот купон не успел обработаться — пришли его отдельно."
+        | s when s = "OCR failed" -> "Не получилось распознать этот купон. Пришли его отдельно."
+        | _ -> "Не смог распознать этот купон. Пришли его отдельно."
+
+    /// Close-handler invoked by BatchDebounce after debounceMs of silence.
+    /// DB-driven: atomically flips status, claims any still-pending items as
+    /// timeout, snapshots, renders the bulk-confirm UI, sends per-failed-photo
+    /// replies. Safe to call concurrently — TryFlipBatchToAwaiting enforces single-winner.
+    member this.FinalizeBatch (batchId: int64) : Task =
+        task {
+            let! won = db.TryFlipBatchToAwaiting batchId
+            if not won then () else
+
+            let! claimedCount = db.ClaimPendingItemsAsTimeout batchId
+            if claimedCount > 0 then
+                logger.LogInformation("Batch {BatchId}: {Count} item(s) timed out at finalize", batchId, claimedCount)
+
+            let! batchOpt = db.GetBatchById batchId
+            match batchOpt with
+            | None -> ()
+            | Some batch ->
+                let! items = db.GetBatchItems batchId
+                let text, kb = this.RenderBulkConfirm batchId items
+
+                // Best-effort: delete the placeholder so the fresh confirm message pushes a notification.
+                if batch.bulk_message_id.HasValue then
+                    try
+                        do! botClient.DeleteMessage(ChatId batch.bulk_chat_id, batch.bulk_message_id.Value)
+                    with _ -> ()
+
+                let! sent =
+                    botClient.SendMessage(
+                        ChatId batch.bulk_chat_id,
+                        text,
+                        replyMarkup = kb)
+                do! db.SetBatchBulkMessageId(batchId, sent.MessageId)
+
+                let needsInput = items |> Array.filter (fun i -> i.status = "needs_input")
+                for item in needsInput do
+                    let replyText = this.NeedsInputReplyText item.failure_note
+                    let replyParams =
+                        ReplyParameters(
+                            MessageId = item.photo_message_id,
+                            AllowSendingWithoutReply = true)
+                    try
+                        do! botClient.SendMessage(
+                                ChatId batch.bulk_chat_id,
+                                replyText,
+                                replyParameters = replyParams)
+                            |> taskIgnore
+                    with _ ->
+                        // Reply target gone (user deleted photo etc.). Fall back to plain message.
+                        try
+                            do! sendText batch.bulk_chat_id replyText
+                        with _ -> ()
+        } :> Task
+
+    /// Webhook entry for an album photo. Fast path: DB upsert + placeholder
+    /// (first photo only) + fire OCR in background + re-arm debounce. Returns
+    /// quickly so Telegram can deliver the next album photo.
+    member this.HandleAlbumPhoto (user: DbUser) (msg: Message) : Task<bool> =
+        task {
+            let mediaGroupId = msg.MediaGroupId
+            if String.IsNullOrWhiteSpace mediaGroupId then return false else
+
+            match BotHelpers.getLargestPhotoFileId msg with
+            | None -> return false
+            | Some photoFileId ->
+                // A new album supersedes any single-photo wizard in progress.
+                do! db.ClearPendingAddFlow user.id
+
+                let chatId = msg.Chat.Id
+                let! batchId, isNew = db.CreateOrFindBatch(user.id, mediaGroupId, chatId)
+
+                if isNew then
+                    // Cancel any other in-flight batch the user might have (different media_group_id).
+                    let! abandoned = db.AbandonOpenBatchesExcept(user.id, Some batchId)
+                    for stale in abandoned do
+                        if stale.bulk_message_id.HasValue then
+                            try
+                                do! botClient.EditMessageText(
+                                        ChatId stale.bulk_chat_id,
+                                        stale.bulk_message_id.Value,
+                                        "Отменено: пришёл новый альбом.")
+                                    |> taskIgnore
+                            with _ -> ()
+
+                    try
+                        let! placeholder =
+                            botClient.SendMessage(
+                                ChatId chatId,
+                                "Получил, обрабатываю купоны, подожди немного…")
+                        do! db.SetBatchBulkMessageId(batchId, placeholder.MessageId)
+                    with ex ->
+                        logger.LogWarning(ex, "Failed to send album placeholder for batch {BatchId}", batchId)
+
+                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, msg.MessageId)
+                match itemIdOpt with
+                | None ->
+                    // Either a Telegram redelivery (same photo_file_id) or the batch
+                    // was concurrently abandoned. Either way, nothing more to do.
+                    return true
+                | Some itemId ->
+                    // Fire-and-forget OCR. DB is the channel back to FinalizeBatch.
+                    Task.Run(fun () -> this.OcrItem batchId itemId photoFileId) |> ignore
+
+                    let debounceMs = botOptions.Value.BatchDebounceMs
+                    batchDebounce.Schedule(
+                        batchId,
+                        debounceMs,
+                        Func<Task>(fun () -> this.FinalizeBatch batchId))
+                    return true
         }

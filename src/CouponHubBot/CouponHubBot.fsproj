@@ -11,9 +11,11 @@
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />
     <Compile Include="Services/BotHelpers.fs" />
+    <Compile Include="Services/BatchDebounce.fs" />
     <Compile Include="Services/CouponFlowHandler.fs" />
     <Compile Include="Services/CommandHandler.fs" />
     <Compile Include="Services/CallbackHandler.fs" />
+    <Compile Include="Services/BatchRecoveryService.fs" />
     <Compile Include="Services/BotService.fs" />
     <Compile Include="Services/BotCommandsSetup.fs" />
     <Compile Include="Program.fs" />

@@ -33,3 +33,26 @@ type AzureResponseMock =
 type MethodErrorMock =
     { methodName: string
       enabled: bool }
+
+/// Mock payload for FakeAzureOcrApi /test/mock/delay (per-call response delay).
+[<CLIMutable>]
+type AzureDelayMock =
+    { delayMs: int }
+
+/// Mock payload for FakeAzureOcrApi /test/mock/errorMode.
+/// Recognized values: "" (off), "network" (TCP abort), "timeout" (10s stall).
+[<CLIMutable>]
+type AzureErrorModeMock =
+    { mode: string }
+
+/// Single scripted response. errorMode "" means use status+body normally.
+[<CLIMutable>]
+type AzureScriptedResponse =
+    { status: int
+      body: string
+      delayMs: int
+      errorMode: string }
+
+[<CLIMutable>]
+type AzureScriptMock =
+    { responses: AzureScriptedResponse array }

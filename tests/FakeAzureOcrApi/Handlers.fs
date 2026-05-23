@@ -4,6 +4,7 @@ open System
 open System.Net
 open System.Text
 open System.Text.Json
+open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 
 module Handlers =
@@ -31,7 +32,31 @@ module Handlers =
             Console.WriteLine($"FAKE AZURE IN  {ctx.Request.Method} {url} bodyLen={body.Length}")
             Store.logCall ctx.Request.Method url body
 
-            do! respondJson ctx Store.responseStatus Store.responseBody
+            // Per-call scripted response wins over static, if any are queued.
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.responseScript.TryDequeue(&item) then Some item else None
+
+            let status, respBody, delayMs, errorMode =
+                match scripted with
+                | Some s ->
+                    let em = if isNull (box s.errorMode) then "" else s.errorMode
+                    s.status, s.body, s.delayMs, em
+                | None -> Store.responseStatus, Store.responseBody, Store.responseDelayMs, Store.responseErrorMode
+
+            if delayMs > 0 then
+                do! Task.Delay(delayMs)
+
+            match errorMode with
+            | "network" ->
+                // Abort the request so the client sees a TCP-level failure → HttpRequestException.
+                ctx.Abort()
+            | "timeout" ->
+                // Stall well past the client's HttpClient.Timeout so it cancels first.
+                do! Task.Delay(10_000)
+                do! respondJson ctx status respBody
+            | _ ->
+                do! respondJson ctx status respBody
         }
 
     /// Fake Azure OpenAI Chat Completions handler.
@@ -152,6 +177,54 @@ module Handlers =
                 | payload ->
                     Store.responseStatus <- payload.status
                     Store.responseBody <- payload.body
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    let setDelay (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<DelayMockDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.responseDelayMs <- payload.delayMs
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    let setErrorMode (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ErrorModeDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.responseErrorMode <- if isNull (box payload.mode) then "" else payload.mode
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    let setScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.responseScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

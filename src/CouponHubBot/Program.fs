@@ -64,7 +64,8 @@ let buildBotConf () =
       GitHubToken = getEnvOr "GITHUB_TOKEN" ""
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/coupon-bot")
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
-      MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int }
+      MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
+      BatchDebounceMs = getSettingOr "BATCH_DEBOUNCE_MS" "5000" |> int }
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
@@ -97,9 +98,11 @@ WebhookHost.configureSharedServices webhookCfg builder
 
 %builder.Services.AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
 
-// OCR: register shared IBotOcr
+// OCR: register shared IBotOcr with a 2s per-attempt HTTP timeout so the batch
+// flow can safely render results at debounce time without awaiting in-flight calls.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
+%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>(fun c ->
+    c.Timeout <- TimeSpan.FromSeconds 2.)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()
@@ -108,6 +111,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .Services
     .AddSingleton<BotService>()
     .AddSingleton<CouponFlowHandler>()
+    .AddSingleton<BatchDebounce>()
     .AddSingleton<CommandHandler>()
     .AddSingleton<CallbackHandler>()
     .AddSingleton<DbService>(fun sp ->
@@ -117,6 +121,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
     .AddHostedService<BotCommandsSetupService>()
+    .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
 
