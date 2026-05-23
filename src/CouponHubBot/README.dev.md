@@ -27,7 +27,7 @@ cp env.example .env
 ```
 
 Update `.env` with your values:
-- `DATABASE_URL` — should point to `localhost:5439` (Postgres from docker-compose)
+- `DATABASE_URL` — should point to `localhost:15432` (Postgres from docker-compose)
 - `TELEGRAM_API_URL` — set to `http://localhost:8080` if using FakeTgApi, or leave empty for real Telegram API
 - `BOT_TELEGRAM_TOKEN` — your real bot token (or `123:456` for testing with FakeTgApi)
 - `BOT_AUTH_TOKEN` — secret token for webhook authentication
@@ -58,6 +58,94 @@ The bot will log:
 FakeTgApi logs:
 - `FAKE TG IN {method} {path}` — incoming Telegram API calls
 - Check `/test/calls` endpoint to see all logged API calls
+
+## Smoke Test Against Real Telegram (Bot in Docker + ngrok)
+
+End-to-end test the album-upload flow against the real Telegram API using a
+**duplicate test bot** (NOT the production bot). Webhook traffic from Telegram
+is tunnelled to the local Docker container via ngrok.
+
+### 1. Configure secrets
+
+```bash
+cp src/coupon-hub-bot/.env.local.example src/coupon-hub-bot/.env.local
+# Edit .env.local: BOT_TELEGRAM_TOKEN (from @BotFather, NEW test bot),
+# BOT_AUTH_TOKEN (any random secret), FEEDBACK_ADMINS (your tg user id).
+```
+
+`.env.local` is gitignored (`**/.env.local`).
+
+### 2. Bring up the stack
+
+```bash
+docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile smoke up -d --build
+```
+
+This starts Postgres (15432), runs Flyway migrations, seeds `bot_setting` from a
+prod snapshot (`dev-bot-settings.sql` — includes `OCR_ENABLED=true`,
+`AZURE_OCR_ENDPOINT=...`, etc.), and runs the bot on host port 5000. Default
+`up` (without `--profile smoke`) brings only Postgres + Flyway + the
+settings seed for the Rider workflow.
+
+Tail bot logs:
+
+```bash
+docker logs -f coupon-hub-bot-dev
+```
+
+### 3. Expose the bot to Telegram via ngrok
+
+```bash
+ngrok http 5000
+```
+
+Copy the `https://<id>.ngrok-free.app` URL ngrok prints.
+
+### 4. Register the webhook with Telegram
+
+```bash
+curl "https://api.telegram.org/bot<BOT_TELEGRAM_TOKEN>/setWebhook" \
+  -d "url=https://<ngrok-id>.ngrok-free.app/bot" \
+  -d "secret_token=<BOT_AUTH_TOKEN>"
+
+# Verify:
+curl "https://api.telegram.org/bot<BOT_TELEGRAM_TOKEN>/getWebhookInfo"
+```
+
+### 5. (Optional) Tweak bot_setting
+
+`OCR_ENABLED`, `AZURE_OCR_ENDPOINT`, `FEEDBACK_ADMINS`, etc. are already
+seeded from the prod snapshot — no manual flip needed for OCR. To change a
+value mid-session and have the bot pick it up without a restart:
+
+```bash
+docker exec -it coupon-hub-postgres-dev psql -U admin -d coupon_hub_bot \
+  -c "UPDATE bot_setting SET value='false' WHERE key='OCR_ENABLED';"
+docker exec -it coupon-hub-bot-dev sh -c "curl -s -X POST http://localhost:5000/reload-settings -H 'X-Telegram-Bot-Api-Secret-Token: '\$BOT_AUTH_TOKEN"
+```
+
+The seed uses `ON CONFLICT DO NOTHING`, so on a subsequent `docker compose up`
+your manual UPDATEs are preserved. To force a re-seed from the file:
+
+```bash
+docker exec -it coupon-hub-postgres-dev psql -U admin -d coupon_hub_bot -c "DELETE FROM bot_setting;"
+docker compose -f src/coupon-hub-bot/docker-compose.dev.yml run --rm seed-bot-settings
+```
+
+### 6. Test
+
+Send an album (multiple photos as one Telegram message) to the duplicate bot.
+You should see:
+- Immediate "Получил, обрабатываю купоны…" placeholder.
+- After ~5s (or `BATCH_DEBOUNCE_MS` in `bot_setting`), the placeholder is deleted
+  and replaced with a fresh "Подтвердить N купонов" message.
+
+### 7. Tear down
+
+```bash
+docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile smoke down -v
+curl "https://api.telegram.org/bot<BOT_TELEGRAM_TOKEN>/deleteWebhook"
+```
 
 ## OCR (CouponOcrEngine) — Separate Test Suite
 
@@ -103,8 +191,8 @@ docker ps | grep coupon-hub-postgres-dev
 # Check Postgres logs
 docker logs coupon-hub-postgres-dev
 
-# Connect manually (host, port 5439)
-psql -h localhost -p 5439 -U coupon_hub_bot_service -d coupon_hub_bot
+# Connect manually (host, port 15432)
+psql -h localhost -p 15432 -U coupon_hub_bot_service -d coupon_hub_bot
 
 # Or from inside container (port 5432)
 docker exec -it coupon-hub-postgres-dev psql -U coupon_hub_bot_service -d coupon_hub_bot

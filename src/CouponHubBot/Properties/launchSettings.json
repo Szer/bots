@@ -11,7 +11,7 @@
         "BOT_AUTH_TOKEN": "OUR_SECRET",
         "COMMUNITY_CHAT_ID": "-42",
         "LOGS_CHAT_ID": "",
-        "DATABASE_URL": "Server=localhost;Database=coupon_hub_bot;Port=5439;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;",
+        "DATABASE_URL": "Server=localhost;Database=coupon_hub_bot;Port=15432;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;",
         "TELEGRAM_API_URL": "http://localhost:8080",
         "REMINDER_HOUR_DUBLIN" : "10",
         "REMINDER_RUN_ON_START": "false",
