@@ -33,7 +33,7 @@ type BatchRecoveryService(
                         for item in items do
                             if item.status = "pending" then
                                 Task.Run(fun () ->
-                                    couponFlow.OcrItem batch.id item.id item.photo_file_id)
+                                    couponFlow.OcrItem batch.id item.id item.photo_file_id None)
                                 |> ignore
                         batchDebounce.Schedule(
                             batch.id,
