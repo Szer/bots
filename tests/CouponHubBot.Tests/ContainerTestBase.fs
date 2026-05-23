@@ -64,7 +64,12 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
                 "GITHUB_REPO",             "",                     "FREE_FORM", "CORE"
                 "TEST_MODE",               "true",                 "FEATURE_FLAG", "CORE"
                 "MAX_TAKEN_COUPONS",       "4",                    "FREE_FORM", "CORE"
-                "BATCH_DEBOUNCE_MS",       "2000",                 "FREE_FORM", "BATCH"
+                // With TestMode the bot uses FakeTimeProvider, so this debounce timer
+                // does NOT fire on its own — tests call fixture.AdvanceBotClock to fire
+                // it deterministically. 30s is just a defensive fallback: if the
+                // FakeTimeProvider wiring breaks, batch tests still fail fast (and
+                // loudly) instead of hanging.
+                "BATCH_DEBOUNCE_MS",       "30000",                "FREE_FORM", "BATCH"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

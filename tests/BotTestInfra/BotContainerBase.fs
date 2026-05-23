@@ -308,6 +308,19 @@ type BotContainerBase(config: BotContainerConfig) =
             return resp
         }
 
+    /// Advances the bot's FakeTimeProvider by `ms` milliseconds, deterministically
+    /// firing any pending TimeProvider-driven timers (notably BatchDebounce.Schedule).
+    /// Requires TEST_MODE=true on the bot. Returns once the bot has accepted the
+    /// advance — the timer callback work itself is async, so call should be followed
+    /// by polling the DB / GetFakeCalls for the expected post-finalize state.
+    member _.AdvanceBotClock(ms: int) =
+        task {
+            use content = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = botHttp.PostAsync($"/test/clock/advance?ms={ms}", content)
+            resp.EnsureSuccessStatusCode() |> ignore
+            return ()
+        }
+
     /// Stops and re-starts the bot app container, preserving postgres + fakes so
     /// DB state survives. Used for restart-recovery tests.
     member this.RestartBotApp() =
