@@ -75,9 +75,14 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
 
             let mgidA = $"mg-2usrs-A-{DateTime.UtcNow.Ticks}"
             let mgidB = $"mg-2usrs-B-{DateTime.UtcNow.Ticks}"
-            do! fixture.SetTelegramFile("2u-a-1", readImageBytes goodFile)
-            do! fixture.SetTelegramFile("2u-b-1", readImageBytes goodFile)
-            do! fixture.SetAzureOcrResponse(200, readAzureCacheJson goodFile)
+            // Different images for each user so their barcodes differ — otherwise
+            // the 2nd TryAddCoupon hits coupon_barcode_active_uniq (V13) and
+            // returns DuplicateBarcode, dropping that user's count to 0.
+            let fileA = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let fileB = "10_50_2026-01-17_2026-01-26_2706688198838.jpg"
+            do! fixture.SetTelegramFile("2u-a-1", readImageBytes fileA)
+            do! fixture.SetTelegramFile("2u-b-1", readImageBytes fileB)
+            do! fixture.SetAzureOcrResponse(200, readAzureCacheJson fileA)
 
             // Send both concurrently.
             let tasks = [
@@ -111,7 +116,7 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
         }
 
     [<Fact>]
-    let ``Two concurrent albums (different mgid) from same user: one wins, one is abandoned`` () =
+    let ``Two concurrent albums (different mgid) from same user: one wins, the other is deleted`` () =
         task {
             do! setupBatchTest ()
             let user = Tg.user(id = 7320L, username = "two_albums_same", firstName = "TwoAlb")
@@ -131,22 +136,23 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
             let! _ = Task.WhenAll(tasks)
 
             // Both batches initially get created (different media_group_id). Then
-            // AbandonOpenBatchesExcept on the second arrival marks the first as
-            // abandoned. Wait for the abandonment to settle.
+            // AbandonOpenBatchesExcept on the second arrival DELETES the first
+            // (DbService.fs:982 — DELETE … RETURNING *).
             do! Task.Delay 500
 
+            // Exactly one batch remains for this user.
+            let! totalCount =
+                fixture.QuerySingle<int64>(
+                    "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u",
+                    {| u = user.Id |})
+            Assert.Equal(1L, totalCount)
+
+            // And it's in an active state.
             let! activeBatchCount =
                 fixture.QuerySingle<int64>(
                     "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u AND status IN ('open','awaiting_user')",
                     {| u = user.Id |})
-            // Exactly one is in an active state; the other is abandoned.
             Assert.Equal(1L, activeBatchCount)
-
-            let! abandonedCount =
-                fixture.QuerySingle<int64>(
-                    "SELECT COUNT(*)::bigint FROM pending_add_batch WHERE user_id=@u AND status='abandoned'",
-                    {| u = user.Id |})
-            Assert.Equal(1L, abandonedCount)
         }
 
     [<Fact>]

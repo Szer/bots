@@ -262,7 +262,9 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             Assert.Equal(1L, count)
 
             // Summary edit should mention "истёкший" so the user understands what was skipped.
-            do! waitForSendMessageMatching fixture user.Id (fun t -> t.Contains "истёкший") 3000
+            // EditBulkOrSend uses editMessageText (with sendMessage fallback) — use the
+            // helper that checks both endpoints.
+            do! waitForSendMessageOrEditMatching fixture user.Id (fun t -> t.Contains "истёкший") 3000
         }
 
     // ── Happens-before: OCR vs finalize claim ────────────────────────────

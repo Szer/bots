@@ -133,7 +133,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
     // ── New-album supersedes ────────────────────────────────────────────
 
     [<Fact>]
-    let ``New album (different mgid) while previous open: old abandoned, message edited`` () =
+    let ``New album (different mgid) while previous open: old deleted, message edited`` () =
         task {
             do! setupBatchTest ()
             let user = Tg.user(id = 7210L, username = "supersede_open", firstName = "Super")
@@ -145,12 +145,13 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             let! batchA = waitForBatchByUser fixture user.Id 5000
 
             // Second album with different media_group_id → bot's HandleAlbumPhoto
-            // calls AbandonOpenBatchesExcept on the older one.
+            // calls AbandonOpenBatchesExcept which DELETEs the older batch
+            // (see DbService.fs:982 — DELETE … RETURNING *).
             let mgidB = $"mg-sB-{DateTime.UtcNow.Ticks + 1L}"
             do! sendOnePhotoAlbum user mgidB "sB-1" 9902
 
-            // Wait for batchA to be marked 'abandoned'.
-            do! waitForBatchStatus fixture batchA "abandoned" 5000
+            // batchA should be gone, not merely 'abandoned'.
+            do! waitForBatchCleared fixture batchA 5000
 
             // The old bulk message gets edited to "Отменено: пришёл новый альбом."
             do! waitForSendMessageOrEditMatching fixture user.Id (fun t -> t.Contains "Отменено: пришёл новый альбом") 5000
@@ -164,7 +165,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
         }
 
     [<Fact>]
-    let ``New album while previous in awaiting_user: old abandoned too`` () =
+    let ``New album while previous in awaiting_user: old deleted too`` () =
         task {
             do! setupBatchTest ()
             let user = Tg.user(id = 7211L, username = "supersede_aw", firstName = "SuperAw")
@@ -182,7 +183,9 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             let mgidB = $"mg-sAw-B-{DateTime.UtcNow.Ticks + 1L}"
             do! sendOnePhotoAlbum user mgidB "sAw-2" 9911
 
-            do! waitForBatchStatus fixture batchA "abandoned" 5000
+            // AbandonOpenBatchesExcept DELETEs the old batch, even from
+            // 'awaiting_user' state. (The SQL filter is status IN ('open','awaiting_user').)
+            do! waitForBatchCleared fixture batchA 5000
             do! waitForSendMessageOrEditMatching fixture user.Id (fun t -> t.Contains "Отменено: пришёл новый альбом") 5000
         }
 
