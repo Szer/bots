@@ -123,15 +123,24 @@ type CallbackHandler(
                 | false, _ ->
                     do! sendText cq.Message.Chat.Id "Не понял идентификатор пакета."
                 | true, batchId ->
-                    let! batchOpt = db.GetBatchById batchId
-                    match batchOpt with
-                    | Some batch when batch.user_id = user.id && batch.status = "awaiting_user" ->
-                        match parts[2] with
-                        | "cancel" -> do! this.BulkBatchCancel batch
-                        | "confirm" -> do! this.BulkBatchConfirm user batch
-                        | _ -> do! sendText cq.Message.Chat.Id "Не понял действие."
+                    match parts[2] with
+                    | "cancel"
+                    | "confirm" ->
+                        // Atomic claim: only one of confirm/cancel wins the row;
+                        // the loser sees None and answers "уже устарел". This is
+                        // what prevents the confirm-and-cancel double-fire from
+                        // both running TryAddCoupon + EditBulkOrSend and leaving
+                        // the user with a "Ок, отменил" message after the coupon
+                        // was actually added.
+                        let! claimed = db.TryClaimAwaitingBatch(batchId, user.id)
+                        match claimed with
+                        | None ->
+                            do! sendText cq.Message.Chat.Id "Этот пакет уже устарел, отправь альбом заново."
+                        | Some batch ->
+                            if parts[2] = "cancel" then do! this.BulkBatchCancel batch
+                            else do! this.BulkBatchConfirm user batch
                     | _ ->
-                        do! sendText cq.Message.Chat.Id "Этот пакет уже устарел, отправь альбом заново."
+                        do! sendText cq.Message.Chat.Id "Не понял действие."
         }
 
     member this.HandleCallbackQuery (cq: CallbackQuery) =

@@ -1093,6 +1093,38 @@ RETURNING *;
             return ()
         }
 
+    /// Atomic flip 'awaiting_user' -> 'processing' scoped to (batchId, userId).
+    /// Returns Some batch if THIS caller won the claim — i.e. it's exclusively
+    /// allowed to run BulkBatchConfirm or BulkBatchCancel for this batch.
+    /// Returns None if another callback beat us to it (or the batch was already
+    /// gone / belongs to a different user / never reached awaiting_user).
+    ///
+    /// This is what serialises a confirm-click and a cancel-click that arrive
+    /// within microseconds of each other from the same user: only one of the
+    /// two callback handlers sees a row back; the other answers "уже устарел".
+    /// 'processing' is a transient terminal state — BulkBatchConfirm /
+    /// BulkBatchCancel always end with ClearBatch (DELETE), so 'processing'
+    /// only outlives the winning callback handler if the bot crashes mid-action,
+    /// in which case the 1h TTL reaper in CreateBatchAtomically cleans it up.
+    member _.TryClaimAwaitingBatch(batchId: int64, userId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+UPDATE pending_add_batch
+SET status = 'processing', updated_at = @now_utc
+WHERE id = @id AND user_id = @user_id AND status = 'awaiting_user'
+RETURNING *;
+"""
+            let! row =
+                conn.QuerySingleOrDefaultAsync<PendingAddBatch>(
+                    sql,
+                    {| id = batchId; user_id = userId; now_utc = utcNow () |})
+            if obj.ReferenceEquals(row, null) then return None
+            else return Some row
+        }
+
     /// Atomic flip 'open' -> 'awaiting_user'. Returns true if THIS caller won the
     /// flip (i.e. it's our job to render the bulk-confirm UI). Returns false if
     /// another finalize handler beat us to it, or the batch was abandoned.
