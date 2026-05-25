@@ -85,6 +85,10 @@ type BatchResilienceTests(fixture: OcrCouponHubTestContainers) =
             do! advancePastDebounce fixture
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
+            // SendPerPhotoReplies runs AFTER the bulk-confirm send in
+            // RenderAndSendBulkConfirm, so waitForBulkConfirmCall returning does
+            // not mean the per-photo replies have landed yet. Poll for them.
+            do! waitForReplyCount fixture user.Id "Распознал штрихкод, но не разобрал" 3 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -138,6 +142,9 @@ type BatchResilienceTests(fixture: OcrCouponHubTestContainers) =
             do! advancePastDebounce fixture
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
+            // SendPerPhotoReplies runs after the bulk-confirm send, so poll
+            // for the partial reply to land before asserting (see helper docs).
+            do! waitForReplyCount fixture user.Id "Распознал штрихкод, но не разобрал" 1 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls user.Id "Не смог распознать ни одного",

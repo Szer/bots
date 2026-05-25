@@ -69,6 +69,8 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             do! advancePastDebounce fixture
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
+            // SendPerPhotoReplies runs after the bulk-confirm send; poll for it.
+            do! waitForReplyCount fixture user.Id "распознать" 1 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -121,6 +123,8 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             do! advancePastDebounce fixture
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
+            // SendPerPhotoReplies runs after the bulk-confirm send; poll for it.
+            do! waitForReplyCount fixture user.Id "распознать" 2 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls user.Id "Подтвердить 3 купонов",
@@ -164,6 +168,8 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             do! advancePastDebounce fixture
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
+            // SendPerPhotoReplies runs after the bulk-confirm send; poll for it.
+            do! waitForReplyCount fixture user.Id "распознать" 3 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls user.Id "Не смог распознать ни одного",
