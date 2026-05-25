@@ -75,8 +75,8 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             let! calls = fixture.GetFakeCalls("sendMessage")
 
             // Bulk-confirm advertises 2 ok items (the bad one is skipped from header).
-            Assert.True(findCallWithText calls user.Id "Подтвердить 2 купонов",
-                        "Expected 'Подтвердить 2 купонов' header")
+            Assert.True(findCallWithText calls user.Id "Подтвердить 2 купона",
+                        "Expected 'Подтвердить 2 купона' header")
 
             // Exactly one per-photo reply with reply_to targeting the BAD photo's mid.
             let replies = replyCalls calls user.Id (Some "распознать")
@@ -127,8 +127,8 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             do! waitForReplyCount fixture user.Id "распознать" 2 5000
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls user.Id "Подтвердить 3 купонов",
-                        "Expected 'Подтвердить 3 купонов' header for 3 ok + 2 bad")
+            Assert.True(findCallWithText calls user.Id "Подтвердить 3 купона",
+                        "Expected 'Подтвердить 3 купона' header for 3 ok + 2 bad")
 
             let replies = replyCalls calls user.Id (Some "распознать")
             Assert.Equal(2, replies.Length)

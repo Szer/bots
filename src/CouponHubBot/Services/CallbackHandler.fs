@@ -108,12 +108,14 @@ type CallbackHandler(
                     if insertedIds.Count = 0 then "Ничего не добавил."
                     else
                         let ids = insertedIds |> Seq.map string |> String.concat ", "
-                        $"Добавил {insertedIds.Count} купона: ID:{ids}."
+                        let word = RussianPlural.choose insertedIds.Count "купон" "купона" "купонов"
+                        $"Добавил {insertedIds.Count} {word}: ID:{ids}."
                 let skipPart =
                     if skippedNotes.Count = 0 then ""
                     else
                         let notes = skippedNotes |> String.concat "; "
-                        $" {skippedNotes.Count} пропустил: {notes}."
+                        let word = RussianPlural.choose skippedNotes.Count "купон" "купона" "купонов"
+                        $" Пропустил {skippedNotes.Count} {word}: {notes}."
                 addedPart + skipPart
 
             do! this.EditBulkOrSend batch summary
