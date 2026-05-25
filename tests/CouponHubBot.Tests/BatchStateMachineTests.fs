@@ -306,7 +306,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             // from the first finalize, so this UPDATE matches 0 rows and
             // returns false → FinalizeBatch early-returns without re-rendering
             // the bulk-confirm message. The user's chat still shows
-            // "Подтвердить 1 купонов" even though 2 items now sit in
+            // "Подтвердить 1 купон" even though 2 items now sit in
             // status='ok'.
             //
             // The leaked late item IS silently included when the user clicks

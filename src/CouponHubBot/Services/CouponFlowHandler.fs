@@ -444,7 +444,8 @@ type CouponFlowHandler(
         if okItems.Length = 0 then
             "Не смог распознать ни одного купона.", BotHelpers.addBatchConfirmKeyboard batchId 0
         else
-            let header = $"Подтвердить {okItems.Length} купонов:"
+            let couponWord = RussianPlural.choose okItems.Length "купон" "купона" "купонов"
+            let header = $"Подтвердить {okItems.Length} {couponWord}:"
             let lines = okItems |> Array.map this.FormatBatchItemLine
             let body = String.concat "\n" lines
             $"{header}\n{body}", BotHelpers.addBatchConfirmKeyboard batchId okItems.Length

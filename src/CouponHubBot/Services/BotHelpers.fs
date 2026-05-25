@@ -225,7 +225,8 @@ let addBatchConfirmKeyboard (batchId: int64) (okCount: int) =
         |> InlineKeyboardMarkup
     else
         seq {
-            seq { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {okCount} купонов", $"addflow:bulk:confirm:{batchId}") }
+            let couponWord = RussianPlural.choose okCount "купон" "купона" "купонов"
+            seq { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {okCount} {couponWord}", $"addflow:bulk:confirm:{batchId}") }
             seq { InlineKeyboardButton.WithCallbackData("↩️ Отменить", $"addflow:bulk:cancel:{batchId}") }
         }
         |> InlineKeyboardMarkup

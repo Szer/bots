@@ -79,8 +79,8 @@ type BatchAddFlowTests(fixture: OcrCouponHubTestContainers) =
             Assert.True(deletes.Length >= 1, $"Expected ≥1 deleteMessage; got {deletes.Length}")
 
             Assert.True(
-                findCallWithText calls user.Id "Подтвердить 3 купонов",
-                "Expected bulk-confirm text 'Подтвердить 3 купонов'")
+                findCallWithText calls user.Id "Подтвердить 3 купона",
+                "Expected bulk-confirm text 'Подтвердить 3 купона'")
 
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback($"addflow:bulk:confirm:{batchId}", user))
