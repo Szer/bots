@@ -348,6 +348,29 @@ module BatchTestHelpers =
                 failwith $"Timeout: pending_add for user {userId} not cleared after {timeoutMs}ms"
         }
 
+    /// Waits until at least `expected` sendMessage calls to `chatId` carry
+    /// `reply_parameters` AND their text contains `textContains`. Used after
+    /// `waitForBulkConfirmCall` to assert per-photo reply counts without racing
+    /// against `SendPerPhotoReplies` — which runs AFTER the bulk-confirm send
+    /// in `RenderAndSendBulkConfirm`, so the bulk-confirm landing in the fake-tg
+    /// log does NOT mean the per-photo replies have landed yet.
+    let waitForReplyCount
+        (fixture: OcrCouponHubTestContainers)
+        (chatId: int64)
+        (textContains: string)
+        (expected: int)
+        (timeoutMs: int) =
+        task {
+            let sw = Stopwatch.StartNew()
+            let mutable count = 0
+            while sw.ElapsedMilliseconds < int64 timeoutMs && count < expected do
+                let! calls = fixture.GetFakeCalls("sendMessage")
+                count <- (replyCalls calls chatId (Some textContains)).Length
+                if count < expected then do! Task.Delay pollIntervalMs
+            if count < expected then
+                failwith $"Timeout: only {count} reply(s) matching '{textContains}' to chat {chatId}, expected {expected} after {timeoutMs}ms"
+        }
+
     /// Waits for a batch's item count to reach the given value.
     let waitForItemCount
         (fixture: OcrCouponHubTestContainers)
