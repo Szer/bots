@@ -2,7 +2,9 @@ namespace CouponHubBot.Services
 
 open System
 open System.Collections.Generic
+open System.Diagnostics
 open System.Runtime.ExceptionServices
+open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Telegram.Bot
 open Telegram.Bot.Types
@@ -20,7 +22,8 @@ type CallbackHandler(
     membership: TelegramMembershipService,
     couponFlow: CouponFlowHandler,
     commandHandler: CommandHandler,
-    time: TimeProvider
+    time: TimeProvider,
+    logger: ILogger<CallbackHandler>
 ) =
     let sendText = BotHelpers.sendText botClient
     let ensureCommunityMember = BotHelpers.ensureCommunityMember membership sendText
@@ -48,6 +51,9 @@ type CallbackHandler(
             Metrics.batchCancelTotal.Add(
                 1L,
                 KeyValuePair("had_ok_items", box (if hadOkItems then "true" else "false")))
+            logger.LogInformation(
+                "Batch {BatchId} cancelled by user {UserId} (had_ok_items={HadOkItems})",
+                batch.id, batch.user_id, hadOkItems)
             do! db.ClearBatch batch.id
             do! this.EditBulkOrSend batch "Ок, отменил пакет."
         }
@@ -91,6 +97,10 @@ type CallbackHandler(
                     Metrics.batchSkippedTotal.Add(1L, KeyValuePair("reason", box "DuplicateBarcode"))
                     do! db.MarkBatchItemFailed(item.id, $"dup_barcode:{existingId}")
 
+            logger.LogInformation(
+                "Batch {BatchId} confirmed by user {UserId}: added={Added} skipped={Skipped}",
+                batch.id, user.id, insertedIds.Count, skippedNotes.Count)
+
             do! db.ClearBatch batch.id
 
             let summary =
@@ -123,6 +133,10 @@ type CallbackHandler(
                 | false, _ ->
                     do! sendText cq.Message.Chat.Id "Не понял идентификатор пакета."
                 | true, batchId ->
+                    // Tag the parent handleCallbackQuery span so the trace is
+                    // searchable by batchId in Tempo (mirrors finalizeBatch's tag).
+                    if not (isNull Activity.Current) then
+                        %Activity.Current.SetTag("batchId", batchId)
                     match parts[2] with
                     | "cancel"
                     | "confirm" ->

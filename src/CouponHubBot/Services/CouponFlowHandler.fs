@@ -236,7 +236,7 @@ type CouponFlowHandler(
                             if String.IsNullOrWhiteSpace ocr.barcode then null else ocr.barcode
 
                         logger.LogInformation(
-                            "OCR result for user {UserId}: hasBarcode={HasBarcode} hasValue={HasValue} hasMinCheck={HasMinCheck} hasValidTo={HasValidTo}",
+                            "Single-photo OCR result for user {UserId}: hasBarcode={HasBarcode} hasValue={HasValue} hasMinCheck={HasMinCheck} hasValidTo={HasValidTo}",
                             user.id, not (isNull barcodeText), valueOpt.IsSome, minCheckOpt.IsSome, validToOpt.IsSome)
 
                         if isNull barcodeText then
@@ -466,6 +466,9 @@ type CouponFlowHandler(
             let recordOk () =
                 if not (isNull a) then %a.SetTag("outcome", "ok")
                 Metrics.batchItemOutcomeTotal.Add(1L, KeyValuePair("outcome", box "ok"))
+                logger.LogInformation(
+                    "Batch {BatchId} item {ItemId}: outcome=ok",
+                    batchId, itemId)
             let writeNeedsInput note =
                 task {
                     do! db.UpdateBatchItemNeedsInput(itemId, note)
@@ -476,6 +479,9 @@ type CouponFlowHandler(
                         1L,
                         KeyValuePair("outcome", box "needs_input"),
                         KeyValuePair("failure_note", box note))
+                    logger.LogInformation(
+                        "Batch {BatchId} item {ItemId}: outcome=needs_input note={FailureNote}",
+                        batchId, itemId, note)
                 }
 
             try
@@ -659,6 +665,9 @@ type CouponFlowHandler(
                 if not (isNull a) then %a.SetTag("outcome", outcome)
                 Metrics.batchFinalizedTotal.Add(1L, KeyValuePair("outcome", box outcome))
                 Metrics.batchSize.Record(itemCount, KeyValuePair("outcome", box outcome))
+                logger.LogInformation(
+                    "Batch {BatchId} finalized: outcome={Outcome} items={ItemCount}",
+                    batchId, outcome, itemCount)
         } :> Task
 
     /// Webhook entry for an album photo. Fast path: DB upsert + placeholder
@@ -691,6 +700,9 @@ type CouponFlowHandler(
 
                 if isNew then
                     Metrics.batchCreatedTotal.Add(1L)
+                    logger.LogInformation(
+                        "Batch {BatchId} created for user {UserId} (mgid={MediaGroupId})",
+                        batchId, user.id, mediaGroupId)
                 if abandoned.Length > 0 then
                     Metrics.batchAbandonedTotal.Add(
                         int64 abandoned.Length,
