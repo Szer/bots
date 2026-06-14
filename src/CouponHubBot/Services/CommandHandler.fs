@@ -23,16 +23,58 @@ type CommandHandler(
 ) =
     let sendText = BotHelpers.sendText botClient
 
+    // Sends the coupon's full event-history table as a <pre> HTML block, with an optional
+    // header above it. Shared by /debug and /undo.
+    let sendCouponHistory (chatId: int64) (couponId: int) (header: string option) =
+        task {
+            let! rows = db.GetCouponEventHistory(couponId)
+            let table =
+                if rows.Length = 0 then "Нет событий."
+                else BotHelpers.formatEventHistoryTable rows
+            let headerPart =
+                match header with
+                | Some h -> h + "\n"
+                | None -> ""
+            let html = $"{headerPart}<pre>{table}</pre>"
+            do! botClient.SendMessage(ChatId chatId, html, parseMode = Telegram.Bot.Types.Enums.ParseMode.Html) |> taskIgnore
+        }
+
     let handleDebug (userId: int64) (chatId: int64) (couponId: int) =
         task {
             if options.Value.FeedbackAdminIds |> Array.contains userId then
-                let! rows = db.GetCouponEventHistory(couponId)
-                if rows.Length = 0 then
-                    do! sendText chatId $"Нет событий для купона #{couponId}"
-                else
-                    let table = BotHelpers.formatEventHistoryTable rows
-                    let html = $"<pre>{table}</pre>"
-                    do! botClient.SendMessage(ChatId chatId, html, parseMode = Telegram.Bot.Types.Enums.ParseMode.Html) |> taskIgnore
+                do! sendCouponHistory chatId couponId None
+            // else silently ignore for non-admins
+        }
+
+    // Admin-only rewind of the latest live action on a coupon. Replies with the post-undo
+    // state plus the full event-history table (same render as /debug).
+    let handleUndo (adminId: int64) (chatId: int64) (couponId: int) =
+        task {
+            if options.Value.FeedbackAdminIds |> Array.contains adminId then
+                match! db.UndoLastEvent(couponId, adminId) with
+                | UndoResult.CouponNotFound ->
+                    do! sendText chatId $"Купон ID:{couponId} не найден."
+                | UndoResult.NothingToUndo ->
+                    do! sendText chatId $"У купона ID:{couponId} нет действий для отката."
+                | UndoResult.NotUndoable "added" ->
+                    do! sendText chatId "Нельзя откатить добавление купона. Используй /void."
+                | UndoResult.NotUndoable other ->
+                    do! sendText chatId $"Последнее действие нельзя откатить ({other})."
+                | UndoResult.StateChanged ->
+                    do! sendText chatId "Состояние купона изменилось, попробуй ещё раз."
+                | UndoResult.Undone (coupon, revertedEvent, backToPocket) ->
+                    logger.LogInformation(
+                        "Admin {AdminUserId} undid '{Event}' on coupon {CouponId}; new status {Status}",
+                        adminId, revertedEvent, couponId, coupon.status)
+                    let pocketLine =
+                        match backToPocket with
+                        | Some uid -> $"Купон снова в кармане у пользователя {uid}."
+                        | None -> if coupon.status = "available" then "Купон снова в общей копилке." else ""
+                    let header =
+                        $"Откат купона ID:{couponId}: {revertedEvent} → {coupon.status}.\n"
+                        + (if pocketLine = "" then "" else pocketLine + "\n")
+                        + $"Текущее состояние: {coupon.status}, до {BotHelpers.formatUiDate coupon.expires_at}."
+                    do! sendCouponHistory chatId couponId (Some header)
             // else silently ignore for non-admins
         }
 
@@ -302,6 +344,7 @@ type CommandHandler(
     member _.HandleUsed (user: DbUser) (chatId: int64) (couponId: int) = handleUsed user chatId couponId
     member _.HandleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgToDelete: Message option) = handleVoid user chatId couponId isAdmin deleteMsg msgToDelete
     member _.HandleAdded (user: DbUser) (chatId: int64) = handleAdded user chatId
+    member _.HandleUndo (adminId: int64) (chatId: int64) (couponId: int) = handleUndo adminId chatId couponId
 
     member _.Dispatch (user: DbUser) (msg: Message) =
         task {
@@ -390,6 +433,11 @@ type CommandHandler(
                 recordCommand "debug"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId -> do! handleDebug msg.From.Id msg.Chat.Id couponId
+                | None -> ()
+            | t when not (isNull t) && t.StartsWith("/undo ") ->
+                recordCommand "undo"
+                match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
+                | Some couponId -> do! handleUndo msg.From.Id msg.Chat.Id couponId
                 | None -> ()
             | _ ->
                 if msg.Photo <> null && msg.Photo.Length > 0 && not (isNull msg.Caption) && (msg.Caption.StartsWith("/add") || msg.Caption.StartsWith("/a")) then
