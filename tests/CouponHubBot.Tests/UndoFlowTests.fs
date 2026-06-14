@@ -272,3 +272,115 @@ type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
             Assert.True(findCallWithText calls taker.Id "Взято: 1",
                 "Non-reverted take should remain counted")
         }
+
+    [<Fact>]
+    let ``Undo on a coupon with zero events reports nothing to undo`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 740L, username = "undo_noevt_owner", firstName = "Owner")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+
+            // /add creates the user row (and an 'added' event on its own coupon)…
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            // …then insert a second coupon directly, with NO coupon_event rows.
+            let! _ =
+                fixture.Execute(
+                    "INSERT INTO coupon (owner_id, photo_file_id, value, min_check, expires_at, status) VALUES (@o, @p, 7.00, 35.00, '2026-01-25'::date, 'available')",
+                    {| o = owner.Id; p = "no-events-photo" |})
+            let! couponId = getLatestCouponId ()
+            let! evCount = getEventCount couponId "added"
+            Assert.Equal(0L, evCount) // sanity: this coupon really has no events
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "нет действий для отката",
+                "Coupon with zero events should report nothing to undo")
+            let! status = getStatus couponId
+            Assert.Equal("available", status)
+        }
+
+    [<Fact>]
+    let ``Undo on a non-existent coupon reports not found`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            do! fixture.SetChatMemberStatus(adminId, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/undo 999999", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "не найден",
+                "Undo on a missing coupon should report not found")
+        }
+
+    [<Fact>]
+    let ``Deep chain peels through every event type and never redoes a reverted action`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 741L, username = "undo_chain_owner", firstName = "Owner")
+            let taker = Tg.user(id = 742L, username = "undo_chain_taker", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+
+            // Mirrors coupon 1057: added → taken → returned → taken → used
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/return {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId}", taker))
+
+            let undoOnce () = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin))
+
+            // Peel back one live action at a time.
+            let! _ = undoOnce ()      // used      → taken
+            let! s1 = getStatus couponId
+            Assert.Equal("taken", s1)
+
+            let! _ = undoOnce ()      // taken (#2)→ available
+            let! s2 = getStatus couponId
+            Assert.Equal("available", s2)
+
+            let! _ = undoOnce ()      // returned  → taken (holder restored)
+            let! s3 = getStatus couponId
+            Assert.Equal("taken", s3)
+            let! takenBy3 = getTakenBy couponId
+            Assert.Equal(taker.Id, takenBy3)
+
+            let! _ = undoOnce ()      // taken (#1)→ available
+            let! s4 = getStatus couponId
+            Assert.Equal("available", s4)
+
+            // Only 'added' remains live → refused, state unchanged.
+            do! fixture.ClearFakeCalls()
+            let! _ = undoOnce ()
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "/void", "Floor at 'added' should refuse")
+            let! s5 = getStatus couponId
+            Assert.Equal("available", s5)
+
+            // Crucially: reverts only ever appended compensations — no action was ever redone.
+            let! added = getEventCount couponId "added"
+            let! taken = getEventCount couponId "taken"
+            let! returned = getEventCount couponId "returned"
+            let! used = getEventCount couponId "used"
+            let! takenRev = getEventCount couponId "taken_reverted"
+            let! returnedRev = getEventCount couponId "returned_reverted"
+            let! usedRev = getEventCount couponId "used_reverted"
+            let! addedRev = getEventCount couponId "added_reverted"
+            Assert.Equal(1L, added)
+            Assert.Equal(2L, taken)        // original two takes, never re-applied
+            Assert.Equal(1L, returned)
+            Assert.Equal(1L, used)
+            Assert.Equal(2L, takenRev)     // each take reverted exactly once
+            Assert.Equal(1L, returnedRev)
+            Assert.Equal(1L, usedRev)
+            Assert.Equal(0L, addedRev)     // 'added' was refused, never compensated
+        }
