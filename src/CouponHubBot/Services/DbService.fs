@@ -27,6 +27,20 @@ type VoidCouponResult =
     | Voided of coupon: Coupon * takenByUserId: int64 option
     | NotFoundOrNotAllowed
 
+[<RequireQualifiedAccess>]
+type UndoResult =
+    /// The latest live action was reverted. `coupon` is the row after the undo,
+    /// `revertedEvent` is the original event_type that was rolled back,
+    /// `backToPocketUserId` is the member whose pocket the coupon landed back in (if any).
+    | Undone of coupon: Coupon * revertedEvent: string * backToPocketUserId: int64 option
+    /// Coupon has no live (not-yet-reverted) action left to undo.
+    | NothingToUndo
+    /// The latest live action cannot be reverted (e.g. "added"): carries its event_type.
+    | NotUndoable of eventType: string
+    | CouponNotFound
+    /// The coupon's status changed between read and write (lost an atomic-claim race).
+    | StateChanged
+
 [<CLIMutable>]
 type PendingAddFlow =
     { user_id: int64
@@ -368,7 +382,9 @@ GROUP BY event_type;
                 |> Map.tryFind eventType
                 |> Option.defaultValue 0L
 
-            return get "added", get "taken", get "returned", get "used", get "voided"
+            // Net out admin /undo compensations so counts reflect reality.
+            let net pos = max 0L (get pos - get (pos + "_reverted"))
+            return get "added", net "taken", net "returned", net "used", net "voided"
         }
 
     member _.GetPersonalCouponOutcomes(userId: int64) =
@@ -579,25 +595,31 @@ ORDER BY taken_by;
     member _.GetUserEventCounts(eventType: string, sinceUtc: DateTime, untilUtc: DateTime) =
         task {
             use! conn = openConn()
+            // Net out admin /undo compensations: subtract "<type>_reverted" in the same window.
+            let revertedType = eventType + "_reverted"
             //language=postgresql
             let sql =
                 """
 SELECT e.user_id,
        u.username,
        u.first_name,
-       COUNT(*)::bigint AS count
+       (COUNT(*) FILTER (WHERE e.event_type = @event_type)
+        - COUNT(*) FILTER (WHERE e.event_type = @reverted_type))::bigint AS count
 FROM coupon_event e
 JOIN "user" u ON u.id = e.user_id
-WHERE e.event_type = @event_type
+WHERE e.event_type IN (@event_type, @reverted_type)
   AND e.created_at >= @since_utc
   AND e.created_at < @until_utc
 GROUP BY e.user_id, u.username, u.first_name
+HAVING (COUNT(*) FILTER (WHERE e.event_type = @event_type)
+        - COUNT(*) FILTER (WHERE e.event_type = @reverted_type)) > 0
 ORDER BY count DESC, e.user_id;
 """
             let! rows =
                 conn.QueryAsync<UserEventCount>(
                     sql,
                     {| event_type = eventType
+                       reverted_type = revertedType
                        since_utc = sinceUtc
                        until_utc = untilUtc |}
                 )
@@ -804,6 +826,103 @@ WHERE id = @coupon_id;
                 do! insertEvent conn tx couponId original.owner_id "voided"
                 do! tx.CommitAsync()
                 return VoidCouponResult.Voided ({ original with status = "voided"; taken_by = Nullable(); taken_at = Nullable() }, takenBy)
+        }
+
+    /// Admin-only rewind: reverses the latest *live* (not-yet-reverted) action on a coupon
+    /// and appends a compensating "<type>_reverted" event. Repeated calls peel back further.
+    member _.UndoLastEvent(couponId: int, adminId: int64) =
+        task {
+            use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+
+            // Lock the coupon row for the duration of the undo.
+            //language=postgresql
+            let selectCouponSql = "SELECT * FROM coupon WHERE id = @coupon_id FOR UPDATE;"
+            let! couponRows = conn.QueryAsync<Coupon>(selectCouponSql, {| coupon_id = couponId |}, tx)
+
+            match couponRows |> Seq.tryHead with
+            | None ->
+                do! tx.RollbackAsync()
+                return UndoResult.CouponNotFound
+            | Some _ ->
+                // Full event stream, newest first.
+                //language=postgresql
+                let eventsSql =
+                    """
+SELECT id, coupon_id, user_id, event_type, created_at
+FROM coupon_event
+WHERE coupon_id = @coupon_id
+ORDER BY created_at DESC, id DESC;
+"""
+                let! eventRows = conn.QueryAsync<CouponEvent>(eventsSql, {| coupon_id = couponId |}, tx)
+                let events = eventRows |> Seq.toArray
+
+                // Pick the latest live action. Reverts are strictly LIFO, so a skip counter
+                // pairs each "*_reverted" with the action it cancelled.
+                let isRevert (et: string) = et.EndsWith("_reverted", StringComparison.Ordinal)
+                let target =
+                    let mutable skip = 0
+                    let mutable found = None
+                    let mutable i = 0
+                    while found.IsNone && i < events.Length do
+                        let ev = events[i]
+                        if isRevert ev.event_type then skip <- skip + 1
+                        elif skip > 0 then skip <- skip - 1
+                        else found <- Some ev
+                        i <- i + 1
+                    found
+
+                match target with
+                | None ->
+                    do! tx.RollbackAsync()
+                    return UndoResult.NothingToUndo
+                | Some ev ->
+                    // Apply a guarded revert (WHERE status = expected post-state), append the
+                    // compensating event, and return the post-undo snapshot.
+                    let finish (updateSql: string) (parms: 'p) (backToPocket: int64 option) =
+                        task {
+                            let! rows = conn.ExecuteAsync(updateSql, parms, tx)
+                            if rows <> 1 then
+                                do! tx.RollbackAsync()
+                                return UndoResult.StateChanged
+                            else
+                                do! insertEvent conn tx couponId ev.user_id (ev.event_type + "_reverted")
+                                let! updated = conn.QueryAsync<Coupon>("SELECT * FROM coupon WHERE id = @coupon_id;", {| coupon_id = couponId |}, tx)
+                                do! tx.CommitAsync()
+                                return UndoResult.Undone(updated |> Seq.head, ev.event_type, backToPocket)
+                        }
+
+                    match ev.event_type with
+                    | "used" ->
+                        // taken_by/taken_at were never cleared on use; just flip status back.
+                        //language=postgresql
+                        let sql = "UPDATE coupon SET status = 'taken' WHERE id = @coupon_id AND status = 'used';"
+                        return! finish sql {| coupon_id = couponId |} (Some ev.user_id)
+                    | "taken" ->
+                        //language=postgresql
+                        let sql = "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id AND status = 'taken';"
+                        return! finish sql {| coupon_id = couponId |} None
+                    | "returned" ->
+                        // Restore the holder; recover taken_at from the most recent prior take.
+                        //language=postgresql
+                        let sql =
+                            """
+UPDATE coupon
+SET status = 'taken',
+    taken_by = @taken_by,
+    taken_at = COALESCE((SELECT MAX(created_at) FROM coupon_event WHERE coupon_id = @coupon_id AND event_type = 'taken'), @now)
+WHERE id = @coupon_id AND status = 'available';
+"""
+                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (Some ev.user_id)
+                    | "voided" ->
+                        // Back to the common pool; prior holder is not restored.
+                        //language=postgresql
+                        let sql = "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id AND status = 'voided';"
+                        return! finish sql {| coupon_id = couponId |} None
+                    | other ->
+                        // "added" (terminal — use /void) or anything unrecognised.
+                        do! tx.RollbackAsync()
+                        return UndoResult.NotUndoable other
         }
 
     member _.GetVoidableCouponsByOwner(ownerId: int64) =
