@@ -232,13 +232,10 @@ type CommandHandler(
                 let kb =
                     let couponRows =
                         shown
-                        |> Array.indexed
-                        |> Array.map (fun (i, c) ->
-                            let humanIdx = i + 1
-                            let ord = BotHelpers.formatOrdinalShort humanIdx
+                        |> Array.map (fun c ->
                             seq {
-                                InlineKeyboardButton.WithCallbackData($"Вернуть {ord}", $"return:{c.id}")
-                                InlineKeyboardButton.WithCallbackData($"Использован {ord}", $"used:{c.id}")
+                                InlineKeyboardButton.WithCallbackData($"Вернуть ID:{c.id}", $"return:{c.id}")
+                                InlineKeyboardButton.WithCallbackData($"Использован ID:{c.id}", $"used:{c.id}")
                             })
                     let addedRow = [| seq { InlineKeyboardButton.WithCallbackData("Мои добавленные", "myAdded") } |]
                     InlineKeyboardMarkup(Array.append couponRows addedRow)
@@ -275,7 +272,7 @@ type CommandHandler(
                                 match c.status with
                                 | "taken" -> " (взят)"
                                 | _ -> ""
-                            $"{n}. {BotHelpers.formatCouponValue c}, до {d}{barcodeSuffix}{statusText}")
+                            $"{n}. ID:{c.id} — {BotHelpers.formatCouponValue c}, {d}{barcodeSuffix}{statusText}")
                         |> String.concat "\n"
                     if remaining > 0 then
                         lines + $"\n...и ещё {remaining} купонов"
@@ -284,11 +281,8 @@ type CommandHandler(
 
                 let kb =
                     coupons
-                    |> Array.indexed
-                    |> Array.map (fun (i, c) ->
-                        let humanIdx = i + 1
-                        let ord = BotHelpers.formatOrdinalShort humanIdx
-                        seq { InlineKeyboardButton.WithCallbackData($"Аннулировать {ord}", $"void:{c.id}") })
+                    |> Array.map (fun c ->
+                        seq { InlineKeyboardButton.WithCallbackData($"Аннулировать ID:{c.id}", $"void:{c.id}") })
                     |> Seq.ofArray
                     |> InlineKeyboardMarkup
 
