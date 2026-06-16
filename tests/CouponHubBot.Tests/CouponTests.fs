@@ -1760,7 +1760,8 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
             Assert.Contains("Всего доступно купонов:", couponsText.Value)
             Assert.Contains("Доступные купоны:", couponsText.Value)
             Assert.Contains("1.", couponsText.Value)
-            Assert.Contains("до ", couponsText.Value)
+            // Listing line now surfaces the coupon ID so users can reference it
+            Assert.Contains($"ID:{couponId}", couponsText.Value)
             // Human-visible list uses 1..N, but callback_data must still reference real coupon id
             let hasTakeButton (callBody: string) =
                 try

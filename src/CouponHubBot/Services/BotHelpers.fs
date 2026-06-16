@@ -95,7 +95,7 @@ let formatUiDate (d: DateOnly) =
 
 let formatAvailableCouponLine (idx: int) (c: Coupon) =
     let d = formatUiDate c.expires_at
-    $"{idx}. {formatCouponValue c}, до {d}"
+    $"{idx}. ID:{c.id} — {formatCouponValue c}, {d}"
 
 let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
     let headers = [| "date"; "user"; "event_type" |]

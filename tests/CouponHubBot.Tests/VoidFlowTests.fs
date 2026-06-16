@@ -170,6 +170,9 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! _ = conn.ExecuteAsync(
                 "UPDATE coupon SET barcode_text = @barcode WHERE owner_id = @owner_id",
                 {| barcode = testBarcode; owner_id = owner.Id |})
+            let! couponId = conn.ExecuteScalarAsync<int>(
+                "SELECT id FROM coupon WHERE owner_id = @owner_id",
+                {| owner_id = owner.Id |})
 
             do! fixture.ClearFakeCalls()
             let! resp = fixture.SendUpdate(Tg.dmMessage("/added", owner))
@@ -183,6 +186,27 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
             // Check full barcode suffix format (···XXXX) appears in the message text
             Assert.True(findCallWithText calls owner.Id "···1191",
                 "Expected barcode suffix '···1191' in /added output")
+            // Check the coupon ID is shown in the listing text (so users can match what admins reference)
+            Assert.True(findCallWithText calls owner.Id $"ID:{couponId}",
+                $"Expected coupon ID 'ID:{couponId}' in /added output")
+            // Check the void button label carries the coupon ID, e.g. "Аннулировать ID:1043"
+            Assert.True(
+                calls |> Array.exists (fun c ->
+                    try
+                        use doc = JsonDocument.Parse(c.Body)
+                        match doc.RootElement.TryGetProperty("reply_markup") with
+                        | true, rm ->
+                            match rm.TryGetProperty("inline_keyboard") with
+                            | true, kb ->
+                                kb.EnumerateArray() |> Seq.exists (fun row ->
+                                    row.EnumerateArray() |> Seq.exists (fun btn ->
+                                        match btn.TryGetProperty("text") with
+                                        | true, t -> t.GetString().Contains($"ID:{couponId}")
+                                        | _ -> false))
+                            | _ -> false
+                        | _ -> false
+                    with _ -> false),
+                $"Expected void button label to contain 'ID:{couponId}'")
             // Check reply_markup contains Аннулировать via JSON parsing (Cyrillic may be escaped in raw JSON)
             Assert.True(
                 calls |> Array.exists (fun c ->
