@@ -64,6 +64,7 @@ let buildBotConf () =
       PotentialSpamChannelId = getRequiredSetting "POTENTIAL_SPAM_CHANNEL_ID" |> int64
       DetectedSpamChannelId = getRequiredSetting "DETECTED_SPAM_CHANNEL_ID" |> int64
       AllLogsChannelId = getRequiredSetting "ALL_LOGS_CHANNEL_ID" |> int64
+      AdminChannelId = getSettingOr "ADMIN_CHANNEL_ID" "0" |> int64
       DetectedSpamCleanupAge = getSettingOr "DETECTED_SPAM_CLEANUP_AGE_HOURS" "24" |> int |> TimeSpan.FromHours
       ChatsToMonitor = getRequiredSetting "CHATS_TO_MONITOR" |> fromJson
       AllowedUsers = getRequiredSetting "ALLOWED_USERS" |> fromJson
@@ -164,11 +165,20 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<DbService>(fun sp ->
         DbService(connString, sp.GetRequiredService<TimeProvider>()))
     .AddSingleton<IOcrCache>(fun _ -> OcrCacheRepository(connString) :> IOcrCache)
+    // Reload hook: lets admin commands publish bot_setting changes without a restart
+    .AddSingleton<ISettingsReloader>({ new ISettingsReloader with
+        member _.Reload() = task { reloadSettings() } :> Task })
     .AddSingleton<BotService>()
     // MachineLearning must start before CleanupService (loads model from DB on startup)
     .AddSingleton<MachineLearning>()
     .AddHostedService<MachineLearning>(fun sp -> sp.GetRequiredService<MachineLearning>())
-    .AddHostedService<CleanupService>()
+    // Single CleanupService instance, exposed both as the hosted scheduler and as
+    // the IForcedCleanup used by the /vahter cleanup admin command.
+    .AddSingleton<CleanupService>()
+    .AddHostedService<CleanupService>(fun sp -> sp.GetRequiredService<CleanupService>())
+    .AddSingleton<IForcedCleanup>(fun sp ->
+        let cs = sp.GetRequiredService<CleanupService>()
+        { new IForcedCleanup with member _.Run() = cs.ForceCleanup() :> Task })
     .AddHostedService<StartupMessage>()
     .AddHostedService<UpdateChatAdmins>()
 

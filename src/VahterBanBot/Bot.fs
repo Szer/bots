@@ -87,6 +87,51 @@ module private BotHelpers =
          isUnbanCommand msg ||
          isSoftBanCommand msg)
 
+    // -----------------------------------------------------------------------
+    // Vahter-channel admin commands (/vahter <subcommand> ...)
+    // -----------------------------------------------------------------------
+
+    /// Strips a trailing "@botusername" mention from a command token,
+    /// e.g. "/vahter@my_bot" -> "/vahter".
+    let stripBotMention (token: string) =
+        let at = token.IndexOf '@'
+        if at >= 0 then token.Substring(0, at) else token
+
+    /// True if the message's first token is the "/vahter" command (mention-tolerant).
+    let isVahterCommand (msg: TgMessage) =
+        msg.Text <> null &&
+        (let trimmed = msg.Text.TrimStart()
+         let first = trimmed.Split([| ' '; '\n'; '\t' |]).[0]
+         stripBotMention first = "/vahter")
+
+    /// Stable, machine-parseable reference embedded in spam-deletion log posts so
+    /// that `/vahter unmarkspam` can recover the original (chatId, messageId).
+    let msgRefToken (chatId: int64) (messageId: int) = $"#ref:{chatId}:{messageId}"
+
+    let private msgRefRegex = System.Text.RegularExpressions.Regex(@"#ref:(-?\d+):(\d+)")
+
+    /// Parses the first `#ref:<chatId>:<messageId>` token out of a log message text.
+    let tryParseMsgRef (text: string) : (int64 * int) option =
+        if isNull text then None
+        else
+            let m = msgRefRegex.Match text
+            if m.Success then Some(int64 m.Groups.[1].Value, int m.Groups.[2].Value)
+            else None
+
+    let adminHelpText =
+        String.concat "\n" [
+            "🛡️ Vahter admin commands (this channel only):"
+            ""
+            "/vahter addchat <@username | id username> — start monitoring a chat"
+            "/vahter removechat <@username | id> — stop monitoring a chat"
+            "/vahter addvahter <id username> — grant vahter rights"
+            "/vahter removevahter <@username | id> — revoke vahter rights"
+            "/vahter retrain — force ML model retrain (runs in background)"
+            "/vahter cleanup — force cleanup job (runs in background)"
+            "/vahter unmarkspam — reply to a forwarded bot spam-deletion log post to undo it"
+            "/vahter help — show this help"
+        ]
+
     let isBanAuthorized
         (cfg: BotConfiguration)
         (bannedMsg: TgMessage)
@@ -211,6 +256,8 @@ type BotService(
     llmTriage: ILlmTriage,
     reactionTriage: IReactionTriageClassifier,
     profileFetcher: IUserProfileFetcher,
+    settingsReloader: ISettingsReloader,
+    forcedCleanup: IForcedCleanup,
     logger: ILogger<BotService>,
     timeProvider: TimeProvider
 ) =
@@ -544,7 +591,7 @@ type BotService(
         // RecordCallbackCreated runs synchronously so a button click is always routable;
         // the channel post + RecordCallbackMessagePosted run in background. The cleanup
         // path tolerates action_message_id = NULL, so the brief race window is safe.
-        let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
+        let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}\n{msgRefToken msg.ChatId msg.MessageId}"
         let callbackId = Guid.NewGuid()
         do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.DetectedSpamChannelId)
         let markup = InlineKeyboardMarkup [
@@ -583,7 +630,7 @@ type BotService(
             .SetTag("spammerId", msg.SenderId)
             .SetTag("spammerUsername", msg.SenderUsername)
 
-        let logMsg = $"Detected spam ({formatReasonStr reason None}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
+        let logMsg = $"Detected spam ({formatReasonStr reason None}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}\n{msgRefToken msg.ChatId msg.MessageId}"
 
         // Create three callbacks for human triage
         let killId = Guid.NewGuid()
@@ -1211,7 +1258,7 @@ type BotService(
             else do! db.InsertMessage(msg)
 
             // just delete message and move on
-            let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned"
+            let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned\n{msgRefToken msg.ChatId msg.MessageId}"
             logger.LogInformation logMsg
             do! botClient.SendMessage(
                     chatId = ChatId(botConfig.Value.AllLogsChannelId),
@@ -1289,6 +1336,147 @@ type BotService(
         }
 
     // -----------------------------------------------------------------------
+    // Private members — Vahter-channel admin commands (/vahter ...)
+    // -----------------------------------------------------------------------
+
+    /// Sends a feedback message into the admin channel, quoting the command.
+    member private _.ReplyAdmin(msg: TgMessage, text: string) =
+        botClient.SendMessage(
+            chatId = ChatId(botConfig.Value.AdminChannelId),
+            text = text,
+            replyParameters = ReplyParameters(MessageId = msg.MessageId, AllowSendingWithoutReply = true))
+        |> taskIgnore
+
+    /// Resolves a public chat/channel by @username via Telegram getChat.
+    member private _.ResolveChatByUsername(username: string) = task {
+        try
+            let handle = if username.StartsWith "@" then username else "@" + username
+            let! chat = botClient.GetChat(ChatId handle)
+            let key =
+                if not (isNull chat.Username) then chat.Username
+                elif not (isNull chat.Title) then chat.Title
+                else username.TrimStart('@')
+            return Ok(key, chat.Id)
+        with e ->
+            return Error e.Message
+    }
+
+    member private this.VahterAdminCommand(vahter: User, msg: TgMessage) = task {
+        use _ = botActivity.StartActivity("vahterAdminCommand")
+        let parts = msg.Text.Trim().Split([| ' '; '\n'; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+        let sub = if parts.Length >= 2 then parts.[1].ToLowerInvariant() else "help"
+        let args = if parts.Length > 2 then parts.[2..] else [||]
+        match sub with
+        | "addchat"      -> do! this.AdminAddChat(msg, args)
+        | "removechat"   -> do! this.AdminRemoveChat(msg, args)
+        | "addvahter"    -> do! this.AdminAddVahter(msg, args)
+        | "removevahter" -> do! this.AdminRemoveVahter(msg, args)
+        | "retrain"      -> do! this.AdminRetrain(msg)
+        | "cleanup"      -> do! this.AdminCleanup(msg)
+        | "unmarkspam"   -> do! this.VahterUnmarkSpam(vahter, msg)
+        | "help"         -> do! this.ReplyAdmin(msg, adminHelpText)
+        | unknown        -> do! this.ReplyAdmin(msg, $"❓ Unknown command: {unknown}\n\n{adminHelpText}")
+    }
+
+    /// Parses addchat args into Result<(key, id), errorMessage>, resolving @username when needed.
+    member private this.ResolveAddChatArgs(args: string[]) = task {
+        if args.Length = 1 && args.[0].StartsWith "@" then
+            let! r = this.ResolveChatByUsername args.[0]
+            return r |> Result.mapError (fun e ->
+                $"Could not resolve {args.[0]}: {e}. Pass explicit id and username: /vahter addchat <id> <username>")
+        elif args.Length = 2 then
+            match Int64.TryParse args.[0] with
+            | true, id -> return Ok(args.[1].TrimStart('@'), id)
+            | _ -> return Error "Invalid chat id. Usage: /vahter addchat <@username | id username>"
+        else
+            return Error "Usage: /vahter addchat <@username | id username>"
+    }
+
+    member private this.AdminAddChat(msg: TgMessage, args: string[]) = task {
+        let! resolved = this.ResolveAddChatArgs args
+        match resolved with
+        | Error e -> do! this.ReplyAdmin(msg, $"⚠️ {e}")
+        | Ok(key, id) ->
+            let newJson = JsonSetup.addEntry (JsonSetup.toJson botConfig.Value.ChatsToMonitor) key id
+            do! db.UpsertBotSetting("CHATS_TO_MONITOR", newJson, "JSON_BLOB", "CHANNELS")
+            do! settingsReloader.Reload()
+            do! this.ReplyAdmin(msg, $"✅ Now monitoring chat {prependUsername key} ({id})")
+    }
+
+    member private this.AdminRemoveChat(msg: TgMessage, args: string[]) = task {
+        match args with
+        | [| arg |] ->
+            let currentJson = JsonSetup.toJson botConfig.Value.ChatsToMonitor
+            let newJson =
+                match Int64.TryParse arg with
+                | true, id -> JsonSetup.removeEntryById currentJson id
+                | _ -> JsonSetup.removeEntryByKey currentJson arg
+            do! db.UpsertBotSetting("CHATS_TO_MONITOR", newJson, "JSON_BLOB", "CHANNELS")
+            do! settingsReloader.Reload()
+            do! this.ReplyAdmin(msg, $"✅ Stopped monitoring chat {arg}")
+        | _ ->
+            do! this.ReplyAdmin(msg, "Usage: /vahter removechat <@username | id>")
+    }
+
+    member private this.AdminAddVahter(msg: TgMessage, args: string[]) = task {
+        match args with
+        | [| idStr; uname |] ->
+            match Int64.TryParse idStr with
+            | true, id ->
+                let newJson = JsonSetup.addEntry (JsonSetup.toJson botConfig.Value.AllowedUsers) uname id
+                do! db.UpsertBotSetting("ALLOWED_USERS", newJson, "JSON_BLOB", "CHANNELS")
+                do! settingsReloader.Reload()
+                do! this.ReplyAdmin(msg, $"✅ Added vahter {prependUsername (uname.TrimStart('@'))} ({id})")
+            | _ ->
+                do! this.ReplyAdmin(msg, "Invalid user id. Usage: /vahter addvahter <id> <username>")
+        | [| arg |] when arg.StartsWith "@" ->
+            do! this.ReplyAdmin(msg, "Resolving a vahter by @username is not supported (Telegram limitation). Usage: /vahter addvahter <id> <username>")
+        | _ ->
+            do! this.ReplyAdmin(msg, "Usage: /vahter addvahter <id> <username>")
+    }
+
+    member private this.AdminRemoveVahter(msg: TgMessage, args: string[]) = task {
+        match args with
+        | [| arg |] ->
+            let currentJson = JsonSetup.toJson botConfig.Value.AllowedUsers
+            let newJson =
+                match Int64.TryParse arg with
+                | true, id -> JsonSetup.removeEntryById currentJson id
+                | _ -> JsonSetup.removeEntryByKey currentJson arg
+            do! db.UpsertBotSetting("ALLOWED_USERS", newJson, "JSON_BLOB", "CHANNELS")
+            do! settingsReloader.Reload()
+            do! this.ReplyAdmin(msg, $"✅ Removed vahter {arg}")
+        | _ ->
+            do! this.ReplyAdmin(msg, "Usage: /vahter removevahter <@username | id>")
+    }
+
+    member private this.AdminRetrain(msg: TgMessage) = task {
+        fireAndForget logger "adminForceRetrain" (fun () -> ml.RetrainAndSave() :> Task)
+        do! this.ReplyAdmin(msg, "🔄 Retrain started (running in background).")
+    }
+
+    member private this.AdminCleanup(msg: TgMessage) = task {
+        fireAndForget logger "adminForceCleanup" (fun () -> forcedCleanup.Run())
+        do! this.ReplyAdmin(msg, "🧹 Cleanup started (running in background).")
+    }
+
+    /// Reply to a forwarded bot spam-deletion log post to reverse the spam mark
+    /// (records MessageMarkedHam). For a hard KILL ban, unbanning stays /unban.
+    member private this.VahterUnmarkSpam(vahter: User, msg: TgMessage) = task {
+        match msg.ReplyToMessage with
+        | None ->
+            do! this.ReplyAdmin(msg, "Reply to a forwarded bot spam-deletion log post with /vahter unmarkspam.")
+        | Some replied ->
+            match tryParseMsgRef replied.Text with
+            | None ->
+                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot spam-deletion log message and reply /vahter unmarkspam to it.")
+            | Some(chatId, messageId) ->
+                do! db.RecordMessageMarkedHam(chatId, messageId, "", Some vahter.Id)
+                do! this.ReplyAdmin(msg, $"✅ Reversed: message {messageId} in chat {chatId} marked as NOT spam (ham).")
+                logger.LogInformation($"Vahter {vahter.Id} reversed spam mark for {chatId}:{messageId}")
+    }
+
+    // -----------------------------------------------------------------------
     // Private members — Message handling
     // -----------------------------------------------------------------------
 
@@ -1298,6 +1486,21 @@ type BotService(
         // early return if we can't process it
         if not msg.HasSender then
             logger.LogWarning "Received message without resolvable sender"
+        else
+
+        // Vahter-channel admin commands. Handled BEFORE the ChatsToMonitor gate
+        // because the admin channel is not a monitored chat. Zero footprint
+        // elsewhere: the same /vahter text in any other chat falls through to the
+        // normal message path (the channel id won't match AdminChannelId).
+        if botConfig.Value.AdminChannelId <> 0L
+           && msg.ChatId = botConfig.Value.AdminChannelId
+           && isVahterCommand msg then
+            let! user = db.UpsertUser(msg.SenderId, Option.ofObj msg.SenderUsername)
+            if isUserVahter botConfig.Value user then
+                do! this.VahterAdminCommand(user, msg)
+            else
+                logger.LogWarning("Non-vahter {Id} attempted /vahter command in admin channel", msg.SenderId)
+                do! this.ReplyAdmin(msg, "⛔ You are not authorized to use vahter admin commands.")
         else
 
         // early return if we don't monitor this chat
@@ -1598,7 +1801,7 @@ type BotService(
 
         // 3. Log the action
         let vahterUsername = vahter.Username |> Option.defaultValue null
-        let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as SPAM (soft, no ban)\n{tgMsg.Text}"
+        let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as SPAM (soft, no ban)\n{tgMsg.Text}\n{msgRefToken chatId msgId}"
         do! botClient.SendMessage(
                 chatId = ChatId(botConfig.Value.AllLogsChannelId),
                 text = logMsg

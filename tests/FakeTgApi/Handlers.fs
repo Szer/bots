@@ -44,6 +44,18 @@ module Handlers =
             | _ -> 1L
         with _ -> 1L
 
+    /// Returns chat_id as a raw string, handling both numeric and "@username" forms.
+    let parseChatIdRaw (body: string) : string =
+        try
+            use doc = JsonDocument.Parse(body: string)
+            match doc.RootElement.TryGetProperty("chat_id") with
+            | true, v ->
+                match v.ValueKind with
+                | JsonValueKind.String -> v.GetString()
+                | _ -> string (v.GetInt64())
+            | _ -> ""
+        with _ -> ""
+
     let parseChatIdAndMessageId (body: string) =
         let chatId = parseChatId body
         let messageId =
@@ -129,9 +141,19 @@ module Handlers =
 
     let private handleGetChat ctx (body: string) =
         // Minimal ChatFullInfo. No `bio` field — empty bio in dossier.
-        let chatId = parseChatId body
+        let raw = parseChatIdRaw body
         let resultJson =
-            $"""{{"id":{chatId},"type":"private","accent_color_id":0,"max_reaction_count":11}}"""
+            if not (String.IsNullOrEmpty raw) && raw.StartsWith "@" then
+                let uname = raw.TrimStart('@')
+                match Store.chatByUsername.TryGetValue(uname.ToLowerInvariant()) with
+                | true, (id, title) ->
+                    $"""{{"id":{id},"type":"supergroup","username":"{uname}","title":"{title}","accent_color_id":0,"max_reaction_count":11}}"""
+                | _ ->
+                    // Unknown username — return a benign default (id 1).
+                    $"""{{"id":1,"type":"private","accent_color_id":0,"max_reaction_count":11}}"""
+            else
+                let chatId = parseChatId body
+                $"""{{"id":{chatId},"type":"private","accent_color_id":0,"max_reaction_count":11}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleGetFile ctx (body: string) =
@@ -273,6 +295,20 @@ module Handlers =
                 else
                     let bytes = Convert.FromBase64String(payload.contentBase64)
                     Store.files[payload.fileId] <- bytes
+                    do! respondJson ctx 200 (okResult "true")
+            with _ ->
+                do! respondJson ctx 400 (okResult "false")
+        }
+
+    let setMockChat (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload = JsonSerializer.Deserialize<ChatMock>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                if Object.ReferenceEquals(payload, null) || String.IsNullOrWhiteSpace payload.username then
+                    do! respondJson ctx 400 (okResult "false")
+                else
+                    Store.chatByUsername[payload.username.TrimStart('@').ToLowerInvariant()] <- (payload.id, payload.title)
                     do! respondJson ctx 200 (okResult "true")
             with _ ->
                 do! respondJson ctx 400 (okResult "false")

@@ -10,6 +10,10 @@ module Store =
     let files = ConcurrentDictionary<string, byte[]>()
     let methodErrors = ConcurrentDictionary<string, bool>()
 
+    /// username (normalized: lowercase, no leading '@') -> (chatId, title).
+    /// Lets getChat("@username") resolve to a meaningful id/title in tests.
+    let chatByUsername = ConcurrentDictionary<string, int64 * string>()
+
     /// Per-method artificial delay (ms) applied at the START of handleAuxMethod
     /// so concurrency-race tests can force webhook A to be slow at e.g.
     /// sendMessage, letting webhook C win the lock-acquisition race window

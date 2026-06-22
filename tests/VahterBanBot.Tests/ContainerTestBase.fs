@@ -96,6 +96,7 @@ type VahterTestContainers(mlEnabled: bool) =
                 "POTENTIAL_SPAM_CHANNEL_ID", "-101",                                    "FREE_FORM",    "CHANNELS"
                 "DETECTED_SPAM_CHANNEL_ID",  "-102",                                    "FREE_FORM",    "CHANNELS"
                 "ALL_LOGS_CHANNEL_ID",       "-103",                                    "FREE_FORM",    "CHANNELS"
+                "ADMIN_CHANNEL_ID",          "-200",                                    "FREE_FORM",    "CHANNELS"
                 "DETECTED_SPAM_CLEANUP_AGE_HOURS", "24",                                "FREE_FORM",    "CHANNELS"
                 "CHATS_TO_MONITOR",          """{"pro.hell":"-666","dotnetru":-42}""",  "JSON_BLOB",    "CHANNELS"
                 "ALLOWED_USERS",             """{"vahter_1":"34","vahter_2":69}""",     "JSON_BLOB",    "CHANNELS"
@@ -185,6 +186,7 @@ type VahterTestContainers(mlEnabled: bool) =
     member _.PotentialSpamChannel = Tg.chat(id = -101, username = "potential_spam_channel")
     member _.DetectedSpamChannel = Tg.chat(id = -102, username = "detected_spam_channel")
     member _.AllLogsChannel = Tg.chat(id = -103, username = "all_logs_channel")
+    member _.AdminChannel = Tg.chat(id = -200, username = "vahter_admin_channel")
     member _.ChatsToMonitor = [
         Tg.chat(id = -666, username = "pro.hell")
         Tg.chat(id = -42, username = "dotnetru")
@@ -651,6 +653,28 @@ ON CONFLICT (key) DO UPDATE SET value = @value
     member this.ReloadSettings() = task {
         let! resp = this.BotHttp.PostAsync("/reload-settings", null)
         resp.EnsureSuccessStatusCode() |> ignore
+    }
+
+    /// Reads a raw bot_setting value (None if absent or NULL).
+    member this.GetBotSetting(key: string) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        let! values = conn.QueryAsync<string>("SELECT value FROM bot_setting WHERE key = @key", {| key = key |})
+        return values |> Seq.tryHead |> Option.bind Option.ofObj
+    }
+
+    /// True if a MessageMarkedHam event exists for the given (chatId, messageId).
+    member this.MessageMarkedHam(chatId: int64, messageId: int) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+SELECT COUNT(*) FROM event
+WHERE event_type = 'MessageMarkedHam'
+  AND (data->>'chatId')::BIGINT = @chatId
+  AND (data->>'messageId')::INT  = @messageId
+            """
+        let! count = conn.QuerySingleAsync<int>(sql, {| chatId = chatId; messageId = messageId |})
+        return count > 0
     }
 
 /// Polls `/ready` until the bot reports its ML model is loaded or trained.

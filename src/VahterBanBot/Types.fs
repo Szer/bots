@@ -267,6 +267,9 @@ type BotConfiguration =
       PotentialSpamChannelId: int64
       DetectedSpamChannelId: int64
       AllLogsChannelId: int64
+      /// Private vahter channel where privileged /vahter admin commands are accepted.
+      /// 0 = disabled (admin commands never match).
+      AdminChannelId: int64
       DetectedSpamCleanupAge: TimeSpan
       ChatsToMonitor: Dictionary<string, int64>
       AllowedUsers: Dictionary<string, int64>
