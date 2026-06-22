@@ -233,6 +233,15 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Registers a username->chat mapping so the bot's getChat("@username") resolves
+    /// to the given id/title (used by /vahter addchat @username tests).
+    member _.SetMockChat(username: string, id: int64, title: string) =
+        task {
+            let payload: ChatMock = { username = username; id = id; title = title }
+            let! _ = fakeTgHttp.PostAsJsonAsync("/test/mock/chat", payload)
+            return ()
+        }
+
     member _.SetTelegramFile(fileId: string, bytes: byte[]) =
         task {
             let payload: FileMock =

@@ -43,6 +43,13 @@ type MethodDelayMock =
     { methodName: string
       delayMs: int }
 
+/// Mock payload for FakeTgApi /test/mock/chat — registers username->chat resolution.
+[<CLIMutable>]
+type ChatMock =
+    { username: string
+      id: int64
+      title: string }
+
 /// Mock payload for FakeAzureOcrApi /test/mock/delay (per-call response delay).
 [<CLIMutable>]
 type AzureDelayMock =

@@ -215,6 +215,10 @@ WHERE event_type = 'MessageReceived'
             return Array.ofSeq messages
         }
 
+    /// Inserts or updates a single bot_setting value (used by admin commands).
+    member _.UpsertBotSetting(key: string, value: string, typ: string, featureGroup: string) : Task<unit> =
+        DbSettings.upsertBotSetting connString key value typ featureGroup
+
     /// Records a MessageMarkedHam event. Latest Spam/Ham decision wins.
     member _.RecordMessageMarkedHam(chatId: int64, messageId: int, text: string, markedBy: int64 option) : Task<unit> =
         task {
