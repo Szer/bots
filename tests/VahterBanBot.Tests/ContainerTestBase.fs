@@ -131,8 +131,11 @@ type VahterTestContainers(mlEnabled: bool) =
                     "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","false", "FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
                 ]
             for (key, value, typ, group) in commonSettings @ mlSettings do
+                // Upsert so test seeds win over any rows pre-seeded by Flyway migrations
+                // (e.g. V36 seeds ADMIN_CHANNEL_ID with a NULL value).
                 do! conn.ExecuteAsync(
-                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g)",
+                        "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g) \
+                         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type, feature_group = EXCLUDED.feature_group",
                         {| k = key; v = value; t = typ; g = group |})
                     :> Task
         }
