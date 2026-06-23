@@ -231,7 +231,7 @@ let addBatchConfirmKeyboard (batchId: int64) (okCount: int) =
         }
         |> InlineKeyboardMarkup
 
-/// Клавиатура для сообщения «Ты взял купон»: при успешном used/return сообщение удаляем.
+/// Клавиатура для сообщения о взятом купоне: при успешном used/return сообщение удаляем.
 let singleTakenKeyboard (c: Coupon) =
     seq {
         seq {
@@ -251,6 +251,6 @@ let ensureCommunityMember (membership: TelegramMembershipService) (sendText: int
     task {
         let! isMember = membership.IsMember(userId)
         if not isMember then
-            do! sendText chatId "Бот доступен только членам сообщества. Если ты уверен что ты в чате — напиши /start ещё раз."
+            do! sendText chatId "Бот доступен только членам сообщества. Если ты точно в чате — напиши /start ещё раз."
         return isMember
     }

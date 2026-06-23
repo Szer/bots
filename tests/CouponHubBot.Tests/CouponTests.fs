@@ -175,7 +175,7 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
                         match FakeCallHelpers.parseCallBody call.Body with
                         | Some parsed when parsed.ChatId = Some user.Id ->
                             match parsed.Text with
-                            | Some text when text.Contains("Добавил купон") -> successes + 1, dups
+                            | Some text when text.Contains("Добавлен купон") -> successes + 1, dups
                             | Some text when
                                 text.Contains("уже был добавлен") || text.Contains("та же фотография")
                                 ->
@@ -199,8 +199,8 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 200L "Добавил купон",
-                $"Expected DM to user 200 with 'Добавил купон'. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 200L "Добавлен купон",
+                $"Expected DM to user 200 with 'Добавлен купон'. Got %d{calls.Length} calls")
         }
 
     [<Fact>]
@@ -273,9 +273,9 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
                 |> Array.tryFind (fun c ->
                     match parseCallBody c.Body with
                     | Some p when p.ChatId = Some 260L ->
-                        p.Caption.IsSome && p.Caption.Value.Contains("Ты взял")
+                        p.Caption.IsSome && p.Caption.Value.Contains("теперь твой")
                     | _ -> false)
-            Assert.True(takenMsg.IsSome, "Expected 'Ты взял купон' photo with caption to taker")
+            Assert.True(takenMsg.IsSome, "Expected 'теперь твой' photo with caption to taker")
             Assert.True(
                 takenMsg.Value.Body.Contains("return:") && takenMsg.Value.Body.Contains("used:") && takenMsg.Value.Body.Contains(":del"),
                 "Expected inline buttons Вернуть/Использован with :del (delete on success)")
@@ -394,7 +394,7 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:confirm", user))
             let! callsAfterConfirm = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsAfterConfirm 214L "Добавил купон",
+            Assert.True(findCallWithText callsAfterConfirm 214L "Добавлен купон",
                 "Expected success message after confirm")
         }
 
@@ -472,7 +472,7 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:confirm", user))
             let! callsDone = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsDone 217L "Добавил купон",
+            Assert.True(findCallWithText callsDone 217L "Добавлен купон",
                 "Expected success message after confirm for restarted wizard")
 
             let! countAfter = getCouponCount ()
@@ -519,7 +519,7 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:confirm", user))
             let! callsAfterConfirm = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsAfterConfirm 218L "Добавил купон",
+            Assert.True(findCallWithText callsAfterConfirm 218L "Добавлен купон",
                 "Expected success message after confirm")
 
             let! v = getLatestCouponValue ()
@@ -631,8 +631,8 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 221L "Отметил",
-                $"Expected DM with 'Отметил'. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 221L "отмечен",
+                $"Expected DM with 'отмечен'. Got %d{calls.Length} calls")
         }
 
     [<Fact>]
@@ -677,8 +677,8 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 226L "Вернул",
-                $"Expected DM with 'Вернул'. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 226L "возвращён",
+                $"Expected DM with 'возвращён'. Got %d{calls.Length} calls")
         }
 
     [<Fact>]
@@ -1561,8 +1561,8 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback($"used:{couponId}", taker))
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 236L "Отметил",
-                $"Expected 'Отметил' when pressing Использован. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 236L "отмечен",
+                $"Expected 'отмечен' when pressing Использован. Got %d{calls.Length} calls")
         }
 
     [<Fact>]
@@ -1581,8 +1581,8 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback($"return:{couponId}", taker))
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 238L "Вернул",
-                $"Expected 'Вернул' when pressing Вернуть. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 238L "возвращён",
+                $"Expected 'возвращён' when pressing Вернуть. Got %d{calls.Length} calls")
         }
 
     [<Fact>]
@@ -1704,8 +1704,8 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
             let! _ = fixture.SendUpdate(Tg.dmCallback($"used:{couponId}:del", taker))
 
             let! msgCalls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText msgCalls 281L "Отметил",
-                "Expected 'Отметил' when pressing Использован on take-confirmation")
+            Assert.True(findCallWithText msgCalls 281L "отмечен",
+                "Expected 'отмечен' when pressing Использован on take-confirmation")
             let! delCalls = fixture.GetFakeCalls("deleteMessage")
             Assert.True(delCalls.Length >= 1, "Expected deleteMessage after successful used from take-confirmation")
         }
@@ -1727,8 +1727,8 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
             let! _ = fixture.SendUpdate(Tg.dmCallback($"return:{couponId}:del", taker))
 
             let! msgCalls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText msgCalls 283L "Вернул",
-                "Expected 'Вернул' when pressing Вернуть on take-confirmation")
+            Assert.True(findCallWithText msgCalls 283L "возвращён",
+                "Expected 'возвращён' when pressing Вернуть on take-confirmation")
             let! delCalls = fixture.GetFakeCalls("deleteMessage")
             Assert.True(delCalls.Length >= 1, "Expected deleteMessage after successful return from take-confirmation")
         }

@@ -127,7 +127,7 @@ type CommandHandler(
                 do! botClient.SendPhoto(
                         ChatId chatId,
                         InputFileId coupon.photo_file_id,
-                        caption = $"Ты взял(а) купон ID:{couponId}: {BotHelpers.formatCouponValue coupon}, истекает {d}",
+                        caption = $"Купон ID:{couponId} теперь твой: {BotHelpers.formatCouponValue coupon}, истекает {d}",
                         replyMarkup = BotHelpers.singleTakenKeyboard coupon)
                     |> taskIgnore
         }
@@ -136,7 +136,7 @@ type CommandHandler(
         task {
             let! updated = db.MarkUsed(couponId, user.id)
             if updated then
-                do! sendText chatId $"Отметил купон ID:{couponId} как использованный."
+                do! sendText chatId $"Купон ID:{couponId} отмечен как использованный."
             else
                 do! sendText chatId $"Не получилось отметить купон ID:{couponId}. Убедись что он взят тобой."
             return updated
@@ -146,7 +146,7 @@ type CommandHandler(
         task {
             let! updated = db.ReturnToAvailable(couponId, user.id)
             if updated then
-                do! sendText chatId $"Вернул купон ID:{couponId} в доступные."
+                do! sendText chatId $"Купон ID:{couponId} возвращён в доступные."
             else
                 do! sendText chatId $"Не получилось вернуть купон ID:{couponId}. Убедись что он взят тобой."
             return updated
@@ -331,7 +331,7 @@ type CommandHandler(
                 do! db.SetPendingFeedback(user.id)
                 do!
                     sendText chatId
-                        "Следующее твоё сообщение в этом чате (в любом виде: текст, фото, голосовое и т.д.) я отправлю моим авторам. Если передумал — просто введи любую команду (например /help)."
+                        "Следующее твоё сообщение в этом чате (в любом виде: текст, фото, голосовое и т.д.) я отправлю моим авторам. Если передумаешь — просто введи любую команду (например /help)."
         }
 
     member _.HandleTake (taker: DbUser) (chatId: int64) (couponId: int) = handleTake taker chatId couponId
