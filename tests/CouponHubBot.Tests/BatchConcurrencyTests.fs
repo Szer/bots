@@ -271,7 +271,7 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
     /// user on the same batch. Without serialisation, both handlers see
     /// status='awaiting_user', both run TryAddCoupon + EditBulkOrSend, and the
     /// user-facing message ends up disagreeing with the actual coupon count
-    /// (e.g. coupon added but final edit reads "Ок, отменил пакет.").
+    /// (e.g. coupon added but final edit reads "Ок, пакет отменён.").
     ///
     /// Serialisation lives in `DbService.TryClaimAwaitingBatch`: a single
     /// UPDATE…WHERE status='awaiting_user' RETURNING flips the row to
@@ -365,8 +365,8 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
                         | _ -> None)
                 let editTexts = textsFor edits
                 let sendTexts = textsFor sends
-                let sawAddedEdit = editTexts |> Array.exists (fun t -> t.Contains "Добавил")
-                let sawCancelEdit = editTexts |> Array.exists (fun t -> t.Contains "Ок, отменил пакет")
+                let sawAddedEdit = editTexts |> Array.exists (fun t -> t.Contains "Добавлено")
+                let sawCancelEdit = editTexts |> Array.exists (fun t -> t.Contains "Ок, пакет отменён")
                 let sawStaleSend = sendTexts |> Array.exists (fun t -> t.Contains "пакет уже устарел")
 
                 // Invariant (a): no duplicate coupons.
@@ -376,22 +376,22 @@ type BatchConcurrencyTests(fixture: OcrCouponHubTestContainers) =
 
                 // Invariant (b): atomic claim — never both terminal edits. The
                 // loser must hit the stale path (a sendMessage, not an edit), so
-                // exactly one of {Добавил, Ок отменил} appears as an edit.
+                // exactly one of {Добавлено, Ок отменил} appears as an edit.
                 if sawAddedEdit && sawCancelEdit then
                     violations <- violations + 1
                     violationDetails.Add(
-                        $"iter {i}: BOTH 'Добавил' and 'Ок, отменил' edits present — claim was not exclusive")
+                        $"iter {i}: BOTH 'Добавлено' and 'Ок, пакет отменён' edits present — claim was not exclusive")
 
                 // Invariant (c): the surviving edit agrees with the coupon count.
-                // If a coupon was inserted, the user must see 'Добавил'. If none
-                // was inserted, the user must see 'Ок, отменил'. (Together with
+                // If a coupon was inserted, the user must see 'Добавлено'. If none
+                // was inserted, the user must see 'Ок, пакет отменён'. (Together with
                 // (b) this means exactly one terminal edit, matching the state.)
                 if thisIterCount = 1L && not sawAddedEdit then
                     violations <- violations + 1
-                    violationDetails.Add($"iter {i}: 1 coupon added but no 'Добавил' edit")
+                    violationDetails.Add($"iter {i}: 1 coupon added but no 'Добавлено' edit")
                 if thisIterCount = 0L && not sawCancelEdit then
                     violations <- violations + 1
-                    violationDetails.Add($"iter {i}: 0 coupons but no 'Ок, отменил' edit")
+                    violationDetails.Add($"iter {i}: 0 coupons but no 'Ок, пакет отменён' edit")
 
                 // Invariant (d): both callbacks actually contended. Exactly one
                 // should have lost the claim and produced a 'пакет уже устарел'

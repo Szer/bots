@@ -98,7 +98,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:ocr:yes", user))
             let! callsDone = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsDone user.Id "Добавил купон", "Expected coupon to be created after OCR yes")
+            Assert.True(findCallWithText callsDone user.Id "Добавлен купон", "Expected coupon to be created after OCR yes")
         }
 
     [<Fact>]
@@ -202,7 +202,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:ocr:yes", user))
 
             let! calls2 = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls2 user.Id "Добавил купон", "Expected coupon created")
+            Assert.True(findCallWithText calls2 user.Id "Добавлен купон", "Expected coupon created")
 
             let! count = getCouponCount ()
             Assert.Equal(1L, count)
@@ -308,7 +308,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:ocr:yes", user))
             let! calls3 = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls3 user.Id "Добавил купон", "Expected success message right after OCR yes")
+            Assert.True(findCallWithText calls3 user.Id "Добавлен купон", "Expected success message right after OCR yes")
 
             let! v = getLatestValue ()
             let! mc = getLatestMinCheck ()
@@ -356,7 +356,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:confirm", user))
             let! callsDone = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsDone user.Id "Добавил купон", "Expected success message after confirm")
+            Assert.True(findCallWithText callsDone user.Id "Добавлен купон", "Expected success message after confirm")
 
             let! v = getLatestValue ()
             let! mc = getLatestMinCheck ()
@@ -402,7 +402,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:confirm", user))
             let! callsDone = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText callsDone user.Id "Добавил купон", "Expected success message after confirm")
+            Assert.True(findCallWithText callsDone user.Id "Добавлен купон", "Expected success message after confirm")
 
             let! v = getLatestValue ()
             let! mc = getLatestMinCheck ()
@@ -461,7 +461,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:ocr:yes", user))
 
             let! calls3 = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls3 user.Id "Добавил купон", "Expected coupon created")
+            Assert.True(findCallWithText calls3 user.Id "Добавлен купон", "Expected coupon created")
 
             // Only one coupon in DB (not two).
             let! count2 = getCouponCount ()

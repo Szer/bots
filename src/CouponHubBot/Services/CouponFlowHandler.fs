@@ -129,7 +129,7 @@ type CouponFlowHandler(
                         let v = coupon.value.ToString("0.##")
                         let mc = coupon.min_check.ToString("0.##")
                         let d = BotHelpers.formatUiDate coupon.expires_at
-                        do! sendText chatId $"Добавил купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
+                        do! sendText chatId $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
                     | AddCouponResult.Expired ->
                         do! sendText chatId "Нельзя добавить истёкший купон (дата в прошлом). Проверь дату и попробуй ещё раз."
                     | AddCouponResult.DuplicatePhoto existingId ->

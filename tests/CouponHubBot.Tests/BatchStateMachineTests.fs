@@ -33,7 +33,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
     // ── Cancel paths ────────────────────────────────────────────────────
 
     [<Fact>]
-    let ``Cancel callback while awaiting_user: batch cleared, message edited to 'Ок, отменил пакет.'`` () =
+    let ``Cancel callback while awaiting_user: batch cleared, message edited to 'Ок, пакет отменён.'`` () =
         task {
             do! setupBatchTest ()
             let user = Tg.user(id = 7200L, username = "cancel_aw", firstName = "Cancel")
@@ -52,7 +52,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! waitForBatchCleared fixture batchId 5000
 
             // The bulk-confirm message is edited to the cancel summary.
-            do! waitForSendMessageOrEditMatching fixture user.Id (fun t -> t.Contains "Ок, отменил пакет") 3000
+            do! waitForSendMessageOrEditMatching fixture user.Id (fun t -> t.Contains "Ок, пакет отменён") 3000
         }
 
     [<Fact>]

@@ -55,7 +55,7 @@ type CallbackHandler(
                 "Batch {BatchId} cancelled by user {UserId} (had_ok_items={HadOkItems})",
                 batch.id, batch.user_id, hadOkItems)
             do! db.ClearBatch batch.id
-            do! this.EditBulkOrSend batch "Ок, отменил пакет."
+            do! this.EditBulkOrSend batch "Ок, пакет отменён."
         }
 
     member private this.BulkBatchConfirm (user: DbUser) (batch: PendingAddBatch) =
@@ -105,17 +105,17 @@ type CallbackHandler(
 
             let summary =
                 let addedPart =
-                    if insertedIds.Count = 0 then "Ничего не добавил."
+                    if insertedIds.Count = 0 then "Ничего не добавлено."
                     else
                         let ids = insertedIds |> Seq.map string |> String.concat ", "
                         let word = RussianPlural.choose insertedIds.Count "купон" "купона" "купонов"
-                        $"Добавил {insertedIds.Count} {word}: ID:{ids}."
+                        $"Добавлено {insertedIds.Count} {word}: ID:{ids}."
                 let skipPart =
                     if skippedNotes.Count = 0 then ""
                     else
                         let notes = skippedNotes |> String.concat "; "
                         let word = RussianPlural.choose skippedNotes.Count "купон" "купона" "купонов"
-                        $" Пропустил {skippedNotes.Count} {word}: {notes}."
+                        $" Пропущено {skippedNotes.Count} {word}: {notes}."
                 addedPart + skipPart
 
             do! this.EditBulkOrSend batch summary
@@ -146,7 +146,7 @@ type CallbackHandler(
                         // the loser sees None and answers "уже устарел". This is
                         // what prevents the confirm-and-cancel double-fire from
                         // both running TryAddCoupon + EditBulkOrSend and leaving
-                        // the user with a "Ок, отменил" message after the coupon
+                        // the user with a "Ок, пакет отменён" message after the coupon
                         // was actually added.
                         let! claimed = db.TryClaimAwaitingBatch(batchId, user.id)
                         match claimed with
@@ -284,7 +284,7 @@ type CallbackHandler(
                                         let v = coupon.value.ToString("0.##")
                                         let mc = coupon.min_check.ToString("0.##")
                                         let d = BotHelpers.formatUiDate coupon.expires_at
-                                        do! sendText cq.Message.Chat.Id $"Добавил купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
+                                        do! sendText cq.Message.Chat.Id $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
                                     | AddCouponResult.Expired ->
                                         do! db.ClearPendingAddFlow user.id
                                         do! sendText cq.Message.Chat.Id "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
@@ -332,7 +332,7 @@ type CallbackHandler(
                                         let v = coupon.value.ToString("0.##")
                                         let mc = coupon.min_check.ToString("0.##")
                                         let d = BotHelpers.formatUiDate coupon.expires_at
-                                        do! sendText cq.Message.Chat.Id $"Добавил купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
+                                        do! sendText cq.Message.Chat.Id $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
                                     | AddCouponResult.Expired ->
                                         do! db.ClearPendingAddFlow user.id
                                         do! sendText cq.Message.Chat.Id "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
@@ -346,7 +346,7 @@ type CallbackHandler(
                                     do! sendText cq.Message.Chat.Id "Не хватает данных для добавления. Начни заново: /add"
                             | "addflow:cancel" ->
                                 do! db.ClearPendingAddFlow user.id
-                                do! sendText cq.Message.Chat.Id "Ок, отменил добавление купона."
+                                do! sendText cq.Message.Chat.Id "Ок, добавление купона отменено."
                             | _ ->
                                 do! sendText cq.Message.Chat.Id "Не понял действие. Начни заново: /add"
                     elif isPrivateChat && hasData && cq.Data.StartsWith("return:") then
