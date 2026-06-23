@@ -597,9 +597,15 @@ ORDER BY taken_by;
             use! conn = openConn()
             // Net out admin /undo compensations: subtract "<type>_reverted" in the same window.
             let revertedType = eventType + "_reverted"
+            // Only emit/bind the lower bound when present. A null timestamptz parameter has no
+            // inferable type for Npgsql, so we omit the clause and the param entirely for None.
+            let sinceClause =
+                match sinceUtc with
+                | Some _ -> "AND e.created_at >= @since_utc"
+                | None -> ""
             //language=postgresql
             let sql =
-                """
+                $"""
 SELECT e.user_id,
        u.username,
        u.first_name,
@@ -608,23 +614,21 @@ SELECT e.user_id,
 FROM coupon_event e
 JOIN "user" u ON u.id = e.user_id
 WHERE e.event_type IN (@event_type, @reverted_type)
-  AND (@since_utc IS NULL OR e.created_at >= @since_utc)
+  {sinceClause}
   AND e.created_at < @until_utc
 GROUP BY e.user_id, u.username, u.first_name
 HAVING (COUNT(*) FILTER (WHERE e.event_type = @event_type)
         - COUNT(*) FILTER (WHERE e.event_type = @reverted_type)) > 0
 ORDER BY count DESC, e.user_id;
 """
-            // Pass Nullable rather than F# option — Dapper does not bind option params.
-            let sinceParam = match sinceUtc with Some d -> Nullable d | None -> Nullable()
-            let! rows =
-                conn.QueryAsync<UserEventCount>(
-                    sql,
-                    {| event_type = eventType
-                       reverted_type = revertedType
-                       since_utc = sinceParam
-                       until_utc = untilUtc |}
-                )
+            let parameters = DynamicParameters()
+            parameters.Add("event_type", eventType)
+            parameters.Add("reverted_type", revertedType)
+            parameters.Add("until_utc", untilUtc)
+            match sinceUtc with
+            | Some d -> parameters.Add("since_utc", d)
+            | None -> ()
+            let! rows = conn.QueryAsync<UserEventCount>(sql, parameters)
             return rows |> Seq.toArray
         }
 
