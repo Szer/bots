@@ -285,7 +285,7 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls owner.Id "Аннулировано",
                 "Expected voided count in stats")
-            Assert.True(findCallWithText calls owner.Id "использовал вне бота",
+            Assert.True(findCallWithText calls owner.Id "использованный вне бота",
                 "Expected /stats to explain what 'Аннулировано' means")
         }
 
