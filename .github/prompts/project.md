@@ -58,12 +58,34 @@ curl -s -G http://loki.internal/loki/api/v1/query_range \
 
 Think like a senior engineer. Read key files and look for bugs, security issues, hidden assumptions, race conditions, missing error handling, and tech debt.
 
+**Scan the whole tech-debt surface — do not tunnel on one theme.** Each run, deliberately cover a
+spread of categories rather than re-reporting the same kind of finding: error handling & resource
+cleanup, input/callback validation, SQL correctness & missing indexes, race conditions, dead code,
+config/setting drift (see AGENTS.md "Settings configuration"), migration hygiene, test coverage
+gaps, and documentation staleness. **Async/`task`/`Task` style is NOT a priority area** and must not
+be re-filed unless you can point to a *demonstrable runtime defect* (a reproducer or a real
+exception path), not a stylistic preference.
+
 **VahterBanBot source**: `src/VahterBanBot/` — key files: `Bot.fs`, `Types.fs`, `DB.fs`, `Program.fs`
 **CouponHubBot source**: `src/CouponHubBot/Services/` — key files: `CallbackHandler.fs`, `CommandHandler.fs`, `BotService.fs`, `DbService.fs`, `CouponFlowHandler.fs`, `ReminderService.fs`, `NotificationService.fs`
 **Shared infra**: `src/BotInfra/`
 **Tests**: `tests/VahterBanBot.Tests/`, `tests/CouponHubBot.Tests/`
 
-**Do NOT flag**: F# compilation order, Cyrillic UI text, `TreatWarningsAsErrors`, minor style, working code, anything that changes product behavior.
+### Respect inline justifications
+
+If a candidate line — or the line directly above it — carries a `NOTE(project-agent):` comment
+explaining the pattern is intentional, **do not create an issue for it**. These comments are the
+maintainer's standing decision; treat them as resolved. The same applies to anything already
+documented as intentional in `AGENTS.md`.
+
+**Do NOT flag**: F# compilation order, Cyrillic UI text, `TreatWarningsAsErrors`, minor style,
+working code, anything that changes product behavior, and specifically these known-good patterns:
+
+- `Task<T> :> Task` upcasts — a valid, idiomatic F# upcast (not a runtime cast); it compiles under
+  `TreatWarningsAsErrors` and merely discards the result. This is **not** a bug.
+- Intentional blocking `.Result` / `.GetAwaiter().GetResult()` that is marked with a
+  `NOTE(project-agent):` comment (e.g. one-time startup init, or test-only fake handlers). ASP.NET
+  Core has no `SynchronizationContext`, so these do not deadlock.
 
 ## Issue Management
 
@@ -75,7 +97,16 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
 
 ### Rules
 
-1. **Search before creating** — always check existing open issues before creating a new one.
+1. **Search before creating — by root cause, not wording.** List open **and recently-closed**
+   `project` issues and match on the underlying problem, not the title text. Differently-worded
+   issues about the same root cause (e.g. several "blocking startup call" or "invalid Task cast"
+   reports) are duplicates — never re-file them.
+   ```bash
+   gh issue list --state all --label project --limit 100 --json number,title,state \
+     --jq '.[] | "\(.number) [\(.state)]: \(.title)"'
+   ```
+   If a finding was **closed as invalid / won't-fix / by-design**, it is settled — do not reopen or
+   re-file it. Prefer bumping an existing open issue over creating anything new.
 2. **Bump if exists** — if a similar issue is open, add a comment: `**Project assessment bump (YYYY-MM-DD)** This issue is still relevant. [updated context]`. Add `project` label if missing.
 3. **Always use `--label "project"`** when creating issues.
 4. **Assign priority labels**: `priority-medium` (bugs, security, performance, significant debt) or `priority-low` (nice-to-have). Never use `priority-high`. Add `infra` label for issues that can't be fixed in this repo.
