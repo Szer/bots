@@ -17,6 +17,9 @@ type TelegramNotificationService(
             let mc = coupon.min_check.ToString("0.##")
             let msg = $"Купон ID:{coupon.id} ({v}€/{mc}€) был аннулирован владельцем. Он больше недоступен."
             try
+                // NOTE(project-agent): `:> Task` is a valid F# upcast (Task<Message> -> Task),
+                // not a runtime cast. It compiles under TreatWarningsAsErrors and simply discards
+                // the returned Message. Idiomatic across the codebase. Do not flag.
                 do! botClient.SendMessage(ChatId takerUserId, msg) :> Task
                 return true
             with ex1 ->

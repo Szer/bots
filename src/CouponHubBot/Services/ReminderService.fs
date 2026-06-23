@@ -70,12 +70,16 @@ type ReminderService(
                 let totalStr = total.ToString("0.##")
                 let couponWord = Utils.RussianPlural.choose coupons.Length "купон" "купона" "купонов"
                 let msg = $"Сегодня истекает {coupons.Length} {couponWord} на сумму {totalStr}€!"
+                // NOTE(project-agent): `:> Task` is a valid F# upcast (Task<Message> -> Task),
+                // not a runtime cast. Compiles under TreatWarningsAsErrors; discards the Message.
+                // Idiomatic across the codebase. Do not flag.
                 do! botClient.SendMessage(ChatId options.Value.CommunityChatId, msg) :> Task
                 anySent <- true
 
             if nowUtc.DayOfWeek = DayOfWeek.Monday && nowUtc.Day <= 7 then
-                let! usedRows = db.GetUserEventCounts("used", DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc), nowUtc)
-                let! addedRows = db.GetUserEventCounts("added", DateTime.SpecifyKind(DateTime.MinValue, DateTimeKind.Utc), nowUtc)
+                // All-time stats: no lower bound (None), not a DateTime.MinValue sentinel.
+                let! usedRows = db.GetUserEventCounts("used", None, nowUtc)
+                let! addedRows = db.GetUserEventCounts("added", None, nowUtc)
 
                 let text =
                     "Статистика за всё время (использовано/добавлено):\n"

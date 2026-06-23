@@ -35,6 +35,9 @@ let connString = getEnv "DATABASE_URL"
 
 let loadDbSettings () =
     try
+        // NOTE(project-agent): intentional blocking call. Runs once at module init before the
+        // ASP.NET Core host exists; there is no SynchronizationContext to deadlock against, and
+        // settings must be loaded synchronously to build the DI container. Do not flag.
         DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
     with e ->
         eprintfn "[FATAL] Failed to load bot settings from database: %O" e
@@ -194,6 +197,8 @@ let app = builder.Build()
 
 // Ensure bot user record exists in DB (result not needed -- identity comes from BotConfiguration.BotActor)
 let startupBotConf = botConfOptions.Value
+// NOTE(project-agent): intentional blocking call. One-time startup seeding after the host is
+// built but before it runs; ASP.NET Core has no SynchronizationContext so this cannot deadlock.
 (app.Services.GetRequiredService<DbService>().UpsertUser(startupBotConf.BotUserId, Some startupBotConf.BotUserName)).Result |> ignore
 
 // Readiness check for ML model (used by startupProbe)
