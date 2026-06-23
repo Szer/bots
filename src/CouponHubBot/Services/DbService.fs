@@ -597,15 +597,9 @@ ORDER BY taken_by;
             use! conn = openConn()
             // Net out admin /undo compensations: subtract "<type>_reverted" in the same window.
             let revertedType = eventType + "_reverted"
-            // Only emit/bind the lower bound when present. A null timestamptz parameter has no
-            // inferable type for Npgsql, so we omit the clause and the param entirely for None.
-            let sinceClause =
-                match sinceUtc with
-                | Some _ -> "AND e.created_at >= @since_utc"
-                | None -> ""
             //language=postgresql
             let sql =
-                $"""
+                """
 SELECT e.user_id,
        u.username,
        u.first_name,
@@ -614,21 +608,26 @@ SELECT e.user_id,
 FROM coupon_event e
 JOIN "user" u ON u.id = e.user_id
 WHERE e.event_type IN (@event_type, @reverted_type)
-  {sinceClause}
+  AND (NOT @has_since OR e.created_at >= @since_utc)
   AND e.created_at < @until_utc
 GROUP BY e.user_id, u.username, u.first_name
 HAVING (COUNT(*) FILTER (WHERE e.event_type = @event_type)
         - COUNT(*) FILTER (WHERE e.event_type = @reverted_type)) > 0
 ORDER BY count DESC, e.user_id;
 """
-            let parameters = DynamicParameters()
-            parameters.Add("event_type", eventType)
-            parameters.Add("reverted_type", revertedType)
-            parameters.Add("until_utc", untilUtc)
-            match sinceUtc with
-            | Some d -> parameters.Add("since_utc", d)
-            | None -> ()
-            let! rows = conn.QueryAsync<UserEventCount>(sql, parameters)
+            // @has_since gates the lower bound so the SQL text stays constant (preparable, and
+            // Rider can still validate it). @since_utc is always a real timestamptz value — never
+            // null — so when there is no bound we pass an unused placeholder (untilUtc) that the
+            // @has_since guard short-circuits away.
+            let! rows =
+                conn.QueryAsync<UserEventCount>(
+                    sql,
+                    {| event_type = eventType
+                       reverted_type = revertedType
+                       has_since = Option.isSome sinceUtc
+                       since_utc = (sinceUtc |> Option.defaultValue untilUtc)
+                       until_utc = untilUtc |}
+                )
             return rows |> Seq.toArray
         }
 
