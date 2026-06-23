@@ -180,7 +180,8 @@ type CommandHandler(
                     + $"Использовано: {globalStats.used_count}\n"
                     + $"Истекло: {globalStats.expired_count}\n"
                     + $"Активных сейчас: {globalStats.active_count}\n"
-                    + $"Утилизация: {globalRate}")
+                    + $"Утилизация: {globalRate}\n\n"
+                    + "ℹ️ «Аннулировано» — купон, использованный вне бота (в приложении или на сайте Dunnes). Аннулируй его в /added, чтобы он не висел в боте как доступный.")
         }
 
     let handleMy (user: DbUser) (chatId: int64) =
