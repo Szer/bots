@@ -1041,16 +1041,30 @@ type BotService(
     // Private members — ML / LLM auto-verdict
     // -----------------------------------------------------------------------
 
+    /// Repeat-count lookup gated by feature flag. Skipped when the flag is
+    /// off so we don't pay the DB round-trip on the hot inference path; the
+    /// trained pipeline doesn't reference repeatCountF in that case anyway.
+    /// Window matches MlTrainInterval so the inference distribution lines up
+    /// with the training-time text_repeat_counts CTE in DB.MlData.
+    member private _.GetMlRepeatCount(text: string) = task {
+        if not botConfig.Value.MlRepeatCountEnabled || isNull text then
+            return 0
+        else
+            let since = utcNow() - botConfig.Value.MlTrainInterval
+            return! db.GetTextRepeatCount(text, since)
+    }
+
     /// Fast text-only ML check used to short-circuit before Azure OCR.
     /// Returns Some score when ML alone is confident the message is spam
     /// (records the ML score so callers don't double-record). Returns None
     /// for null text, low ML score, warning band, or old-user immunity —
     /// in which case the caller should run Azure OCR for any cache misses
     /// and then call GetAutoVerdict for the full verdict.
-    member private _.PreOcrMlCheck(msg: TgMessage, usrMsgCount: int) = task {
+    member private this.PreOcrMlCheck(msg: TgMessage, usrMsgCount: int) = task {
         if isNull msg.Text then return None
         else
-        match ml.Predict(msg.Text, usrMsgCount, msg.Entities) with
+        let! repeatCount = this.GetMlRepeatCount(msg.Text)
+        match ml.Predict(msg.Text, usrMsgCount, msg.Entities, repeatCount) with
         | None -> return None
         | Some prediction ->
             // Old-user immunity: defer to GetAutoVerdict so the
@@ -1065,8 +1079,9 @@ type BotService(
     }
 
     /// Runs ML prediction + optional LLM triage, returns verdict.
-    member private _.GetAutoVerdict(msg: TgMessage, usrMsgCount: int) = task {
-        match ml.Predict(msg.Text, usrMsgCount, msg.Entities) with
+    member private this.GetAutoVerdict(msg: TgMessage, usrMsgCount: int) = task {
+        let! repeatCount = this.GetMlRepeatCount(msg.Text)
+        match ml.Predict(msg.Text, usrMsgCount, msg.Entities, repeatCount) with
         | None -> return None
         | Some prediction ->
             do! db.RecordMlScoredMessage(msg.ChatId, msg.MessageId, float prediction.Score, prediction.Score >= botConfig.Value.MlSpamThreshold)

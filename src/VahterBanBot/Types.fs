@@ -305,6 +305,11 @@ type BotConfiguration =
       MlStopWordsInChats: Dictionary<int64, string list>
       /// Time-decay weight parameter: w(t) = exp(-k * age_in_days). 0 = no decay (all weights 1.0).
       MlWeightDecayK: float
+      /// Feature flag: include text-repeat count as an ML feature.
+      /// Affects training only — inference always populates the field correctly,
+      /// so toggling without retrain leaves predictions consistent with the
+      /// currently loaded model's pipeline.
+      MlRepeatCountEnabled: bool
       /// Users with >= this many unique messages are immune from ML/LLM triage.
       MlOldUserMsgCount: int
       // Reaction spam detection

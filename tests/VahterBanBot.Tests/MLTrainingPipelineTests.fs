@@ -12,6 +12,12 @@ open BotTestInfra
 /// deliberately starts with no model in the DB — forcing the bot's prod
 /// MachineLearning.StartAsync to train end-to-end.
 ///
+/// The fixture also enables ML_REPEAT_COUNT_ENABLED=true so this test
+/// exercises the repeat-count feature path through training (conditional
+/// Concatenate of repeatCountF) and inference (DB.GetTextRepeatCount lookup
+/// gated by the FF in Bot.GetMlRepeatCount). Production default is FF=off,
+/// covered implicitly by every other ML test (which uses the pinned model).
+///
 /// The training pipeline is the most important property of this bot (it's what
 /// kills 90% of spam autonomously), so we assert it can:
 ///   1. Train successfully from seed data within a reasonable timeout

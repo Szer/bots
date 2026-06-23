@@ -41,6 +41,7 @@ type SpamOrHamDb =
       spam: bool
       less_than_n_messages: bool
       custom_emoji_count: int
+      text_repeat_count: int
       created_at: DateTime }
 
 type DbService(connString: string, timeProvider: TimeProvider) =
@@ -807,6 +808,7 @@ WITH final_messages AS (
         (data->>'userId')::BIGINT              AS user_id,
         data->>'text'                          AS text,
         data->'rawMessage'->'entities'         AS entities,
+        msg_text_md5,
         created_at
     FROM event
     WHERE event_type IN ('MessageReceived', 'MessageEdited')
@@ -819,6 +821,16 @@ user_msg_counts AS (
            COUNT(DISTINCT text) < @criticalMsgCount AS less_than_n_messages
     FROM final_messages
     GROUP BY user_id
+),
+text_repeat_counts AS (
+    -- How many times the same text appears in the training window.
+    -- Repeated spam blasts (campaigns) get a high count; one-off chatter
+    -- gets 1. Symmetric with the GetTextRepeatCount inference query so
+    -- training and inference see the same feature distribution.
+    SELECT msg_text_md5, COUNT(*)::INT AS text_repeat_count
+    FROM final_messages
+    WHERE msg_text_md5 IS NOT NULL
+    GROUP BY msg_text_md5
 ),
 verdicts AS (
     -- All verdict-bearing events, unified across message and moderation streams
@@ -851,16 +863,41 @@ SELECT m.text,
        COALESCE(u.less_than_n_messages, TRUE)                              AS less_than_n_messages,
        (SELECT COUNT(*) FROM jsonb_array_elements(m.entities) ent
         WHERE ent->>'type' = 'custom_emoji')::INT                          AS custom_emoji_count,
+       COALESCE(rc.text_repeat_count, 1)                                   AS text_repeat_count,
        MAX(m.created_at)                                                   AS created_at
 FROM final_messages m
 LEFT JOIN last_verdict v ON v.chat_id = m.chat_id AND v.message_id = m.message_id
 LEFT JOIN user_msg_counts u ON u.user_id = m.user_id
-GROUP BY m.text, v.is_spam, u.less_than_n_messages, m.entities
+LEFT JOIN text_repeat_counts rc ON rc.msg_text_md5 = m.msg_text_md5
+GROUP BY m.text, v.is_spam, u.less_than_n_messages, m.entities, rc.text_repeat_count
 ORDER BY MAX(m.created_at);
 """
 
             let! data = conn.QueryAsync<SpamOrHamDb>(sql, {| criticalDate = criticalDate; criticalMsgCount = criticalMsgCount |})
             return Array.ofSeq data
+        }
+
+    /// Counts how many MessageReceived events with the same text exist
+    /// in the time window [since, NOW]. Used at inference time to populate
+    /// the repeat-count ML feature symmetrically with how training computes
+    /// it from text_repeat_counts CTE in MlData.
+    /// Backed by idx_event_msg_text_md5 (V35).
+    member _.GetTextRepeatCount(text: string, since: DateTime) : Task<int> =
+        task {
+            use conn = new NpgsqlConnection(connString)
+
+            //language=postgresql
+            let sql =
+                """
+SELECT COUNT(*)::INT
+FROM event
+WHERE event_type = 'MessageReceived'
+  AND msg_text_md5 = md5(@text)
+  AND created_at >= @since;
+"""
+
+            let! count = conn.ExecuteScalarAsync<int>(sql, {| text = text; since = since |})
+            return count
         }
 
     /// Saves a trained ML model to the database (singleton row, upsert).
