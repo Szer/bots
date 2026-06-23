@@ -592,7 +592,7 @@ ORDER BY taken_by;
             return rows |> Seq.toArray
         }
 
-    member _.GetUserEventCounts(eventType: string, sinceUtc: DateTime, untilUtc: DateTime) =
+    member _.GetUserEventCounts(eventType: string, sinceUtc: DateTime option, untilUtc: DateTime) =
         task {
             use! conn = openConn()
             // Net out admin /undo compensations: subtract "<type>_reverted" in the same window.
@@ -608,19 +608,21 @@ SELECT e.user_id,
 FROM coupon_event e
 JOIN "user" u ON u.id = e.user_id
 WHERE e.event_type IN (@event_type, @reverted_type)
-  AND e.created_at >= @since_utc
+  AND (@since_utc IS NULL OR e.created_at >= @since_utc)
   AND e.created_at < @until_utc
 GROUP BY e.user_id, u.username, u.first_name
 HAVING (COUNT(*) FILTER (WHERE e.event_type = @event_type)
         - COUNT(*) FILTER (WHERE e.event_type = @reverted_type)) > 0
 ORDER BY count DESC, e.user_id;
 """
+            // Pass Nullable rather than F# option — Dapper does not bind option params.
+            let sinceParam = match sinceUtc with Some d -> Nullable d | None -> Nullable()
             let! rows =
                 conn.QueryAsync<UserEventCount>(
                     sql,
                     {| event_type = eventType
                        reverted_type = revertedType
-                       since_utc = sinceUtc
+                       since_utc = sinceParam
                        until_utc = untilUtc |}
                 )
             return rows |> Seq.toArray
