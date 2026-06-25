@@ -321,6 +321,9 @@ type BotConfiguration =
       AzureOpenAiKey: string
       AzureOpenAiDeployment: string
       LlmChatDescriptions: Dictionary<int64, string>
+      /// Minutes a cached LLM verdict (text or reaction triage) is reused before re-asking
+      /// the model. Dedups identical spam across channels and absorbs rate-limit bursts.
+      LlmVerdictCacheTtlMinutes: int
       // Reaction-spam triage (vision LLM)
       /// When true, LLM verdict acts autonomously (UNSURE falls through to vahter).
       /// When false (default — shadow mode), LLM runs but verdict is recorded only; vahter always decides.
