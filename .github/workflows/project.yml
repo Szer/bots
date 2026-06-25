@@ -104,7 +104,7 @@ jobs:
         model: gpt-5-mini
         sandbox: workspace-write
         safety-strategy: drop-sudo
-        effort: minimal
+        effort: low
         codex-args: '--config sandbox_workspace_write.network_access=true'
         prompt: |
           <instructions>

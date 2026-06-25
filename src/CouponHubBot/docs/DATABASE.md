@@ -55,7 +55,7 @@ Migration files live in `src/migrations/` (V1 through V11+). Flyway runs them:
 
 ## Access Control
 
-Application connects as role `coupon_hub_bot_service`. When adding a **new table** or changing access, always include `GRANT` statements for this role in the migration.
+Application connects as role `coupon_hub_bot_service`. When adding a **new table** or changing access, grant it to this role — in the same migration, or in a dedicated later grants migration (e.g. `V3__missing_grants.sql`, which also grants `ALL SEQUENCES IN SCHEMA public`). The Testcontainers suite runs every migration and exercises the queries, so a genuinely missing grant fails CI.
 
 Example:
 ```sql

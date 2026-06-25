@@ -67,7 +67,7 @@ scripts/
 ## Database
 
 - Migration files: `V{N}__{description}.sql` (sequential number, double underscore, snake_case)
-- New tables/sequences must include `GRANT` for the service role
+- New tables/sequences must be granted to the service role — either in the creating migration or in a dedicated later grants migration (e.g. `V3__missing_grants.sql`, `V17__grant_permissions.sql`, which also use catch-all `GRANT … ON ALL TABLES/SEQUENCES` + `ALTER DEFAULT PRIVILEGES`). The Testcontainers suite runs every migration, so a genuinely missing grant fails CI; absence of a `GRANT` in a single file is not by itself a defect.
 - Use parameterized SQL only — never string-interpolate user input into SQL
 - VahterBanBot DB: `vahter_db_v2`, role: `vahter_bot_service`
 - CouponHubBot DB: `coupon_hub_bot`, role: `coupon_hub_bot_service`
@@ -106,7 +106,7 @@ Do NOT flag: style preferences, minor formatting, subjective naming choices.
 
 ### Issue Categories
 
-- **BLOCKING**: bugs, security vulnerabilities, missing validation, data loss risks, deadlocks, missing GRANT in migrations
+- **BLOCKING**: bugs, security vulnerabilities, missing validation, data loss risks, deadlocks, a new table/sequence left ungranted to the service role (verify it isn't covered by a later or catch-all grants migration before flagging)
 - **NON-BLOCKING**: convention suggestions, minor improvements, naming preferences
 
 ## VahterBanBot — Specific Notes
