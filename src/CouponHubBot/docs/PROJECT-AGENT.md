@@ -5,7 +5,7 @@ This monorepo runs three "agentic" GitHub Actions that delegate decisions to an 
 | Agent | Workflow | Trigger | Scope | Effort | Sandbox |
 |-------|----------|---------|-------|--------|---------|
 | **SRE** | `.github/workflows/sre.yml` | `issues: labeled` (`deploy-failure`) | All bots in this monorepo | `high` | `workspace-write` |
-| **Project** | `.github/workflows/project.yml` | Daily cron `37 4 * * *` + manual | CouponHubBot only | `minimal` | `workspace-write` |
+| **Project** | `.github/workflows/project.yml` | Daily cron `37 4 * * *` + manual | CouponHubBot only | `low` | `workspace-write` |
 | **Product** | `.github/workflows/product.yml` | Cron `15 10 * * 2,5` + manual | CouponHubBot only | `medium` | `workspace-write` |
 
 All three agents use `workspace-write` even though project/product never modify the repo. Codex's `read-only` sandbox **disables network access**, which would kill the agents' ability to call `gh issue ...` and `curl http://*.internal/...`. **`workspace-write` also defaults network to off**, so every workflow passes `codex-args: '--config sandbox_workspace_write.network_access=true'` to flip it on. The blast radius is bounded by each workflow's `permissions:` block — for project/product, `contents: read` blocks any push to the repo even though the agent can write inside `$GITHUB_WORKSPACE`.
@@ -28,6 +28,8 @@ The agent can rollback ArgoCD apps (disabling auto-sync first), trigger syncs, d
 ## Project — daily backlog maintenance (coupon-only)
 
 Each morning at 04:37 UTC the cleanup job closes yesterday's stale orchestration issue, then `gather-metrics.sh` snapshots Prometheus + Loki + ArgoCD for the `coupon-bot` deployment. The snapshot is embedded in a new `project`-labelled orchestration issue, the agent is invoked with the snapshot inlined, and it creates / bumps / closes backlog issues.
+
+The agent's mandate is **runtime signals + demonstrable tech debt**, on the operating assumption that the scanned code already compiles, passes tests, and runs in prod. It does **not** perform static code review or bug-hunting — correctness is owned by the compiler, the test suite, the review agent (PR-time), and the SRE agent. Findings must cite a runtime signal (Error/Fatal log, 5xx, restart, memory/latency anomaly) or a concrete debt artifact, and use **stable, undated titles** so a recurring problem bumps its existing issue instead of spawning duplicates. A clean day where nothing is filed is a valid outcome. Effort is `low` (raised from `minimal`, which was too shallow for reliable search-before-create dedup).
 
 Issue lifecycle: `project` issues are left **unassigned** for human triage. Priority is capped at `priority-medium` — only humans set `priority-high`.
 
