@@ -17,6 +17,12 @@ module Store =
     /// "first call fails, second call succeeds" retry semantics.
     let responseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Scripted responses for the Azure OpenAI chat-completions endpoint (separate from the
+    /// OCR queue so the two don't interfere). If non-empty, dequeue one per LLM call; after it
+    /// empties, fall back to the normal keyword-routed 200. Used to inject HTTP 429s so tests
+    /// can exercise the bot's retry/backoff and the "leak to action channel on failure" behavior.
+    let llmResponseScript = ConcurrentQueue<ScriptedResponse>()
+
     let logCall (methodName: string) (url: string) (body: string) =
         calls.Enqueue(
             { Method = methodName
@@ -33,5 +39,10 @@ module Store =
     let clearScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while responseScript.TryDequeue(&item) do
+            ()
+
+    let clearLlmScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while llmResponseScript.TryDequeue(&item) do
             ()
 

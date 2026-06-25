@@ -1,6 +1,7 @@
 module VahterBanBot.LlmTriage
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.Net.Http
 open System.Security.Cryptography
@@ -13,7 +14,27 @@ open Microsoft.Extensions.Options
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
 open VahterBanBot.Utils
+open VahterBanBot.LlmVerdictCache
 open BotInfra
+
+// ── Dedup helpers ─────────────────────────────────────────────────────────────
+
+let private md5Hex (s: string) =
+    MD5.HashData(Encoding.UTF8.GetBytes s) |> Convert.ToHexString |> _.ToLower()
+
+/// Coalesces concurrent calls with the same key onto a single in-flight Task, so a burst of
+/// identical spam delivered across channels at once triggers only one Azure call (the rest
+/// await the same result). The entry is removed once the task completes, so later (temporal)
+/// repeats fall through to the DB verdict cache instead. Per-process — sufficient for the
+/// single webhook instance.
+let private singleFlight (inflight: ConcurrentDictionary<string, Lazy<Task<'T>>>) (key: string) (factory: unit -> Task<'T>) : Task<'T> =
+    let entry =
+        inflight.GetOrAdd(key, fun k ->
+            lazy (task {
+                try   return! factory()
+                finally inflight.TryRemove(k) |> ignore
+            }))
+    entry.Value
 
 // ── Response parsing ──────────────────────────────────────────────────────────
 
@@ -67,7 +88,10 @@ type ILlmTriage =
     abstract member PromptHash: string
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmVerdict>
 
-type AzureLlmTriage(httpClient: HttpClient, botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService) =
+type AzureLlmTriage(httpClient: HttpClient, botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService, cache: ILlmVerdictCache) =
+
+    // Coalesces concurrent identical-text classifications (same spam across channels at once).
+    let inflight = ConcurrentDictionary<string, Lazy<Task<LlmVerdict>>>()
 
     // Static part of the system prompt — used to compute the prompt hash once at startup.
     // Per-chat descriptions are configuration, not the prompt itself.
@@ -96,36 +120,32 @@ Respond with exactly: {"verdict":"SPAM"} or {"verdict":"SKIP"} or {"verdict":"NO
 
     let modelName = botConf.Value.AzureOpenAiDeployment
 
-    interface ILlmTriage with
-        member _.ModelName  = modelName
-        member _.PromptHash = promptHash
+    // Performs the actual Azure call (no dedup/cache). On a successful verdict it records the
+    // classification and, when `cacheKey` is provided, stores the verdict for reuse. Errors are
+    // never cached, so a transient 429 is retried next time rather than pinned.
+    let classifyUncached (msg: TgMessage) (userMsgCount: int64) (cacheKey: string option) (ct: CancellationToken) = task {
+        use activity = botActivity.StartActivity("llmTriage")
 
-        member _.Classify(msg: TgMessage, userMsgCount: int64, ct: CancellationToken) = task {
-            if not botConf.Value.LlmTriageEnabled then return LlmVerdict.Skip
-            else
+        let chatDescLine =
+            match botConf.Value.LlmChatDescriptions.TryGetValue(msg.ChatId) with
+            | true, d -> $"\nChat: {d}"
+            | _       -> ""
 
-            use activity = botActivity.StartActivity("llmTriage")
+        let systemPrompt =
+            $"""{staticSystemPrompt}{chatDescLine}"""
 
-            let chatDescLine =
-                match botConf.Value.LlmChatDescriptions.TryGetValue(msg.ChatId) with
-                | true, d -> $"\nChat: {d}"
-                | _       -> ""
-
-            let systemPrompt =
-                $"""{staticSystemPrompt}{chatDescLine}"""
-
-            let username    = if isNull msg.SenderUsername then "(none)" else $"@{msg.SenderUsername}"
-            let displayName = msg.SenderDisplayName
-            let userPrompt  =
-                $"""Username: {username}
+        let username    = if isNull msg.SenderUsername then "(none)" else $"@{msg.SenderUsername}"
+        let displayName = msg.SenderDisplayName
+        let userPrompt  =
+            $"""Username: {username}
 Display name: {displayName}
 Total messages seen from this user: {userMsgCount}
 
 Message:
 {msg.Text}"""
 
-            let requestJson =
-                $"""{{
+        let requestJson =
+            $"""{{
   "messages": [
     {{"role":"system","content":{JsonSerializer.Serialize(systemPrompt)}}},
     {{"role":"user","content":{JsonSerializer.Serialize(userPrompt)}}}
@@ -147,38 +167,65 @@ Message:
   "temperature": 0
 }}"""
 
-            let url = $"{botConf.Value.AzureOpenAiEndpoint}/openai/deployments/{botConf.Value.AzureOpenAiDeployment}/chat/completions?api-version=2024-08-01-preview"
+        let url = $"{botConf.Value.AzureOpenAiEndpoint}/openai/deployments/{botConf.Value.AzureOpenAiDeployment}/chat/completions?api-version=2024-08-01-preview"
 
-            let sw = Stopwatch.StartNew()
-            use request = new HttpRequestMessage(HttpMethod.Post, url)
-            request.Headers.Add("api-key", botConf.Value.AzureOpenAiKey)
-            request.Content <- new StringContent(requestJson, Encoding.UTF8, "application/json")
+        let sw = Stopwatch.StartNew()
+        use request = new HttpRequestMessage(HttpMethod.Post, url)
+        request.Headers.Add("api-key", botConf.Value.AzureOpenAiKey)
+        request.Content <- new StringContent(requestJson, Encoding.UTF8, "application/json")
 
-            use! response = httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)
-            let! body = response.Content.ReadAsStringAsync(ct)
-            sw.Stop()
+        use! response = httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)
+        let! body = response.Content.ReadAsStringAsync(ct)
+        sw.Stop()
 
-            if response.IsSuccessStatusCode then
-                match parseResponse logger body with
-                | Some (verdictStr, promptTokens, completionTokens) ->
-                    if not (isNull activity) then
-                        %activity
-                            .SetTag("verdict",      verdictStr)
-                            .SetTag("latency_ms",   sw.ElapsedMilliseconds)
-                            .SetTag("total_tokens", promptTokens + completionTokens)
-                            .SetTag("chat_id",      msg.ChatId)
-                            .SetTag("user_id",      msg.SenderId)
-                    do! db.RecordLlmClassified(
-                            msg.ChatId, msg.MessageId, verdictStr,
-                            promptTokens, completionTokens, int sw.ElapsedMilliseconds,
-                            Some modelName, Some promptHash)
-                    return LlmVerdict.FromString verdictStr
-                | None ->
-                    // warning already logged in parseResponse
-                    return LlmVerdict.Error
-            else
-                logger.LogWarning("LLM triage returned {Status}: {Body}", int response.StatusCode, body)
+        if response.IsSuccessStatusCode then
+            match parseResponse logger body with
+            | Some (verdictStr, promptTokens, completionTokens) ->
+                if not (isNull activity) then
+                    %activity
+                        .SetTag("verdict",      verdictStr)
+                        .SetTag("latency_ms",   sw.ElapsedMilliseconds)
+                        .SetTag("total_tokens", promptTokens + completionTokens)
+                        .SetTag("chat_id",      msg.ChatId)
+                        .SetTag("user_id",      msg.SenderId)
+                do! db.RecordLlmClassified(
+                        msg.ChatId, msg.MessageId, verdictStr,
+                        promptTokens, completionTokens, int sw.ElapsedMilliseconds,
+                        Some modelName, Some promptHash)
+                match cacheKey with
+                | Some k -> do! cache.Save(k, verdictStr, None, Some modelName)
+                | None   -> ()
+                return LlmVerdict.FromString verdictStr
+            | None ->
+                // warning already logged in parseResponse
                 return LlmVerdict.Error
+        else
+            logger.LogWarning("LLM triage returned {Status}: {Body}", int response.StatusCode, body)
+            return LlmVerdict.Error
+    }
+
+    interface ILlmTriage with
+        member _.ModelName  = modelName
+        member _.PromptHash = promptHash
+
+        member _.Classify(msg: TgMessage, userMsgCount: int64, ct: CancellationToken) = task {
+            if not botConf.Value.LlmTriageEnabled then return LlmVerdict.Skip
+            else
+
+            // Same spammer + same text ⇒ same key (the "duplicate across N channels" case). The
+            // verdict depends on the user (username / display name / message count), so the key is
+            // scoped by sender id — different users posting identical text are NOT deduped.
+            // Concurrent duplicates share one in-flight call (single-flight); temporal repeats hit
+            // the DB verdict cache. Photo-only / empty-text messages have no stable key → classify directly.
+            match (if String.IsNullOrEmpty msg.Text then None else Some (sprintf "text:%d:%s" msg.SenderId (md5Hex msg.Text))) with
+            | None -> return! classifyUncached msg userMsgCount None ct
+            | Some key ->
+                return! singleFlight inflight key (fun () -> task {
+                    let ttl = TimeSpan.FromMinutes(float botConf.Value.LlmVerdictCacheTtlMinutes)
+                    match! cache.TryGet(key, ttl) with
+                    | Some cv -> return LlmVerdict.FromString cv.Verdict
+                    | None    -> return! classifyUncached msg userMsgCount (Some key) ct
+                })
         }
 
 // ── Reaction-spam triage classifier (vision-enabled) ──────────────────────────
@@ -277,6 +324,9 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
         member _.ModelName  = modelName
         member _.PromptHash = promptHash
 
+        // Reaction triage relies on retry (configured at the HttpClient level in Program.fs) to
+        // survive 429s; it deliberately does NOT use the verdict cache — re-triage is already
+        // governed by the per-user cooldown in RunReactionTriagePipeline.
         member _.ClassifyReactionSpammer(dossier: ReactionTriageDossier, shadowMode: bool, ct: CancellationToken) = task {
             use activity = botActivity.StartActivity("llmReactionTriage")
             if not (isNull activity) then

@@ -330,6 +330,29 @@ type BotContainerBase(config: BotContainerConfig) =
             return resp
         }
 
+    /// Scripts the Azure OpenAI chat-completions endpoint (e.g. a 429 then fall-through to a
+    /// keyword-routed 200) so tests can exercise the bot's retry/backoff and failure handling.
+    /// An empty array clears the script.
+    member _.SetAzureLlmScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/llm-script", payload)
+            return ()
+        }
+
+    /// Returns only the Azure OpenAI chat-completions calls the fake recorded (filters out OCR).
+    /// Tests count these to assert dedup/single-flight (e.g. "exactly 1 call for this content")
+    /// and retry (e.g. ">= 2 calls" after a scripted 429).
+    member _.GetAzureLlmCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
+            return resp |> Array.filter (fun c -> c.Url.Contains("/openai/"))
+        }
+
     /// Advances the bot's FakeTimeProvider by `ms` milliseconds, deterministically
     /// firing any pending TimeProvider-driven timers (notably BatchDebounce.Schedule).
     /// Requires TEST_MODE=true on the bot. Returns once the bot has accepted the

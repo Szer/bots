@@ -83,6 +83,28 @@ module Handlers =
             let isReactionTriage =
                 body.Contains("reaction_spam_verdict", StringComparison.Ordinal)
 
+            // Per-call scripted response wins over keyword routing, if any are queued. This lets
+            // tests inject HTTP 429s (and "network"/"timeout") to exercise retry/backoff and the
+            // failure-fallthrough-to-action-channel behavior. Scoped to TEXT triage (spam_verdict)
+            // only, so reaction-triage tests can never consume a leftover script entry. When the
+            // queue empties, calls fall back to the normal keyword routing below.
+            let scripted =
+                if isReactionTriage then None
+                else
+                    let mutable item = Unchecked.defaultof<ScriptedResponse>
+                    if Store.llmResponseScript.TryDequeue(&item) then Some item else None
+
+            if scripted.IsSome then
+                let s = scripted.Value
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            else
+
             let responseJson =
                 if isReactionTriage then
                     let verdict =
@@ -225,6 +247,26 @@ module Handlers =
                     if not (isNull (box payload.responses)) then
                         for r in payload.responses do
                             Store.responseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Sets the scripted-response queue for the Azure OpenAI chat-completions endpoint.
+    /// An empty/absent `responses` array clears it (calls fall back to keyword routing).
+    let setLlmScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearLlmScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.llmResponseScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

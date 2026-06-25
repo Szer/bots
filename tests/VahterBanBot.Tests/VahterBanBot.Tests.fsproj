@@ -23,6 +23,7 @@
         <Compile Include="PingTests.fs" />
         <Compile Include="EventSerializationTests.fs" />
         <Compile Include="LlmTriageTests.fs" />
+        <Compile Include="LlmTriageResilienceTests.fs" />
         <Compile Include="OcrCacheTests.fs" />
         <Compile Include="OcrShortCircuitTests.fs" />
         <Compile Include="CleanupTests.fs" />
