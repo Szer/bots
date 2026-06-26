@@ -12,7 +12,7 @@
 - **OpenTelemetry** for traces and metrics
 - Metrics exported to **Prometheus** at `http://prometheus.internal:9090` (requires VPN)
 - Key metrics: HTTP request duration, Npgsql query duration
-- Health queries: see Cursor skill `prometheus-metrics`
+- Health queries: PromQL against `http://prometheus.internal:9090/api/v1/query` (no auth, VPN); see `scripts/gather-metrics.sh` and `.github/prompts/sre.md` for ready-made queries
 
 ### Custom Bot Metrics
 
@@ -35,13 +35,18 @@ All custom metrics are defined in `src/CouponHubBot/Telemetry.fs` under the `Cou
 
 - OpenTelemetry traces configured in `Telemetry.fs`
 - Includes Npgsql instrumentation for database query tracing
+- Traces shipped to **Tempo**. Query directly over the VPN (no auth) at
+  `http://tempo.monitoring.svc.cluster.local:3200` (TraceQL `/api/search`, `/api/traces/{id}`).
+  There is no `tempo.internal` DNS alias, but the `svc.cluster.local` name resolves over WireGuard.
+  Trace attributes include `chatId`, `chatUsername`, `action`, `fromUserId`.
 
 ## Accessing Over VPN
 
 All observability endpoints are behind WireGuard VPN:
 - Loki: `http://loki.internal` (no auth, direct access)
-- Grafana: `http://grafana.internal` (requires auth, dashboards only)
-- Prometheus: `http://prometheus.internal:9090`
+- Grafana: `http://grafana.internal` (dashboards + token-authenticated HTTP API)
+- Prometheus: `http://prometheus.internal:9090` (no auth)
+- Tempo: `http://tempo.monitoring.svc.cluster.local:3200` (no auth; no `.internal` alias)
 - ArgoCD: `http://argo.internal`
 
 Locally: ensure WireGuard is connected.
