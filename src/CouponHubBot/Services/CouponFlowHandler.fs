@@ -210,7 +210,43 @@ type CouponFlowHandler(
                             )
                             |> taskIgnore
                     else
-                        let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                        // OCR runs synchronously inside the webhook update handler here,
+                        // so a transient backend failure (e.g. the OCR HttpClient's 2s
+                        // timeout) must NOT escape as an unhandled exception. Mirror the
+                        // batch path: retry once on transient failure, then fall back to
+                        // manual entry instead of crashing the update handler.
+                        let attemptOcr () = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                        let! ocrOpt =
+                            task {
+                                try
+                                    let! r = attemptOcr ()
+                                    return Some r
+                                with
+                                | :? OperationCanceledException
+                                | :? HttpRequestException as ex ->
+                                    logger.LogInformation(ex, "Single-photo OCR transient failure for user {UserId}, retrying once", user.id)
+                                    do! Task.Delay 100
+                                    try
+                                        let! r = attemptOcr ()
+                                        return Some r
+                                    with ex2 ->
+                                        logger.LogWarning(ex2, "Single-photo OCR failed after retry for user {UserId}; falling back to manual entry", user.id)
+                                        return None
+                            }
+                        if ocrOpt.IsNone then
+                            // The pending flow was already upserted above at
+                            // awaiting_discount_choice with the photo retained, so just
+                            // prompt for manual entry (same UX as the OCR-disabled path).
+                            do!
+                                botClient.SendMessage(
+                                    ChatId chatId,
+                                    "Не получилось распознать фото. Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
+                                    replyMarkup = BotHelpers.addWizardDiscountKeyboard()
+                                )
+                                |> taskIgnore
+                        else
+
+                        let ocr = ocrOpt.Value
 
                         let valueOpt =
                             if ocr.couponValue.HasValue then
