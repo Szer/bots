@@ -289,6 +289,10 @@ type BotConfiguration =
       AzureOcrKey: string
       MlEnabled: bool
       MlRetrainScheduledTime: TimeSpan
+      /// When false, the scheduled daily ML retrain is skipped (the loaded model stays put).
+      /// Default true in production; disabled in tests so a wall-clock-triggered retrain can't
+      /// rebuild the pinned fixture model mid-suite.
+      MlRetrainScheduledEnabled: bool
       MlSeed: Nullable<int>
       MlSpamDeletionEnabled: bool
       MlSpamAutobanEnabled: bool

@@ -108,6 +108,10 @@ type VahterTestContainers(mlEnabled: bool) =
                     "ML_ENABLED",                          "true",  "FEATURE_FLAG", "ML"
                     "ML_SEED",                             "42",    "FREE_FORM",    "ML"
                     "ML_TRAIN_RANDOM_SORT_DATA",           "false", "FEATURE_FLAG", "ML"
+                    // Pin the loaded ml-model.bin for the whole suite: disable the wall-clock daily
+                    // retrain so spam created by triage tests can't rebuild the model mid-run and
+                    // shift the deterministic ML scores other tests assert on.
+                    "ML_RETRAIN_SCHEDULED_ENABLED",        "false", "FEATURE_FLAG", "ML"
                     "ML_SPAM_THRESHOLD",                   "1.0",   "FREE_FORM",    "ML"
                     "ML_STOP_WORDS_IN_CHATS",              """{"-42":["2"]}""", "JSON_BLOB", "ML"
                     "ML_SPAM_DELETION_ENABLED",            "true",  "FEATURE_FLAG", "ML_SPAM_DELETION"

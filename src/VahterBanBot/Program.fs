@@ -99,6 +99,7 @@ let buildBotConf () =
       MlRetrainScheduledTime =
           let s = getSettingOr "ML_RETRAIN_SCHEDULED_TIME_UTC" "23:30"
           TimeOnly.Parse(s).ToTimeSpan()
+      MlRetrainScheduledEnabled = getSettingOr "ML_RETRAIN_SCHEDULED_ENABLED" "true" |> bool.Parse
       MlSeed =
           match getSetting "ML_SEED" with
           | null -> Nullable<int>()
