@@ -71,6 +71,49 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
     let getCouponCount () =
         fixture.QuerySingle<int64>("SELECT COUNT(*)::bigint FROM coupon", null)
 
+    /// Regression for #158: the single-photo /add OCR runs synchronously inside
+    /// the webhook update handler. When the OCR backend stalls past the OCR
+    /// HttpClient's 2s timeout, the resulting TaskCanceledException must NOT
+    /// escape as an "Unhandled error in update handler" — it must be caught,
+    /// retried once, and then degrade to the manual-entry prompt so the user is
+    /// never left hanging. Pre-fix this threw and sent the user nothing.
+    [<Fact>]
+    let ``Single-photo OCR timeout: falls back to manual entry, no unhandled error`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let user = Tg.user(id = 661L, username = "ocr_timeout", firstName = "Timeout")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let fileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let fileId = "ocr-photo-timeout"
+            do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
+
+            try
+                // Azure OCR stalls 10s on every call → the 2s OCR HttpClient
+                // timeout fires on both the initial attempt and the one retry.
+                do! fixture.SetAzureOcrErrorMode("timeout")
+
+                let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("", user, fileId = fileId))
+                // The update handler must complete cleanly (no 5xx) despite the
+                // OCR timeout.
+                Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+                let! calls = fixture.GetFakeCalls("sendMessage")
+                Assert.True(findCallWithText calls user.Id "Не получилось распознать фото",
+                            "Expected manual-entry fallback after OCR timeout")
+                Assert.True(findCallWithText calls user.Id "Выбери скидку и минимальный чек",
+                            "Expected manual discount/min-check prompt in the fallback")
+
+                // No coupon should have been created from a timed-out OCR.
+                let! count = getCouponCount ()
+                Assert.Equal(0L, count)
+            finally
+                // Never leak the stall mode into sibling tests sharing the container.
+                fixture.SetAzureOcrErrorMode("").GetAwaiter().GetResult()
+        }
+
     [<Fact>]
     let ``Implicit /add: photo with no pending flows starts OCR wizard`` () =
         task {
