@@ -374,22 +374,11 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
-            let! ocrAnalysis =
-                task {
-                    try
-                        return! azureTextOcr.AnalyzeImageBytes(imageBytes)
-                    with
-                    | :? System.OperationCanceledException as ex ->
-                        // Transient: surface so the batch flow can retry once.
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | :? System.Net.Http.HttpRequestException as ex ->
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | ex ->
-                        logger.LogWarning(ex, "Azure text OCR failed")
-                        return (null: OcrAnalysis | null)
-                }
+            // AnalyzeImageBytes degrades transient failures (timeout/network/5xx,
+            // already retried by the HTTP resilience pipeline) to a null result, so
+            // a slow or unavailable Azure OCR yields no text rather than throwing —
+            // the barcode from ZXing above is independent and may still be present.
+            let! ocrAnalysis = azureTextOcr.AnalyzeImageBytes(imageBytes)
 
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
 

@@ -90,15 +90,10 @@ type AzureBotOcr(httpClient: HttpClient, options: IOptions<BotOcrConfig>, logger
                         else
                             logger.LogWarning("Azure OCR returned status {Status}. Response: {Body}", response.StatusCode, responseContent)
                             return (null: OcrAnalysis | null)
-                    with
-                    | :? OperationCanceledException as ex ->
-                        // Transient: let the caller decide whether to retry.
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | :? HttpRequestException as ex ->
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | ex ->
-                        logger.LogError(ex, "Failed to extract text via Azure OCR")
+                    with ex ->
+                        // Transient failures (timeout/network/5xx) are retried by the HTTP
+                        // resilience pipeline; if one still surfaces here the attempts are
+                        // spent, so degrade to "no OCR result" instead of throwing.
+                        logger.LogWarning(ex, "Failed to extract text via Azure OCR")
                         return (null: OcrAnalysis | null)
             }

@@ -1,12 +1,15 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
+open Polly
+open Microsoft.Extensions.Http.Resilience
 open Microsoft.Extensions.Time.Testing
 open CouponHubBot
 open CouponHubBot.Services
@@ -119,11 +122,23 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
-// OCR: register shared IBotOcr with a 2s per-attempt HTTP timeout so the batch
-// flow can safely render results at debounce time without awaiting in-flight calls.
+// OCR: register shared IBotOcr. Retry + per-attempt timeout live in the HTTP
+// resilience pipeline rather than in the call sites — a transient failure or a
+// slow attempt is retried once, and the 2s per-attempt budget keeps the batch
+// flow from awaiting an in-flight call past debounce time. HttpClient.Timeout is
+// disabled because it would bound the whole pipeline (all attempts share one
+// budget, defeating retry); the pipeline's attempt/total timeouts govern instead.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>(fun c ->
-    c.Timeout <- TimeSpan.FromSeconds 2.)
+%builder.Services
+    .AddHttpClient<IBotOcr, AzureBotOcr>(fun c -> c.Timeout <- Timeout.InfiniteTimeSpan)
+    .AddStandardResilienceHandler(fun o ->
+        o.AttemptTimeout.Timeout <- TimeSpan.FromSeconds 2.
+        o.Retry.MaxRetryAttempts <- 1
+        o.Retry.Delay <- TimeSpan.FromMilliseconds 100.
+        o.Retry.BackoffType <- DelayBackoffType.Constant
+        // Bound the whole operation so a webhook handler holding this call can't
+        // stall: ~2s + 0.1s + 2s ≈ 4.1s worst case, well under Telegram's timeout.
+        o.TotalRequestTimeout.Timeout <- TimeSpan.FromSeconds 6.)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()

@@ -4,7 +4,6 @@ open System
 open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
-open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
@@ -210,43 +209,13 @@ type CouponFlowHandler(
                             )
                             |> taskIgnore
                     else
-                        // OCR runs synchronously inside the webhook update handler here,
-                        // so a transient backend failure (e.g. the OCR HttpClient's 2s
-                        // timeout) must NOT escape as an unhandled exception. Mirror the
-                        // batch path: retry once on transient failure, then fall back to
-                        // manual entry instead of crashing the update handler.
-                        let attemptOcr () = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
-                        let! ocrOpt =
-                            task {
-                                try
-                                    let! r = attemptOcr ()
-                                    return Some r
-                                with
-                                | :? OperationCanceledException
-                                | :? HttpRequestException as ex ->
-                                    logger.LogInformation(ex, "Single-photo OCR transient failure for user {UserId}, retrying once", user.id)
-                                    do! Task.Delay 100
-                                    try
-                                        let! r = attemptOcr ()
-                                        return Some r
-                                    with ex2 ->
-                                        logger.LogWarning(ex2, "Single-photo OCR failed after retry for user {UserId}; falling back to manual entry", user.id)
-                                        return None
-                            }
-                        if ocrOpt.IsNone then
-                            // The pending flow was already upserted above at
-                            // awaiting_discount_choice with the photo retained, so just
-                            // prompt for manual entry (same UX as the OCR-disabled path).
-                            do!
-                                botClient.SendMessage(
-                                    ChatId chatId,
-                                    "Не получилось распознать фото. Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
-                                    replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                                )
-                                |> taskIgnore
-                        else
-
-                        let ocr = ocrOpt.Value
+                        // OCR runs synchronously inside the webhook update handler, but
+                        // Recognize degrades a transient/timeout failure (retried by the
+                        // OCR HTTP resilience pipeline) to a null-field result rather than
+                        // throwing — so a slow Azure OCR can't crash the handler. The
+                        // barcode from ZXing may still be present, in which case the wizard
+                        // falls through to manual discount/min-check entry below.
+                        let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
 
                         let valueOpt =
                             if ocr.couponValue.HasValue then
@@ -487,9 +456,10 @@ type CouponFlowHandler(
             $"{header}\n{body}", BotHelpers.addBatchConfirmKeyboard batchId okItems.Length
 
     /// Background OCR for one item. Fire-and-forget from the webhook handler.
-    /// 2s HTTP timeout (configured on the OCR HttpClient), one retry on
-    /// transient network failures. All writes are conditional on status='pending'
-    /// so a late OCR finish after finalize's claim is a safe no-op.
+    /// Per-attempt 2s timeout and one retry on transient failures are handled by
+    /// the OCR HTTP resilience pipeline (see Program.fs). All writes are
+    /// conditional on status='pending' so a late OCR finish after finalize's
+    /// claim is a safe no-op.
     member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) (parent: ActivityContext option) : Task =
         task {
             use a =
@@ -537,18 +507,10 @@ type CouponFlowHandler(
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                             do! writeNeedsInput "OCR failed"
                         else
-                            let attempt () = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
-                            let! ocr =
-                                task {
-                                    try
-                                        return! attempt ()
-                                    with
-                                    | :? OperationCanceledException
-                                    | :? HttpRequestException as ex ->
-                                        logger.LogInformation(ex, "OCR transient failure for item {ItemId}, retrying once", itemId)
-                                        do! Task.Delay 100
-                                        return! attempt ()
-                                }
+                            // Transient/timeout failures are retried by the OCR HTTP
+                            // resilience pipeline; Recognize then degrades to a null-field
+                            // result, which falls through to needs_input below.
+                            let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
 
                             // Barcode comes from ZXing on the raw image bytes — independent of
                             // Azure OCR. If Azure fails (e.g. 403, VNet block) ZXing can still

@@ -72,11 +72,12 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
         fixture.QuerySingle<int64>("SELECT COUNT(*)::bigint FROM coupon", null)
 
     /// Regression for #158: the single-photo /add OCR runs synchronously inside
-    /// the webhook update handler. When the OCR backend stalls past the OCR
-    /// HttpClient's 2s timeout, the resulting TaskCanceledException must NOT
-    /// escape as an "Unhandled error in update handler" — it must be caught,
-    /// retried once, and then degrade to the manual-entry prompt so the user is
-    /// never left hanging. Pre-fix this threw and sent the user nothing.
+    /// the webhook update handler. When Azure OCR stalls past its per-attempt
+    /// timeout, the OCR HTTP resilience pipeline retries once and then Recognize
+    /// degrades to a null-field result instead of throwing — so the handler must
+    /// NOT raise an "Unhandled error in update handler". ZXing still decodes the
+    /// barcode from the image, so the wizard falls through to manual discount /
+    /// min-check entry. Pre-#158 this threw and the user got nothing.
     [<Fact>]
     let ``Single-photo OCR timeout: falls back to manual entry, no unhandled error`` () =
         task {
@@ -91,8 +92,8 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
 
             try
-                // Azure OCR stalls 10s on every call → the 2s OCR HttpClient
-                // timeout fires on both the initial attempt and the one retry.
+                // Azure OCR stalls 10s on every call → the resilience pipeline's
+                // 2s per-attempt timeout fires on both the attempt and the retry.
                 do! fixture.SetAzureOcrErrorMode("timeout")
 
                 let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("", user, fileId = fileId))
@@ -100,11 +101,11 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
                 // OCR timeout.
                 Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
+                // Azure timed out (no value/min/date), but ZXing decoded the
+                // barcode, so the wizard asks for manual discount / min-check.
                 let! calls = fixture.GetFakeCalls("sendMessage")
-                Assert.True(findCallWithText calls user.Id "Не получилось распознать фото",
-                            "Expected manual-entry fallback after OCR timeout")
                 Assert.True(findCallWithText calls user.Id "Выбери скидку и минимальный чек",
-                            "Expected manual discount/min-check prompt in the fallback")
+                            "Expected manual discount/min-check prompt after OCR timeout")
 
                 // No coupon should have been created from a timed-out OCR.
                 let! count = getCouponCount ()
