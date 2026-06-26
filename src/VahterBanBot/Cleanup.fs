@@ -116,7 +116,7 @@ type CleanupService(
                 do! tryRunJob "daily_cleanup" (TimeSpan.FromHours botConf.Value.CleanupScheduledHour) runCleanup
                 do! tryRunJob "daily_stats" (TimeSpan.FromHours botConf.Value.StatsScheduledHour) runStats
 
-                if botConf.Value.MlEnabled then
+                if botConf.Value.MlEnabled && botConf.Value.MlRetrainScheduledEnabled then
                     do! tryRunJob "daily_ml_retrain" botConf.Value.MlRetrainScheduledTime (fun () -> ml.RetrainAndSave())
 
                 // Check if another pod retrained a newer model (all pods)
