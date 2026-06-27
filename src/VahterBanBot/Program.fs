@@ -4,8 +4,6 @@ open System.Net.Http
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
-open Polly
-open Microsoft.Extensions.Http.Resilience
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.Logging
@@ -196,26 +194,11 @@ WebhookHost.configureSharedServices webhookCfg builder
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
 %builder.Services.AddSingleton<IComputerVision, BotOcrComputerVision>()
-// Azure OpenAI calls get retry-with-backoff so a single 429 (rate limit) recovers instead of
-// leaking the message to the vahter action channel. Default ShouldHandle treats 429/5xx/timeouts
-// as transient and the HTTP retry honors the Retry-After header. Single-flight + the verdict
-// cache (see LlmTriage.fs) keep the call volume low so 429s are rare to begin with.
-let addAzureOpenAiRetry (b: IHttpClientBuilder) =
-    b.AddResilienceHandler("azure-openai-retry", fun (p: ResiliencePipelineBuilder<HttpResponseMessage>) ->
-        p.AddRetry(
-            // Bounded, fast retries: a webhook handler is holding this call, so total retry time
-            // must stay well under Telegram's webhook timeout. ~0.5s, 1s, 2s ≈ 3.5s worst case.
-            // When Azure sends Retry-After on the 429, the handler honors it instead of the backoff.
-            HttpRetryStrategyOptions(
-                MaxRetryAttempts = 3,
-                Delay = TimeSpan.FromMilliseconds 500.0,
-                BackoffType = DelayBackoffType.Exponential,
-                UseJitter = true))
-        |> ignore)
-    |> ignore
-
-addAzureOpenAiRetry (builder.Services.AddHttpClient<ILlmTriage, AzureLlmTriage>())
-addAzureOpenAiRetry (builder.Services.AddHttpClient<IReactionTriageClassifier, AzureReactionTriage>())
+// Both LLM classifiers talk to Azure OpenAI through the Azure.AI.OpenAI SDK, which carries its own
+// retry pipeline (honors Retry-After on 429) — see LlmTriage.fs. Singleton so the per-instance
+// single-flight/verdict-cache state and the memoized ChatClient are shared across requests.
+%builder.Services.AddSingleton<ILlmTriage, AzureLlmTriage>()
+%builder.Services.AddSingleton<IReactionTriageClassifier, AzureReactionTriage>()
 %builder.Services.AddSingleton<IUserProfileFetcher, UserProfileFetcher>()
 
 let app = builder.Build()
