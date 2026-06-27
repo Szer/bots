@@ -246,7 +246,8 @@ let startupBotConf = botConfOptions.Value
             let db = ctx.RequestServices.GetRequiredService<DbService>()
             let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
             logger.LogInformation "Snapshot rebuild starting"
-            let! count = db.RebuildSnapshots()
+            let onProgress (msg: string) = logger.LogInformation("Snapshot rebuild progress: {Progress}", msg)
+            let! count = db.RebuildSnapshots(onProgress = onProgress)
             logger.LogInformation("Snapshot rebuild done: {Count} streams", count)
             return Results.Ok $"Rebuilt {count} snapshots"
     }))

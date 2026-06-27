@@ -303,3 +303,57 @@ let ``MessageReceived with rawMessage as a JSON object deserializes (legacy back
         Assert.Equal(Some "hi", e.text)
     | other -> Assert.Fail $"Expected MessageReceived but got {other}"
 
+
+// ---------------------------------------------------------------------------
+// Message.FoldTimeline — a message's spam/ham status folded in F# from BOTH streams
+// (message marks + moderation bot/vahter actions), last decisive event wins. Mirrors MlData.
+// Pure: the caller feeds events already ordered by (created_at, id).
+// ---------------------------------------------------------------------------
+
+let private rawEl () = JsonSerializer.SerializeToElement("{}")
+let private recv () = FromMessage (MessageReceived {| chatId = -1L; messageId = 1; userId = 5L; text = Some "x"; rawMessage = rawEl () |})
+let private botDeleted () = FromModeration (BotAutoDeleted {| chatId = -1L; messageId = 1; userId = 5L; reason = MlSpam {| score = 4.0 |} |})
+let private vahter (act: VahterAction) = FromModeration (VahterActed {| vahterId = 34L; actionType = act; targetUserId = 5L; chatId = -1L; messageId = 1 |})
+let private markSpam () = FromMessage (MessageMarkedSpam {| chatId = -1L; messageId = 1; markedBy = Some 34L |})
+let private markHam () = FromMessage (MessageMarkedHam {| chatId = -1L; messageId = 1; text = "x"; markedBy = Some 34L |})
+let private foldTl evs = evs |> List.fold (fun s e -> Message.FoldTimeline(s, e)) Message.Zero
+
+[<Fact>]
+let ``FoldTimeline: plain received message has Unknown status`` () =
+    Assert.Equal(SpamClassification.Unknown, (foldTl [ recv () ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: bot auto-delete -> Spam`` () =
+    Assert.Equal(SpamClassification.Spam, (foldTl [ recv (); botDeleted () ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: vahter ManualBan -> Spam`` () =
+    Assert.Equal(SpamClassification.Spam, (foldTl [ recv (); vahter ManualBan ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: vahter DetectedNotSpam -> Ham`` () =
+    Assert.Equal(SpamClassification.Ham, (foldTl [ recv (); vahter DetectedNotSpam ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: reaction-triage / soft-spam are non-decisive`` () =
+    Assert.Equal(SpamClassification.Unknown, (foldTl [ recv (); vahter ReactionTriageBan; vahter PotentialSoftSpam ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: marked spam then moderation not-spam (later) -> Ham`` () =
+    // cross-stream last-wins: a later vahter not-spam overrides an earlier spam mark
+    Assert.Equal(SpamClassification.Ham, (foldTl [ recv (); markSpam (); vahter DetectedNotSpam ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: bot-deleted then marked ham (later) -> Ham`` () =
+    Assert.Equal(SpamClassification.Ham, (foldTl [ recv (); botDeleted (); markHam () ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: marked ham then bot-deleted (later) -> Spam`` () =
+    Assert.Equal(SpamClassification.Spam, (foldTl [ recv (); markHam (); botDeleted () ]).Classification)
+
+[<Fact>]
+let ``FoldTimeline: keeps message fields (text/received) regardless of moderation`` () =
+    let m = foldTl [ recv (); botDeleted () ]
+    Assert.True(m.Received)
+    Assert.Equal(Some "x", m.Text)
+    Assert.Equal(Some 5L, m.UserId)

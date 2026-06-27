@@ -68,36 +68,64 @@ ON CONFLICT (user_id) DO UPDATE
             """
         conn.ExecuteAsync(sql, {| userId = userId; state = stateJson; sid = $"user:{userId}" |}, tx) :> Task
 
-    let upsertMessageData (chatId: int64) (messageId: int) (stateJson: string) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
-        //language=postgresql
-        let sql =
-            """
-INSERT INTO snapshot_message (chat_id, message_id, message_data, msg_version, created_at)
-SELECT @chatId, @messageId, @state::jsonb, COALESCE(MAX(stream_version), 0), MIN(created_at)
-FROM event WHERE stream_id = @sid
-ON CONFLICT (chat_id, message_id) DO UPDATE
-   SET message_data = EXCLUDED.message_data,
-       msg_version  = EXCLUDED.msg_version,
-       created_at   = COALESCE(snapshot_message.created_at, EXCLUDED.created_at),
-       updated_at   = now()
- WHERE snapshot_message.msg_version IS NULL OR snapshot_message.msg_version <= EXCLUDED.msg_version
-            """
-        conn.ExecuteAsync(sql, {| chatId = chatId; messageId = messageId; state = stateJson; sid = $"message:{chatId}:{messageId}" |}, tx) :> Task
+    // Recompute a message's snapshot row from BOTH of its streams (message:* + moderation:*) and
+    // write it in one TX. message_data.classification is the cross-stream spam/ham status produced by
+    // Message.FoldTimeline (last decisive event wins, ordered by (created_at, id)); moderation_data is
+    // the moderation-stream fold. The row is locked first, so concurrent message/moderation writers and
+    // the rebuild serialize and each recomputes from the fully-committed log — no version-guard races.
+    // All verdict logic lives in F#; the SQL here is static and parameterized.
+    let upsertMessageSnapshot (chatId: int64) (messageId: int) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
+        task {
+            let msgSid = $"message:{chatId}:{messageId}"
+            let modSid = $"moderation:{chatId}:{messageId}"
 
-    let upsertModerationData (chatId: int64) (messageId: int) (stateJson: string) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
-        //language=postgresql
-        let sql =
-            """
-INSERT INTO snapshot_message (chat_id, message_id, moderation_data, mod_version)
-SELECT @chatId, @messageId, @state::jsonb, COALESCE(MAX(stream_version), 0)
-FROM event WHERE stream_id = @sid
-ON CONFLICT (chat_id, message_id) DO UPDATE
-   SET moderation_data = EXCLUDED.moderation_data,
-       mod_version     = EXCLUDED.mod_version,
+            // 1. ensure the row exists and lock it for this TX (DO UPDATE takes a row lock).
+            //language=postgresql
+            let lockSql =
+                """
+INSERT INTO snapshot_message (chat_id, message_id) VALUES (@chatId, @messageId)
+ON CONFLICT (chat_id, message_id) DO UPDATE SET updated_at = snapshot_message.updated_at
+                """
+            let! _ = conn.ExecuteAsync(lockSql, {| chatId = chatId; messageId = messageId |}, tx)
+
+            // 2. read both streams on this TX — sees others' committed events plus our own just-appended ones.
+            let! msgRaws = store.ReadRawEventsForStream(conn, tx, msgSid)
+            let! modRaws = store.ReadRawEventsForStream(conn, tx, modSid)
+
+            // 3. fold: message status from the merged, time-ordered timeline; moderation from its stream.
+            let timeline =
+                [ for r in msgRaws -> r.created_at, r.id, FromMessage (store.Deserialize<MessageEvent> r)
+                  for r in modRaws -> r.created_at, r.id, FromModeration (store.Deserialize<ModerationEvent> r) ]
+                |> List.sortBy (fun (ts, id, _) -> ts, id)
+            let message = timeline |> List.fold (fun s (_, _, ev) -> Message.FoldTimeline(s, ev)) Message.Zero
+            let moderation = modRaws |> List.fold (fun s r -> Moderation.Fold(s, store.Deserialize<ModerationEvent> r)) Moderation.Zero
+
+            let messageData    = if List.isEmpty msgRaws then null else JsonSerializer.Serialize(messageSnapshot message, snapshotJsonOpts)
+            let moderationData = if List.isEmpty modRaws then null else JsonSerializer.Serialize(moderationSnapshot moderation, snapshotJsonOpts)
+            let msgVersion = msgRaws |> List.tryLast |> Option.map (fun r -> r.stream_version) |> Option.toNullable
+            let modVersion = modRaws |> List.tryLast |> Option.map (fun r -> r.stream_version) |> Option.toNullable
+            let createdAt  = msgRaws |> List.tryHead |> Option.map (fun r -> r.created_at) |> Option.toNullable   // receipt time
+
+            // 4. write the recomputed row (we hold the lock, so an unconditional update is correct).
+            //language=postgresql
+            let updateSql =
+                """
+UPDATE snapshot_message
+   SET message_data    = @messageData::jsonb,
+       moderation_data = @moderationData::jsonb,
+       msg_version     = @msgVersion,
+       mod_version     = @modVersion,
+       created_at      = @createdAt,
        updated_at      = now()
- WHERE snapshot_message.mod_version IS NULL OR snapshot_message.mod_version <= EXCLUDED.mod_version
-            """
-        conn.ExecuteAsync(sql, {| chatId = chatId; messageId = messageId; state = stateJson; sid = $"moderation:{chatId}:{messageId}" |}, tx) :> Task
+ WHERE chat_id = @chatId AND message_id = @messageId
+                """
+            let! _ =
+                conn.ExecuteAsync(updateSql,
+                    {| chatId = chatId; messageId = messageId
+                       messageData = messageData; moderationData = moderationData
+                       msgVersion = msgVersion; modVersion = modVersion; createdAt = createdAt |}, tx)
+            return ()
+        } :> Task
 
     // Append wrappers: fold the new events to final state, serialize the snapshot DTO,
     // and attach the matching upsert as the in-TX projection.
@@ -110,23 +138,20 @@ ON CONFLICT (chat_id, message_id) DO UPDATE
                 let json = JsonSerializer.Serialize(userSnapshot final, snapshotJsonOpts)
                 evts, Some (upsertUserSnapshot userId json))
 
+    // The snapshot row is recomputed from BOTH streams by upsertMessageSnapshot, so both append
+    // paths attach the same projection. The decider's folded state is only used for its decision /
+    // the returned value; the snapshot itself is rebuilt from the log in the projection.
     let appendMessageEvents (chatId: int64) (messageId: int) (decide: Message -> MessageEvent list) : Task<MessageEvent list * Message> =
         EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
             match decide state with
             | [] -> [], None
-            | evts ->
-                let final = evts |> List.fold (fun s e -> Message.Fold(s, e)) state
-                let json = JsonSerializer.Serialize(messageSnapshot final, snapshotJsonOpts)
-                evts, Some (upsertMessageData chatId messageId json))
+            | evts -> evts, Some (upsertMessageSnapshot chatId messageId))
 
     let appendModerationEvents (chatId: int64) (messageId: int) (decide: Moderation -> ModerationEvent list) : Task<ModerationEvent list * Moderation> =
         EventStore.appendEventWithProjection store $"moderation:{chatId}:{messageId}" (fun (state: Moderation) ->
             match decide state with
             | [] -> [], None
-            | evts ->
-                let final = evts |> List.fold (fun s e -> Moderation.Fold(s, e)) state
-                let json = JsonSerializer.Serialize(moderationSnapshot final, snapshotJsonOpts)
-                evts, Some (upsertModerationData chatId messageId json))
+            | evts -> evts, Some (upsertMessageSnapshot chatId messageId))
 
     // -----------------------------------------------------------------------
     // Private helpers (called by multiple public members)
@@ -175,8 +200,7 @@ ON CONFLICT (chat_id, message_id) DO UPDATE
                     // Store rawMessage as a JSON string (the live wire shape); JsonElement just makes
                     // *reading* tolerant of the legacy object shape too (issue #166).
                     let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |}
-                    let snapJson = JsonSerializer.Serialize(messageSnapshot (Message.Fold(state, evt)), snapshotJsonOpts)
-                    // One TX: optional text-index upsert, then the message_data snapshot upsert.
+                    // One TX: optional text-index upsert, then the snapshot recompute.
                     let projection (conn: NpgsqlConnection) (tx: NpgsqlTransaction) =
                         task {
                             match text with
@@ -190,7 +214,7 @@ ON CONFLICT DO NOTHING
                                 let! _ = conn.ExecuteAsync(sql, {| userId = userId; text = t |}, tx)
                                 ()
                             | _ -> ()
-                            do! upsertMessageData chatId messageId snapJson conn tx
+                            do! upsertMessageSnapshot chatId messageId conn tx
                         } :> Task
                     [ evt ], Some projection)
             return ()
@@ -1076,23 +1100,38 @@ WHERE job_name = @jobName;
     // Snapshot rebuild (one-off backfill)
     // -----------------------------------------------------------------------
 
-    /// Rebuilds snapshot_user / snapshot_message from the event log. Idempotent and safe to
-    /// re-run: each upsert is guarded by its *_version, so it never regresses a fresher live write.
-    /// Paged by stream-id prefix (keyset over idx_event_stream) because the event table is too
-    /// large for a single DISTINCT scan. Returns the number of streams processed.
-    member _.RebuildSnapshots(?batchSize: int) : Task<int> =
+    /// Rebuilds snapshot_user / snapshot_message from the event log. Idempotent and safe to re-run:
+    /// it RE-FOLDS and overwrites every row (it does not skip up-to-date rows) — required when a code
+    /// change alters the fold, since stream versions are unchanged. Each message row is locked and
+    /// recomputed from both its streams, so it serializes safely with concurrent live writes.
+    /// Paged by stream-id prefix (keyset over idx_event_stream). `onProgress` (optional) is called at
+    /// phase boundaries and every ~5000 streams. Returns the number of streams processed.
+    member _.RebuildSnapshots(?batchSize: int, ?onProgress: string -> unit) : Task<int> =
         let batch = defaultArg batchSize 500
+        let report = defaultArg onProgress ignore
+        let reportEvery = 5000
         task {
-            let mutable total = 0
+            let mutable grandTotal = 0
 
-            let rebuildPrefix (prefix: string) (handle: string -> NpgsqlConnection -> NpgsqlTransaction -> Task) =
+            // `totalSql` returns the denominator for progress; @prefix is supplied but may be unused.
+            let rebuildPrefix (prefix: string) (phase: string) (totalSql: string)
+                              (handle: string -> NpgsqlConnection -> NpgsqlTransaction -> Task) =
                 task {
                     use conn = new NpgsqlConnection(connString)
                     do! conn.OpenAsync()
+                    let! total =
+                        task {
+                            try return! conn.ExecuteScalarAsync<int64>(totalSql, {| prefix = prefix |})
+                            with _ -> return -1L
+                        }
+                    let totalStr = if total < 0L then "?" else string total
+                    report $"{phase}: starting ({totalStr} streams)"
                     //language=postgresql
                     let listSql =
                         "SELECT DISTINCT stream_id FROM event WHERE stream_id LIKE @prefix AND stream_id > @cursor ORDER BY stream_id LIMIT @n"
                     let mutable cursor = ""
+                    let mutable processed = 0
+                    let mutable lastReported = 0
                     let mutable go = true
                     while go do
                         let! idsSeq = conn.QueryAsync<string>(listSql, {| prefix = prefix; cursor = cursor; n = batch |})
@@ -1102,10 +1141,15 @@ WHERE job_name = @jobName;
                             let! tx = conn.BeginTransactionAsync()
                             for sid in ids do
                                 do! handle sid conn tx
-                                total <- total + 1
+                                processed <- processed + 1
                             do! tx.CommitAsync()
                             do! tx.DisposeAsync()
                             cursor <- List.last ids
+                            if processed - lastReported >= reportEvery then
+                                report $"{phase}: {processed}/{totalStr} streams"
+                                lastReported <- processed
+                    report $"{phase}: done ({processed} streams)"
+                    grandTotal <- grandTotal + processed
                 }
 
             // chat:msg ids parsed from "<prefix>:{chatId}:{messageId}"
@@ -1113,7 +1157,9 @@ WHERE job_name = @jobName;
                 let parts = sid.Split(':')
                 int64 parts.[1], int parts.[2]
 
-            do! rebuildPrefix "user:%" (fun sid conn tx ->
+            let countDistinctSql = "SELECT count(DISTINCT stream_id) FROM event WHERE stream_id LIKE @prefix"
+
+            do! rebuildPrefix "user:%" "users" countDistinctSql (fun sid conn tx ->
                 task {
                     let userId = sid.Substring("user:".Length) |> int64
                     let! state = store.FoldEvents((fun s e -> User.Fold(s, e)), User.Zero, sid)
@@ -1121,21 +1167,26 @@ WHERE job_name = @jobName;
                     do! upsertUserSnapshot userId json conn tx
                 } :> Task)
 
-            do! rebuildPrefix "message:%" (fun sid conn tx ->
+            // Each message row is recomputed from BOTH streams by upsertMessageSnapshot.
+            // one MessageReceived per message stream — cheaper than count(DISTINCT) via the type index.
+            do! rebuildPrefix "message:%" "messages" "SELECT count(*) FROM event WHERE event_type = 'MessageReceived'" (fun sid conn tx ->
                 task {
                     let chatId, messageId = parseChatMsg sid
-                    let! state = store.FoldEvents((fun s e -> Message.Fold(s, e)), Message.Zero, sid)
-                    let json = JsonSerializer.Serialize(messageSnapshot state, snapshotJsonOpts)
-                    do! upsertMessageData chatId messageId json conn tx
+                    do! upsertMessageSnapshot chatId messageId conn tx
                 } :> Task)
 
-            do! rebuildPrefix "moderation:%" (fun sid conn tx ->
+            // Moderation streams whose message sibling exists were already covered above; only handle
+            // orphan moderation (a bot/vahter action on a message that was never recorded).
+            do! rebuildPrefix "moderation:%" "moderation (orphans)" countDistinctSql (fun sid conn tx ->
                 task {
                     let chatId, messageId = parseChatMsg sid
-                    let! state = store.FoldEvents((fun s e -> Moderation.Fold(s, e)), Moderation.Zero, sid)
-                    let json = JsonSerializer.Serialize(moderationSnapshot state, snapshotJsonOpts)
-                    do! upsertModerationData chatId messageId json conn tx
+                    let! hasMsg =
+                        conn.ExecuteScalarAsync<bool>(
+                            "SELECT EXISTS(SELECT 1 FROM event WHERE stream_id = @sid)",
+                            {| sid = $"message:{chatId}:{messageId}" |}, tx)
+                    if not hasMsg then
+                        do! upsertMessageSnapshot chatId messageId conn tx
                 } :> Task)
 
-            return total
+            return grandTotal
         }

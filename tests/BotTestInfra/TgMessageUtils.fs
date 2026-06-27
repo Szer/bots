@@ -201,6 +201,23 @@ type Tg() =
             )
         )
 
+    /// A reaction authored by a channel (actor_chat) rather than a user. Telegram sends ActorChat
+    /// and leaves User null in this case (anonymous channel admin / a channel reacting on its own
+    /// behalf). Exercises the null-User guard in OnMessageReaction.
+    static member quickChannelReaction(chat: Chat, messageId: int, actorChat: Chat, ?emoji: string) =
+        let reactionEmoji = emoji |> Option.defaultValue "\U0001F44D"
+        Update(
+            Id = next(),
+            MessageReaction = MessageReactionUpdated(
+                Chat = chat,
+                MessageId = messageId,
+                ActorChat = actorChat,
+                Date = DateTime.UtcNow,
+                OldReaction = [||],
+                NewReaction = [| ReactionTypeEmoji(Emoji = reactionEmoji) |]
+            )
+        )
+
     // ── Message factories (CouponHubBot-style) ──────────────────────────────
 
     static member dmMessage(text: string, fromUser: User) =
