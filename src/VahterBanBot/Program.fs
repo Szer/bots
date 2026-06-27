@@ -253,6 +253,21 @@ let startupBotConf = botConfOptions.Value
         Results.Ok "Settings reloaded"
 ))
 
+// One-off backfill of the snapshot_* read models from the event log. Idempotent; run manually
+// after deploy. Not auto-run on boot — the event table is too large to rescan every start.
+%app.MapPost("/rebuild-snapshots", Func<HttpContext, Task<IResult>>(fun ctx ->
+    task {
+        if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
+            return Results.Text("Access Denied", statusCode = 401)
+        else
+            let db = ctx.RequestServices.GetRequiredService<DbService>()
+            let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
+            logger.LogInformation "Snapshot rebuild starting"
+            let! count = db.RebuildSnapshots()
+            logger.LogInformation("Snapshot rebuild done: {Count} streams", count)
+            return Results.Ok $"Rebuilt {count} snapshots"
+    }))
+
 // Main webhook endpoint with bot-specific update handling
 WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
     task {

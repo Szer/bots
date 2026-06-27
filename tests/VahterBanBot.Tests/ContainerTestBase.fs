@@ -30,6 +30,31 @@ type TestMessage =
       raw_message: string
       created_at: DateTime }
 
+/// Snapshot read-model rows (generated columns), for snapshot_* assertions.
+[<CLIMutable>]
+type SnapshotUserRow =
+    { user_id: int64
+      stream_version: int
+      username: string
+      banned: Nullable<bool>
+      banned_at: Nullable<DateTime>
+      banned_by: Nullable<int64>
+      reaction_count: Nullable<int> }
+
+[<CLIMutable>]
+type SnapshotMessageRow =
+    { chat_id: int64
+      message_id: int
+      msg_version: Nullable<int>
+      mod_version: Nullable<int>
+      user_id: Nullable<int64>
+      text: string
+      spam_status: string
+      deleted: Nullable<bool>
+      bot_auto_deleted: Nullable<bool>
+      vahter_verdict: string
+      created_at: Nullable<DateTime> }
+
 module private VahterTestConfig =
     let secret = "OUR_SECRET"
     let fakeAzureAlias = "fake-azure-ocr"
@@ -682,6 +707,50 @@ WHERE event_type = 'MessageMarkedHam'
             """
         let! count = conn.QuerySingleAsync<int>(sql, {| chatId = chatId; messageId = messageId |})
         return count > 0
+    }
+
+    /// Reads the snapshot_user row (None if absent).
+    member this.TryGetSnapshotUser(userId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+SELECT user_id, stream_version, username, banned, banned_at, banned_by, reaction_count
+FROM snapshot_user
+WHERE user_id = @userId
+            """
+        let! rows = conn.QueryAsync<SnapshotUserRow>(sql, {| userId = userId |})
+        return rows |> Seq.tryHead
+    }
+
+    /// Reads the snapshot_message row (None if absent).
+    member this.TryGetSnapshotMessage(chatId: int64, messageId: int) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+SELECT chat_id, message_id, msg_version, mod_version, user_id, text, spam_status,
+       deleted, bot_auto_deleted, vahter_verdict, created_at
+FROM snapshot_message
+WHERE chat_id = @chatId AND message_id = @messageId
+            """
+        let! rows = conn.QueryAsync<SnapshotMessageRow>(sql, {| chatId = chatId; messageId = messageId |})
+        return rows |> Seq.tryHead
+    }
+
+    /// Runs the snapshot rebuild over the whole event log (idempotent backfill).
+    member this.RebuildSnapshots() = task {
+        let db = VahterBanBot.DbService(this.DbConnectionString, TimeProvider.System)
+        return! db.RebuildSnapshots()
+    }
+
+    /// Empties the snapshot tables (used to prove RebuildSnapshots reconstructs from the log).
+    /// Uses the admin (owner) connection: the bot's `vahter_bot_ban_service` role is granted only
+    /// SELECT/INSERT/UPDATE (it never deletes snapshots), so it deliberately cannot TRUNCATE.
+    member this.ClearSnapshots() = task {
+        use conn = new NpgsqlConnection(this.AdminDbConnectionString)
+        let! _ = conn.ExecuteAsync("TRUNCATE snapshot_user, snapshot_message")
+        return ()
     }
 
 /// Polls `/ready` until the bot reports its ML model is loaded or trained.

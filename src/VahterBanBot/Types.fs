@@ -148,8 +148,12 @@ type SpamClassification =
     | Ham
 
 type MessageEvent =
-    | MessageReceived    of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: string |}
-    | MessageEdited      of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: string |}
+    // rawMessage is a JsonElement (not string) on purpose: production has it stored BOTH as a JSON
+    // string (live app) and as a JSON object (legacy backfill) — see issue #166. JsonElement reads
+    // either shape, so folding a stream never breaks; the field is write-only (folds/reads use JSONB
+    // operators, never the DU), and we keep writing a string (see DB.recordMessage*).
+    | MessageReceived    of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
+    | MessageEdited      of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
     | MessageDeleted     of {| chatId: int64; messageId: int; deletedBy: int64 |}
     | MessageMarkedSpam  of {| chatId: int64; messageId: int; markedBy: int64 option |}
     | MessageMarkedHam   of {| chatId: int64; messageId: int; text: string; markedBy: int64 option |}
@@ -157,15 +161,17 @@ type MessageEvent =
 type Message =
     { Received:       bool
       Deleted:        bool
-      Classification: SpamClassification }
-    static member Zero = { Received = false; Deleted = false; Classification = Unknown }
+      Classification: SpamClassification
+      Text:           string option   // latest text (received/edited/marked-ham), for the snapshot read model
+      UserId:         int64 option }   // author, for the snapshot read model
+    static member Zero = { Received = false; Deleted = false; Classification = Unknown; Text = None; UserId = None }
     static member Fold (state: Message, event: MessageEvent) : Message =
         match event with
-        | MessageReceived _   -> { state with Received = true }
-        | MessageEdited _     -> state   // edit is recorded but doesn't change aggregate state
+        | MessageReceived e   -> { state with Received = true; Text = e.text; UserId = Some e.userId }
+        | MessageEdited e     -> { state with Text = e.text; UserId = Some e.userId }   // latest text wins
         | MessageDeleted _    -> { state with Deleted = true }
         | MessageMarkedSpam _ -> { state with Classification = Spam }
-        | MessageMarkedHam _  -> { state with Classification = Ham }
+        | MessageMarkedHam e  -> { state with Classification = Ham; Text = Some e.text }
 
 // ---------------------------------------------------------------------------
 
@@ -204,11 +210,12 @@ type ModerationEvent =
 
 type Moderation =
     { VahterActedCount:    int
-      BotAutoDeletedCount: int }
-    static member Zero = { VahterActedCount = 0; BotAutoDeletedCount = 0 }
+      BotAutoDeletedCount: int
+      LastVahterAction:    VahterAction option }   // last action wins; drives the snapshot verdict
+    static member Zero = { VahterActedCount = 0; BotAutoDeletedCount = 0; LastVahterAction = None }
     static member Fold (state: Moderation, event: ModerationEvent) : Moderation =
         match event with
-        | VahterActed _      -> { state with VahterActedCount = state.VahterActedCount + 1 }
+        | VahterActed e      -> { state with VahterActedCount = state.VahterActedCount + 1; LastVahterAction = Some e.actionType }
         | BotAutoDeleted _   -> { state with BotAutoDeletedCount = state.BotAutoDeletedCount + 1 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +415,46 @@ let eventJsonOpts =
         .WithUnwrapOption()
         .WithSkippableOptionFields(SkippableOptionFields.Always, deserializeNullAsNone = true)
         .ToJsonSerializerOptions()
+
+/// JSON options for the snapshot read-model tables (snapshot_user / snapshot_message).
+/// No union tag is needed (the DTOs are flat primitive records); options are unwrapped and
+/// None fields skipped, so an absent key yields a NULL in the GENERATED column.
+let snapshotJsonOpts =
+    JsonFSharpOptions.Default()
+        .WithUnwrapOption()
+        .WithSkippableOptionFields(SkippableOptionFields.Always)
+        .ToJsonSerializerOptions()
+
+/// Flat snapshot DTOs. Keys MUST match the GENERATED-column expressions in V38__snapshot.sql.
+
+let userSnapshot (s: User) =                 // -> snapshot_user.state
+    let bannedByUserId =
+        s.Banned |> Option.bind (fun (a, _) -> match a with Actor.User u -> Some u.userId | _ -> None)
+    {| userId         = s.Id
+       username       = s.Username
+       banned         = s.Banned.IsSome
+       bannedAt       = s.Banned |> Option.map snd
+       bannedByUserId = bannedByUserId
+       reactionCount  = s.ReactionCount
+       notSpamUntil   = s.NotSpamUntil |}
+
+let messageSnapshot (s: Message) =           // -> snapshot_message.message_data
+    {| userId         = s.UserId
+       text           = s.Text
+       classification = (match s.Classification with SpamClassification.Spam -> "Spam" | SpamClassification.Ham -> "Ham" | SpamClassification.Unknown -> "Unknown")
+       received       = s.Received
+       deleted        = s.Deleted |}
+
+let moderationSnapshot (s: Moderation) =     // -> snapshot_message.moderation_data
+    let verdict =
+        match s.LastVahterAction with
+        | Some (PotentialKill | ManualBan | ReactionTriageBan | ReactionTriageSpam) -> Some "Spam"
+        | Some (PotentialNotSpam | DetectedNotSpam | ReactionTriageNotSpam)         -> Some "NotSpam"
+        | Some PotentialSoftSpam | None                                            -> None
+    {| botAutoDeleted      = s.BotAutoDeletedCount > 0
+       verdict             = verdict
+       vahterActedCount    = s.VahterActedCount
+       botAutoDeletedCount = s.BotAutoDeletedCount |}
 
 // Callback data serialization uses different JSON options (Telegram-aware)
 let private callbackJsonOpts =
