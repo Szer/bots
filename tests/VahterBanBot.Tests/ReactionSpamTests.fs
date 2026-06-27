@@ -558,6 +558,30 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.Equal(0, reactionCount)
     }
 
+    [<Fact>]
+    let ``Channel reactions (actor_chat, no user) are skipped without crashing`` () = task {
+        // A reaction can be authored by an actor_chat (a channel reacting on its own behalf / an
+        // anonymous channel admin). Telegram then sends ActorChat and leaves User null. Before the
+        // guard, OnMessageReaction dereferenced reaction.User.Id and threw a NullReferenceException.
+        // Here we fire enough channel reactions to trip the threshold *if* they were counted, and
+        // assert the bot handles each cleanly and records nothing for the acting channel.
+        let chat = fixture.ChatsToMonitor[0]
+        let actorChannel = Tg.channel(username = "so_csharp", title = "SO CSharp")
+
+        for i in 1..6 do
+            let! resp =
+                Tg.quickChannelReaction(chat, 6000 + i, actorChannel)
+                |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        // Nothing is attributed to the acting channel: no reactions counted, no triage verdict.
+        let! reactionCount = fixture.GetUserReactionCount actorChannel.Id
+        Assert.Equal(0, reactionCount)
+
+        let! verdict = fixture.TryGetReactionTriageVerdict actorChannel.Id
+        Assert.Equal(None, verdict)
+    }
+
 
 // NOTE: autonomous-mode tests (LLM_REACTION_TRIAGE_AUTO_ACT=true) are deliberately not added
 // here yet. Per the plan's rollout order, the feature ships in shadow mode first; the
