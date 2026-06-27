@@ -68,18 +68,39 @@ ON CONFLICT (user_id) DO UPDATE
             """
         conn.ExecuteAsync(sql, {| userId = userId; state = stateJson; sid = $"user:{userId}" |}, tx) :> Task
 
+    // ml_label keep-newer clause shared by both message- and moderation-stream upserts: each upsert
+    // proposes its own stream's latest decisive verdict (EXCLUDED.ml_label/at); the row keeps whichever
+    // verdict is chronologically newer, giving cross-stream "latest event wins" (matches MlData).
+    let mlLabelKeepNewer =
+        """
+       ml_label    = CASE WHEN EXCLUDED.ml_label_at IS NOT NULL
+                           AND (snapshot_message.ml_label_at IS NULL OR EXCLUDED.ml_label_at >= snapshot_message.ml_label_at)
+                          THEN EXCLUDED.ml_label ELSE snapshot_message.ml_label END,
+       ml_label_at = CASE WHEN EXCLUDED.ml_label_at IS NOT NULL
+                           AND (snapshot_message.ml_label_at IS NULL OR EXCLUDED.ml_label_at >= snapshot_message.ml_label_at)
+                          THEN EXCLUDED.ml_label_at ELSE snapshot_message.ml_label_at END"""
+
     let upsertMessageData (chatId: int64) (messageId: int) (stateJson: string) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
         //language=postgresql
         let sql =
-            """
-INSERT INTO snapshot_message (chat_id, message_id, message_data, msg_version, created_at)
-SELECT @chatId, @messageId, @state::jsonb, COALESCE(MAX(stream_version), 0), MIN(created_at)
-FROM event WHERE stream_id = @sid
+            $"""
+INSERT INTO snapshot_message (chat_id, message_id, message_data, msg_version, created_at, ml_label, ml_label_at)
+SELECT
+    @chatId, @messageId, @state::jsonb,
+    COALESCE((SELECT MAX(stream_version) FROM event WHERE stream_id = @sid), 0),
+    (SELECT MIN(created_at) FROM event WHERE stream_id = @sid),
+    -- latest decisive message-stream verdict (explicit ham/spam marks)
+    (SELECT CASE event_type WHEN 'MessageMarkedSpam' THEN 'spam' WHEN 'MessageMarkedHam' THEN 'ham' END
+     FROM event WHERE stream_id = @sid AND event_type IN ('MessageMarkedSpam', 'MessageMarkedHam')
+     ORDER BY id DESC LIMIT 1),
+    (SELECT created_at
+     FROM event WHERE stream_id = @sid AND event_type IN ('MessageMarkedSpam', 'MessageMarkedHam')
+     ORDER BY id DESC LIMIT 1)
 ON CONFLICT (chat_id, message_id) DO UPDATE
    SET message_data = EXCLUDED.message_data,
        msg_version  = EXCLUDED.msg_version,
        created_at   = COALESCE(snapshot_message.created_at, EXCLUDED.created_at),
-       updated_at   = now()
+       updated_at   = now(),{mlLabelKeepNewer}
  WHERE snapshot_message.msg_version IS NULL OR snapshot_message.msg_version <= EXCLUDED.msg_version
             """
         conn.ExecuteAsync(sql, {| chatId = chatId; messageId = messageId; state = stateJson; sid = $"message:{chatId}:{messageId}" |}, tx) :> Task
@@ -87,14 +108,30 @@ ON CONFLICT (chat_id, message_id) DO UPDATE
     let upsertModerationData (chatId: int64) (messageId: int) (stateJson: string) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
         //language=postgresql
         let sql =
-            """
-INSERT INTO snapshot_message (chat_id, message_id, moderation_data, mod_version)
-SELECT @chatId, @messageId, @state::jsonb, COALESCE(MAX(stream_version), 0)
-FROM event WHERE stream_id = @sid
+            $"""
+INSERT INTO snapshot_message (chat_id, message_id, moderation_data, mod_version, ml_label, ml_label_at)
+SELECT
+    @chatId, @messageId, @state::jsonb,
+    COALESCE((SELECT MAX(stream_version) FROM event WHERE stream_id = @sid), 0),
+    -- latest decisive moderation-stream verdict (matches MlData: ignores soft-spam / reaction-triage)
+    (SELECT CASE
+              WHEN event_type = 'BotAutoDeleted' THEN 'spam'
+              WHEN data->'actionType'->>'Case' IN ('PotentialKill', 'ManualBan') THEN 'spam'
+              WHEN data->'actionType'->>'Case' IN ('PotentialNotSpam', 'DetectedNotSpam') THEN 'ham'
+            END
+     FROM event WHERE stream_id = @sid
+       AND (event_type = 'BotAutoDeleted'
+            OR (event_type = 'VahterActed' AND data->'actionType'->>'Case' IN ('PotentialKill', 'ManualBan', 'PotentialNotSpam', 'DetectedNotSpam')))
+     ORDER BY id DESC LIMIT 1),
+    (SELECT created_at
+     FROM event WHERE stream_id = @sid
+       AND (event_type = 'BotAutoDeleted'
+            OR (event_type = 'VahterActed' AND data->'actionType'->>'Case' IN ('PotentialKill', 'ManualBan', 'PotentialNotSpam', 'DetectedNotSpam')))
+     ORDER BY id DESC LIMIT 1)
 ON CONFLICT (chat_id, message_id) DO UPDATE
    SET moderation_data = EXCLUDED.moderation_data,
        mod_version     = EXCLUDED.mod_version,
-       updated_at      = now()
+       updated_at      = now(),{mlLabelKeepNewer}
  WHERE snapshot_message.mod_version IS NULL OR snapshot_message.mod_version <= EXCLUDED.mod_version
             """
         conn.ExecuteAsync(sql, {| chatId = chatId; messageId = messageId; state = stateJson; sid = $"moderation:{chatId}:{messageId}" |}, tx) :> Task
@@ -1080,19 +1117,36 @@ WHERE job_name = @jobName;
     /// re-run: each upsert is guarded by its *_version, so it never regresses a fresher live write.
     /// Paged by stream-id prefix (keyset over idx_event_stream) because the event table is too
     /// large for a single DISTINCT scan. Returns the number of streams processed.
-    member _.RebuildSnapshots(?batchSize: int) : Task<int> =
+    /// `onProgress` (optional) is called with a human-readable line at each phase boundary and every
+    /// ~`reportEvery` streams within a phase — wired to the logger by POST /rebuild-snapshots so the
+    /// long backfill is observable. `batchSize` controls the streams-per-transaction page size.
+    member _.RebuildSnapshots(?batchSize: int, ?onProgress: string -> unit) : Task<int> =
         let batch = defaultArg batchSize 500
+        let report = defaultArg onProgress ignore
+        let reportEvery = 5000
         task {
-            let mutable total = 0
+            let mutable grandTotal = 0
 
-            let rebuildPrefix (prefix: string) (handle: string -> NpgsqlConnection -> NpgsqlTransaction -> Task) =
+            // `totalSql` returns the denominator for progress %; @prefix is supplied but may be unused.
+            let rebuildPrefix (prefix: string) (phase: string) (totalSql: string)
+                              (handle: string -> NpgsqlConnection -> NpgsqlTransaction -> Task) =
                 task {
                     use conn = new NpgsqlConnection(connString)
                     do! conn.OpenAsync()
+                    // Best-effort denominator; never let a slow count abort the rebuild.
+                    let! total =
+                        task {
+                            try return! conn.ExecuteScalarAsync<int64>(totalSql, {| prefix = prefix |})
+                            with _ -> return -1L
+                        }
+                    let totalStr = if total < 0L then "?" else string total
+                    report $"{phase}: starting ({totalStr} streams)"
                     //language=postgresql
                     let listSql =
                         "SELECT DISTINCT stream_id FROM event WHERE stream_id LIKE @prefix AND stream_id > @cursor ORDER BY stream_id LIMIT @n"
                     let mutable cursor = ""
+                    let mutable processed = 0
+                    let mutable lastReported = 0
                     let mutable go = true
                     while go do
                         let! idsSeq = conn.QueryAsync<string>(listSql, {| prefix = prefix; cursor = cursor; n = batch |})
@@ -1102,10 +1156,15 @@ WHERE job_name = @jobName;
                             let! tx = conn.BeginTransactionAsync()
                             for sid in ids do
                                 do! handle sid conn tx
-                                total <- total + 1
+                                processed <- processed + 1
                             do! tx.CommitAsync()
                             do! tx.DisposeAsync()
                             cursor <- List.last ids
+                            if processed - lastReported >= reportEvery then
+                                report $"{phase}: {processed}/{totalStr} streams"
+                                lastReported <- processed
+                    report $"{phase}: done ({processed} streams)"
+                    grandTotal <- grandTotal + processed
                 }
 
             // chat:msg ids parsed from "<prefix>:{chatId}:{messageId}"
@@ -1113,7 +1172,9 @@ WHERE job_name = @jobName;
                 let parts = sid.Split(':')
                 int64 parts.[1], int parts.[2]
 
-            do! rebuildPrefix "user:%" (fun sid conn tx ->
+            let countDistinctSql = "SELECT count(DISTINCT stream_id) FROM event WHERE stream_id LIKE @prefix"
+
+            do! rebuildPrefix "user:%" "users" countDistinctSql (fun sid conn tx ->
                 task {
                     let userId = sid.Substring("user:".Length) |> int64
                     let! state = store.FoldEvents((fun s e -> User.Fold(s, e)), User.Zero, sid)
@@ -1121,7 +1182,8 @@ WHERE job_name = @jobName;
                     do! upsertUserSnapshot userId json conn tx
                 } :> Task)
 
-            do! rebuildPrefix "message:%" (fun sid conn tx ->
+            // one MessageReceived per message stream — cheaper than count(DISTINCT) via the type index.
+            do! rebuildPrefix "message:%" "messages" "SELECT count(*) FROM event WHERE event_type = 'MessageReceived'" (fun sid conn tx ->
                 task {
                     let chatId, messageId = parseChatMsg sid
                     let! state = store.FoldEvents((fun s e -> Message.Fold(s, e)), Message.Zero, sid)
@@ -1129,7 +1191,7 @@ WHERE job_name = @jobName;
                     do! upsertMessageData chatId messageId json conn tx
                 } :> Task)
 
-            do! rebuildPrefix "moderation:%" (fun sid conn tx ->
+            do! rebuildPrefix "moderation:%" "moderation" countDistinctSql (fun sid conn tx ->
                 task {
                     let chatId, messageId = parseChatMsg sid
                     let! state = store.FoldEvents((fun s e -> Moderation.Fold(s, e)), Moderation.Zero, sid)
@@ -1137,5 +1199,5 @@ WHERE job_name = @jobName;
                     do! upsertModerationData chatId messageId json conn tx
                 } :> Task)
 
-            return total
+            return grandTotal
         }
