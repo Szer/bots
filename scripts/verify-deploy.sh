@@ -44,6 +44,68 @@ summary "**Expected Image Tag:** \`${EXPECTED_IMAGE_TAG:0:12}...\`  "
 summary "**Started:** $(date -u +%Y-%m-%d\ %H:%M:%S) UTC"
 summary ""
 
+APP_PATH="/api/v1/applications/${APP_NAME}"
+
+# Maximum number of *consecutive* unreachable-ArgoCD polls to tolerate before
+# giving up. The previous implementation collapsed "API unreachable" into
+# sync=Unknown via `curl -sf ... 2>/dev/null || echo "{}"`, so a dropped VPN
+# tunnel looked identical to "app not synced yet" and the script polled
+# uselessly until the full timeout — reporting a deploy failure even when the
+# deployment had actually succeeded (see issue #167).
+MAX_FAIL_STREAK="${MAX_FAIL_STREAK:-5}"
+
+# argocd_fetch — GET the ArgoCD application JSON.
+#   success: echoes the response body to stdout, returns 0
+#   failure: echoes nothing, logs a diagnostic to stderr, returns non-zero
+# A non-zero return means "could NOT observe ArgoCD" (network / DNS / VPN /
+# timeout / non-2xx / unparseable body) and MUST NOT be confused with a valid
+# observation of an un-synced / unhealthy app. All diagnostics go to stderr so
+# they never pollute the captured body.
+argocd_fetch() {
+    local body http_code curl_exit=0 err_file
+    err_file=$(mktemp)
+    # No -f: keep the body on 4xx/5xx so diagnostics are useful. -w appends the
+    # HTTP status on a trailing line; -m bounds a hung connection so a dead
+    # tunnel fails fast instead of blocking the whole poll interval.
+    body=$(curl -sS -m 15 -w $'\n%{http_code}' \
+        "${ARGOCD_URL}${APP_PATH}" -H "${AUTH_HEADER}" 2>"$err_file") || curl_exit=$?
+    http_code="${body##*$'\n'}"
+    body="${body%$'\n'*}"
+
+    if [ "$curl_exit" -ne 0 ]; then
+        log "  WARN: ArgoCD request failed (curl exit ${curl_exit}): $(tr '\n' ' ' < "$err_file")" >&2
+        rm -f "$err_file"
+        return 1
+    fi
+    rm -f "$err_file"
+
+    if [ "$http_code" != "200" ]; then
+        log "  WARN: ArgoCD returned HTTP ${http_code}" >&2
+        return 1
+    fi
+
+    if ! echo "$body" | jq -e . >/dev/null 2>&1; then
+        log "  WARN: ArgoCD returned a non-JSON / unparseable body" >&2
+        return 1
+    fi
+
+    echo "$body"
+}
+
+# fail_connectivity — exit with a clear "this is infrastructure, not a bad
+# deploy" message after too many consecutive unreachable-ArgoCD polls.
+fail_connectivity() {
+    local phase="$1" streak="$2" elapsed_s="$3"
+    log "FAILED: Cannot reach ArgoCD at ${ARGOCD_URL} after ${streak} consecutive attempts (elapsed=${elapsed_s}s)."
+    log "  This is a connectivity problem (VPN / DNS / network), NOT a deployment failure."
+    log "  The deployment itself may well have succeeded — verify ArgoCD directly before treating this as a bad release."
+    summary "### ❌ ${phase}: ArgoCD CONNECTIVITY FAILURE"
+    summary "- **Reason:** Could not reach ArgoCD API at \`${ARGOCD_URL}\` (${streak} consecutive failures)"
+    summary "- **Likely cause:** VPN / DNS / network between the runner and the cluster — not necessarily a bad deploy"
+    summary "- **Action:** Check ArgoCD directly; if the app is Synced/Healthy this is a CI connectivity flake."
+    exit 1
+}
+
 # ─── Phase 1: Wait for ArgoCD to sync with expected image tag ────────────────
 
 log "Phase 1: Waiting for ArgoCD sync (app=${APP_NAME}, expected tag contains ${EXPECTED_IMAGE_TAG:0:12}...)"
@@ -53,25 +115,34 @@ SYNC_INTERVAL=30
 elapsed=0
 
 synced=false
+fail_streak=0
 while [ "$elapsed" -lt "$SYNC_TIMEOUT" ]; do
-    RESPONSE=$(curl -sf "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" \
-        -H "${AUTH_HEADER}" 2>/dev/null || echo "{}")
+    if RESPONSE=$(argocd_fetch); then
+        fail_streak=0
 
-    SYNC_STATUS=$(echo "$RESPONSE" | jq -r '.status.sync.status // "Unknown"')
-    IMAGES=$(echo "$RESPONSE" | jq -r '.status.summary.images // [] | .[]' 2>/dev/null || echo "")
-    IMAGE_MATCH=$(echo "$IMAGES" | grep -c "${EXPECTED_IMAGE_TAG}" || true)
+        SYNC_STATUS=$(echo "$RESPONSE" | jq -r '.status.sync.status // "Unknown"')
+        IMAGES=$(echo "$RESPONSE" | jq -r '.status.summary.images // [] | .[]' 2>/dev/null || echo "")
+        IMAGE_MATCH=$(echo "$IMAGES" | grep -c "${EXPECTED_IMAGE_TAG}" || true)
 
-    log "  sync=${SYNC_STATUS} images_with_tag=${IMAGE_MATCH} (elapsed=${elapsed}s)"
+        log "  sync=${SYNC_STATUS} images_with_tag=${IMAGE_MATCH} (elapsed=${elapsed}s)"
 
-    if [ "$SYNC_STATUS" = "Synced" ] && [ "$IMAGE_MATCH" -gt 0 ]; then
-        log "Phase 1 PASSED: Image tag found, sync status is Synced."
-        summary "### ✅ Phase 1: ArgoCD Sync"
-        summary "- **Status:** Synced"
-        summary "- **Image Tag Match:** Yes"
-        summary "- **Elapsed Time:** ${elapsed}s"
-        summary ""
-        synced=true
-        break
+        if [ "$SYNC_STATUS" = "Synced" ] && [ "$IMAGE_MATCH" -gt 0 ]; then
+            log "Phase 1 PASSED: Image tag found, sync status is Synced."
+            summary "### ✅ Phase 1: ArgoCD Sync"
+            summary "- **Status:** Synced"
+            summary "- **Image Tag Match:** Yes"
+            summary "- **Elapsed Time:** ${elapsed}s"
+            summary ""
+            synced=true
+            break
+        fi
+    else
+        # Could not observe ArgoCD — this is connectivity, not "not synced yet".
+        fail_streak=$((fail_streak + 1))
+        log "  ArgoCD API unreachable (consecutive failures=${fail_streak}/${MAX_FAIL_STREAK}, elapsed=${elapsed}s)"
+        if [ "$fail_streak" -ge "$MAX_FAIL_STREAK" ]; then
+            fail_connectivity "Phase 1: ArgoCD Sync" "$fail_streak" "$elapsed"
+        fi
     fi
 
     sleep "$SYNC_INTERVAL"
@@ -99,22 +170,31 @@ log "Phase 2: Readiness grace period (${GRACE}s). Waiting for pod to become heal
 GRACE_INTERVAL=15
 grace_elapsed=0
 healthy=false
+fail_streak=0
 
 while [ "$grace_elapsed" -lt "$GRACE" ]; do
-    RESPONSE=$(curl -sf "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" \
-        -H "${AUTH_HEADER}" 2>/dev/null || echo "{}")
-    HEALTH=$(echo "$RESPONSE" | jq -r '.status.health.status // "Unknown"')
+    if RESPONSE=$(argocd_fetch); then
+        fail_streak=0
+        HEALTH=$(echo "$RESPONSE" | jq -r '.status.health.status // "Unknown"')
 
-    log "  health=${HEALTH} (grace elapsed=${grace_elapsed}s/${GRACE}s)"
+        log "  health=${HEALTH} (grace elapsed=${grace_elapsed}s/${GRACE}s)"
 
-    if [ "$HEALTH" = "Healthy" ]; then
-        log "Phase 2 PASSED: Pod is healthy (before grace period expired)."
-        summary "### ✅ Phase 2: Readiness Check"
-        summary "- **Health Status:** Healthy"
-        summary "- **Time to Healthy:** ${grace_elapsed}s (within ${GRACE}s grace period)"
-        summary ""
-        healthy=true
-        break
+        if [ "$HEALTH" = "Healthy" ]; then
+            log "Phase 2 PASSED: Pod is healthy (before grace period expired)."
+            summary "### ✅ Phase 2: Readiness Check"
+            summary "- **Health Status:** Healthy"
+            summary "- **Time to Healthy:** ${grace_elapsed}s (within ${GRACE}s grace period)"
+            summary ""
+            healthy=true
+            break
+        fi
+    else
+        # Could not observe ArgoCD — connectivity, not "not healthy yet".
+        fail_streak=$((fail_streak + 1))
+        log "  ArgoCD API unreachable (consecutive failures=${fail_streak}/${MAX_FAIL_STREAK}, grace elapsed=${grace_elapsed}s)"
+        if [ "$fail_streak" -ge "$MAX_FAIL_STREAK" ]; then
+            fail_connectivity "Phase 2: Readiness Check" "$fail_streak" "$grace_elapsed"
+        fi
     fi
 
     sleep "$GRACE_INTERVAL"
@@ -122,9 +202,11 @@ while [ "$grace_elapsed" -lt "$GRACE" ]; do
 done
 
 if [ "$healthy" = false ]; then
-    # Final check after grace period
-    RESPONSE=$(curl -sf "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" \
-        -H "${AUTH_HEADER}" 2>/dev/null || echo "{}")
+    # Final check after grace period. If we cannot even reach ArgoCD here, treat
+    # it as a connectivity failure rather than declaring the pod unhealthy.
+    if ! RESPONSE=$(argocd_fetch); then
+        fail_connectivity "Phase 2: Readiness Check" "final-check" "$grace_elapsed"
+    fi
     HEALTH=$(echo "$RESPONSE" | jq -r '.status.health.status // "Unknown"')
 
     if [ "$HEALTH" != "Healthy" ]; then
