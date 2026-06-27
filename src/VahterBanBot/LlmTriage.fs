@@ -412,9 +412,21 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
                     return { Verdict = LlmReactionVerdict.Error; Reason = Some (sprintf "HTTP %d" (int response.StatusCode)); ModelName = modelName; PromptHash = promptHash }
             with ex ->
                 sw.Stop()
-                logger.LogWarning(ex, "Reaction triage HTTP call threw")
+                logger.LogWarning(ex, "Reaction triage HTTP call threw after {LatencyMs}ms", sw.ElapsedMilliseconds)
+                // Record the actual cause, not a constant "exception". A cancelled call is almost
+                // always the 60s ceiling firing while Polly waits out a 429 Retry-After; capturing the
+                // type/message lets the event table tell that apart from a transport/parse failure
+                // without log archaeology (the 2026-06-27 reaction-spam incident was 429s, but every
+                // verdict just said "exception").
+                let reason =
+                    match ex with
+                    | :? OperationCanceledException ->
+                        sprintf "canceled after %dms (timeout, or 429 Retry-After backoff exceeded the deadline)" sw.ElapsedMilliseconds
+                    | _ ->
+                        let m = ex.Message
+                        sprintf "%s: %s" (ex.GetType().Name) (if m.Length > 160 then m.Substring(0, 160) else m)
                 do! db.RecordLlmReactionTriageClassified(
-                        dossier.OriginatingChatId, dossier.UserId, "ERROR", Some "exception",
+                        dossier.OriginatingChatId, dossier.UserId, "ERROR", Some reason,
                         0, 0, int sw.ElapsedMilliseconds, Some modelName, Some promptHash, shadowMode)
-                return { Verdict = LlmReactionVerdict.Error; Reason = Some "exception"; ModelName = modelName; PromptHash = promptHash }
+                return { Verdict = LlmReactionVerdict.Error; Reason = Some reason; ModelName = modelName; PromptHash = promptHash }
         }

@@ -1970,8 +1970,19 @@ type BotService(
                 .SetTag("chatId", reaction.Chat.Id)
                 .SetTag("chatUsername", reaction.Chat.Username)
                 .SetTag("messageId", reaction.MessageId)
-                .SetTag("userId", reaction.User.Id)
-                .SetTag("userUsername", reaction.User.Username)
+
+        // A reaction can be authored by an actor_chat (a channel reacting on its own behalf, or an
+        // anonymous channel admin) instead of a user. Telegram then sends `actor_chat` and no `user`,
+        // so reaction.User is null — there's no real user to triage. Skip. This also guards the
+        // user tagging and the whole downstream pipeline against a NullReferenceException.
+        if isNull reaction.User then
+            %activity.SetTag("skipped", "noUser")
+            return ()
+        else
+
+        %activity
+            .SetTag("userId", reaction.User.Id)
+            .SetTag("userUsername", reaction.User.Username)
 
         // Check if reaction spam detection is enabled
         if not botConfig.Value.ReactionSpamEnabled then
