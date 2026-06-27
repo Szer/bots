@@ -148,8 +148,12 @@ type SpamClassification =
     | Ham
 
 type MessageEvent =
-    | MessageReceived    of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: string |}
-    | MessageEdited      of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: string |}
+    // rawMessage is a JsonElement (not string) on purpose: production has it stored BOTH as a JSON
+    // string (live app) and as a JSON object (legacy backfill) — see issue #166. JsonElement reads
+    // either shape, so folding a stream never breaks; the field is write-only (folds/reads use JSONB
+    // operators, never the DU), and we keep writing a string (see DB.recordMessage*).
+    | MessageReceived    of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
+    | MessageEdited      of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
     | MessageDeleted     of {| chatId: int64; messageId: int; deletedBy: int64 |}
     | MessageMarkedSpam  of {| chatId: int64; messageId: int; markedBy: int64 option |}
     | MessageMarkedHam   of {| chatId: int64; messageId: int; text: string; markedBy: int64 option |}

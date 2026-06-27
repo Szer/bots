@@ -279,3 +279,27 @@ let ``moderationSnapshot with only a bot auto-delete has no verdict but flags bo
     Assert.Equal(Some true, prop json "botAutoDeleted" |> Option.map (fun v -> v.GetBoolean()))
     Assert.Equal(None, prop json "verdict")   // no vahter action -> absent -> NULL column
 
+// rawMessage exists in production as BOTH a JSON string (live app) and a JSON object (legacy
+// backfill) — issue #166. Folding must tolerate both, otherwise rebuild / mark-ham on old
+// messages throws "Cannot get the value of a token type 'StartObject' as a string".
+
+[<Fact>]
+let ``MessageReceived with rawMessage as a JSON string deserializes`` () =
+    let json =
+        """{"Case":"MessageReceived","chatId":-666,"messageId":1,"userId":42,"text":"hi","rawMessage":"{\"text\":\"hi\"}"}"""
+    match JsonSerializer.Deserialize<MessageEvent>(json, eventJsonOpts) with
+    | MessageReceived e ->
+        Assert.Equal(-666L, e.chatId)
+        Assert.Equal(Some "hi", e.text)
+    | other -> Assert.Fail $"Expected MessageReceived but got {other}"
+
+[<Fact>]
+let ``MessageReceived with rawMessage as a JSON object deserializes (legacy backfill shape)`` () =
+    let json =
+        """{"Case":"MessageReceived","chatId":-666,"messageId":2,"userId":42,"text":"hi","rawMessage":{"text":"hi","entities":[]}}"""
+    match JsonSerializer.Deserialize<MessageEvent>(json, eventJsonOpts) with
+    | MessageReceived e ->
+        Assert.Equal(-666L, e.chatId)
+        Assert.Equal(Some "hi", e.text)
+    | other -> Assert.Fail $"Expected MessageReceived but got {other}"
+

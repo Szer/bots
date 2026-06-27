@@ -172,7 +172,9 @@ ON CONFLICT (chat_id, message_id) DO UPDATE
             let! _ = EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
                 if state.Received then [], None
                 else
-                    let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |}
+                    // Store rawMessage as a JSON string (the live wire shape); JsonElement just makes
+                    // *reading* tolerant of the legacy object shape too (issue #166).
+                    let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |}
                     let snapJson = JsonSerializer.Serialize(messageSnapshot (Message.Fold(state, evt)), snapshotJsonOpts)
                     // One TX: optional text-index upsert, then the message_data snapshot upsert.
                     let projection (conn: NpgsqlConnection) (tx: NpgsqlTransaction) =
@@ -197,7 +199,7 @@ ON CONFLICT DO NOTHING
     let recordMessageEdited (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
             let! _ = appendMessageEvents chatId messageId (fun (_: Message) ->
-                [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |} ])
+                [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |} ])
             return ()
         }
 
