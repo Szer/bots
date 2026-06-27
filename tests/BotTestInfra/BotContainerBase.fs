@@ -49,6 +49,7 @@ type BotContainerBase(config: BotContainerConfig) =
     let mutable fakeTgHttp: HttpClient = null
     let mutable fakeAzureHttp: HttpClient = null
     let mutable publicConnectionString: string = null
+    let mutable adminConnectionString: string = null
     let mutable testArtifactsDir: string = null
 
     let network = createNetwork()
@@ -110,8 +111,13 @@ type BotContainerBase(config: BotContainerConfig) =
                 testArtifactsDir <- Path.Combine(solutionDirPath, "test-artifacts", $"{config.BotProject}.Tests", this.GetType().Name)
                 do! dbContainer.StartAsync()
 
-                publicConnectionString <-
-                    $"Server=127.0.0.1;Database={config.DbName};Port={dbContainer.GetMappedPublicPort(5432)};User Id={config.DbUser};Password={config.DbPassword};Include Error Detail=true;Timeout=120;Command Timeout=120;Keepalive=30;"
+                let mappedPort = dbContainer.GetMappedPublicPort(5432)
+                let connStr (user: string) (password: string) =
+                    $"Server=127.0.0.1;Database={config.DbName};Port={mappedPort};User Id={user};Password={password};Include Error Detail=true;Timeout=120;Command Timeout=120;Keepalive=30;"
+                publicConnectionString <- connStr config.DbUser config.DbPassword
+                // `admin` owns the DB (see init.sql) and runs migrations (FLYWAY_USER) — use it for
+                // owner-only ops like TRUNCATE that the least-privilege bot role intentionally lacks.
+                adminConnectionString <- connStr "admin" "admin"
 
                 // init schema/user/db
                 let initSql = File.ReadAllText(Path.Combine(solutionDirPath, "src", config.MigrationsSubdir, "init.sql"))
@@ -177,7 +183,11 @@ type BotContainerBase(config: BotContainerConfig) =
     member _.BotHttp = botHttp
     member _.FakeTgHttp = fakeTgHttp
     member _.FakeAzureHttp = fakeAzureHttp
+    /// Connection string as the bot's least-privilege service role (`config.DbUser`).
     member _.DbConnectionString = publicConnectionString
+    /// Connection string as the table owner `admin` — for owner-only ops (DDL/TRUNCATE) the
+    /// service role intentionally can't perform.
+    member _.AdminDbConnectionString = adminConnectionString
     member _.OcrEnabled = config.OcrEnabled
 
     // ── Shared helpers ──────────────────────────────────────────────────

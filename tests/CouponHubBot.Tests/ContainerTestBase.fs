@@ -37,18 +37,11 @@ module private CouponTestConfig =
 type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
     inherit BotContainerBase(CouponTestConfig.makeConfig ocrEnabled)
 
-    let mutable adminConnectionString: string = null
-
     let fixedDate = CouponTestConfig.fixedUtcNow.UtcDateTime.Date
     let fixedDateIso = fixedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
 
     override this.SeedDatabase(connString: string) =
         task {
-            // Store admin connection string for truncate operations
-            let parts = connString.Split("Port=")
-            let port = parts.[1].Split(";").[0]
-            adminConnectionString <- $"Server=127.0.0.1;Database=coupon_hub_bot;Port={port};User Id=admin;Password=admin;Include Error Detail=true;Timeout=120;Command Timeout=120;Keepalive=30;"
-
             use conn = new NpgsqlConnection(connString)
             do! conn.OpenAsync()
 
@@ -124,16 +117,16 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
             return! conn.ExecuteAsync(sql, param)
         }
 
-    member _.TruncateCoupons() =
+    member this.TruncateCoupons() =
         task {
-            use conn = new NpgsqlConnection(adminConnectionString)
+            use conn = new NpgsqlConnection(this.AdminDbConnectionString)
             do! conn.OpenAsync()
             do! conn.ExecuteAsync("TRUNCATE coupon CASCADE") :> Task
         }
 
-    member _.TruncateUserFeedback() =
+    member this.TruncateUserFeedback() =
         task {
-            use conn = new NpgsqlConnection(adminConnectionString)
+            use conn = new NpgsqlConnection(this.AdminDbConnectionString)
             do! conn.OpenAsync()
             do! conn.ExecuteAsync("TRUNCATE user_feedback CASCADE") :> Task
         }
@@ -143,9 +136,9 @@ VALUES (100, 'seed-photo', 10.00, 50.00, @expires_at::date, 'available');
     /// in global queries (e.g. COUNT(*) FROM pending_add_batch). Also defangs
     /// any leftover BatchDebounce timers: when they fire for a since-truncated
     /// batch, TryFlipBatchToAwaiting returns false and FinalizeBatch is a no-op.
-    member _.TruncateBatches() =
+    member this.TruncateBatches() =
         task {
-            use conn = new NpgsqlConnection(adminConnectionString)
+            use conn = new NpgsqlConnection(this.AdminDbConnectionString)
             do! conn.OpenAsync()
             do! conn.ExecuteAsync("TRUNCATE pending_add_batch CASCADE") :> Task
         }

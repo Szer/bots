@@ -745,8 +745,10 @@ WHERE chat_id = @chatId AND message_id = @messageId
     }
 
     /// Empties the snapshot tables (used to prove RebuildSnapshots reconstructs from the log).
+    /// Uses the admin (owner) connection: the bot's `vahter_bot_ban_service` role is granted only
+    /// SELECT/INSERT/UPDATE (it never deletes snapshots), so it deliberately cannot TRUNCATE.
     member this.ClearSnapshots() = task {
-        use conn = new NpgsqlConnection(this.DbConnectionString)
+        use conn = new NpgsqlConnection(this.AdminDbConnectionString)
         let! _ = conn.ExecuteAsync("TRUNCATE snapshot_user, snapshot_message")
         return ()
     }
