@@ -1,14 +1,17 @@
 module VahterBanBot.LlmTriage
 
 open System
+open System.ClientModel
+open System.ClientModel.Primitives
 open System.Collections.Concurrent
 open System.Diagnostics
-open System.Net.Http
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
+open Azure.AI.OpenAI
+open OpenAI.Chat
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open VahterBanBot.Telemetry
@@ -36,49 +39,67 @@ let private singleFlight (inflight: ConcurrentDictionary<string, Lazy<Task<'T>>>
             }))
     entry.Value
 
-// ── Response parsing ──────────────────────────────────────────────────────────
+// ── Azure OpenAI client (memoized, hot-reload aware) ──────────────────────────
 
-let private parseResponse (logger: ILogger) (json: string) =
+/// Builds a `ChatClient` for the current (endpoint, key, deployment) and caches it, rebuilding only
+/// when that tuple changes. All three are hot-reloadable settings (read live from BotConfiguration on
+/// every call), so the client must NOT be frozen at startup — but rebuilding it per call is wasteful,
+/// hence the memoization. The SDK's own retry pipeline (`ClientRetryPolicy`) honors `Retry-After` on
+/// 429, which is what replaces the old Microsoft.Extensions.Http.Resilience handler. Thread-safe; the
+/// rebuild path runs only right after a settings reload.
+type private ChatClientCache() =
+    let gate = obj()
+    // Reference-typed option so the lock-free fast-path read below is atomic (no torn struct read).
+    let mutable cached : (struct (string * string * string) * ChatClient) option = None
+    member _.Get(endpoint: string, key: string, deployment: string) : ChatClient =
+        let want = struct (endpoint, key, deployment)
+        match cached with
+        | Some (have, client) when have = want -> client
+        | _ ->
+            lock gate (fun () ->
+                match cached with
+                | Some (have, client) when have = want -> client
+                | _ ->
+                    // 3 attempts total, honoring Retry-After. Kept short to fit the webhook timeout —
+                    // a webhook handler is holding the call, so retries must stay well under Telegram's
+                    // webhook deadline.
+                    let options = AzureOpenAIClientOptions(RetryPolicy = ClientRetryPolicy(3))
+                    let client  = AzureOpenAIClient(Uri(endpoint), ApiKeyCredential(key), options)
+                    let chat    = client.GetChatClient(deployment)
+                    cached <- Some (want, chat)
+                    chat)
+
+// ── Response-format schemas (strict JSON) ─────────────────────────────────────
+
+let private spamVerdictSchema =
+    BinaryData.FromString """{"type":"object","properties":{"verdict":{"type":"string","enum":["SPAM","SKIP","NOT_SPAM"]}},"required":["verdict"],"additionalProperties":false}"""
+
+let private reactionVerdictSchema =
+    BinaryData.FromString """{"type":"object","properties":{"verdict":{"type":"string","enum":["BAN","SPAM","NOT_SPAM","UNSURE"]},"reason":{"type":"string"}},"required":["verdict","reason"],"additionalProperties":false}"""
+
+// ── Response parsing ──────────────────────────────────────────────────────────
+// The SDK hands back the assistant message text; with json_schema strict mode that text IS the
+// verdict object, so we only parse the inner JSON (no chat-completions envelope to unwrap anymore).
+
+let private parseVerdict (logger: ILogger) (content: string) =
     try
-        use doc = JsonDocument.Parse(json)
-        let root = doc.RootElement
-        let content =
-            root.GetProperty("choices").[0]
-                .GetProperty("message")
-                .GetProperty("content")
-                .GetString()
         use inner = JsonDocument.Parse(content)
-        let verdict = inner.RootElement.GetProperty("verdict").GetString()
-        let usage = root.GetProperty("usage")
-        let promptTokens     = usage.GetProperty("prompt_tokens").GetInt32()
-        let completionTokens = usage.GetProperty("completion_tokens").GetInt32()
-        Some (verdict, promptTokens, completionTokens)
+        Some (inner.RootElement.GetProperty("verdict").GetString())
     with ex ->
-        // Log raw body so unexpected response structures can be analyzed later
-        logger.LogWarning(ex, "Failed to parse LLM triage response. Raw body: {Body}", json)
+        logger.LogWarning(ex, "Failed to parse LLM triage content. Raw: {Body}", content)
         None
 
-let private parseReactionTriageResponse (logger: ILogger) (json: string) =
+let private parseVerdictAndReason (logger: ILogger) (content: string) =
     try
-        use doc = JsonDocument.Parse(json)
-        let root = doc.RootElement
-        let content =
-            root.GetProperty("choices").[0]
-                .GetProperty("message")
-                .GetProperty("content")
-                .GetString()
         use inner = JsonDocument.Parse(content)
         let verdict = inner.RootElement.GetProperty("verdict").GetString()
         let reason =
             match inner.RootElement.TryGetProperty("reason") with
             | true, r when r.ValueKind = JsonValueKind.String -> Some (r.GetString())
             | _ -> None
-        let usage = root.GetProperty("usage")
-        let promptTokens     = usage.GetProperty("prompt_tokens").GetInt32()
-        let completionTokens = usage.GetProperty("completion_tokens").GetInt32()
-        Some (verdict, reason, promptTokens, completionTokens)
+        Some (verdict, reason)
     with ex ->
-        logger.LogWarning(ex, "Failed to parse reaction-triage LLM response. Raw body: {Body}", json)
+        logger.LogWarning(ex, "Failed to parse reaction-triage content. Raw: {Body}", content)
         None
 
 // ── Interface + implementation ────────────────────────────────────────────────
@@ -88,10 +109,11 @@ type ILlmTriage =
     abstract member PromptHash: string
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmVerdict>
 
-type AzureLlmTriage(httpClient: HttpClient, botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService, cache: ILlmVerdictCache) =
+type AzureLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService, cache: ILlmVerdictCache) =
 
     // Coalesces concurrent identical-text classifications (same spam across channels at once).
     let inflight = ConcurrentDictionary<string, Lazy<Task<LlmVerdict>>>()
+    let clientCache = ChatClientCache()
 
     // Static part of the system prompt — used to compute the prompt hash once at startup.
     // Per-chat descriptions are configuration, not the prompt itself.
@@ -118,13 +140,14 @@ Respond with exactly: {"verdict":"SPAM"} or {"verdict":"SKIP"} or {"verdict":"NO
         |> Convert.ToHexString
         |> _.ToLower()
 
-    let modelName = botConf.Value.AzureOpenAiDeployment
-
     // Performs the actual Azure call (no dedup/cache). On a successful verdict it records the
     // classification and, when `cacheKey` is provided, stores the verdict for reuse. Errors are
     // never cached, so a transient 429 is retried next time rather than pinned.
     let classifyUncached (msg: TgMessage) (userMsgCount: int64) (cacheKey: string option) (ct: CancellationToken) = task {
         use activity = botActivity.StartActivity("llmTriage")
+
+        // endpoint/key/deployment are hot-reloadable — read live for this call.
+        let modelName = botConf.Value.AzureOpenAiDeployment
 
         let chatDescLine =
             match botConf.Value.LlmChatDescriptions.TryGetValue(msg.ChatId) with
@@ -144,43 +167,27 @@ Total messages seen from this user: {userMsgCount}
 Message:
 {msg.Text}"""
 
-        let requestJson =
-            $"""{{
-  "messages": [
-    {{"role":"system","content":{JsonSerializer.Serialize(systemPrompt)}}},
-    {{"role":"user","content":{JsonSerializer.Serialize(userPrompt)}}}
-  ],
-  "response_format": {{
-    "type": "json_schema",
-    "json_schema": {{
-      "name": "spam_verdict",
-      "strict": true,
-      "schema": {{
-        "type": "object",
-        "properties": {{"verdict": {{"type": "string", "enum": ["SPAM","SKIP","NOT_SPAM"]}}}},
-        "required": ["verdict"],
-        "additionalProperties": false
-      }}
-    }}
-  }},
-  "max_tokens": 20,
-  "temperature": 0
-}}"""
-
-        let url = $"{botConf.Value.AzureOpenAiEndpoint}/openai/deployments/{botConf.Value.AzureOpenAiDeployment}/chat/completions?api-version=2024-08-01-preview"
+        let options =
+            ChatCompletionOptions(
+                Temperature         = Nullable 0.0f,
+                MaxOutputTokenCount = Nullable 20,
+                ResponseFormat      = ChatResponseFormat.CreateJsonSchemaFormat(
+                                        "spam_verdict", spamVerdictSchema, jsonSchemaIsStrict = Nullable true))
+        let messages : ChatMessage[] =
+            [| SystemChatMessage(systemPrompt)
+               UserChatMessage(userPrompt) |]
 
         let sw = Stopwatch.StartNew()
-        use request = new HttpRequestMessage(HttpMethod.Post, url)
-        request.Headers.Add("api-key", botConf.Value.AzureOpenAiKey)
-        request.Content <- new StringContent(requestJson, Encoding.UTF8, "application/json")
-
-        use! response = httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)
-        let! body = response.Content.ReadAsStringAsync(ct)
-        sw.Stop()
-
-        if response.IsSuccessStatusCode then
-            match parseResponse logger body with
-            | Some (verdictStr, promptTokens, completionTokens) ->
+        try
+            let chatClient =
+                clientCache.Get(botConf.Value.AzureOpenAiEndpoint, botConf.Value.AzureOpenAiKey, modelName)
+            let! result = chatClient.CompleteChatAsync(messages, options, ct)
+            sw.Stop()
+            let content = result.Value.Content.[0].Text
+            match parseVerdict logger content with
+            | Some verdictStr ->
+                let promptTokens     = result.Value.Usage.InputTokenCount
+                let completionTokens = result.Value.Usage.OutputTokenCount
                 if not (isNull activity) then
                     %activity
                         .SetTag("verdict",      verdictStr)
@@ -197,15 +204,23 @@ Message:
                 | None   -> ()
                 return LlmVerdict.FromString verdictStr
             | None ->
-                // warning already logged in parseResponse
+                // warning already logged in parseVerdict
                 return LlmVerdict.Error
-        else
-            logger.LogWarning("LLM triage returned {Status}: {Body}", int response.StatusCode, body)
+        with
+        | :? ClientResultException as ex ->
+            // Retries are exhausted by the time the SDK throws (e.g. a sustained 429). Fail safe:
+            // Error routes the message to human review rather than letting it through.
+            sw.Stop()
+            logger.LogWarning(ex, "LLM triage returned {Status}", ex.Status)
+            return LlmVerdict.Error
+        | ex ->
+            sw.Stop()
+            logger.LogWarning(ex, "LLM triage call failed")
             return LlmVerdict.Error
     }
 
     interface ILlmTriage with
-        member _.ModelName  = modelName
+        member _.ModelName  = botConf.Value.AzureOpenAiDeployment
         member _.PromptHash = promptHash
 
         member _.Classify(msg: TgMessage, userMsgCount: int64, ct: CancellationToken) = task {
@@ -260,7 +275,9 @@ type IReactionTriageClassifier =
     /// recorded with verdict="ERROR").
     abstract member ClassifyReactionSpammer: dossier: ReactionTriageDossier * shadowMode: bool * ct: CancellationToken -> Task<ReactionTriageResult>
 
-type AzureReactionTriage(httpClient: HttpClient, botConf: IOptions<BotConfiguration>, logger: ILogger<AzureReactionTriage>, db: DbService) =
+type AzureReactionTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureReactionTriage>, db: DbService) =
+
+    let clientCache = ChatClientCache()
 
     let staticSystemPrompt =
         """You are a spam-detection assistant for Russian-language IT Telegram chats. You are evaluating whether a user is an emoji-reaction spammer. These spammers join groups, place positive emoji reactions on random messages to surface their profile in notifications, and their profile picture + bio link are the actual ad. Treat these signals as load-bearing:
@@ -282,8 +299,6 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
         SHA256.HashData(Encoding.UTF8.GetBytes(staticSystemPrompt))
         |> Convert.ToHexString
         |> _.ToLower()
-
-    let modelName = botConf.Value.AzureOpenAiDeployment
 
     let formatDossier (d: ReactionTriageDossier) =
         let username = d.Username |> Option.map (fun u -> $"@{u}") |> Option.defaultValue "(none)"
@@ -307,26 +322,25 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
         sprintf "Username: %s\nDisplay name: %s\nFirst seen: %s\nTotal messages across all monitored chats: %d\n\nBio:\n%s\n\nLast %d events (newest first):\n%s\n\nOriginating chat: %d"
             username d.DisplayName firstSeen d.TotalMessagesAcrossChats bioLine d.Last10Events.Length eventsLine d.OriginatingChatId
 
-    let buildContent (d: ReactionTriageDossier) =
+    /// Builds the user turn — multimodal (text + profile photo) when a photo is available, text-only
+    /// otherwise. The image goes as an inline data part so no URL fetch is needed.
+    let buildUserMessage (d: ReactionTriageDossier) : UserChatMessage =
         let dossierText = formatDossier d
         match d.PhotoBytes with
         | Some bytes ->
-            let b64 = Convert.ToBase64String(bytes)
-            // multimodal: text + image_url
-            sprintf """[{"type":"text","text":%s},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,%s"}}]"""
-                (JsonSerializer.Serialize(dossierText))
-                b64
+            UserChatMessage(
+                [| ChatMessageContentPart.CreateTextPart(dossierText)
+                   ChatMessageContentPart.CreateImagePart(BinaryData.FromBytes(bytes), "image/jpeg") |])
         | None ->
-            // text-only — still wrap as content array for consistency
-            sprintf """[{"type":"text","text":%s}]""" (JsonSerializer.Serialize(dossierText))
+            UserChatMessage(ChatMessageContentPart.CreateTextPart(dossierText))
 
     interface IReactionTriageClassifier with
-        member _.ModelName  = modelName
+        member _.ModelName  = botConf.Value.AzureOpenAiDeployment
         member _.PromptHash = promptHash
 
-        // Reaction triage relies on retry (configured at the HttpClient level in Program.fs) to
-        // survive 429s; it deliberately does NOT use the verdict cache — re-triage is already
-        // governed by the per-user cooldown in RunReactionTriagePipeline.
+        // Reaction triage relies on the SDK's retry pipeline (ClientRetryPolicy, honors Retry-After) to
+        // survive 429s; it deliberately does NOT use the verdict cache — re-triage is already governed by
+        // the per-user cooldown in RunReactionTriagePipeline.
         member _.ClassifyReactionSpammer(dossier: ReactionTriageDossier, shadowMode: bool, ct: CancellationToken) = task {
             use activity = botActivity.StartActivity("llmReactionTriage")
             if not (isNull activity) then
@@ -337,9 +351,13 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
                     .SetTag("has_photo",    dossier.PhotoBytes.IsSome)
                     .SetTag("bio_present",  not (String.IsNullOrWhiteSpace dossier.Bio))
 
-            let endpoint = botConf.Value.AzureOpenAiEndpoint
+            // endpoint/key/deployment are hot-reloadable — read live for this call.
+            let modelName = botConf.Value.AzureOpenAiDeployment
+            let endpoint  = botConf.Value.AzureOpenAiEndpoint
+            let key       = botConf.Value.AzureOpenAiKey
+
             // If endpoint or key is missing, return Error without calling — config issue, not a runtime failure.
-            if String.IsNullOrWhiteSpace endpoint || String.IsNullOrWhiteSpace botConf.Value.AzureOpenAiKey then
+            if String.IsNullOrWhiteSpace endpoint || String.IsNullOrWhiteSpace key then
                 logger.LogWarning("Reaction triage skipped: Azure OpenAI endpoint/key is not configured")
                 do! db.RecordLlmReactionTriageClassified(
                         dossier.OriginatingChatId, dossier.UserId, "ERROR", Some "config missing",
@@ -347,74 +365,62 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
                 return { Verdict = LlmReactionVerdict.Error; Reason = Some "config missing"; ModelName = modelName; PromptHash = promptHash }
             else
 
-            let url = $"{endpoint}/openai/deployments/{modelName}/chat/completions?api-version=2024-08-01-preview"
-            let userContent = buildContent dossier
-
-            let requestJson =
-                $"""{{
-  "messages": [
-    {{"role":"system","content":{JsonSerializer.Serialize(staticSystemPrompt)}}},
-    {{"role":"user","content":{userContent}}}
-  ],
-  "response_format": {{
-    "type": "json_schema",
-    "json_schema": {{
-      "name": "reaction_spam_verdict",
-      "strict": true,
-      "schema": {{
-        "type": "object",
-        "properties": {{
-          "verdict": {{"type": "string", "enum": ["BAN","SPAM","NOT_SPAM","UNSURE"]}},
-          "reason":  {{"type": "string"}}
-        }},
-        "required": ["verdict","reason"],
-        "additionalProperties": false
-      }}
-    }}
-  }},
-  "max_tokens": 200,
-  "temperature": 0
-}}"""
+            let options =
+                ChatCompletionOptions(
+                    Temperature         = Nullable 0.0f,
+                    MaxOutputTokenCount = Nullable 200,
+                    ResponseFormat      = ChatResponseFormat.CreateJsonSchemaFormat(
+                                            "reaction_spam_verdict", reactionVerdictSchema, jsonSchemaIsStrict = Nullable true))
+            let messages : ChatMessage[] =
+                [| SystemChatMessage(staticSystemPrompt)
+                   buildUserMessage dossier |]
 
             let sw = Stopwatch.StartNew()
             try
-                use request = new HttpRequestMessage(HttpMethod.Post, url)
-                request.Headers.Add("api-key", botConf.Value.AzureOpenAiKey)
-                request.Content <- new StringContent(requestJson, Encoding.UTF8, "application/json")
-
-                use! response = httpClient.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct)
-                let! body = response.Content.ReadAsStringAsync(ct)
+                let chatClient = clientCache.Get(endpoint, key, modelName)
+                let! result = chatClient.CompleteChatAsync(messages, options, ct)
                 sw.Stop()
-
-                if response.IsSuccessStatusCode then
-                    match parseReactionTriageResponse logger body with
-                    | Some (verdictStr, reason, promptTokens, completionTokens) ->
-                        if not (isNull activity) then
-                            %activity
-                                .SetTag("verdict",      verdictStr)
-                                .SetTag("latency_ms",   sw.ElapsedMilliseconds)
-                                .SetTag("total_tokens", promptTokens + completionTokens)
-                        do! db.RecordLlmReactionTriageClassified(
-                                dossier.OriginatingChatId, dossier.UserId, verdictStr, reason,
-                                promptTokens, completionTokens, int sw.ElapsedMilliseconds,
-                                Some modelName, Some promptHash, shadowMode)
-                        return { Verdict = LlmReactionVerdict.FromString verdictStr; Reason = reason; ModelName = modelName; PromptHash = promptHash }
-                    | None ->
-                        do! db.RecordLlmReactionTriageClassified(
-                                dossier.OriginatingChatId, dossier.UserId, "ERROR", Some "parse failure",
-                                0, 0, int sw.ElapsedMilliseconds, Some modelName, Some promptHash, shadowMode)
-                        return { Verdict = LlmReactionVerdict.Error; Reason = Some "parse failure"; ModelName = modelName; PromptHash = promptHash }
-                else
-                    logger.LogWarning("Reaction triage returned {Status}: {Body}", int response.StatusCode, body)
+                let content = result.Value.Content.[0].Text
+                match parseVerdictAndReason logger content with
+                | Some (verdictStr, reason) ->
+                    let promptTokens     = result.Value.Usage.InputTokenCount
+                    let completionTokens = result.Value.Usage.OutputTokenCount
+                    if not (isNull activity) then
+                        %activity
+                            .SetTag("verdict",      verdictStr)
+                            .SetTag("latency_ms",   sw.ElapsedMilliseconds)
+                            .SetTag("total_tokens", promptTokens + completionTokens)
                     do! db.RecordLlmReactionTriageClassified(
-                            dossier.OriginatingChatId, dossier.UserId, "ERROR", Some (sprintf "HTTP %d" (int response.StatusCode)),
+                            dossier.OriginatingChatId, dossier.UserId, verdictStr, reason,
+                            promptTokens, completionTokens, int sw.ElapsedMilliseconds,
+                            Some modelName, Some promptHash, shadowMode)
+                    return { Verdict = LlmReactionVerdict.FromString verdictStr; Reason = reason; ModelName = modelName; PromptHash = promptHash }
+                | None ->
+                    do! db.RecordLlmReactionTriageClassified(
+                            dossier.OriginatingChatId, dossier.UserId, "ERROR", Some "parse failure",
                             0, 0, int sw.ElapsedMilliseconds, Some modelName, Some promptHash, shadowMode)
-                    return { Verdict = LlmReactionVerdict.Error; Reason = Some (sprintf "HTTP %d" (int response.StatusCode)); ModelName = modelName; PromptHash = promptHash }
-            with ex ->
+                    return { Verdict = LlmReactionVerdict.Error; Reason = Some "parse failure"; ModelName = modelName; PromptHash = promptHash }
+            with
+            | :? ClientResultException as ex ->
+                // Retries exhausted (e.g. sustained 429). Record the real status, not a generic "exception".
                 sw.Stop()
-                logger.LogWarning(ex, "Reaction triage HTTP call threw")
+                logger.LogWarning(ex, "Reaction triage returned {Status} after {LatencyMs}ms", ex.Status, sw.ElapsedMilliseconds)
+                let reason = sprintf "HTTP %d" ex.Status
                 do! db.RecordLlmReactionTriageClassified(
-                        dossier.OriginatingChatId, dossier.UserId, "ERROR", Some "exception",
+                        dossier.OriginatingChatId, dossier.UserId, "ERROR", Some reason,
                         0, 0, int sw.ElapsedMilliseconds, Some modelName, Some promptHash, shadowMode)
-                return { Verdict = LlmReactionVerdict.Error; Reason = Some "exception"; ModelName = modelName; PromptHash = promptHash }
+                return { Verdict = LlmReactionVerdict.Error; Reason = Some reason; ModelName = modelName; PromptHash = promptHash }
+            | ex ->
+                sw.Stop()
+                logger.LogWarning(ex, "Reaction triage call failed after {LatencyMs}ms", sw.ElapsedMilliseconds)
+                let reason =
+                    match ex with
+                    | :? OperationCanceledException -> sprintf "canceled after %dms" sw.ElapsedMilliseconds
+                    | _ ->
+                        let m = ex.Message
+                        sprintf "%s: %s" (ex.GetType().Name) (if m.Length > 160 then m.Substring(0, 160) else m)
+                do! db.RecordLlmReactionTriageClassified(
+                        dossier.OriginatingChatId, dossier.UserId, "ERROR", Some reason,
+                        0, 0, int sw.ElapsedMilliseconds, Some modelName, Some promptHash, shadowMode)
+                return { Verdict = LlmReactionVerdict.Error; Reason = Some reason; ModelName = modelName; PromptHash = promptHash }
         }

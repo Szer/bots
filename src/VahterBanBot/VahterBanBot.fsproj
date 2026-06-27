@@ -25,9 +25,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Azure.AI.OpenAI" />
     <PackageReference Include="Dapper.FSharp" />
     <PackageReference Include="FSharp.SystemTextJson" />
-    <PackageReference Include="Microsoft.Extensions.Http.Resilience" />
     <PackageReference Include="Microsoft.ML" />
   </ItemGroup>
 
