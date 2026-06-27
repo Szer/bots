@@ -83,6 +83,9 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            // Shared fake across the assembly — start from a pristine OCR mock so a prior test's
+            // custom response body can't change this flow's outcome.
+            do! fixture.ResetAzureOcr()
 
             let user = Tg.user(id = 661L, username = "ocr_timeout", firstName = "Timeout")
             do! fixture.SetChatMemberStatus(user.Id, "member")
@@ -111,8 +114,8 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
                 let! count = getCouponCount ()
                 Assert.Equal(0L, count)
             finally
-                // Never leak the stall mode into sibling tests sharing the container.
-                fixture.SetAzureOcrErrorMode("").GetAwaiter().GetResult()
+                // Never leak the stall mode (or any other mock state) into sibling tests sharing the container.
+                fixture.ResetAzureOcr().GetAwaiter().GetResult()
         }
 
     [<Fact>]

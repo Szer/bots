@@ -119,11 +119,11 @@ module BatchTestHelpers =
     // ── Fake-OCR setup helpers ──────────────────────────────────────────
 
     let resetOcrFakes (fixture: OcrCouponHubTestContainers) =
-        task {
-            do! fixture.SetAzureOcrDelay(0)
-            do! fixture.SetAzureOcrErrorMode("")
-            do! fixture.SetAzureOcrScript([||])
-        }
+        // Full reset (default response body + no delay/error/script). The fake is shared across the
+        // whole assembly, so resetting only delay/error/script left a prior test's custom response
+        // BODY in place — a later test that read it (e.g. an OCR call that wasn't cancelled) got
+        // stale state. See #163 review.
+        fixture.ResetAzureOcr()
 
     let setupGoodOcr (fixture: OcrCouponHubTestContainers) (fileId: string) (fileName: string) =
         task {

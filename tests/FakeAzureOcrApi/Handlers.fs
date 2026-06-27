@@ -188,6 +188,12 @@ module Handlers =
             do! respondJson ctx 200 """{"ok":true}"""
         }
 
+    let resetMock (ctx: HttpContext) =
+        task {
+            Store.resetOcrMock()
+            do! respondJson ctx 200 """{"ok":true}"""
+        }
+
     let setResponse (ctx: HttpContext) =
         task {
             let! body = readBody ctx

@@ -1,6 +1,7 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
+open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -128,17 +129,30 @@ if botConfOptions.Value.TestMode then
 // flow from awaiting an in-flight call past debounce time. HttpClient.Timeout is
 // disabled because it would bound the whole pipeline (all attempts share one
 // budget, defeating retry); the pipeline's attempt/total timeouts govern instead.
+//
+// The pipeline is pinned to TimeProvider.System (real wall-clock) on purpose. A
+// resilience pipeline otherwise resolves TimeProvider from DI, which in TestMode is
+// a FROZEN FakeTimeProvider used for deterministic *business* time (batch debounce,
+// coupon expiry). Binding HTTP *transport* timeouts to that clock means the
+// per-attempt/total timeouts and the retry delay never elapse during a synchronous
+// OCR call, so a stalled or failing OCR hangs until the test's real-time budget —
+// the flakiness found in the #163 review. Transport timeouts must use real time
+// (in production the DI clock is real, so this is a no-op there).
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services
     .AddHttpClient<IBotOcr, AzureBotOcr>(fun c -> c.Timeout <- Timeout.InfiniteTimeSpan)
-    .AddStandardResilienceHandler(fun o ->
-        o.AttemptTimeout.Timeout <- TimeSpan.FromSeconds 2.
-        o.Retry.MaxRetryAttempts <- 1
-        o.Retry.Delay <- TimeSpan.FromMilliseconds 100.
-        o.Retry.BackoffType <- DelayBackoffType.Constant
-        // Bound the whole operation so a webhook handler holding this call can't
-        // stall: ~2s + 0.1s + 2s ≈ 4.1s worst case, well under Telegram's timeout.
-        o.TotalRequestTimeout.Timeout <- TimeSpan.FromSeconds 6.)
+    .AddResilienceHandler("ocr-pipeline", fun (b: ResiliencePipelineBuilder<HttpResponseMessage>) ->
+        b.TimeProvider <- TimeProvider.System
+        b
+            // Bound the whole operation so a webhook handler holding this call can't
+            // stall: ~2s + 0.1s + 2s ≈ 4.1s worst case, well under Telegram's timeout.
+            .AddTimeout(TimeSpan.FromSeconds 6.)            // total request budget (outermost)
+            .AddRetry(HttpRetryStrategyOptions(
+                MaxRetryAttempts = 1,
+                Delay = TimeSpan.FromMilliseconds 100.,
+                BackoffType = DelayBackoffType.Constant))   // retry transient failures + per-attempt timeouts
+            .AddTimeout(TimeSpan.FromSeconds 2.)            // per-attempt timeout (innermost)
+        |> ignore)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()
