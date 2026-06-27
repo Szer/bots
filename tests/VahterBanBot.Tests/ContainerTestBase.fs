@@ -753,6 +753,22 @@ WHERE chat_id = @chatId AND message_id = @messageId
         return ()
     }
 
+    /// Inserts one event with a controlled created_at, serializing the typed event via eventJsonOpts
+    /// (so the 'Case' discriminator / shape match production). For snapshot status-timeline tests.
+    member this.InsertRawEvent<'e>(streamId: string, version: int, evt: 'e, createdAt: DateTime) = task {
+        let dataJson = JsonSerializer.Serialize(evt, eventJsonOpts)
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+INSERT INTO event(stream_id, stream_version, data, created_at)
+VALUES (@streamId, @version, @data::jsonb, @createdAt)
+ON CONFLICT (stream_id, stream_version) DO NOTHING
+            """
+        let! _ = conn.ExecuteAsync(sql, {| streamId = streamId; version = version; data = dataJson; createdAt = createdAt |})
+        return ()
+    }
+
 /// Polls `/ready` until the bot reports its ML model is loaded or trained.
 /// Preload path: ready in <1s. Fresh-train path (first local run): up to ~3 minutes.
 let private waitForReady (http: HttpClient) (timeout: TimeSpan) : Task<unit> = task {

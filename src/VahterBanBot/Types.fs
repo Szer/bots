@@ -218,6 +218,30 @@ type Moderation =
         | VahterActed e      -> { state with VahterActedCount = state.VahterActedCount + 1; LastVahterAction = Some e.actionType }
         | BotAutoDeleted _   -> { state with BotAutoDeletedCount = state.BotAutoDeletedCount + 1 }
 
+/// A message's spam/ham status spans two streams: its own `message:*` marks AND the sibling
+/// `moderation:*` bot/vahter actions. This unifies them so a single fold over the time-ordered
+/// merge of both streams yields the message's status — the F# home of MlData's verdict logic.
+type MessageTimelineEvent =
+    | FromMessage    of MessageEvent
+    | FromModeration of ModerationEvent
+
+type Message with
+    /// Folds the full Message state from the merged, time-ordered timeline of BOTH streams.
+    /// Spam/ham mapping mirrors DbService.MlData (last decisive event wins): BotAutoDeleted and
+    /// VahterActed PotentialKill/ManualBan -> Spam; VahterActed PotentialNotSpam/DetectedNotSpam ->
+    /// Ham; soft-spam and reaction-triage actions are non-decisive (status unchanged), as in MlData.
+    /// The caller must feed events in (created_at, id) order.
+    static member FoldTimeline (state: Message, ev: MessageTimelineEvent) : Message =
+        match ev with
+        | FromMessage me                     -> Message.Fold(state, me)   // Received/Text/UserId/Deleted + mark verdicts
+        | FromModeration (BotAutoDeleted _)  -> { state with Classification = Spam }
+        | FromModeration (VahterActed e) ->
+            match e.actionType with
+            | PotentialKill | ManualBan          -> { state with Classification = Spam }
+            | PotentialNotSpam | DetectedNotSpam -> { state with Classification = Ham }
+            | PotentialSoftSpam
+            | ReactionTriageBan | ReactionTriageSpam | ReactionTriageNotSpam -> state
+
 // ---------------------------------------------------------------------------
 
 type CallbackEvent =
