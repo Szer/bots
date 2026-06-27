@@ -205,3 +205,77 @@ let ``Old UserUnbanned without actor deserializes correctly`` () =
         Assert.Equal(None, e.actor)
     | other -> Assert.Fail $"Expected UserUnbanned but got {other}"
 
+// ---------------------------------------------------------------------------
+// Snapshot DTO serialization. These guard the contract between the F# DTO keys
+// and the GENERATED-column expressions in V38__snapshot.sql — a key rename here
+// silently turns a generated column into all-NULLs, so assert the exact keys.
+// ---------------------------------------------------------------------------
+
+let private snapJson (o: obj) = JsonSerializer.Serialize(o, snapshotJsonOpts)
+let private prop (json: string) (name: string) =
+    use doc = JsonDocument.Parse json
+    match doc.RootElement.TryGetProperty name with
+    | true, v -> Some (v.Clone())
+    | _ -> None
+
+[<Fact>]
+let ``userSnapshot of a banned user emits the generated-column keys`` () =
+    let bannedAt = DateTime(2026, 6, 27, 10, 0, 0, DateTimeKind.Utc)
+    let user =
+        { User.Zero with
+            Id = 555L
+            Username = Some "alice"
+            Banned = Some (Actor.User {| userId = 42L; username = Some "vahter_1" |}, bannedAt)
+            ReactionCount = 7 }
+    let json = snapJson (userSnapshot user)
+    Assert.Equal(Some "alice", prop json "username" |> Option.map (fun v -> v.GetString()))
+    Assert.Equal(Some true,    prop json "banned"   |> Option.map (fun v -> v.GetBoolean()))
+    Assert.Equal(Some 42L,     prop json "bannedByUserId" |> Option.map (fun v -> v.GetInt64()))
+    Assert.Equal(Some 7,       prop json "reactionCount"  |> Option.map (fun v -> v.GetInt32()))
+    // bannedAt must be a UTC instant with a Z offset so the IMMUTABLE timestamptz cast is deterministic.
+    let bannedAtStr = prop json "bannedAt" |> Option.map (fun v -> v.GetString())
+    Assert.True(bannedAtStr |> Option.exists (fun s -> s.EndsWith "Z"), $"bannedAt should be UTC/Z, got {bannedAtStr}")
+
+[<Fact>]
+let ``userSnapshot of a non-banned user omits ban keys (NULL columns)`` () =
+    let user = { User.Zero with Id = 1L; Username = Some "bob" }
+    let json = snapJson (userSnapshot user)
+    Assert.Equal(Some false, prop json "banned" |> Option.map (fun v -> v.GetBoolean()))
+    Assert.Equal(None, prop json "bannedAt")        // skipped option -> absent -> NULL column
+    Assert.Equal(None, prop json "bannedByUserId")
+
+[<Fact>]
+let ``messageSnapshot maps classification and carries text/userId`` () =
+    let msg = { Message.Zero with Received = true; Text = Some "hello"; UserId = Some 99L; Classification = SpamClassification.Ham }
+    let json = snapJson (messageSnapshot msg)
+    Assert.Equal(Some "hello", prop json "text" |> Option.map (fun v -> v.GetString()))
+    Assert.Equal(Some 99L,     prop json "userId" |> Option.map (fun v -> v.GetInt64()))
+    Assert.Equal(Some "Ham",   prop json "classification" |> Option.map (fun v -> v.GetString()))
+    Assert.Equal(Some false,   prop json "deleted" |> Option.map (fun v -> v.GetBoolean()))
+
+[<Theory>]
+[<InlineData("PotentialKill", "Spam")>]
+[<InlineData("ManualBan", "Spam")>]
+[<InlineData("ReactionTriageBan", "Spam")>]
+[<InlineData("PotentialNotSpam", "NotSpam")>]
+[<InlineData("DetectedNotSpam", "NotSpam")>]
+let ``moderationSnapshot maps the last vahter action to a verdict`` (action: string, expected: string) =
+    let act =
+        match action with
+        | "PotentialKill" -> PotentialKill
+        | "ManualBan" -> ManualBan
+        | "ReactionTriageBan" -> ReactionTriageBan
+        | "PotentialNotSpam" -> PotentialNotSpam
+        | "DetectedNotSpam" -> DetectedNotSpam
+        | other -> failwith $"unmapped {other}"
+    let m = { Moderation.Zero with VahterActedCount = 1; LastVahterAction = Some act }
+    let json = snapJson (moderationSnapshot m)
+    Assert.Equal(Some expected, prop json "verdict" |> Option.map (fun v -> v.GetString()))
+
+[<Fact>]
+let ``moderationSnapshot with only a bot auto-delete has no verdict but flags botAutoDeleted`` () =
+    let m = { Moderation.Zero with BotAutoDeletedCount = 1 }
+    let json = snapJson (moderationSnapshot m)
+    Assert.Equal(Some true, prop json "botAutoDeleted" |> Option.map (fun v -> v.GetBoolean()))
+    Assert.Equal(None, prop json "verdict")   // no vahter action -> absent -> NULL column
+
