@@ -190,9 +190,14 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddHostedService<StartupMessage>()
     .AddHostedService<UpdateChatAdmins>()
 
-// OCR: register shared IBotOcr, then the VahterBanBot adapter that keeps the IComputerVision interface
+// OCR: register shared IBotOcr (Azure AI Vision SDK; SDK-native retry), then the VahterBanBot
+// adapter that keeps the IComputerVision interface.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>()
+%builder.Services.AddSingleton<IBotOcr>(fun sp ->
+    AzureBotOcr(
+        sp.GetRequiredService<IOptions<BotOcrConfig>>(),
+        sp.GetRequiredService<ILogger<AzureBotOcr>>(),
+        null) :> IBotOcr)
 %builder.Services.AddSingleton<IComputerVision, BotOcrComputerVision>()
 // Both LLM classifiers talk to Azure OpenAI through the Azure.AI.OpenAI SDK, which carries its own
 // retry pipeline (honors Retry-After on 429) — see LlmTriage.fs. Singleton so the per-instance

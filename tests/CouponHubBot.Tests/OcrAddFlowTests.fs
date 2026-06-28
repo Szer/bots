@@ -73,7 +73,7 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
 
     /// Regression for #158: the single-photo /add OCR runs synchronously inside
     /// the webhook update handler. When Azure OCR stalls past its per-attempt
-    /// timeout, the OCR HTTP resilience pipeline retries once and then Recognize
+    /// timeout, the Azure OCR SDK retries once and then Recognize
     /// degrades to a null-field result instead of throwing — so the handler must
     /// NOT raise an "Unhandled error in update handler". ZXing still decodes the
     /// barcode from the image, so the wizard falls through to manual discount /

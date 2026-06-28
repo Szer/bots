@@ -374,12 +374,11 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
-            // The HTTP resilience pipeline already retried transient failures; if one still
-            // surfaces, AnalyzeImageBytes re-raises it. Catch it here (don't crash) and record that
-            // the OCR *backend* failed, so callers can tell "Azure was down/timed out" apart from
-            // "Azure answered but found no usable text". The ZXing barcode above is independent of
-            // Azure and may still be set. A non-2xx response returns null (not an exception) and is
-            // treated as no-text, matching the field-based "no barcode"/"partial" classification.
+            // The Azure OCR SDK already retried transient failures; if one still surfaces (network,
+            // timeout, or a non-2xx response after retries) AnalyzeImageBytes re-throws it. Catch it
+            // here (don't crash) and record that the OCR *backend* failed, so callers can tell "Azure
+            // was down/timed out/errored" apart from "Azure answered 200 but found no usable text".
+            // The ZXing barcode above is independent of Azure and may still be set.
             let! ocrAnalysis, backendFailed =
                 task {
                     try

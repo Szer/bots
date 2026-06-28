@@ -1,7 +1,6 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
-open System.Net.Http
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -9,8 +8,6 @@ open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Polly
-open Microsoft.Extensions.Http.Resilience
 open Microsoft.Extensions.Time.Testing
 open CouponHubBot
 open CouponHubBot.Services
@@ -123,36 +120,15 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
-// OCR: register shared IBotOcr. Retry + per-attempt timeout live in the HTTP
-// resilience pipeline rather than in the call sites — a transient failure or a
-// slow attempt is retried once, and the 2s per-attempt budget keeps the batch
-// flow from awaiting an in-flight call past debounce time. HttpClient.Timeout is
-// disabled because it would bound the whole pipeline (all attempts share one
-// budget, defeating retry); the pipeline's attempt/total timeouts govern instead.
-//
-// The pipeline is pinned to TimeProvider.System (real wall-clock) on purpose. A
-// resilience pipeline otherwise resolves TimeProvider from DI, which in TestMode is
-// a FROZEN FakeTimeProvider used for deterministic *business* time (batch debounce,
-// coupon expiry). Binding HTTP *transport* timeouts to that clock means the
-// per-attempt/total timeouts and the retry delay never elapse during a synchronous
-// OCR call, so a stalled or failing OCR hangs until the test's real-time budget —
-// the flakiness found in the #163 review. Transport timeouts must use real time
-// (in production the DI clock is real, so this is a no-op there).
+// OCR: register shared IBotOcr, backed by the Azure AI Vision Image Analysis SDK. Retry +
+// per-attempt timeout live inside the SDK's own pipeline (Azure.Core — honors Retry-After, runs on
+// the real wall-clock). Singleton so the memoized ImageAnalysisClient is shared across requests.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services
-    .AddHttpClient<IBotOcr, AzureBotOcr>(fun c -> c.Timeout <- Timeout.InfiniteTimeSpan)
-    .AddResilienceHandler("ocr-pipeline", fun (b: ResiliencePipelineBuilder<HttpResponseMessage>) ->
-        b.TimeProvider <- TimeProvider.System
-        b
-            // Bound the whole operation so a webhook handler holding this call can't
-            // stall: ~2s + 0.1s + 2s ≈ 4.1s worst case, well under Telegram's timeout.
-            .AddTimeout(TimeSpan.FromSeconds 6.)            // total request budget (outermost)
-            .AddRetry(HttpRetryStrategyOptions(
-                MaxRetryAttempts = 1,
-                Delay = TimeSpan.FromMilliseconds 100.,
-                BackoffType = DelayBackoffType.Constant))   // retry transient failures + per-attempt timeouts
-            .AddTimeout(TimeSpan.FromSeconds 2.)            // per-attempt timeout (innermost)
-        |> ignore)
+%builder.Services.AddSingleton<IBotOcr>(fun sp ->
+    AzureBotOcr(
+        sp.GetRequiredService<IOptions<BotOcrConfig>>(),
+        sp.GetRequiredService<ILogger<AzureBotOcr>>(),
+        null) :> IBotOcr)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()

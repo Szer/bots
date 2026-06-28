@@ -211,7 +211,7 @@ type CouponFlowHandler(
                     else
                         // OCR runs synchronously inside the webhook update handler, but
                         // Recognize degrades a transient/timeout failure (retried by the
-                        // OCR HTTP resilience pipeline) to a null-field result rather than
+                        // Azure OCR SDK) to a null-field result rather than
                         // throwing — so a slow Azure OCR can't crash the handler. The
                         // barcode from ZXing may still be present, in which case the wizard
                         // falls through to manual discount/min-check entry below.
@@ -456,8 +456,8 @@ type CouponFlowHandler(
             $"{header}\n{body}", BotHelpers.addBatchConfirmKeyboard batchId okItems.Length
 
     /// Background OCR for one item. Fire-and-forget from the webhook handler.
-    /// Per-attempt 2s timeout and one retry on transient failures are handled by
-    /// the OCR HTTP resilience pipeline (see Program.fs). All writes are
+    /// Per-attempt timeout and one retry on transient failures are handled by
+    /// the Azure OCR SDK's built-in pipeline. All writes are
     /// conditional on status='pending' so a late OCR finish after finalize's
     /// claim is a safe no-op.
     member _.OcrItem (batchId: int64) (itemId: int64) (photoFileId: string) (parent: ActivityContext option) : Task =

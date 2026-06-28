@@ -15,8 +15,8 @@
     <!-- Azure OpenAI SDK (LLM triage; SDK-native retry honors Retry-After on 429) -->
     <PackageVersion Include="Azure.AI.OpenAI" Version="2.9.0-beta.1" />
 
-    <!-- Resilience (retry/per-attempt timeout for the CouponHubBot OCR HTTP client) -->
-    <PackageVersion Include="Microsoft.Extensions.Http.Resilience" Version="10.7.0" />
+    <!-- Azure AI Vision (OCR via the Image Analysis "read" feature; SDK-native retry) -->
+    <PackageVersion Include="Azure.AI.Vision.ImageAnalysis" Version="1.0.0" />
 
     <!-- Database -->
     <PackageVersion Include="Dapper" Version="2.1.72" />

@@ -185,7 +185,10 @@ type OcrTests(output: ITestOutputHelper) =
                   OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                   AzureOcrEndpoint = effectiveEndpoint
                   AzureOcrKey = effectiveKey })
-        let azure = AzureBotOcr(http, ocrOptions, XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs)) :> IBotOcr
+        // Route the SDK through the cache-replay HttpClient via Azure.Core's transport seam.
+        let transport = new Azure.Core.Pipeline.HttpClientTransport(http)
+        let azure =
+            AzureBotOcr(ocrOptions, XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs), transport) :> IBotOcr
 
         // Freeze "now" to 2026 so year inference is stable.
         let timeProvider =
