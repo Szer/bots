@@ -517,13 +517,17 @@ type CouponFlowHandler(
                             // decode the barcode while value/min/date come back NULL. Treating
                             // that as 'ok' crashes RenderBulkConfirm later. Require ALL fields.
                             let hasAllFields =
-                                not (String.IsNullOrWhiteSpace ocr.barcode)
+                                not ocr.backendFailed
+                                && not (String.IsNullOrWhiteSpace ocr.barcode)
                                 && ocr.couponValue.HasValue
                                 && ocr.minCheck.HasValue
                                 && ocr.validTo.HasValue
                             if not hasAllFields then
                                 let note =
-                                    if String.IsNullOrWhiteSpace ocr.barcode then "no barcode"
+                                    // A backend failure (Azure down/timed out, already retried) is distinct
+                                    // from a readable photo missing a barcode — report it as such.
+                                    if ocr.backendFailed then "OCR failed"
+                                    elif String.IsNullOrWhiteSpace ocr.barcode then "no barcode"
                                     else "partial"
                                 do! writeNeedsInput note
                             else

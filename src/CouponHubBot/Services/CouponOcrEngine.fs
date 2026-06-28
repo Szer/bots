@@ -374,11 +374,21 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
-            // AnalyzeImageBytes degrades transient failures (timeout/network/5xx,
-            // already retried by the HTTP resilience pipeline) to a null result, so
-            // a slow or unavailable Azure OCR yields no text rather than throwing —
-            // the barcode from ZXing above is independent and may still be present.
-            let! ocrAnalysis = azureTextOcr.AnalyzeImageBytes(imageBytes)
+            // The HTTP resilience pipeline already retried transient failures; if one still
+            // surfaces, AnalyzeImageBytes re-raises it. Catch it here (don't crash) and record that
+            // the OCR *backend* failed, so callers can tell "Azure was down/timed out" apart from
+            // "Azure answered but found no usable text". The ZXing barcode above is independent of
+            // Azure and may still be set. A non-2xx response returns null (not an exception) and is
+            // treated as no-text, matching the field-based "no barcode"/"partial" classification.
+            let! ocrAnalysis, backendFailed =
+                task {
+                    try
+                        let! a = azureTextOcr.AnalyzeImageBytes(imageBytes)
+                        return a, false
+                    with ex ->
+                        logger.LogWarning(ex, "Azure OCR backend call failed after retries")
+                        return (null: OcrAnalysis | null), true
+                }
 
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
 
@@ -406,6 +416,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                   minCheck = minCheck
                   validFrom = validFrom
                   validTo = validTo
-                  barcode = barcode }
+                  barcode = barcode
+                  backendFailed = backendFailed }
         }
 

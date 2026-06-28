@@ -91,9 +91,14 @@ type AzureBotOcr(httpClient: HttpClient, options: IOptions<BotOcrConfig>, logger
                             logger.LogWarning("Azure OCR returned status {Status}. Response: {Body}", response.StatusCode, responseContent)
                             return (null: OcrAnalysis | null)
                     with ex ->
-                        // Transient failures (timeout/network/5xx) are retried by the HTTP
-                        // resilience pipeline; if one still surfaces here the attempts are
-                        // spent, so degrade to "no OCR result" instead of throwing.
+                        // Transient failures (timeout/network) are retried by the HTTP resilience
+                        // pipeline (where configured); if one still surfaces here the attempts are
+                        // spent. Re-throw so callers can tell a *backend failure* apart from a
+                        // successful-but-no-text result (a non-2xx response still returns null above).
+                        // Every caller wraps this in its own try/with, so re-throwing never crashes a
+                        // handler — it just preserves the failure signal. (reraise() isn't usable
+                        // inside a task CE, so dispatch the captured exception preserving its stack.)
                         logger.LogWarning(ex, "Failed to extract text via Azure OCR")
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
                         return (null: OcrAnalysis | null)
             }
