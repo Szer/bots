@@ -96,14 +96,21 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
                             logger.LogWarning("Azure OCR returned no readable text")
                         let rawJson = response.GetRawResponse().Content.ToString()
                         return { RawJson = rawJson; Text = text }
-                    with ex ->
-                        // Transient backend failure (network/timeout/5xx), already retried by the SDK.
-                        // Re-throw so callers can tell a *backend failure* apart from a successful-but-
-                        // no-text result. Every caller wraps this in its own try/with, so re-throwing
-                        // never crashes a handler — it just preserves the failure signal. (reraise()
-                        // isn't usable inside a task CE, so dispatch the captured exception preserving
-                        // its stack.)
-                        logger.LogWarning(ex, "Failed to extract text via Azure OCR")
+                    with
+                    | :? RequestFailedException as rfe when rfe.Status > 0 ->
+                        // The service responded with an HTTP error (e.g. 403 VNet block, 500), already
+                        // retried by the SDK where applicable. Treat as "no usable OCR text" (null) so
+                        // downstream uses the field-based classification ("no barcode"/"partial") — a
+                        // ZXing-decoded barcode is still usable. Matches the pre-SDK non-2xx behavior.
+                        logger.LogWarning(rfe, "Azure OCR returned HTTP {Status}", rfe.Status)
+                        return (null: OcrAnalysis | null)
+                    | ex ->
+                        // Transport failure (network/timeout, no HTTP response), already retried by the
+                        // SDK. Re-throw so callers can tell a *backend failure* apart from a no-text
+                        // result. Every caller wraps this in its own try/with, so re-throwing never
+                        // crashes a handler. (reraise() isn't usable inside a task CE, so dispatch the
+                        // captured exception preserving its stack.)
+                        logger.LogWarning(ex, "Failed to reach Azure OCR")
                         System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
                         return (null: OcrAnalysis | null)
             }

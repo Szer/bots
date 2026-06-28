@@ -426,9 +426,11 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let fileId = "ocr-photo-partial"
 
             do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
-            // Only provide amounts, no dates -> OCR should prefill discount/min_check, then ask for expiry date.
+            // Real Image Analysis 4.0 shape: text lives in readResult.blocks[].lines[].text (the SDK
+            // does not expose a top-level readResult.content). Amounts only, no date -> the wizard
+            // should prefill discount/min_check, then ask for the expiry date.
             let partialBody =
-                """{"readResult":{"content":"SAVE €10\nWhen you spend €50\n","blocks":[]}}"""
+                """{"modelVersion":"2023-10-01","metadata":{"width":100,"height":100},"readResult":{"blocks":[{"lines":[{"text":"SAVE €10","boundingPolygon":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":5},{"x":0,"y":5}],"words":[]},{"text":"When you spend €50","boundingPolygon":[{"x":0,"y":6},{"x":10,"y":6},{"x":10,"y":11},{"x":0,"y":11}],"words":[]}]}]}}"""
             do! fixture.SetAzureOcrResponse(200, partialBody)
 
             let! _ = fixture.SendUpdate(Tg.dmMessage("/add", user))
