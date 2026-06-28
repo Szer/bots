@@ -297,6 +297,18 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Resets the fake OCR mock to its pristine baseline (default 200 response, no delay,
+    /// no error mode, empty script). The fake is shared across the whole test assembly, so
+    /// tests must reset it rather than inherit a previous test's custom response/error mode.
+    member _.ResetAzureOcr() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            use content = new StringContent("{}", Encoding.UTF8, "application/json")
+            let! _ = fakeAzureHttp.PostAsync("/test/mock/reset", content)
+            return ()
+        }
+
     member _.SetAzureOcrDelay(delayMs: int) =
         task {
             if not config.OcrEnabled then

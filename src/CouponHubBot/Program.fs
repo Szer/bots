@@ -1,6 +1,7 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
@@ -119,11 +120,15 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
-// OCR: register shared IBotOcr with a 2s per-attempt HTTP timeout so the batch
-// flow can safely render results at debounce time without awaiting in-flight calls.
+// OCR: register shared IBotOcr, backed by the Azure AI Vision Image Analysis SDK. Retry +
+// per-attempt timeout live inside the SDK's own pipeline (Azure.Core — honors Retry-After, runs on
+// the real wall-clock). Singleton so the memoized ImageAnalysisClient is shared across requests.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
-%builder.Services.AddHttpClient<IBotOcr, AzureBotOcr>(fun c ->
-    c.Timeout <- TimeSpan.FromSeconds 2.)
+%builder.Services.AddSingleton<IBotOcr>(fun sp ->
+    AzureBotOcr(
+        sp.GetRequiredService<IOptions<BotOcrConfig>>(),
+        sp.GetRequiredService<ILogger<AzureBotOcr>>(),
+        null) :> IBotOcr)
 
 %builder.Services.AddHttpClient<GitHubService>()
 %builder.Services.AddSingleton<CouponOcrEngine>()

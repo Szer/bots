@@ -72,16 +72,20 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
         fixture.QuerySingle<int64>("SELECT COUNT(*)::bigint FROM coupon", null)
 
     /// Regression for #158: the single-photo /add OCR runs synchronously inside
-    /// the webhook update handler. When the OCR backend stalls past the OCR
-    /// HttpClient's 2s timeout, the resulting TaskCanceledException must NOT
-    /// escape as an "Unhandled error in update handler" — it must be caught,
-    /// retried once, and then degrade to the manual-entry prompt so the user is
-    /// never left hanging. Pre-fix this threw and sent the user nothing.
+    /// the webhook update handler. When Azure OCR stalls past its per-attempt
+    /// timeout, the Azure OCR SDK retries once and then Recognize
+    /// degrades to a null-field result instead of throwing — so the handler must
+    /// NOT raise an "Unhandled error in update handler". ZXing still decodes the
+    /// barcode from the image, so the wizard falls through to manual discount /
+    /// min-check entry. Pre-#158 this threw and the user got nothing.
     [<Fact>]
     let ``Single-photo OCR timeout: falls back to manual entry, no unhandled error`` () =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
+            // Shared fake across the assembly — start from a pristine OCR mock so a prior test's
+            // custom response body can't change this flow's outcome.
+            do! fixture.ResetAzureOcr()
 
             let user = Tg.user(id = 661L, username = "ocr_timeout", firstName = "Timeout")
             do! fixture.SetChatMemberStatus(user.Id, "member")
@@ -91,8 +95,8 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
 
             try
-                // Azure OCR stalls 10s on every call → the 2s OCR HttpClient
-                // timeout fires on both the initial attempt and the one retry.
+                // Azure OCR stalls 10s on every call → the resilience pipeline's
+                // 2s per-attempt timeout fires on both the attempt and the retry.
                 do! fixture.SetAzureOcrErrorMode("timeout")
 
                 let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("", user, fileId = fileId))
@@ -100,18 +104,18 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
                 // OCR timeout.
                 Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
+                // Azure timed out (no value/min/date), but ZXing decoded the
+                // barcode, so the wizard asks for manual discount / min-check.
                 let! calls = fixture.GetFakeCalls("sendMessage")
-                Assert.True(findCallWithText calls user.Id "Не получилось распознать фото",
-                            "Expected manual-entry fallback after OCR timeout")
                 Assert.True(findCallWithText calls user.Id "Выбери скидку и минимальный чек",
-                            "Expected manual discount/min-check prompt in the fallback")
+                            "Expected manual discount/min-check prompt after OCR timeout")
 
                 // No coupon should have been created from a timed-out OCR.
                 let! count = getCouponCount ()
                 Assert.Equal(0L, count)
             finally
-                // Never leak the stall mode into sibling tests sharing the container.
-                fixture.SetAzureOcrErrorMode("").GetAwaiter().GetResult()
+                // Never leak the stall mode (or any other mock state) into sibling tests sharing the container.
+                fixture.ResetAzureOcr().GetAwaiter().GetResult()
         }
 
     [<Fact>]
@@ -422,9 +426,11 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             let fileId = "ocr-photo-partial"
 
             do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
-            // Only provide amounts, no dates -> OCR should prefill discount/min_check, then ask for expiry date.
+            // Real Image Analysis 4.0 shape: text lives in readResult.blocks[].lines[].text (the SDK
+            // does not expose a top-level readResult.content). Amounts only, no date -> the wizard
+            // should prefill discount/min_check, then ask for the expiry date.
             let partialBody =
-                """{"readResult":{"content":"SAVE €10\nWhen you spend €50\n","blocks":[]}}"""
+                """{"modelVersion":"2023-10-01","metadata":{"width":100,"height":100},"readResult":{"blocks":[{"lines":[{"text":"SAVE €10","boundingPolygon":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":5},{"x":0,"y":5}],"words":[]},{"text":"When you spend €50","boundingPolygon":[{"x":0,"y":6},{"x":10,"y":6},{"x":10,"y":11},{"x":0,"y":11}],"words":[]}]}]}}"""
             do! fixture.SetAzureOcrResponse(200, partialBody)
 
             let! _ = fixture.SendUpdate(Tg.dmMessage("/add", user))

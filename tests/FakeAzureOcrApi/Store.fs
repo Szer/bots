@@ -46,3 +46,15 @@ module Store =
         while llmResponseScript.TryDequeue(&item) do
             ()
 
+    /// Resets the OCR mock to its pristine baseline: default 200 response, no delay,
+    /// no error mode, and an empty script queue. Tests share one fake across the whole
+    /// assembly, so a test that set a custom response/errorMode must not leak it to the
+    /// next test (which would otherwise read stale state — see #163 review). The OpenAI
+    /// LLM script is intentionally left untouched (a separate queue).
+    let resetOcrMock () =
+        responseStatus <- 200
+        responseBody <- defaultOcrResponse
+        responseDelayMs <- 0
+        responseErrorMode <- ""
+        clearScript ()
+

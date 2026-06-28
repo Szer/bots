@@ -16,6 +16,7 @@ app.MapPost("/openai/deployments/{deployment}/chat/completions", Func<HttpContex
 |> ignore
 
 // Test endpoints (configure response / inspect calls)
+app.MapPost("/test/mock/reset",     Func<HttpContext, Threading.Tasks.Task>(fun ctx -> resetMock ctx))    |> ignore
 app.MapPost("/test/mock/response",  Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setResponse ctx))  |> ignore
 app.MapPost("/test/mock/delay",     Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setDelay ctx))     |> ignore
 app.MapPost("/test/mock/errorMode", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setErrorMode ctx)) |> ignore

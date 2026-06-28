@@ -374,21 +374,19 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
-            let! ocrAnalysis =
+            // The Azure OCR SDK already retried transient failures; if one still surfaces (network,
+            // timeout, or a non-2xx response after retries) AnalyzeImageBytes re-throws it. Catch it
+            // here (don't crash) and record that the OCR *backend* failed, so callers can tell "Azure
+            // was down/timed out/errored" apart from "Azure answered 200 but found no usable text".
+            // The ZXing barcode above is independent of Azure and may still be set.
+            let! ocrAnalysis, backendFailed =
                 task {
                     try
-                        return! azureTextOcr.AnalyzeImageBytes(imageBytes)
-                    with
-                    | :? System.OperationCanceledException as ex ->
-                        // Transient: surface so the batch flow can retry once.
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | :? System.Net.Http.HttpRequestException as ex ->
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
-                        return Unchecked.defaultof<_>
-                    | ex ->
-                        logger.LogWarning(ex, "Azure text OCR failed")
-                        return (null: OcrAnalysis | null)
+                        let! a = azureTextOcr.AnalyzeImageBytes(imageBytes)
+                        return a, false
+                    with ex ->
+                        logger.LogWarning(ex, "Azure OCR backend call failed after retries")
+                        return (null: OcrAnalysis | null), true
                 }
 
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
@@ -417,6 +415,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                   minCheck = minCheck
                   validFrom = validFrom
                   validTo = validTo
-                  barcode = barcode }
+                  barcode = barcode
+                  backendFailed = backendFailed }
         }
 

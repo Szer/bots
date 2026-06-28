@@ -57,7 +57,11 @@ type CouponOCR =
       minCheck: Nullable<decimal>
       validFrom: Nullable<DateTime>
       validTo: Nullable<DateTime>
-      barcode: string | null }
+      barcode: string | null
+      /// True when the OCR *backend* call failed (network/timeout, after the resilience pipeline's
+      /// retries) rather than succeeding with no usable text. Lets callers report "OCR failed"
+      /// (a transient outage — retry) distinctly from "no barcode" (a readable but unusable photo).
+      backendFailed: bool }
 
 [<CLIMutable>]
 type CouponEvent =
