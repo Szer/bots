@@ -676,7 +676,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // (ClientRetryPolicy 3) the 429 is retried, so the single scripted 429 falls through to the
         // keyword-routed 200 → 2 calls and an UNSURE verdict.
         do! fixture.ClearAzureOcrCalls()   // clears ALL recorded fake-Azure calls (OCR + LLM)
-        do! fixture.SetAzureLlmScript [| http429 |]
+        do! fixture.SetAzureReactionLlmScript [| http429 |]   // reaction-scoped queue (the fake keeps text/reaction scripts separate)
         let user = Tg.user()
         do! tripThreshold fixture user 42000
 
@@ -688,7 +688,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let! reason = fixture.TryGetReactionTriageReason user.Id
         Assert.True(reason.IsSome && reason.Value.Contains "429", $"reason should record the 429, got {reason}")
 
-        do! fixture.SetAzureLlmScript [||]  // clean up queued script for neighbouring tests
+        do! fixture.SetAzureReactionLlmScript [||]  // clean up queued script for neighbouring tests
     }
 
 

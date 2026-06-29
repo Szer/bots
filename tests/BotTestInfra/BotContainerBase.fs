@@ -364,6 +364,18 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the REACTION-triage chat-completions calls (separate queue from SetAzureLlmScript, so
+    /// it never collides with text triage). Used to inject a 429 and assert the reaction path fails
+    /// fast (one call, ERROR) instead of retrying into a storm. An empty array clears the script.
+    member _.SetAzureReactionLlmScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/reaction-llm-script", payload)
+            return ()
+        }
+
     /// Returns only the Azure OpenAI chat-completions calls the fake recorded (filters out OCR).
     /// Tests count these to assert dedup/single-flight (e.g. "exactly 1 call for this content")
     /// and retry (e.g. ">= 2 calls" after a scripted 429).
