@@ -149,6 +149,7 @@ type VahterTestContainers(mlEnabled: bool) =
                     "REACTION_SPAM_ENABLED",               "true",  "FEATURE_FLAG", "REACTION_SPAM"
                     "REACTION_SPAM_MIN_MESSAGES",          "3",     "FREE_FORM",    "REACTION_SPAM"
                     "REACTION_SPAM_MAX_REACTIONS",         "5",     "FREE_FORM",    "REACTION_SPAM"
+                    "REACTION_TRIAGE_DEBOUNCE_SECONDS",    "5",     "FREE_FORM",    "REACTION_SPAM"
                     "FORWARD_SPAM_DETECTION_ENABLED",      "true",  "FEATURE_FLAG", "FORWARD_SPAM"
                     "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED","true","FEATURE_FLAG", "INLINE_KEYBOARD_SPAM"
                     "ML_OLD_USER_MSG_COUNT",               "10",    "FREE_FORM",    "ML"

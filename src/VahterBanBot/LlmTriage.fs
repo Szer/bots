@@ -44,10 +44,11 @@ let private singleFlight (inflight: ConcurrentDictionary<string, Lazy<Task<'T>>>
 /// Builds a `ChatClient` for the current (endpoint, key, deployment) and caches it, rebuilding only
 /// when that tuple changes. All three are hot-reloadable settings (read live from BotConfiguration on
 /// every call), so the client must NOT be frozen at startup — but rebuilding it per call is wasteful,
-/// hence the memoization. The SDK's own retry pipeline (`ClientRetryPolicy`) honors `Retry-After` on
-/// 429, which is what replaces the old Microsoft.Extensions.Http.Resilience handler. Thread-safe; the
-/// rebuild path runs only right after a settings reload.
-type private ChatClientCache() =
+/// hence the memoization. The SDK's own retry pipeline (the supplied `ClientRetryPolicy`) honors
+/// `Retry-After` on 429, which is what replaces the old Microsoft.Extensions.Http.Resilience handler.
+/// The retry policy is supplied by the caller so each triage path can pick its own behavior. Thread-safe;
+/// the rebuild path runs only right after a settings reload.
+type private ChatClientCache(retryPolicy: ClientRetryPolicy) =
     let gate = obj()
     // Reference-typed option so the lock-free fast-path read below is atomic (no torn struct read).
     let mutable cached : (struct (string * string * string) * ChatClient) option = None
@@ -60,10 +61,7 @@ type private ChatClientCache() =
                 match cached with
                 | Some (have, client) when have = want -> client
                 | _ ->
-                    // 3 attempts total, honoring Retry-After. Kept short to fit the webhook timeout —
-                    // a webhook handler is holding the call, so retries must stay well under Telegram's
-                    // webhook deadline.
-                    let options = AzureOpenAIClientOptions(RetryPolicy = ClientRetryPolicy(3))
+                    let options = AzureOpenAIClientOptions(RetryPolicy = retryPolicy)
                     let client  = AzureOpenAIClient(Uri(endpoint), ApiKeyCredential(key), options)
                     let chat    = client.GetChatClient(deployment)
                     cached <- Some (want, chat)
@@ -113,7 +111,8 @@ type AzureLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLl
 
     // Coalesces concurrent identical-text classifications (same spam across channels at once).
     let inflight = ConcurrentDictionary<string, Lazy<Task<LlmVerdict>>>()
-    let clientCache = ChatClientCache()
+    // 3 attempts honoring Retry-After — message triage is deduped/single-flighted and can afford to wait.
+    let clientCache = ChatClientCache(ClientRetryPolicy 3)
 
     // Static part of the system prompt — used to compute the prompt hash once at startup.
     // Per-chat descriptions are configuration, not the prompt itself.
@@ -277,7 +276,14 @@ type IReactionTriageClassifier =
 
 type AzureReactionTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureReactionTriage>, db: DbService) =
 
-    let clientCache = ChatClientCache()
+    // Fail fast on throttle: NO retries. A reaction burst must not hold the webhook in a 429
+    // Retry-After backoff (that is what burned the 60s timeout per reaction in the storm). The SDK's
+    // ClientRetryPolicy retry loop runs through non-virtual internals, so we cannot subclass it to skip
+    // only 429s — and in practice 429 is the only retryable error reaction triage has ever hit (30d of
+    // prod: zero transient 5xx), so 0 retries is exactly "fail fast on throttle" for this workload.
+    // A 429 now surfaces immediately as ClientResultException ("HTTP 429"). Re-triage is gated by the
+    // per-user reaction-triage debounce.
+    let clientCache = ChatClientCache(ClientRetryPolicy 0)
 
     let staticSystemPrompt =
         """You are a spam-detection assistant for Russian-language IT Telegram chats. You are evaluating whether a user is an emoji-reaction spammer. These spammers join groups, place positive emoji reactions on random messages to surface their profile in notifications, and their profile picture + bio link are the actual ad. Treat these signals as load-bearing:

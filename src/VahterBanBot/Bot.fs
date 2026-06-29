@@ -992,7 +992,9 @@ type BotService(
                 task { return None }
             else
                 task {
-                    use cts = new CancellationTokenSource(TimeSpan.FromSeconds 60.)
+                    // 10s cap: the classifier fails fast on 429 (no Retry-After backoff), so this only
+                    // bounds a genuinely slow inference/network call — not a throttle storm.
+                    use cts = new CancellationTokenSource(TimeSpan.FromSeconds 10.)
                     let! r = reactionTriage.ClassifyReactionSpammer(dossier, shadowMode, cts.Token)
                     return Some r
                 }
@@ -2035,15 +2037,28 @@ type BotService(
 
                     if msgCount < botConfig.Value.ReactionSpamMinMessages &&
                        updatedUser.ReactionCount >= botConfig.Value.ReactionSpamMaxReactions then
-                        logger.LogWarning(
-                            "Reaction spam threshold tripped: {Username} ({UserId}) has {MsgCount} messages but {ReactionCount} reactions",
-                            reaction.User.Username,
-                            reaction.User.Id,
-                            msgCount,
-                            updatedUser.ReactionCount
-                        )
-                        %activity.SetTag("action", "triage")
-                        do! this.RunReactionTriagePipeline(reaction, updatedUser)
+                        // Debounce: a spammer's reaction burst trips the threshold on every reaction.
+                        // Triage at most once per 5s window so we don't fire a fresh (multimodal, rate-
+                        // limited) LLM call per reaction — those 429 each other into a timeout alert storm.
+                        // DB-backed via the reaction-triage detection stream's last event, so the window
+                        // survives restarts and is shared across replicas.
+                        let! lastTriagedAt = db.GetLastReactionTriageAt(updatedUser.Id)
+                        let debounced =
+                            match lastTriagedAt with
+                            | Some t -> utcNow() - t < botConfig.Value.ReactionTriageDebounce
+                            | None   -> false
+                        if debounced then
+                            %activity.SetTag("action", "debounced")
+                        else
+                            logger.LogWarning(
+                                "Reaction spam threshold tripped: {Username} ({UserId}) has {MsgCount} messages but {ReactionCount} reactions",
+                                reaction.User.Username,
+                                reaction.User.Id,
+                                msgCount,
+                                updatedUser.ReactionCount
+                            )
+                            %activity.SetTag("action", "triage")
+                            do! this.RunReactionTriagePipeline(reaction, updatedUser)
                     else
                         %activity.SetTag("action", "none")
     }

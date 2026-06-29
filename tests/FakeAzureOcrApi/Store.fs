@@ -23,6 +23,12 @@ module Store =
     /// can exercise the bot's retry/backoff and the "leak to action channel on failure" behavior.
     let llmResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Scripted responses for the REACTION-triage chat-completions calls (json_schema
+    /// `reaction_spam_verdict`). Kept separate from `llmResponseScript` so a text-triage script can
+    /// never be consumed by a reaction call and vice versa. Used to inject HTTP 429s and assert the
+    /// reaction path fails fast (no retry) instead of storming.
+    let reactionLlmResponseScript = ConcurrentQueue<ScriptedResponse>()
+
     let logCall (methodName: string) (url: string) (body: string) =
         calls.Enqueue(
             { Method = methodName
@@ -44,6 +50,11 @@ module Store =
     let clearLlmScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while llmResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearReactionLlmScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while reactionLlmResponseScript.TryDequeue(&item) do
             ()
 
     /// Resets the OCR mock to its pristine baseline: default 200 response, no delay,

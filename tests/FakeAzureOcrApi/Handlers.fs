@@ -85,14 +85,13 @@ module Handlers =
 
             // Per-call scripted response wins over keyword routing, if any are queued. This lets
             // tests inject HTTP 429s (and "network"/"timeout") to exercise retry/backoff and the
-            // failure-fallthrough-to-action-channel behavior. Scoped to TEXT triage (spam_verdict)
-            // only, so reaction-triage tests can never consume a leftover script entry. When the
-            // queue empties, calls fall back to the normal keyword routing below.
+            // failure-fallthrough behavior. Text triage (spam_verdict) and reaction triage
+            // (reaction_spam_verdict) draw from SEPARATE queues, so one path can never consume the
+            // other's scripted entry. When a queue empties, calls fall back to keyword routing below.
             let scripted =
-                if isReactionTriage then None
-                else
-                    let mutable item = Unchecked.defaultof<ScriptedResponse>
-                    if Store.llmResponseScript.TryDequeue(&item) then Some item else None
+                let queue = if isReactionTriage then Store.reactionLlmResponseScript else Store.llmResponseScript
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if queue.TryDequeue(&item) then Some item else None
 
             if scripted.IsSome then
                 let s = scripted.Value
@@ -273,6 +272,26 @@ module Handlers =
                     if not (isNull (box payload.responses)) then
                         for r in payload.responses do
                             Store.llmResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Sets the scripted-response queue for the REACTION-triage chat-completions calls.
+    /// An empty/absent `responses` array clears it (calls fall back to keyword routing).
+    let setReactionLlmScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearReactionLlmScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.reactionLlmResponseScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

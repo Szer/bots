@@ -367,6 +367,9 @@ type BotConfiguration =
       LlmReactionTriageShadowDisable: bool
       /// Days after vahter/LLM verdict NOT_SPAM before re-triaging the same user.
       ReactionNotSpamCooldownDays: int
+      /// Debounce window for reaction-triage per user: a reaction burst trips the threshold on every
+      /// reaction, but we run triage at most once per this window. Default: 5s.
+      ReactionTriageDebounce: TimeSpan
       /// Bans older than this many days are considered expired. Default: 7.
       BanExpiryDays: int }
     member this.BotActor =

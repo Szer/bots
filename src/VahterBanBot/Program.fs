@@ -136,6 +136,7 @@ let buildBotConf () =
       LlmReactionTriageAutoAct       = getSettingOr "LLM_REACTION_TRIAGE_AUTO_ACT" "false" |> bool.Parse
       LlmReactionTriageShadowDisable = getSettingOr "LLM_REACTION_TRIAGE_SHADOW_DISABLE" "false" |> bool.Parse
       ReactionNotSpamCooldownDays    = getSettingOr "REACTION_NOT_SPAM_COOLDOWN_DAYS" "30" |> int
+      ReactionTriageDebounce         = getSettingOr "REACTION_TRIAGE_DEBOUNCE_SECONDS" "5" |> int64 |> TimeSpan.FromSeconds
       BanExpiryDays         = getSettingOr "BAN_EXPIRY_DAYS" "7" |> int }
 
 let ocrConfigOf (c: BotConfiguration) =
