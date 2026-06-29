@@ -560,6 +560,26 @@ WHERE stream_id = 'user:' || @userId
                 |> Option.bind (fun n -> if n.HasValue then Some n.Value else None)
         }
 
+    /// Timestamp of this user's most recent reaction-triage attempt (None if never triaged). Used to
+    /// debounce reaction bursts: a flood of reactions from one spammer trips the threshold on every
+    /// reaction, but we triage at most once per cooldown window. DB-backed (reads the user's
+    /// reaction-triage detection stream, where every attempt records an LlmReactionTriageClassified
+    /// event) so the window survives restarts and is shared across replicas.
+    member _.GetLastReactionTriageAt(userId: int64) : Task<DateTime option> =
+        task {
+            use conn = new NpgsqlConnection(connString)
+            //language=postgresql
+            let sql = """
+SELECT MAX(created_at) FROM event
+WHERE stream_id = 'detection:reaction:' || @userId
+            """
+            let! result = conn.QueryAsync<Nullable<DateTime>>(sql, {| userId = userId |})
+            return
+                result
+                |> Seq.tryHead
+                |> Option.bind (fun n -> if n.HasValue then Some n.Value else None)
+        }
+
     /// Returns (chatId, messageId) pairs for every reaction this user has placed where we
     /// recorded the message coordinates. If `chatFilter` is Some, only returns reactions in that chat.
     /// Pre-2026-05 events lacked chatId/messageId — those are silently skipped (we can't act on them anyway).
