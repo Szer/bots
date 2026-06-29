@@ -20,6 +20,20 @@ type TgUser = Telegram.Bot.Types.User
 ///   otherwise     → UNSURE
 type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
+    // One scripted Azure rate-limit response (only the 429 status matters; the body is not parsed).
+    let http429: AzureScriptedResponse =
+        { status = 429; body = """{"error":{"code":"429","message":"rate limited"}}"""; delayMs = 0; errorMode = "" }
+
+    // Counts recorded reaction-triage attempts for a user (one LlmReactionTriageClassified per triage).
+    let countTriageEvents (userId: int64) = task {
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        return!
+            Dapper.SqlMapper.QuerySingleAsync<int>(
+                conn,
+                "SELECT COUNT(*)::INT FROM event WHERE event_type = 'LlmReactionTriageClassified' AND (data->>'userId')::BIGINT = @userId",
+                {| userId = userId |})
+    }
+
     /// Helper: trip the threshold by sending REACTION_SPAM_MAX_REACTIONS reactions from a
     /// user with fewer messages than REACTION_SPAM_MIN_MESSAGES. Returns nothing —
     /// callers assert on DB state.
@@ -348,9 +362,22 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
         // 6 reactions with min_msgs=3, max_reactions=5 → trips fire on reaction #5 and #6
         // (count keeps climbing past the threshold). Two alerts × 3 buttons = 6 callbacks.
-        for i in 1..6 do
+        // The per-user reaction-triage debounce would suppress the #6 trip (it's within the 5s
+        // window of #5), so backdate #5's triage event to force #6 to re-trip — this test is about
+        // the sibling-callback sweep, which needs two real alerts to exist.
+        for i in 1..5 do
             let! resp = Tg.quickReaction(chat, 30000 + i, user) |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        use backdateConn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        let! _ =
+            Dapper.SqlMapper.ExecuteAsync(
+                backdateConn,
+                "UPDATE event SET created_at = created_at - interval '1 hour' WHERE stream_id = 'detection:reaction:' || @userId",
+                {| userId = user.Id |})
+
+        let! resp6 = Tg.quickReaction(chat, 30000 + 6, user) |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp6.StatusCode)
 
         let countActiveSql =
             "SELECT COUNT(*)::INT FROM event e " +
@@ -580,6 +607,88 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
         let! verdict = fixture.TryGetReactionTriageVerdict actorChannel.Id
         Assert.Equal(None, verdict)
+    }
+
+    // ── Debounce + fail-fast (the 2026-06-29 alert-storm fix) ─────────────────
+
+    [<Fact>]
+    let ``Reaction-triage debounce: a rapid burst past the threshold triages only once`` () = task {
+        // A spammer's reaction burst trips the threshold on every reaction past the limit. On master
+        // each trip fires its own (multimodal, rate-limited) LLM call → the alert storm the vahter
+        // had to dismiss repeatedly. The per-user debounce collapses a rapid burst into ONE triage.
+        // Master records one LlmReactionTriageClassified per trip (#5..#8 = 4); the fix records 1.
+        // Deterministic: SendMessage processes the webhook synchronously, so #6 always observes #5's
+        // recorded triage event, and the burst completes well inside the 5s window.
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+        do! fixture.ClearFakeCalls()
+
+        for i in 1..8 do
+            let! resp = Tg.quickReaction(chat, 40000 + i, user) |> fixture.SendMessage
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! triageCount = countTriageEvents user.Id
+        Assert.Equal(1, triageCount)
+
+        // Only one interactive alert reached the vahter channel (not one per reaction).
+        let! sendCalls = fixture.GetFakeCalls("sendMessage")
+        let potentialSpamId = fixture.PotentialSpamChannel.Id
+        let alerts =
+            sendCalls
+            |> Array.filter (fun c ->
+                c.Body.Contains $"\"chat_id\":{potentialSpamId}"
+                && c.Body.Contains "Reaction-spam triage"
+                && c.Body.Contains (string user.Id))
+        Assert.Equal(1, alerts.Length)
+    }
+
+    [<Fact>]
+    let ``Reaction-triage debounce window expires: a later trip re-triages`` () = task {
+        // The debounce is a short window, not a permanent gate — once it lapses a fresh burst must
+        // triage again. Backdating the first trip's event simulates the window elapsing (no sleep).
+        let user = Tg.user()
+        let chat = fixture.ChatsToMonitor[0]
+        do! tripThreshold fixture user 41000   // first trip → 1 triage event
+
+        let! before = countTriageEvents user.Id
+        Assert.Equal(1, before)
+
+        use backdateConn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        let! _ =
+            Dapper.SqlMapper.ExecuteAsync(
+                backdateConn,
+                "UPDATE event SET created_at = created_at - interval '1 hour' WHERE stream_id = 'detection:reaction:' || @userId",
+                {| userId = user.Id |})
+
+        // A further reaction now falls outside the (backdated) window → re-triages.
+        let! resp = Tg.quickReaction(chat, 41100, user) |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let! after = countTriageEvents user.Id
+        Assert.Equal(2, after)
+    }
+
+    [<Fact>]
+    let ``Reaction triage fails fast on a 429 (no retry) and records the throttle`` () = task {
+        // Reaction triage must NOT honor a 429 Retry-After backoff — that is what burned the 60s
+        // timeout per reaction in the storm. FailFastOnThrottlePolicy surfaces the 429 immediately:
+        // exactly ONE Azure call, recorded as an ERROR/"HTTP 429" verdict. On master
+        // (ClientRetryPolicy 3) the 429 is retried, so the single scripted 429 falls through to the
+        // keyword-routed 200 → 2 calls and an UNSURE verdict.
+        do! fixture.ClearAzureOcrCalls()   // clears ALL recorded fake-Azure calls (OCR + LLM)
+        do! fixture.SetAzureLlmScript [| http429 |]
+        let user = Tg.user()
+        do! tripThreshold fixture user 42000
+
+        let! calls = fixture.GetAzureLlmCalls()
+        Assert.Equal(1, calls.Length)
+
+        let! verdict = fixture.TryGetReactionTriageVerdict user.Id
+        Assert.Equal(Some "ERROR", verdict)
+        let! reason = fixture.TryGetReactionTriageReason user.Id
+        Assert.True(reason.IsSome && reason.Value.Contains "429", $"reason should record the 429, got {reason}")
+
+        do! fixture.SetAzureLlmScript [||]  // clean up queued script for neighbouring tests
     }
 
 
