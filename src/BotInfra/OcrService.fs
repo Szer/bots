@@ -42,6 +42,14 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
     let gate = obj()
     let mutable cached : (struct (string * string) * ImageAnalysisClient) option = None
 
+    // The SDK builds the request path/query itself, so it needs the bare resource origin
+    // (scheme://host[:port]) — not a full ".../imageanalysis:analyze?api-version=..." URL. Production
+    // config historically stores the full analyze URL (the old hand-rolled client stripped it to the
+    // host); handing that to the SDK doubles the path and Azure returns 404. Normalize defensively.
+    let endpointBase (raw: string) : Uri =
+        let u = Uri(raw.Trim())
+        UriBuilder(u.Scheme, u.Host, u.Port).Uri
+
     let getClient (endpoint: string) (key: string) : ImageAnalysisClient =
         let want = struct (endpoint, key)
         match cached with
@@ -58,7 +66,7 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
                     opts.Retry.NetworkTimeout <- TimeSpan.FromSeconds 2.
                     if not (isNull (box transport)) then
                         opts.Transport <- transport
-                    let c = ImageAnalysisClient(Uri(endpoint), AzureKeyCredential(key), opts)
+                    let c = ImageAnalysisClient(endpointBase endpoint, AzureKeyCredential(key), opts)
                     cached <- Some (want, c)
                     c)
 
@@ -98,11 +106,13 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
                         return { RawJson = rawJson; Text = text }
                     with
                     | :? RequestFailedException as rfe when rfe.Status > 0 ->
-                        // The service responded with an HTTP error (e.g. 403 VNet block, 500), already
-                        // retried by the SDK where applicable. Treat as "no usable OCR text" (null) so
-                        // downstream uses the field-based classification ("no barcode"/"partial") — a
-                        // ZXing-decoded barcode is still usable. Matches the pre-SDK non-2xx behavior.
-                        logger.LogWarning(rfe, "Azure OCR returned HTTP {Status}", rfe.Status)
+                        // The service responded with an HTTP error (e.g. 404 misconfigured endpoint,
+                        // 403 VNet block, 500), already retried by the SDK where applicable. Logged at
+                        // Error: a non-2xx that survives retries means OCR is broken (usually config or
+                        // access), not a transient blip. We still degrade to "no usable OCR text" (null)
+                        // so downstream uses the field-based classification ("no barcode"/"partial") —
+                        // a ZXing-decoded barcode is still usable — rather than crashing the handler.
+                        logger.LogError(rfe, "Azure OCR returned HTTP {Status}", rfe.Status)
                         return (null: OcrAnalysis | null)
                     | ex ->
                         // Transport failure (network/timeout, no HTTP response), already retried by the

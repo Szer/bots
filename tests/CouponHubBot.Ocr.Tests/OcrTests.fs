@@ -121,6 +121,21 @@ type private AzureOcrCachingHandler(cachePath: string, allowNetwork: bool, log: 
                     return outResp
         }
 
+/// Captures the request URI the SDK actually targets and returns a minimal valid 200 OCR body,
+/// so a test can assert how a configured endpoint is turned into a request path.
+type private RequestCapturingHandler() =
+    inherit HttpMessageHandler()
+    let mutable lastUri : Uri | null = null
+    member _.LastUri = lastUri
+    override _.SendAsync(request: HttpRequestMessage, _cancellationToken: Threading.CancellationToken) =
+        task {
+            lastUri <- request.RequestUri
+            let json = """{"modelVersion":"2023-10-01","metadata":{"width":1,"height":1},"readResult":{"blocks":[]}}"""
+            let resp = new HttpResponseMessage(HttpStatusCode.OK)
+            resp.Content <- new StringContent(json, Encoding.UTF8, "application/json")
+            return resp
+        }
+
 module private Parsing =
     // OCR test filenames may omit year (MM-dd). Make it deterministic by fixing "current year" to 2026.
     // This matches the repo's current test data and avoids dependence on real current time.
@@ -312,4 +327,34 @@ type OcrTests(output: ITestOutputHelper) =
                     let dump = String.concat "\n" (Seq.toList logs)
                     failwithf "Expected barcode from '%s'\n\nLogs:\n%s" fileName dump
                 Assert.Equal(expectedBarcode, res.barcode)
+        }
+
+    // Regression for the prod 404 (2026-06-29): AZURE_OCR_ENDPOINT was stored as the *full* analyze
+    // URL (path + query). The old hand-rolled client stripped it to the host; the SDK appends its own
+    // path, so the full URL doubled the path -> 404. AzureBotOcr must normalize the endpoint to the
+    // resource origin so the SDK targets exactly /computervision/imageanalysis:analyze.
+    [<Fact>]
+    member _.``Full analyze-URL endpoint is normalized to the resource origin``() =
+        task {
+            let handler = new RequestCapturingHandler()
+            use http = new HttpClient(handler)
+            let ocrOptions: IOptions<BotOcrConfig> =
+                LiveOptions(
+                    { OcrEnabled = true
+                      OcrMaxFileSizeBytes = 50L * 1024L * 1024L
+                      // The exact shape prod had: full analyze URL with path + query.
+                      AzureOcrEndpoint = "https://example.cognitiveservices.azure.com/computervision/imageanalysis:analyze?overload=stream&api-version=2024-02-01&features=read"
+                      AzureOcrKey = "test-key" })
+            let transport = new Azure.Core.Pipeline.HttpClientTransport(http)
+            let azure =
+                AzureBotOcr(ocrOptions, XUnitLogging.XUnitLogger<AzureBotOcr>(output, ResizeArray()), transport) :> IBotOcr
+
+            let! _ = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy; 2uy; 3uy |]))
+
+            match handler.LastUri with
+            | null -> failwith "SDK made no request"
+            | uri ->
+                Assert.Equal("example.cognitiveservices.azure.com", uri.Host)
+                // Single, correct path — not the doubled ".../imageanalysis:analyze/computervision/..." that 404s.
+                Assert.Equal("/computervision/imageanalysis:analyze", uri.AbsolutePath)
         }
