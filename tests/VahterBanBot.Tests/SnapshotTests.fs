@@ -148,3 +148,31 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
         let! snap = fixture.TryGetSnapshotMessage(chat, mId)
         Assert.Equal("Spam", snap.Value.spam_status)
     }
+
+    // ---- request-scoped identity map (unit of work) ----
+    // The scope must (a) reflect this handle's own appends on a subsequent in-scope load
+    // (proves cacheAppend synthesizes correct rows, not a stale/empty read) and (b) be fresh
+    // across scopes (the cache never outlives one handle).
+
+    [<Fact>]
+    let ``request scope reflects own appends in-scope and stays fresh across scopes`` () = task {
+        let db = VahterBanBot.DbService(fixture.DbConnectionString, TimeProvider.System)
+        let userId = 7780011L
+
+        // within one scope: upsert (read miss -> DB + append) then read-back is served from the
+        // cache and must reflect our just-appended UsernameChanged.
+        do! task {
+            use _ = db.BeginEventScope()
+            let! _ = db.UpsertUser(userId, Some "scoped_name")
+            let! u = db.GetUserById(userId)
+            Assert.True(u.IsSome, "in-scope read should reflect the upsert")
+            Assert.Equal(Some "scoped_name", u.Value.Username)
+            Assert.Equal(userId, u.Value.Id)
+        }
+
+        // a fresh scope re-reads from the committed log (cache does not outlive a handle).
+        use _ = db.BeginEventScope()
+        let! u2 = db.GetUserById(userId)
+        Assert.True(u2.IsSome, "new scope should read the committed user fresh")
+        Assert.Equal(Some "scoped_name", u2.Value.Username)
+    }

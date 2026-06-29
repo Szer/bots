@@ -272,6 +272,11 @@ WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
               .SetTag("updateBodyJson", updateBodyJson)
 
         let bot = ctx.RequestServices.GetRequiredService<BotService>()
+        // Request-scoped event-stream cache: collapses the repeated per-stream reads one update
+        // would otherwise issue (e.g. the user stream loaded 3× per message). Scoped to this
+        // handle and disposed below; concurrent updates are isolated via AsyncLocal.
+        let db = ctx.RequestServices.GetRequiredService<DbService>()
+        use _ = db.BeginEventScope()
         try
             do! bot.OnUpdate(update)
             %topActivity.SetTag("update-error", false)
@@ -293,6 +298,7 @@ if botConfOptions.Value.UsePolling then
             task {
                 if update.Message <> null && update.Message.Type = MessageType.Text then
                     let bot = app.Services.GetRequiredService<BotService>()
+                    use _ = app.Services.GetRequiredService<DbService>().BeginEventScope()
                     do! bot.OnUpdate(update)
             }
           member this.HandleErrorAsync(botClient, ``exception``, source, cancellationToken) =

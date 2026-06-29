@@ -88,9 +88,11 @@ ON CONFLICT (chat_id, message_id) DO UPDATE SET updated_at = snapshot_message.up
                 """
             let! _ = conn.ExecuteAsync(lockSql, {| chatId = chatId; messageId = messageId |}, tx)
 
-            // 2. read both streams on this TX — sees others' committed events plus our own just-appended ones.
-            let! msgRaws = store.ReadRawEventsForStream(conn, tx, msgSid)
-            let! modRaws = store.ReadRawEventsForStream(conn, tx, modSid)
+            // 2. read both streams on this TX in ONE round-trip — sees others' committed events
+            //    plus our own just-appended ones.
+            let! streams = store.ReadRawEventsForStreams(conn, tx, [ msgSid; modSid ])
+            let msgRaws = streams[msgSid]
+            let modRaws = streams[modSid]
 
             // 3. fold: message status from the merged, time-ordered timeline; moderation from its stream.
             let timeline =
@@ -243,6 +245,15 @@ ON CONFLICT DO NOTHING
                 else [ CallbackExpired ])
             return ()
         }
+
+    // -----------------------------------------------------------------------
+    // Public members — request-scoped identity map (unit of work)
+    // -----------------------------------------------------------------------
+
+    /// Opens a request-scoped event-stream cache for one update handle: repeated loads of the
+    /// same aggregate within the returned scope are served from memory instead of re-querying
+    /// Postgres. Wrap the per-update entry point in `use _ = db.BeginEventScope()`.
+    member _.BeginEventScope() : IDisposable = store.BeginRequestScope()
 
     // -----------------------------------------------------------------------
     // Public members — User operations
