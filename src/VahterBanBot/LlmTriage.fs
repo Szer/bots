@@ -41,21 +41,6 @@ let private singleFlight (inflight: ConcurrentDictionary<string, Lazy<Task<'T>>>
 
 // ── Azure OpenAI client (memoized, hot-reload aware) ──────────────────────────
 
-/// Retry policy that fails fast on throttling. Transient failures (5xx, network) are still retried up
-/// to `maxRetries`, but a 429 is surfaced immediately instead of honoring its (often multi-second)
-/// Retry-After. For reaction triage we'd rather bail right away — not hold the webhook in a backoff
-/// sleep while a burst of reactions piles up — and let the per-user cooldown gate any re-triage.
-type private FailFastOnThrottlePolicy(maxRetries: int) =
-    inherit ClientRetryPolicy(maxRetries)
-    let isThrottled (message: PipelineMessage) =
-        let resp = message.Response
-        not (isNull resp) && resp.Status = 429
-    override _.ShouldRetry(message: PipelineMessage, ex: Exception) =
-        not (isThrottled message) && base.ShouldRetry(message, ex)
-    override _.ShouldRetryAsync(message: PipelineMessage, ex: Exception) =
-        if isThrottled message then ValueTask<bool>(false)
-        else base.ShouldRetryAsync(message, ex)
-
 /// Builds a `ChatClient` for the current (endpoint, key, deployment) and caches it, rebuilding only
 /// when that tuple changes. All three are hot-reloadable settings (read live from BotConfiguration on
 /// every call), so the client must NOT be frozen at startup — but rebuilding it per call is wasteful,
@@ -291,9 +276,14 @@ type IReactionTriageClassifier =
 
 type AzureReactionTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureReactionTriage>, db: DbService) =
 
-    // Fail fast on 429 (still 2 retries for transient 5xx/network): a reaction burst must not hold the
-    // webhook in a Retry-After backoff. Re-triage is gated by the per-user reaction-triage cooldown.
-    let clientCache = ChatClientCache(FailFastOnThrottlePolicy 2)
+    // Fail fast on throttle: NO retries. A reaction burst must not hold the webhook in a 429
+    // Retry-After backoff (that is what burned the 60s timeout per reaction in the storm). The SDK's
+    // ClientRetryPolicy retry loop runs through non-virtual internals, so we cannot subclass it to skip
+    // only 429s — and in practice 429 is the only retryable error reaction triage has ever hit (30d of
+    // prod: zero transient 5xx), so 0 retries is exactly "fail fast on throttle" for this workload.
+    // A 429 now surfaces immediately as ClientResultException ("HTTP 429"). Re-triage is gated by the
+    // per-user reaction-triage debounce.
+    let clientCache = ChatClientCache(ClientRetryPolicy 0)
 
     let staticSystemPrompt =
         """You are a spam-detection assistant for Russian-language IT Telegram chats. You are evaluating whether a user is an emoji-reaction spammer. These spammers join groups, place positive emoji reactions on random messages to surface their profile in notifications, and their profile picture + bio link are the actual ad. Treat these signals as load-bearing:
