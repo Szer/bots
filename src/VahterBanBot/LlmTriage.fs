@@ -207,10 +207,16 @@ Message:
                 return LlmVerdict.Error
         with
         | :? ClientResultException as ex ->
-            // Retries are exhausted by the time the SDK throws (e.g. a sustained 429). Fail safe:
+            // Retries are exhausted by the time the SDK throws. Either way we fail safe:
             // Error routes the message to human review rather than letting it through.
             sw.Stop()
-            logger.LogWarning(ex, "LLM triage returned {Status}", ex.Status)
+            if ex.Status = 429 then
+                // Expected: sustained throttling after the retry budget. Not actionable on its own.
+                logger.LogWarning(ex, "LLM triage throttled (429) after retries; routing to human review")
+            else
+                // Unexpected: 400 content_filter, 401, 5xx, … — a real fault that needs attention,
+                // not a routine throttle. Surface it at Error so it isn't lost in warning noise.
+                logger.LogError(ex, "LLM triage UNEXPECTED ERROR: HTTP {Status}", ex.Status)
             return LlmVerdict.Error
         | ex ->
             sw.Stop()
@@ -408,9 +414,14 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
                     return { Verdict = LlmReactionVerdict.Error; Reason = Some "parse failure"; ModelName = modelName; PromptHash = promptHash }
             with
             | :? ClientResultException as ex ->
-                // Retries exhausted (e.g. sustained 429). Record the real status, not a generic "exception".
+                // Record the real status, not a generic "exception".
                 sw.Stop()
-                logger.LogWarning(ex, "Reaction triage returned {Status} after {LatencyMs}ms", ex.Status, sw.ElapsedMilliseconds)
+                if ex.Status = 429 then
+                    // Expected: fail-fast throttle (this classifier runs with 0 retries by design).
+                    logger.LogWarning(ex, "Reaction triage throttled (429) after {LatencyMs}ms", sw.ElapsedMilliseconds)
+                else
+                    // Unexpected: 400 content_filter (e.g. a flagged profile photo), 401, 5xx, … — needs attention.
+                    logger.LogError(ex, "Reaction triage UNEXPECTED ERROR: HTTP {Status} after {LatencyMs}ms", ex.Status, sw.ElapsedMilliseconds)
                 let reason = sprintf "HTTP %d" ex.Status
                 do! db.RecordLlmReactionTriageClassified(
                         dossier.OriginatingChatId, dossier.UserId, "ERROR", Some reason,
