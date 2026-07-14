@@ -31,16 +31,16 @@ type CouponFlowHandler(
 
     // Best-effort wrappers for cosmetic Telegram calls whose failure should
     // never fail the surrounding flow (e.g. deleting an already-gone placeholder).
-    let tryDeleteMessage (chatId: int64) (messageId: int) : Task =
+    let tryDeleteMessage (chatId: int64) (messageId: int64) : Task =
         task {
-            try do! botClient.DeleteMessage(ChatId chatId, messageId)
+            try do! botClient.DeleteMessage(ChatId chatId, int messageId)
             with _ -> ()
         } :> Task
 
-    let tryEditMessage (chatId: int64) (messageId: int) (text: string) : Task<bool> =
+    let tryEditMessage (chatId: int64) (messageId: int64) (text: string) : Task<bool> =
         task {
             try
-                do! botClient.EditMessageText(ChatId chatId, messageId, text) |> taskIgnore
+                do! botClient.EditMessageText(ChatId chatId, int messageId, text) |> taskIgnore
                 return true
             with _ -> return false
         }
@@ -571,7 +571,7 @@ type CouponFlowHandler(
                 let replyText = this.NeedsInputReplyText item.failure_note
                 let replyParams =
                     ReplyParameters(
-                        MessageId = item.photo_message_id,
+                        MessageId = int item.photo_message_id,
                         AllowSendingWithoutReply = true)
                 try
                     do! botClient.SendMessage(
@@ -595,11 +595,11 @@ type CouponFlowHandler(
                 do! tryDeleteMessage batch.bulk_chat_id batch.bulk_message_id.Value
 
             let! sent = botClient.SendMessage(ChatId batch.bulk_chat_id, text, replyMarkup = kb)
-            let! linked = db.SetBatchBulkMessageId(batchId, sent.MessageId)
+            let! linked = db.SetBatchBulkMessageId(batchId, int64 sent.MessageId)
             if not linked then
                 // Batch was abandoned between SendMessage and SetBatchBulkMessageId.
                 // The bulk-confirm message has no batch to act on; delete the orphan.
-                do! tryDeleteMessage batch.bulk_chat_id sent.MessageId
+                do! tryDeleteMessage batch.bulk_chat_id (int64 sent.MessageId)
 
             do! this.SendPerPhotoReplies batch items
         } :> Task
@@ -720,7 +720,7 @@ type CouponFlowHandler(
                         try
                             do! botClient.EditMessageText(
                                     ChatId stale.bulk_chat_id,
-                                    stale.bulk_message_id.Value,
+                                    int stale.bulk_message_id.Value,
                                     "Отменено: пришёл новый альбом.")
                                 |> taskIgnore
                         with _ -> ()
@@ -731,7 +731,7 @@ type CouponFlowHandler(
                             botClient.SendMessage(
                                 ChatId chatId,
                                 "Получил, обрабатываю купоны, подожди немного…")
-                        let! linked = db.SetBatchBulkMessageId(batchId, placeholder.MessageId)
+                        let! linked = db.SetBatchBulkMessageId(batchId, int64 placeholder.MessageId)
                         if not linked then
                             // Batch was abandoned (by /add, /my, or a fresh album
                             // for a different media_group_id) during the
@@ -743,7 +743,7 @@ type CouponFlowHandler(
                     with ex ->
                         logger.LogWarning(ex, "Failed to send album placeholder for batch {BatchId}", batchId)
 
-                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, msg.MessageId)
+                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, int64 msg.MessageId)
                 match itemIdOpt with
                 | None ->
                     // Either a Telegram redelivery (same photo_file_id) or the batch

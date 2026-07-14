@@ -59,7 +59,7 @@ type PendingAddBatch =
       user_id: int64
       media_group_id: string
       bulk_chat_id: int64
-      bulk_message_id: Nullable<int>
+      bulk_message_id: Nullable<int64>
       status: string
       created_at: DateTime
       updated_at: DateTime }
@@ -70,7 +70,7 @@ type PendingAddBatchItem =
       batch_id: int64
       seq: int
       photo_file_id: string
-      photo_message_id: int
+      photo_message_id: int64
       status: string
       value: Nullable<decimal>
       min_check: Nullable<decimal>
@@ -108,11 +108,11 @@ type CouponOutcomes =
 [<CLIMutable>]
 type ChatMessageRow =
     { user_id: int64
-      message_id: int
+      message_id: int64
       text: string | null
       has_photo: bool
       has_document: bool
-      reply_to_message_id: Nullable<int>
+      reply_to_message_id: Nullable<int64>
       created_at: DateTime }
 
 type DbService(connString: string, timeProvider: TimeProvider, maxTakenCoupons: int) =
@@ -967,7 +967,7 @@ ORDER BY ce.created_at;
 
     // ── Chat message monitoring ──────────────────────────────────────
 
-    member _.SaveChatMessage(chatId: int64, messageId: int, userId: int64, text: string | null, hasPhoto: bool, hasDocument: bool, replyToMessageId: Nullable<int>) =
+    member _.SaveChatMessage(chatId: int64, messageId: int64, userId: int64, text: string | null, hasPhoto: bool, hasDocument: bool, replyToMessageId: Nullable<int64>) =
         task {
             use! conn = openConn()
             //language=postgresql
@@ -1016,7 +1016,7 @@ ORDER BY cm.created_at;
 
     // ── User feedback ────────────────────────────────────────────────
 
-    member _.SaveUserFeedback(userId: int64, feedbackText: string | null, hasMedia: bool, telegramMessageId: int) =
+    member _.SaveUserFeedback(userId: int64, feedbackText: string | null, hasMedia: bool, telegramMessageId: int64) =
         task {
             use! conn = openConn()
             //language=postgresql
@@ -1199,7 +1199,7 @@ RETURNING *;
     /// inspect the result — on false, the just-sent message is an orphan and
     /// should be deleted to avoid a "Получил, обрабатываю купоны..." or
     /// bulk-confirm message lingering in the user's chat with no batch behind it.
-    member _.SetBatchBulkMessageId(batchId: int64, messageId: int) =
+    member _.SetBatchBulkMessageId(batchId: int64, messageId: int64) =
         task {
             use! conn = openConn()
             //language=postgresql
@@ -1291,7 +1291,7 @@ RETURNING id;
     /// Inserts a new item under a batch. Locks the batch row to serialize seq
     /// assignment under concurrent webhook arrivals for the same album. Returns
     /// None on duplicate photo_file_id (Telegram redelivery) or on a closed/missing batch.
-    member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int) =
+    member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int64) =
         task {
             use! conn = openConn()
             use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)

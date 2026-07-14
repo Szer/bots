@@ -91,7 +91,7 @@ let ``New Actor-format UserBanned round-trips correctly`` () =
             Assert.Equal("cafebabe", l.promptHash)
         | other -> Assert.Fail $"Expected Some Actor.LLM but got {other}"
         Assert.Equal(Some 123L, e.chatId)
-        Assert.Equal(Some 77, e.messageId)
+        Assert.Equal(Some 77L, e.messageId)
         Assert.Equal(Some "buy crypto", e.messageText)
     | other -> Assert.Fail $"Expected UserBanned but got {other}"
 
@@ -162,7 +162,7 @@ let ``New UserReactionRecorded with chatId/messageId/emoji round-trips`` () =
     match roundtripped with
     | UserReactionRecorded e ->
         Assert.Equal(Some 123L, e.chatId)
-        Assert.Equal(Some 7, e.messageId)
+        Assert.Equal(Some 7L, e.messageId)
         Assert.Equal(Some "🔥", e.emoji)
         Assert.Equal(1, e.delta)
     | other -> Assert.Fail $"Expected UserReactionRecorded but got {other}"

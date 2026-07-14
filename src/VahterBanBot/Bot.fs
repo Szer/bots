@@ -106,16 +106,16 @@ module private BotHelpers =
 
     /// Stable, machine-parseable reference embedded in spam-deletion log posts so
     /// that `/vahter unmarkspam` can recover the original (chatId, messageId).
-    let msgRefToken (chatId: int64) (messageId: int) = $"#ref:{chatId}:{messageId}"
+    let msgRefToken (chatId: int64) (messageId: int64) = $"#ref:{chatId}:{messageId}"
 
     let private msgRefRegex = System.Text.RegularExpressions.Regex(@"#ref:(-?\d+):(\d+)")
 
     /// Parses the first `#ref:<chatId>:<messageId>` token out of a log message text.
-    let tryParseMsgRef (text: string) : (int64 * int) option =
+    let tryParseMsgRef (text: string) : (int64 * int64) option =
         if isNull text then None
         else
             let m = msgRefRegex.Match text
-            if m.Success then Some(int64 m.Groups.[1].Value, int m.Groups.[2].Value)
+            if m.Success then Some(int64 m.Groups.[1].Value, int64 m.Groups.[2].Value)
             else None
 
     let adminHelpText =
@@ -352,7 +352,7 @@ type BotService(
                     .SetTag("chatId", msg.ChatId)
                     .SetTag("chatUsername", msg.ChatUsername)
             recordDeletedMessage msg.ChatId msg.ChatUsername "totalBan_initial"
-            do! botClient.DeleteMessage(ChatId(msg.ChatId), msg.MessageId)
+            do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
         }
 
@@ -376,7 +376,7 @@ type BotService(
                                 .SetTag("msgId", m.message_id)
                                 .SetTag("chatId", m.chat_id)
                         recordDeletedMessage m.chat_id null "totalBan_history"
-                        do! botClient.DeleteMessage(ChatId(m.chat_id), m.message_id)
+                        do! botClient.DeleteMessage(ChatId(m.chat_id), int m.message_id)
                     with e ->
                         logger.LogWarning ($"Failed to delete message {m.message_id} from chat {m.chat_id}", e)
                 })
@@ -402,7 +402,7 @@ type BotService(
                         // Delete message from action channel
                         match callback.action_message_id with
                         | Some msgId ->
-                            do! botClient.DeleteMessage(ChatId(callback.action_channel_id), msgId)
+                            do! botClient.DeleteMessage(ChatId(callback.action_channel_id), int msgId)
                                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
                         | None -> ()
                         // Expire callback
@@ -487,7 +487,7 @@ type BotService(
                     .SetTag("chatId", messageToRemove.ChatId)
                     .SetTag("chatUsername", messageToRemove.ChatUsername)
             recordDeletedMessage messageToRemove.ChatId messageToRemove.ChatUsername "softBan"
-            do! botClient.DeleteMessage(ChatId(messageToRemove.ChatId), messageToRemove.MessageId)
+            do! botClient.DeleteMessage(ChatId(messageToRemove.ChatId), int messageToRemove.MessageId)
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete reply message {messageToRemove.MessageId} from chat {messageToRemove.ChatId}", e))
         }
 
@@ -584,7 +584,7 @@ type BotService(
 
         // 1. Delete message + record BotAutoDeleted
         recordDeletedMessage msg.ChatId msg.ChatUsername "spamDeletion"
-        do! botClient.DeleteMessage(ChatId(msg.ChatId), msg.MessageId)
+        do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
             |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
         do! db.RecordBotAutoDeleted(msg.ChatId, msg.MessageId, msg.SenderId, reason)
 
@@ -673,7 +673,7 @@ type BotService(
             targets
             |> Seq.map (fun t -> task {
                 try
-                    do! botClient.DeleteMessageReaction(ChatId t.chat_id, t.message_id, userId)
+                    do! botClient.DeleteMessageReaction(ChatId t.chat_id, int t.message_id, userId)
                 with e ->
                     logger.LogInformation(e, "DeleteMessageReaction failed for user {U} msg {C}/{M} (likely already gone)", userId, t.chat_id, t.message_id)
             })
@@ -720,7 +720,7 @@ type BotService(
             |> Seq.map (fun msg -> task {
                 try
                     recordDeletedMessage msg.chat_id null "reactionTriage_ban_history"
-                    do! botClient.DeleteMessage(ChatId msg.chat_id, msg.message_id)
+                    do! botClient.DeleteMessage(ChatId msg.chat_id, int msg.message_id)
                 with e ->
                     logger.LogWarning(e, "Failed to delete message {M} from chat {C}", msg.message_id, msg.chat_id)
             })
@@ -788,7 +788,7 @@ type BotService(
             do!
                 uniqueMessages
                 |> Seq.map (fun (chId, msgId) -> task {
-                    do! botClient.DeleteMessage(ChatId chId, msgId)
+                    do! botClient.DeleteMessage(ChatId chId, int msgId)
                         |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete reaction-triage alert {msgId} in chat {chId}", e))
                 })
                 |> Task.WhenAll
@@ -852,8 +852,8 @@ type BotService(
         //    key as the public username (production keys are the chats' real @handles).
         // Returns None when we can't build a link (legacy events with chat_id = 0, or chats
         // outside our config).
-        let messageLink (chatId: int64) (messageId: int) =
-            if chatId = 0L || messageId = 0 then None
+        let messageLink (chatId: int64) (messageId: int64) =
+            if chatId = 0L || messageId = 0L then None
             elif chatId <= -1000000000000L then
                 Some (sprintf "https://t.me/c/%d/%d" (-chatId - 1000000000000L) messageId)
             else
@@ -1268,7 +1268,7 @@ type BotService(
                     text = logMsg
                 ) |> taskIgnore
             recordDeletedMessage msg.ChatId msg.ChatUsername "alreadyAutoBanned"
-            do! botClient.DeleteMessage(ChatId(msg.ChatId), msg.MessageId)
+            do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
 
         else do! this.ProcessMessage(msg)
@@ -1322,7 +1322,7 @@ type BotService(
                         .SetTag("chatId", msg.ChatId)
                         .SetTag("chatUsername", msg.ChatUsername)
                 recordDeletedMessage msg.ChatId msg.ChatUsername "adminCommand"
-                do! botClient.DeleteMessage(ChatId(msg.ChatId), msg.MessageId)
+                do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
                     |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete command message {msg.MessageId} from chat {msg.ChatId}", e))
             }
             // check that user is allowed to (un)ban others
@@ -1347,7 +1347,7 @@ type BotService(
         botClient.SendMessage(
             chatId = ChatId(botConfig.Value.AdminChannelId),
             text = text,
-            replyParameters = ReplyParameters(MessageId = msg.MessageId, AllowSendingWithoutReply = true))
+            replyParameters = ReplyParameters(MessageId = int msg.MessageId, AllowSendingWithoutReply = true))
         |> taskIgnore
 
     /// Resolves a public chat/channel by @username via Telegram getChat.
@@ -1602,7 +1602,7 @@ type BotService(
 
     /// Azure-only OCR. Caller is expected to have checked the cache.
     /// OcrFresh still saves to cache on success (and tolerates empty fileUniqueId).
-    member private this.OcrPhotosFresh(photos: PhotoSize array, messageId: int) = task {
+    member private this.OcrPhotosFresh(photos: PhotoSize array, messageId: int64) = task {
         match this.SelectOcrPhoto(photos) with
         | None ->
             logger.LogWarning(
@@ -1814,7 +1814,7 @@ type BotService(
 
         // 1. Delete the message from original chat
         recordDeletedMessage chatId chatName "softSpam"
-        do! botClient.DeleteMessage(ChatId(chatId), msgId)
+        do! botClient.DeleteMessage(ChatId(chatId), int msgId)
             |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete message {msgId} from chat {chatId}", e))
 
         // 2. Mark as spam (for ML training + karma)
@@ -1848,7 +1848,7 @@ type BotService(
             match callbackState.ActionMessageId with
             | Some msgId ->
                 do! db.ExpireCallbacksByMessageId(msgId)
-                do! botClient.DeleteMessage(ChatId callbackState.ActionChannelId, msgId)
+                do! botClient.DeleteMessage(ChatId callbackState.ActionChannelId, int msgId)
                     |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msgId} from action channel", e))
             | None -> ()
         }

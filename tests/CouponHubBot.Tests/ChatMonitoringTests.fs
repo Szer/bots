@@ -9,12 +9,12 @@ open Xunit
 [<CLIMutable>]
 type ChatMessageRow =
     { chat_id: int64
-      message_id: int
+      message_id: int64
       user_id: int64
       text: string | null
       has_photo: bool
       has_document: bool
-      reply_to_message_id: Nullable<int> }
+      reply_to_message_id: Nullable<int64> }
 
 type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
 
@@ -34,7 +34,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
 
             Assert.NotNull(row)
             Assert.Equal(fixture.CommunityChatId, row.chat_id)
-            Assert.Equal(msgId, row.message_id)
+            Assert.Equal(int64 msgId, row.message_id)
             Assert.Equal(2001L, row.user_id)
             Assert.Equal("Hello community!", row.text)
             Assert.False(row.has_photo)
@@ -100,7 +100,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
 
             Assert.NotNull(row)
             Assert.True(row.reply_to_message_id.HasValue)
-            Assert.Equal(replyToId, row.reply_to_message_id.Value)
+            Assert.Equal(int64 replyToId, row.reply_to_message_id.Value)
         }
 
     [<Fact>]

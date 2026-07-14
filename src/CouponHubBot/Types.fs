@@ -83,7 +83,7 @@ type UserFeedbackRow =
       user_id: int64
       feedback_text: string | null
       has_media: bool
-      telegram_message_id: Nullable<int>
+      telegram_message_id: Nullable<int64>
       github_issue_number: Nullable<int>
       created_at: DateTime }
 

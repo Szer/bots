@@ -88,13 +88,13 @@ type LlmReactionVerdict =
 
 type UserEvent =
     | UsernameChanged              of {| userId: int64; username: string option |}
-    | UserBanned                   of {| userId: int64; bannedBy: BannedBy option; actor: Actor option; chatId: int64 option; messageId: int option; messageText: string option; bannedAt: DateTime |}
+    | UserBanned                   of {| userId: int64; bannedBy: BannedBy option; actor: Actor option; chatId: int64 option; messageId: int64 option; messageText: string option; bannedAt: DateTime |}
     | UserUnbanned                 of {| userId: int64; unbannedBy: int64 option; actor: Actor option |}
     /// Records a user adding/removing reactions on a specific message. `chatId`, `messageId`
     /// and `emoji` are option to stay backward compatible with earlier events that didn't carry them.
     /// `emoji` is the joined emoji string of the user's NewReaction set (e.g. "🔥❤️"), useful for
     /// vahters reading the dossier — knowing which emoji was used helps spot patterns.
-    | UserReactionRecorded         of {| userId: int64; chatId: int64 option; messageId: int option; emoji: string option; delta: int |}
+    | UserReactionRecorded         of {| userId: int64; chatId: int64 option; messageId: int64 option; emoji: string option; delta: int |}
     /// Reaction-spam triage verdict NOT_SPAM — sets a cooldown so a legit lurker doesn't
     /// keep re-triggering the pipeline. Set by LLM (autonomous mode) or by a vahter button.
     | ReactionTriageNotSpamSet     of {| userId: int64; until: DateTime; actor: Actor |}
@@ -152,11 +152,11 @@ type MessageEvent =
     // string (live app) and as a JSON object (legacy backfill) — see issue #166. JsonElement reads
     // either shape, so folding a stream never breaks; the field is write-only (folds/reads use JSONB
     // operators, never the DU), and we keep writing a string (see DB.recordMessage*).
-    | MessageReceived    of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
-    | MessageEdited      of {| chatId: int64; messageId: int; userId: int64; text: string option; rawMessage: JsonElement |}
-    | MessageDeleted     of {| chatId: int64; messageId: int; deletedBy: int64 |}
-    | MessageMarkedSpam  of {| chatId: int64; messageId: int; markedBy: int64 option |}
-    | MessageMarkedHam   of {| chatId: int64; messageId: int; text: string; markedBy: int64 option |}
+    | MessageReceived    of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: JsonElement |}
+    | MessageEdited      of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: JsonElement |}
+    | MessageDeleted     of {| chatId: int64; messageId: int64; deletedBy: int64 |}
+    | MessageMarkedSpam  of {| chatId: int64; messageId: int64; markedBy: int64 option |}
+    | MessageMarkedHam   of {| chatId: int64; messageId: int64; text: string; markedBy: int64 option |}
 
 type Message =
     { Received:       bool
@@ -205,8 +205,8 @@ type AutoVerdict =
     | Uncertain of score: float
 
 type ModerationEvent =
-    | VahterActed      of {| vahterId: int64; actionType: VahterAction; targetUserId: int64; chatId: int64; messageId: int |}
-    | BotAutoDeleted   of {| chatId: int64; messageId: int; userId: int64; reason: AutoDeleteReason |}
+    | VahterActed      of {| vahterId: int64; actionType: VahterAction; targetUserId: int64; chatId: int64; messageId: int64 |}
+    | BotAutoDeleted   of {| chatId: int64; messageId: int64; userId: int64; reason: AutoDeleteReason |}
 
 type Moderation =
     { VahterActedCount:    int
@@ -246,7 +246,7 @@ type Message with
 
 type CallbackEvent =
     | CallbackCreated       of {| data: string; targetUserId: int64; actionChannelId: int64 |}
-    | CallbackMessagePosted of {| actionMessageId: int |}
+    | CallbackMessagePosted of {| actionMessageId: int64 |}
     | CallbackResolved
     | CallbackExpired
 
@@ -254,7 +254,7 @@ type Callback =
     { Data:             string option
       TargetUserId:     int64
       ActionChannelId:  int64
-      ActionMessageId:  int option
+      ActionMessageId:  int64 option
       IsTerminal:       bool }
     static member Zero = { Data = None; TargetUserId = 0L; ActionChannelId = 0L; ActionMessageId = None; IsTerminal = false }
     static member Fold (state: Callback, event: CallbackEvent) : Callback =
@@ -267,9 +267,9 @@ type Callback =
 // ---------------------------------------------------------------------------
 
 type DetectionEvent =
-    | MlScoredMessage              of {| chatId: int64; messageId: int; score: float; isSpam: bool |}
-    | LlmClassified                of {| chatId: int64; messageId: int; verdict: string; promptTokens: int; completionTokens: int; latencyMs: int; modelName: string option; promptHash: string option |}
-    | InvisibleMentionDetected     of {| chatId: int64; messageId: int; userId: int64 |}
+    | MlScoredMessage              of {| chatId: int64; messageId: int64; score: float; isSpam: bool |}
+    | LlmClassified                of {| chatId: int64; messageId: int64; verdict: string; promptTokens: int; completionTokens: int; latencyMs: int; modelName: string option; promptHash: string option |}
+    | InvisibleMentionDetected     of {| chatId: int64; messageId: int64; userId: int64 |}
     /// Verdict from the reaction-spam triage classifier (vision LLM evaluating profile photo + bio + history).
     /// Recorded in BOTH shadow mode (ignored for action) AND autonomous mode (load-bearing). The presence
     /// of this event for a given (userId, chatId) means a reaction-spam threshold tripped.
@@ -499,7 +499,7 @@ let deserializeCallbackData (json: string) : CallbackMessage =
 [<CLIMutable>]
 type ActiveCallbackInfo =
     { id: Guid
-      action_message_id: int option
+      action_message_id: int64 option
       action_channel_id: int64 }
 
 [<CLIMutable>]
