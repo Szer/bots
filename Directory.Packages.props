@@ -11,6 +11,8 @@
 
     <!-- Telegram -->
     <PackageVersion Include="Telegram.Bot" Version="22.10.0" />
+    <PackageVersion Include="Funogram" Version="3.0.4" />
+    <PackageVersion Include="Funogram.Telegram" Version="10.1.0" />
 
     <!-- Azure OpenAI SDK (LLM triage; SDK-native retry honors Retry-After on 429) -->
     <PackageVersion Include="Azure.AI.OpenAI" Version="2.9.0-beta.1" />
