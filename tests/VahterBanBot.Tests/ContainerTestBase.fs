@@ -710,6 +710,21 @@ WHERE event_type = 'MessageMarkedHam'
         return count > 0
     }
 
+    /// True if a MessageMarkedSpam event exists for the given (chatId, messageId).
+    member this.MessageMarkedSpam(chatId: int64, messageId: int) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+SELECT COUNT(*) FROM event
+WHERE event_type = 'MessageMarkedSpam'
+  AND (data->>'chatId')::BIGINT = @chatId
+  AND (data->>'messageId')::INT  = @messageId
+            """
+        let! count = conn.QuerySingleAsync<int>(sql, {| chatId = chatId; messageId = messageId |})
+        return count > 0
+    }
+
     /// Reads the snapshot_user row (None if absent).
     member this.TryGetSnapshotUser(userId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
