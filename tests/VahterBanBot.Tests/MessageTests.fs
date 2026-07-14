@@ -38,6 +38,40 @@ type MessageTests(fixture: MlDisabledVahterTestContainers) =
     }
 
     [<Fact>]
+    let ``MlData counts custom_emoji entities from live rows and tolerates backfill rows`` () = task {
+        // Live path (issue #166): the webhook stores rawMessage as a JSON *string*;
+        // MlData must unwrap it before reading entities, or custom_emoji_count is
+        // silently 0 for every live row.
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "emoji spam candidate")
+        msgUpdate.Message.Entities <-
+            [| MessageEntity(Type = MessageEntityType.CustomEmoji, Offset = 0, Length = 2, CustomEmojiId = "111")
+               MessageEntity(Type = MessageEntityType.CustomEmoji, Offset = 2, Length = 2, CustomEmojiId = "222")
+               MessageEntity(Type = MessageEntityType.Code, Offset = 4, Length = 5) |]
+        let! _ = fixture.SendMessage msgUpdate
+
+        // V27-backfill row in its post-V40 shape: rawMessage is the string "{}" (no entities).
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        //language=postgresql
+        let seedSql =
+            """
+INSERT INTO event(stream_id, stream_version, data, created_at)
+VALUES ('message:-666:999777', 1,
+        jsonb_build_object('Case', 'MessageReceived', 'chatId', -666, 'messageId', 999777,
+                           'userId', 42, 'text', 'backfilled spam', 'rawMessage', '{}'),
+        now())
+ON CONFLICT DO NOTHING
+            """
+        let! _ = Dapper.SqlMapper.ExecuteAsync(conn, seedSql)
+
+        let db = VahterBanBot.DbService(fixture.DbConnectionString, TimeProvider.System)
+        let! mlData = db.MlData(100, DateTime.UtcNow.AddDays -1.0)
+
+        let byText t = mlData |> Array.find (fun x -> x.text = t)
+        Assert.Equal(2, (byText "emoji spam candidate").custom_emoji_count)
+        Assert.Equal(0, (byText "backfilled spam").custom_emoji_count)
+    }
+
+    [<Fact>]
     let ``Photo messages are processed without OCR when disabled`` () = task {
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "hello-from-photo", photos = [|Tg.hamPhoto|])
 
