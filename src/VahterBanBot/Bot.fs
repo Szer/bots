@@ -129,6 +129,7 @@ module private BotHelpers =
             "/vahter retrain — force ML model retrain (runs in background)"
             "/vahter cleanup — force cleanup job (runs in background)"
             "/vahter unmarkspam — reply to a forwarded bot spam-deletion log post to undo it"
+            "/vahter markspam — reply to a forwarded bot log post to (re-)mark it as spam"
             "/vahter help — show this help"
         ]
 
@@ -1376,6 +1377,7 @@ type BotService(
         | "retrain"      -> do! this.AdminRetrain(msg)
         | "cleanup"      -> do! this.AdminCleanup(msg)
         | "unmarkspam"   -> do! this.VahterUnmarkSpam(vahter, msg)
+        | "markspam"     -> do! this.VahterMarkSpam(vahter, msg)
         | "help"         -> do! this.ReplyAdmin(msg, adminHelpText)
         | unknown        -> do! this.ReplyAdmin(msg, $"❓ Unknown command: {unknown}\n\n{adminHelpText}")
     }
@@ -1476,6 +1478,23 @@ type BotService(
                 do! db.RecordMessageMarkedHam(chatId, messageId, "", Some vahter.Id)
                 do! this.ReplyAdmin(msg, $"✅ Reversed: message {messageId} in chat {chatId} marked as NOT spam (ham).")
                 logger.LogInformation($"Vahter {vahter.Id} reversed spam mark for {chatId}:{messageId}")
+    }
+
+    /// Reply to a forwarded bot log post to (re-)mark the referenced message as spam
+    /// (records MessageMarkedSpam). Classification only — no deletion or ban; the
+    /// ⚠️ SPAM inline button covers delete+ban for live messages.
+    member private this.VahterMarkSpam(vahter: User, msg: TgMessage) = task {
+        match msg.ReplyToMessage with
+        | None ->
+            do! this.ReplyAdmin(msg, "Reply to a forwarded bot log post with /vahter markspam.")
+        | Some replied ->
+            match tryParseMsgRef replied.Text with
+            | None ->
+                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot log message and reply /vahter markspam to it.")
+            | Some(chatId, messageId) ->
+                do! db.RecordMessageMarkedSpam(chatId, messageId, Some vahter.Id)
+                do! this.ReplyAdmin(msg, $"✅ Message {messageId} in chat {chatId} marked as spam.")
+                logger.LogInformation($"Vahter {vahter.Id} marked {chatId}:{messageId} as spam")
     }
 
     // -----------------------------------------------------------------------

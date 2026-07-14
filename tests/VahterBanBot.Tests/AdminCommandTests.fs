@@ -281,6 +281,62 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         Assert.True(calls |> Array.exists (fun c -> c.Body.Contains "Could not find"))
     }
 
+    // ── markspam ─────────────────────────────────────────────────────────────
+
+    [<Fact>]
+    let ``markspam marks message as spam via forwarded ref token`` () = task {
+        let chatId = -667L
+        let messageId = 654321
+        // Simulate a forwarded bot log post carrying the #ref token.
+        let logText = $"Deleted spam (ml) in @pro.hell ({chatId}) from @bad (999) with text:\nbuy now\n#ref:{chatId}:{messageId}"
+        let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
+        let! resp =
+            Tg.replyMsg(logMsg.Message, "/vahter markspam", fixture.Vahters[0])
+            |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+        let! spam = fixture.MessageMarkedSpam(chatId, messageId)
+        Assert.True spam
+    }
+
+    [<Fact>]
+    let ``markspam reverses an erroneous unmarkspam`` () = task {
+        let chatId = -668L
+        let messageId = 654322
+        let logText = $"Deleted spam (ml) in @pro.hell ({chatId}) from @bad (999) with text:\nbuy now\n#ref:{chatId}:{messageId}"
+        let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
+        let! _ =
+            Tg.replyMsg(logMsg.Message, "/vahter unmarkspam", fixture.Vahters[0])
+            |> fixture.SendMessage
+        let! _ =
+            Tg.replyMsg(logMsg.Message, "/vahter markspam", fixture.Vahters[0])
+            |> fixture.SendMessage
+        let! ham = fixture.MessageMarkedHam(chatId, messageId)
+        let! spam = fixture.MessageMarkedSpam(chatId, messageId)
+        Assert.True ham
+        Assert.True spam
+    }
+
+    [<Fact>]
+    let ``markspam without a reply does nothing`` () = task {
+        do! fixture.ClearFakeCalls()
+        let! _ =
+            Tg.quickMsg(text = "/vahter markspam", chat = fixture.AdminChannel, from = fixture.Vahters[0])
+            |> fixture.SendMessage
+        let! calls = fixture.GetFakeCalls "sendMessage"
+        Assert.True(calls |> Array.exists (fun c -> c.Body.Contains "Reply to a forwarded"))
+    }
+
+    [<Fact>]
+    let ``markspam reply without a ref token does nothing`` () = task {
+        let plain = Tg.quickMsg(text = "just a normal message, no reference here", chat = fixture.AdminChannel, from = fixture.Vahters[0])
+        do! fixture.ClearFakeCalls()
+        let! _ =
+            Tg.replyMsg(plain.Message, "/vahter markspam", fixture.Vahters[0])
+            |> fixture.SendMessage
+        let! calls = fixture.GetFakeCalls "sendMessage"
+        Assert.True(calls |> Array.exists (fun c -> c.Body.Contains "Could not find"))
+    }
+
     // Restore the shared config blobs to their seed values after every test.
     interface IAsyncDisposable with
         member _.DisposeAsync() =
