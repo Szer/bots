@@ -16,13 +16,13 @@ open BotInfra
 [<CLIMutable>]
 type UserMessage =
     { chat_id: int64
-      message_id: int }
+      message_id: int64 }
 
 /// Lightweight DTO for the reaction-spam triage dossier (recent activity from one user).
 [<CLIMutable>]
 type DossierEvent =
     { chat_id: int64
-      message_id: int
+      message_id: int64
       kind: string          // "message" or "reaction"
       text: string          // message text (NULL for reaction)
       emoji: string         // joined emoji string for reaction events (NULL for message)
@@ -74,7 +74,7 @@ ON CONFLICT (user_id) DO UPDATE
     // the moderation-stream fold. The row is locked first, so concurrent message/moderation writers and
     // the rebuild serialize and each recomputes from the fully-committed log — no version-guard races.
     // All verdict logic lives in F#; the SQL here is static and parameterized.
-    let upsertMessageSnapshot (chatId: int64) (messageId: int) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
+    let upsertMessageSnapshot (chatId: int64) (messageId: int64) (conn: NpgsqlConnection) (tx: NpgsqlTransaction) : Task =
         task {
             let msgSid = $"message:{chatId}:{messageId}"
             let modSid = $"moderation:{chatId}:{messageId}"
@@ -143,13 +143,13 @@ UPDATE snapshot_message
     // The snapshot row is recomputed from BOTH streams by upsertMessageSnapshot, so both append
     // paths attach the same projection. The decider's folded state is only used for its decision /
     // the returned value; the snapshot itself is rebuilt from the log in the projection.
-    let appendMessageEvents (chatId: int64) (messageId: int) (decide: Message -> MessageEvent list) : Task<MessageEvent list * Message> =
+    let appendMessageEvents (chatId: int64) (messageId: int64) (decide: Message -> MessageEvent list) : Task<MessageEvent list * Message> =
         EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
             match decide state with
             | [] -> [], None
             | evts -> evts, Some (upsertMessageSnapshot chatId messageId))
 
-    let appendModerationEvents (chatId: int64) (messageId: int) (decide: Moderation -> ModerationEvent list) : Task<ModerationEvent list * Moderation> =
+    let appendModerationEvents (chatId: int64) (messageId: int64) (decide: Moderation -> ModerationEvent list) : Task<ModerationEvent list * Moderation> =
         EventStore.appendEventWithProjection store $"moderation:{chatId}:{messageId}" (fun (state: Moderation) ->
             match decide state with
             | [] -> [], None
@@ -167,7 +167,7 @@ UPDATE snapshot_message
             return ()
         }
 
-    let recordUserReaction (userId: int64) (username: string option) (chatId: int64) (messageId: int) (emoji: string option) (reactionIncrement: int) : Task<User> =
+    let recordUserReaction (userId: int64) (username: string option) (chatId: int64) (messageId: int64) (emoji: string option) (reactionIncrement: int) : Task<User> =
         task {
             let! (_, state) = appendUserEvents userId (fun state ->
                 let usernameEvt =
@@ -184,7 +184,7 @@ UPDATE snapshot_message
             return ()
         }
 
-    let recordUserBannedImpl (userId: int64) (actor: Actor) (chatId: int64 option) (messageId: int option) (messageText: string option) (banExpiryDays: int) : Task<unit> =
+    let recordUserBannedImpl (userId: int64) (actor: Actor) (chatId: int64 option) (messageId: int64 option) (messageText: string option) (banExpiryDays: int) : Task<unit> =
         task {
             let! _ = appendUserEvents userId (fun (state: User) ->
                 if state.IsBanned(banExpiryDays, utcNow()) then []   // idempotent — already banned
@@ -194,7 +194,7 @@ UPDATE snapshot_message
             return ()
         }
 
-    let recordMessageReceived (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
+    let recordMessageReceived (chatId: int64) (messageId: int64) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
             let! _ = EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
                 if state.Received then [], None
@@ -222,7 +222,7 @@ ON CONFLICT DO NOTHING
             return ()
         }
 
-    let recordMessageEdited (chatId: int64) (messageId: int) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
+    let recordMessageEdited (chatId: int64) (messageId: int64) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
             let! _ = appendMessageEvents chatId messageId (fun (_: Message) ->
                 [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |} ])
@@ -231,7 +231,7 @@ ON CONFLICT DO NOTHING
 
     let recordVahterAction
         (vahterId: int64) (actionType: VahterAction) (targetUserId: int64)
-        (chatId: int64) (messageId: int) : Task<bool> =
+        (chatId: int64) (messageId: int64) : Task<bool> =
         task {
             let! (_, state) = appendModerationEvents chatId messageId (fun (_: Moderation) ->
                 [ VahterActed {| vahterId = vahterId; actionType = actionType; targetUserId = targetUserId; chatId = chatId; messageId = messageId |} ])
@@ -267,7 +267,7 @@ ON CONFLICT DO NOTHING
             return { state with Id = userId }
         }
 
-    member _.UpsertUserAndIncrementReactions(userId: int64, username: string option, chatId: int64, messageId: int, emoji: string option, reactionIncrement: int) : Task<User> =
+    member _.UpsertUserAndIncrementReactions(userId: int64, username: string option, chatId: int64, messageId: int64, emoji: string option, reactionIncrement: int) : Task<User> =
         task {
             let! state = recordUserReaction userId username chatId messageId emoji reactionIncrement
             return { state with Id = userId }
@@ -278,7 +278,7 @@ ON CONFLICT DO NOTHING
         recordUserBannedImpl msg.SenderId actor (Some msg.ChatId) (Some msg.MessageId) (Option.ofObj msg.Text) banExpiryDays
 
     /// Records a UserBanned event without a TgMessage (e.g. reaction spam).
-    member _.RecordUserBannedNoMessage(userId: int64, actor: Actor, chatId: int64, messageId: int, banExpiryDays: int) : Task<unit> =
+    member _.RecordUserBannedNoMessage(userId: int64, actor: Actor, chatId: int64, messageId: int64, banExpiryDays: int) : Task<unit> =
         recordUserBannedImpl userId actor (Some chatId) (Some messageId) None banExpiryDays
 
     /// Records a UserUnbanned event with the new Actor format.
@@ -328,7 +328,7 @@ ON CONFLICT DO NOTHING
                 """
 SELECT
     (data->>'chatId')::BIGINT    AS chat_id,
-    (data->>'messageId')::INT    AS message_id
+    (data->>'messageId')::BIGINT    AS message_id
 FROM event
 WHERE event_type = 'MessageReceived'
   AND (data->>'userId')::BIGINT = @userId
@@ -343,7 +343,7 @@ WHERE event_type = 'MessageReceived'
         DbSettings.upsertBotSetting connString key value typ featureGroup
 
     /// Records a MessageMarkedHam event. Latest Spam/Ham decision wins.
-    member _.RecordMessageMarkedHam(chatId: int64, messageId: int, text: string, markedBy: int64 option) : Task<unit> =
+    member _.RecordMessageMarkedHam(chatId: int64, messageId: int64, text: string, markedBy: int64 option) : Task<unit> =
         task {
             let! _ = appendMessageEvents chatId messageId (fun state ->
                 if state.Classification = SpamClassification.Ham then []   // already ham
@@ -352,7 +352,7 @@ WHERE event_type = 'MessageReceived'
         }
 
     /// Records a MessageMarkedSpam event. Latest Spam/Ham decision wins.
-    member _.RecordMessageMarkedSpam(chatId: int64, messageId: int, markedBy: int64 option) : Task<unit> =
+    member _.RecordMessageMarkedSpam(chatId: int64, messageId: int64, markedBy: int64 option) : Task<unit> =
         task {
             let! _ = appendMessageEvents chatId messageId (fun state ->
                 if state.Classification = SpamClassification.Spam then []  // already spam
@@ -392,7 +392,7 @@ SELECT COUNT(*)::INT FROM (
 WITH user_messages AS (
     SELECT data->>'text'             AS text,
            (data->>'chatId')::BIGINT AS chat_id,
-           (data->>'messageId')::INT AS message_id,
+           (data->>'messageId')::BIGINT AS message_id,
            created_at
     FROM event
     WHERE event_type = 'MessageReceived'
@@ -400,7 +400,7 @@ WITH user_messages AS (
 ),
 bot_deletions AS (
     SELECT (data->>'chatId')::BIGINT AS chat_id,
-           (data->>'messageId')::INT AS message_id
+           (data->>'messageId')::BIGINT AS message_id
     FROM event
     WHERE event_type = 'BotAutoDeleted'
       AND (data->>'userId')::BIGINT = @userId
@@ -447,11 +447,11 @@ FROM expanded;
     // -----------------------------------------------------------------------
 
     /// Records a VahterActed event. Returns true if first action (used for deduplication).
-    member _.TryRecordVahterAction(vahterId: int64, actionType: VahterAction, targetUserId: int64, chatId: int64, msgId: int) : Task<bool> =
+    member _.TryRecordVahterAction(vahterId: int64, actionType: VahterAction, targetUserId: int64, chatId: int64, msgId: int64) : Task<bool> =
         recordVahterAction vahterId actionType targetUserId chatId msgId
 
     /// Records a BotAutoDeleted event. NOT idempotent — each call adds an event.
-    member _.RecordBotAutoDeleted(chatId: int64, messageId: int, userId: int64, reason: AutoDeleteReason) : Task<unit> =
+    member _.RecordBotAutoDeleted(chatId: int64, messageId: int64, userId: int64, reason: AutoDeleteReason) : Task<unit> =
         task {
             let! _ = appendModerationEvents chatId messageId (fun (_: Moderation) ->
                 [ BotAutoDeleted {| chatId = chatId; messageId = messageId; userId = userId; reason = reason |} ])
@@ -459,7 +459,7 @@ FROM expanded;
         }
 
     /// Records an MlScoredMessage event for observability and determinism testing.
-    member _.RecordMlScoredMessage(chatId: int64, messageId: int, score: float, isSpam: bool) : Task<unit> =
+    member _.RecordMlScoredMessage(chatId: int64, messageId: int64, score: float, isSpam: bool) : Task<unit> =
         task {
             let! _ = EventStore.appendEvent store $"detection:{chatId}:{messageId}" (fun (_: Detection) ->
                 [ MlScoredMessage {| chatId = chatId; messageId = messageId; score = score; isSpam = isSpam |} ])
@@ -468,7 +468,7 @@ FROM expanded;
 
     /// Records an LlmClassified event.
     member _.RecordLlmClassified
-        (chatId: int64, messageId: int, verdict: string,
+        (chatId: int64, messageId: int64, verdict: string,
          promptTokens: int, completionTokens: int, latencyMs: int,
          modelName: string option, promptHash: string option) : Task<unit> =
         task {
@@ -601,7 +601,7 @@ WHERE stream_id = 'detection:reaction:' || @userId
             let sql = """
 SELECT DISTINCT
     (data->>'chatId')::BIGINT     AS chat_id,
-    (data->>'messageId')::INT     AS message_id
+    (data->>'messageId')::BIGINT     AS message_id
 FROM event
 WHERE event_type = 'UserReactionRecorded'
   AND stream_id  = 'user:' || @userId
@@ -624,7 +624,7 @@ WHERE event_type = 'UserReactionRecorded'
 (
     SELECT
         (data->>'chatId')::BIGINT  AS chat_id,
-        (data->>'messageId')::INT  AS message_id,
+        (data->>'messageId')::BIGINT  AS message_id,
         'message'                  AS kind,
         data->>'text'              AS text,
         NULL                       AS emoji,
@@ -637,7 +637,7 @@ UNION ALL
 (
     SELECT
         COALESCE((data->>'chatId')::BIGINT, 0::BIGINT) AS chat_id,
-        COALESCE((data->>'messageId')::INT, 0::INT)   AS message_id,
+        COALESCE((data->>'messageId')::BIGINT, 0::BIGINT)   AS message_id,
         'reaction'                                    AS kind,
         NULL                                          AS text,
         data->>'emoji'                                AS emoji,
@@ -667,7 +667,7 @@ LIMIT @n
         }
 
     /// Records the action message ID after posting to channel.
-    member _.RecordCallbackMessagePosted(callbackId: Guid, messageId: int) : Task<unit> =
+    member _.RecordCallbackMessagePosted(callbackId: Guid, messageId: int64) : Task<unit> =
         task {
             let! _ = EventStore.appendEvent store $"callback:{callbackId}" (fun (state: Callback) ->
                 if state.IsTerminal || state.ActionMessageId.IsSome then []
@@ -702,7 +702,7 @@ LIMIT @n
 SELECT
     REPLACE(e.stream_id, 'callback:', '')::UUID AS id,
     (e.data->>'actionChannelId')::BIGINT AS action_channel_id,
-    (SELECT (e3.data->>'actionMessageId')::INT
+    (SELECT (e3.data->>'actionMessageId')::BIGINT
      FROM event e3
      WHERE e3.stream_id = e.stream_id
        AND e3.event_type = 'CallbackMessagePosted'
@@ -733,7 +733,7 @@ WHERE e.event_type = 'CallbackCreated'
 SELECT
     REPLACE(e.stream_id, 'callback:', '')::UUID AS id,
     (e.data->>'actionChannelId')::BIGINT AS action_channel_id,
-    (SELECT (e3.data->>'actionMessageId')::INT
+    (SELECT (e3.data->>'actionMessageId')::BIGINT
      FROM event e3
      WHERE e3.stream_id = e.stream_id
        AND e3.event_type = 'CallbackMessagePosted'
@@ -791,7 +791,7 @@ WHERE e.event_type = 'CallbackCreated'
 SELECT
     REPLACE(e.stream_id, 'callback:', '')::UUID AS id,
     (e.data->>'actionChannelId')::BIGINT AS action_channel_id,
-    (SELECT (e3.data->>'actionMessageId')::INT
+    (SELECT (e3.data->>'actionMessageId')::BIGINT
      FROM event e3
      WHERE e3.stream_id = e.stream_id
        AND e3.event_type = 'CallbackMessagePosted'
@@ -812,7 +812,7 @@ WHERE e.event_type = 'CallbackCreated'
         }
 
     /// Expires all callbacks sharing the same action message ID (sibling buttons).
-    member _.ExpireCallbacksByMessageId(actionMessageId: int) : Task<unit> =
+    member _.ExpireCallbacksByMessageId(actionMessageId: int64) : Task<unit> =
         task {
             use conn = new NpgsqlConnection(connString)
 
@@ -822,7 +822,7 @@ WHERE e.event_type = 'CallbackCreated'
 SELECT REPLACE(e.stream_id, 'callback:', '')::UUID
 FROM event e
 WHERE e.event_type = 'CallbackMessagePosted'
-  AND (e.data->>'actionMessageId')::INT = @msgId
+  AND (e.data->>'actionMessageId')::BIGINT = @msgId
   AND NOT EXISTS (
       SELECT 1 FROM event e2
       WHERE e2.stream_id = e.stream_id
@@ -946,7 +946,7 @@ WITH final_messages AS (
     SELECT DISTINCT ON (stream_id)
         stream_id,
         (data->>'chatId')::BIGINT              AS chat_id,
-        (data->>'messageId')::INT              AS message_id,
+        (data->>'messageId')::BIGINT              AS message_id,
         (data->>'userId')::BIGINT              AS user_id,
         data->>'text'                          AS text,
         data->'rawMessage'->'entities'         AS entities,
@@ -967,7 +967,7 @@ verdicts AS (
     -- All verdict-bearing events, unified across message and moderation streams
     SELECT
         (data->>'chatId')::BIGINT  AS chat_id,
-        (data->>'messageId')::INT  AS message_id,
+        (data->>'messageId')::BIGINT  AS message_id,
         id                         AS event_id,
         CASE
             WHEN event_type = 'BotAutoDeleted' THEN TRUE

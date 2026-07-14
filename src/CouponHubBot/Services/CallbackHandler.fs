@@ -35,7 +35,7 @@ type CallbackHandler(
                     do!
                         botClient.EditMessageText(
                             ChatId batch.bulk_chat_id,
-                            batch.bulk_message_id.Value,
+                            int batch.bulk_message_id.Value,
                             text)
                         |> taskIgnore
                 with _ ->

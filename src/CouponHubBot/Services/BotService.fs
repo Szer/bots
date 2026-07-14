@@ -59,10 +59,10 @@ type BotService(
                         let hasPhoto = msg.Photo <> null && msg.Photo.Length > 0
                         let hasDocument = not (isNull msg.Document)
                         let replyToId =
-                            if msg.ReplyToMessage <> null then Nullable(msg.ReplyToMessage.MessageId)
+                            if msg.ReplyToMessage <> null then Nullable(int64 msg.ReplyToMessage.MessageId)
                             else Nullable()
                         try
-                            do! db.SaveChatMessage(msg.Chat.Id, msg.MessageId, userId, text, hasPhoto, hasDocument, replyToId)
+                            do! db.SaveChatMessage(msg.Chat.Id, int64 msg.MessageId, userId, text, hasPhoto, hasDocument, replyToId)
                         with ex ->
                             logger.LogWarning(ex, "Failed to save community chat message {MessageId}", msg.MessageId)
         }
@@ -132,7 +132,7 @@ type BotService(
 
                         // 1. Save feedback to database
                         let! feedbackId =
-                            try db.SaveUserFeedback(user.id, feedbackText, hasMedia, msg.MessageId)
+                            try db.SaveUserFeedback(user.id, feedbackText, hasMedia, int64 msg.MessageId)
                             with ex ->
                                 logger.LogError(ex, "Failed to save user feedback to database")
                                 task { return 0L }

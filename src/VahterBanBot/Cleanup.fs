@@ -47,7 +47,7 @@ type CleanupService(
                 try
                     do! telegramClient.DeleteMessage(
                         ChatId(botConf.Value.DetectedSpamChannelId),
-                        msgId
+                        int msgId
                     )
                     deletedFromChannel <- deletedFromChannel + 1
                 with ex ->

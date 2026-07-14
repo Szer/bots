@@ -14,7 +14,7 @@ type UserFeedbackRow =
       user_id: int64
       feedback_text: string | null
       has_media: bool
-      telegram_message_id: int
+      telegram_message_id: int64
       github_issue_number: Nullable<int> }
 
 type FeedbackFlowTests(fixture: DefaultCouponHubTestContainers) =
@@ -45,7 +45,7 @@ type FeedbackFlowTests(fixture: DefaultCouponHubTestContainers) =
             Assert.Equal(3001L, row.user_id)
             Assert.Equal("The bot is great but needs dark mode", row.feedback_text)
             Assert.False(row.has_media)
-            Assert.Equal(feedbackMsgId, row.telegram_message_id)
+            Assert.Equal(int64 feedbackMsgId, row.telegram_message_id)
             // GitHub issue not created (no token configured in tests)
             Assert.False(row.github_issue_number.HasValue)
         }
