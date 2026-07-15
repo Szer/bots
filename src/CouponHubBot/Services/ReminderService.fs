@@ -6,12 +6,11 @@ open System.Threading.Tasks
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types
+open BotInfra
 open CouponHubBot
 
 type ReminderService(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
     db: DbService,
     logger: ILogger<ReminderService>,
@@ -70,10 +69,7 @@ type ReminderService(
                 let totalStr = total.ToString("0.##")
                 let couponWord = Utils.RussianPlural.choose coupons.Length "купон" "купона" "купонов"
                 let msg = $"Сегодня истекает {coupons.Length} {couponWord} на сумму {totalStr}€!"
-                // NOTE(project-agent): `:> Task` is a valid F# upcast (Task<Message> -> Task),
-                // not a runtime cast. Compiles under TreatWarningsAsErrors; discards the Message.
-                // Idiomatic across the codebase. Do not flag.
-                do! botClient.SendMessage(ChatId options.Value.CommunityChatId, msg) :> Task
+                do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(options.Value.CommunityChatId, msg)) |> taskIgnore
                 anySent <- true
 
             if nowUtc.DayOfWeek = DayOfWeek.Monday && nowUtc.Day <= 7 then
@@ -85,7 +81,7 @@ type ReminderService(
                     "Статистика за всё время (использовано/добавлено):\n"
                     + formatCombinedStats usedRows addedRows
 
-                do! botClient.SendMessage(ChatId options.Value.CommunityChatId, text) :> Task
+                do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(options.Value.CommunityChatId, text)) |> taskIgnore
                 anySent <- true
 
             // DM reminder: user has taken coupons older than 1 day and forgot to mark used/return.
@@ -98,7 +94,7 @@ type ReminderService(
                     let notMarked = if r.overdue_count = 1 then "не отмеченный" else "не отмеченных"
                     let text =
                         $"Напоминание: у тебя есть {r.overdue_count} {couponWord}, {participle} более 1 дня назад и всё ещё {notMarked}.\nОткрой /my и нажми «Использован» или «Вернуть»."
-                    do! botClient.SendMessage(ChatId r.user_id, text) :> Task
+                    do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(r.user_id, text)) |> taskIgnore
                     anySent <- true
                 with ex ->
                     logger.LogWarning(ex, "Failed to send overdue-taken reminder to {UserId}", r.user_id)
@@ -109,7 +105,7 @@ type ReminderService(
             for userId in usersWhoUsedButDidNotAdd do
                 try
                     let text = "Не забудь добавить купоны в бота"
-                    do! botClient.SendMessage(ChatId userId, text) :> Task
+                    do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(userId, text)) |> taskIgnore
                     anySent <- true
                 with ex ->
                     logger.LogWarning(ex, "Failed to send add-coupon reminder to {UserId}", userId)

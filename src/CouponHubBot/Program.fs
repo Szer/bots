@@ -212,14 +212,14 @@ let app = builder.Build()
 ))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg WebhookHost.parseTelegramBotUpdate (fun ctx update ->
+WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
         try
             let bot = ctx.RequestServices.GetRequiredService<BotService>()
             do! bot.OnUpdate(update)
         with ex ->
-            logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.Id)
+            logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.UpdateId)
     }) app
 
 app.Run()

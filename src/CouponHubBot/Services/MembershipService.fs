@@ -6,15 +6,13 @@ open System.Threading.Tasks
 open CouponHubBot.Telemetry
 open CouponHubBot.Utils
 open BotInfra
+open Funogram.Telegram.Types
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types.Enums
-open Telegram.Bot.Types
 
 type TelegramMembershipService(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     options: IOptions<CouponHubBot.BotConfiguration>,
     logger: ILogger<TelegramMembershipService>,
     time: TimeProvider
@@ -26,11 +24,10 @@ type TelegramMembershipService(
     let isFresh (cachedAt: DateTime) =
         time.GetUtcNow().UtcDateTime - cachedAt < expiry
 
-    let statusIsMember (status: ChatMemberStatus) =
+    // Telegram wire statuses: "creator", "administrator", "member", "restricted", "left", "kicked".
+    let statusIsMember (status: string) =
         match status with
-        | ChatMemberStatus.Member
-        | ChatMemberStatus.Administrator
-        | ChatMemberStatus.Creator -> true
+        | "member" | "administrator" | "creator" -> true
         | _ -> false
 
     member _.InvalidateCache() = cache.Clear()
@@ -39,13 +36,14 @@ type TelegramMembershipService(
         use span =
             botActivity
                 .StartActivity("onChatMemberUpdated")
-        if update.Chat <> null && update.Chat.Id = options.Value.CommunityChatId && update.NewChatMember <> null then
-            let uid = update.NewChatMember.User.Id
-            let isMember = statusIsMember update.NewChatMember.Status
+        if update.Chat.Id = options.Value.CommunityChatId then
+            let uid = (Tg.chatMemberUser update.NewChatMember).Id
+            let status = Tg.chatMemberStatus update.NewChatMember
+            let isMember = statusIsMember status
             cache[uid] <- (isMember, time.GetUtcNow().UtcDateTime)
             %span.SetTag("userId", uid)
             %span.SetTag("isMember", isMember)
-            %span.SetTag("status", update.NewChatMember.Status)
+            %span.SetTag("status", status)
 
     member _.IsMember(userId) =
         task {
@@ -53,8 +51,8 @@ type TelegramMembershipService(
             | true, (isMember, cachedAt) when isFresh cachedAt -> return isMember
             | _ ->
                 try
-                    let! cm = botClient.GetChatMember(options.Value.CommunityChatId, userId)
-                    let isMember = statusIsMember cm.Status
+                    let! cm = tg.CallExn(Funogram.Telegram.Req.GetChatMember.Make(options.Value.CommunityChatId, userId))
+                    let isMember = statusIsMember (Tg.chatMemberStatus cm)
                     cache[userId] <- (isMember, time.GetUtcNow().UtcDateTime)
                     return isMember
                 with ex ->

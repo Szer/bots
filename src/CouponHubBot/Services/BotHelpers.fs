@@ -2,16 +2,77 @@ module CouponHubBot.Services.BotHelpers
 
 open System
 open System.Collections.Generic
-open Telegram.Bot
-open Telegram.Bot.Types
-open Telegram.Bot.Types.ReplyMarkups
+open System.Threading.Tasks
+open Funogram.Telegram.Types
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Utils
 open BotInfra
 
-let sendText (botClient: ITelegramBotClient) (chatId: int64) (text: string) =
-    botClient.SendMessage(ChatId chatId, text) |> taskIgnore
+module Req = Funogram.Telegram.Req
+
+// ── ITelegramApi call wrappers ──────────────────────────────────────────
+// All of these throw TelegramApiException on a Telegram API error (CallExn),
+// matching the throwing semantics of the old Telegram.Bot client methods.
+
+/// Sends a text message and returns the sent Message (for callers needing MessageId).
+let sendMessage (tg: ITelegramApi) (chatId: int64) (text: string) : Task<Message> =
+    tg.CallExn(Req.SendMessage.Make(chatId, text))
+
+let sendText (tg: ITelegramApi) (chatId: int64) (text: string) =
+    sendMessage tg chatId text |> taskIgnore
+
+/// Sends a text message with an inline keyboard and returns the sent Message.
+let sendMessageMarkup (tg: ITelegramApi) (chatId: int64) (text: string) (kb: InlineKeyboardMarkup) : Task<Message> =
+    tg.CallExn(Req.SendMessage.Make(chatId, text, replyMarkup = Markup.InlineKeyboardMarkup kb))
+
+let sendTextMarkup (tg: ITelegramApi) (chatId: int64) (text: string) (kb: InlineKeyboardMarkup) =
+    sendMessageMarkup tg chatId text kb |> taskIgnore
+
+/// Sends an HTML-formatted text message.
+let sendHtml (tg: ITelegramApi) (chatId: int64) (text: string) =
+    tg.CallExn(Req.SendMessage.Make(chatId, text, parseMode = ParseMode.HTML)) |> taskIgnore
+
+/// Sends a text message as a reply to another message (best-effort target:
+/// falls back to a plain send server-side when the target is gone).
+let sendTextReply (tg: ITelegramApi) (chatId: int64) (text: string) (replyToMessageId: int64) =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams)) |> taskIgnore
+
+let editMessageText (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) =
+    tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text)) |> taskIgnore
+
+let editMessageTextMarkup (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) (kb: InlineKeyboardMarkup) =
+    tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text, replyMarkup = kb)) |> taskIgnore
+
+let deleteMessage (tg: ITelegramApi) (chatId: int64) (messageId: int64) =
+    tg.CallExn(Req.DeleteMessage.Make(chatId, messageId)) |> taskIgnore
+
+/// Sends a photo by Telegram file_id.
+let sendPhoto (tg: ITelegramApi) (chatId: int64) (fileId: string) =
+    tg.CallExn(Req.SendPhoto.Make(chatId, InputFile.FileId fileId)) |> taskIgnore
+
+/// Sends a photo by file_id with a caption and an inline keyboard.
+let sendPhotoWithCaption (tg: ITelegramApi) (chatId: int64) (fileId: string) (caption: string) (kb: InlineKeyboardMarkup) =
+    tg.CallExn(Req.SendPhoto.Make(chatId, InputFile.FileId fileId,
+                                  caption = caption,
+                                  replyMarkup = Markup.InlineKeyboardMarkup kb))
+    |> taskIgnore
+
+/// Sends 2-10 photos (by file_id) as one media group.
+let sendMediaGroupPhotos (tg: ITelegramApi) (chatId: int64) (fileIds: string array) =
+    let media =
+        fileIds
+        |> Array.map (fun fid -> InputMedia.Photo(InputMediaPhoto.Create("photo", InputFile.FileId fid)))
+    tg.CallExn(Req.SendMediaGroup.Make(chatId, media)) |> taskIgnore
+
+// ── Inline keyboard builders ────────────────────────────────────────────
+
+let private btn (text: string) (callbackData: string) =
+    InlineKeyboardButton.Create(text, callbackData = callbackData)
+
+let private inlineKb (rows: InlineKeyboardButton[][]) =
+    InlineKeyboardMarkup.Create(inlineKeyboard = rows)
 
 /// Short Russian ordinal form used in UI: 1ый, 2ой, 3ий, 4ый, ...
 let formatOrdinalShort (n: int) =
@@ -104,7 +165,8 @@ let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
             rows |> Array.fold (fun mx r ->
                 let v = match i with | 0 -> r.date | 1 -> r.user | _ -> r.event_type
                 max mx v.Length) h.Length)
-    let sep = "+" + (widths |> Array.map (fun w -> String('-', w)) |> String.concat "+") + "+"
+    // System.String qualified: `open Funogram.Telegram.Types` shadows `String` with the ChatId.String DU case.
+    let sep = "+" + (widths |> Array.map (fun w -> System.String('-', w)) |> String.concat "+") + "+"
     let fmtRow vals =
         "|" + (Array.zip widths vals |> Array.map (fun (w, v: string) -> v.PadRight(w)) |> String.concat "|") + "|"
     let lines = [
@@ -178,74 +240,58 @@ let pickCouponsForList (today: DateOnly) (coupons: Coupon array) =
 
 let couponsKeyboard (coupons: Coupon array) =
     coupons
-    |> Array.indexed
-    |> Array.map (fun (i, c) ->
-        let humanIdx = i + 1
-        seq { InlineKeyboardButton.WithCallbackData($"Взять {formatOrdinalShort humanIdx}", $"take:{c.id}") })
-    |> Seq.ofArray
-    |> InlineKeyboardMarkup
+    |> Array.mapi (fun i c -> [| btn $"Взять {formatOrdinalShort (i + 1)}" $"take:{c.id}" |])
+    |> inlineKb
 
 let addWizardDiscountKeyboard () =
-    seq {
-        seq { InlineKeyboardButton.WithCallbackData("5€/25€", "addflow:disc:5:25") }
-        seq { InlineKeyboardButton.WithCallbackData("10€/40€", "addflow:disc:10:40") }
-        seq { InlineKeyboardButton.WithCallbackData("10€/50€", "addflow:disc:10:50") }
-        seq { InlineKeyboardButton.WithCallbackData("20€/100€", "addflow:disc:20:100") }
-    }
-    |> InlineKeyboardMarkup
+    inlineKb [|
+        [| btn "5€/25€" "addflow:disc:5:25" |]
+        [| btn "10€/40€" "addflow:disc:10:40" |]
+        [| btn "10€/50€" "addflow:disc:10:50" |]
+        [| btn "20€/100€" "addflow:disc:20:100" |]
+    |]
 
 let addWizardDateKeyboard () =
-    seq {
-        seq { InlineKeyboardButton.WithCallbackData("Сегодня", "addflow:date:today") }
-        seq { InlineKeyboardButton.WithCallbackData("Завтра", "addflow:date:tomorrow") }
-    }
-    |> InlineKeyboardMarkup
+    inlineKb [|
+        [| btn "Сегодня" "addflow:date:today" |]
+        [| btn "Завтра" "addflow:date:tomorrow" |]
+    |]
 
 let addWizardOcrKeyboard () =
-    seq {
-        seq {
-            InlineKeyboardButton.WithCallbackData("✅ Да, всё верно", "addflow:ocr:yes")
-            InlineKeyboardButton.WithCallbackData("Нет, выбрать вручную", "addflow:ocr:no")
-        }
-    }
-    |> InlineKeyboardMarkup
+    inlineKb [|
+        [| btn "✅ Да, всё верно" "addflow:ocr:yes"
+           btn "Нет, выбрать вручную" "addflow:ocr:no" |]
+    |]
 
 let addWizardConfirmKeyboard () =
-    seq {
-        seq {
-            InlineKeyboardButton.WithCallbackData("✅ Добавить", "addflow:confirm")
-            InlineKeyboardButton.WithCallbackData("↩️ Отмена", "addflow:cancel")
-        }
-    }
-    |> InlineKeyboardMarkup
+    inlineKb [|
+        [| btn "✅ Добавить" "addflow:confirm"
+           btn "↩️ Отмена" "addflow:cancel" |]
+    |]
 
 let addBatchConfirmKeyboard (batchId: int64) (okCount: int) =
     if okCount = 0 then
-        seq { seq { InlineKeyboardButton.WithCallbackData("↩️ Отменить", $"addflow:bulk:cancel:{batchId}") } }
-        |> InlineKeyboardMarkup
+        inlineKb [| [| btn "↩️ Отменить" $"addflow:bulk:cancel:{batchId}" |] |]
     else
-        seq {
-            let couponWord = RussianPlural.choose okCount "купон" "купона" "купонов"
-            seq { InlineKeyboardButton.WithCallbackData($"✅ Подтвердить {okCount} {couponWord}", $"addflow:bulk:confirm:{batchId}") }
-            seq { InlineKeyboardButton.WithCallbackData("↩️ Отменить", $"addflow:bulk:cancel:{batchId}") }
-        }
-        |> InlineKeyboardMarkup
+        let couponWord = RussianPlural.choose okCount "купон" "купона" "купонов"
+        inlineKb [|
+            [| btn $"✅ Подтвердить {okCount} {couponWord}" $"addflow:bulk:confirm:{batchId}" |]
+            [| btn "↩️ Отменить" $"addflow:bulk:cancel:{batchId}" |]
+        |]
 
 /// Клавиатура для сообщения о взятом купоне: при успешном used/return сообщение удаляем.
 let singleTakenKeyboard (c: Coupon) =
-    seq {
-        seq {
-            InlineKeyboardButton.WithCallbackData("Вернуть", $"return:{c.id}:del")
-            InlineKeyboardButton.WithCallbackData("Использован", $"used:{c.id}:del")
-        }
-    }
-    |> InlineKeyboardMarkup
+    inlineKb [|
+        [| btn "Вернуть" $"return:{c.id}:del"
+           btn "Использован" $"used:{c.id}:del" |]
+    |]
 
 let getLargestPhotoFileId (msg: Message) =
-    if isNull msg.Photo || msg.Photo.Length = 0 then None
-    else
-        let p = msg.Photo |> Array.maxBy (fun p -> if p.FileSize.HasValue then p.FileSize.Value else 0)
+    match msg.Photo with
+    | Some photos when photos.Length > 0 ->
+        let p = photos |> Array.maxBy (fun p -> p.FileSize |> Option.defaultValue 0L)
         Some p.FileId
+    | _ -> None
 
 let ensureCommunityMember (membership: TelegramMembershipService) (sendText: int64 -> string -> System.Threading.Tasks.Task<unit>) (userId: int64) (chatId: int64) =
     task {

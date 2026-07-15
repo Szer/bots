@@ -4,16 +4,14 @@ open System
 open System.Collections.Generic
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types
-open Telegram.Bot.Types.ReplyMarkups
+open Funogram.Telegram.Types
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Utils
 open BotInfra
 
 type CommandHandler(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
     db: DbService,
     notifications: TelegramNotificationService,
@@ -21,7 +19,7 @@ type CommandHandler(
     time: TimeProvider,
     logger: ILogger<CommandHandler>
 ) =
-    let sendText = BotHelpers.sendText botClient
+    let sendText = BotHelpers.sendText tg
 
     // Sends the coupon's full event-history table as a <pre> HTML block, with an optional
     // header above it. Shared by /debug and /undo.
@@ -36,7 +34,7 @@ type CommandHandler(
                 | Some h -> h + "\n"
                 | None -> ""
             let html = $"{headerPart}<pre>{table}</pre>"
-            do! botClient.SendMessage(ChatId chatId, html, parseMode = Telegram.Bot.Types.Enums.ParseMode.Html) |> taskIgnore
+            do! BotHelpers.sendHtml tg chatId html
         }
 
     let handleDebug (userId: int64) (chatId: int64) (couponId: int) =
@@ -103,12 +101,9 @@ type CommandHandler(
                     |> Array.map (fun (i, c) -> BotHelpers.formatAvailableCouponLine (i + 1) c)
                     |> String.concat "\n"
                 do!
-                    botClient.SendMessage(
-                        ChatId chatId,
-                        $"{todayStr}\n{totalStr}\n\nДоступные купоны:\n{text}",
-                        replyMarkup = BotHelpers.couponsKeyboard shown
-                    )
-                    |> taskIgnore
+                    BotHelpers.sendTextMarkup tg chatId
+                        $"{todayStr}\n{totalStr}\n\nДоступные купоны:\n{text}"
+                        (BotHelpers.couponsKeyboard shown)
         }
 
     let handleTake (taker: DbUser) (chatId: int64) (couponId: int) =
@@ -124,12 +119,9 @@ type CommandHandler(
                 do! sendText chatId $"Купон ID:{couponId} уже взят или не существует."
             | Taken coupon ->
                 let d = BotHelpers.formatUiDate coupon.expires_at
-                do! botClient.SendPhoto(
-                        ChatId chatId,
-                        InputFileId coupon.photo_file_id,
-                        caption = $"Купон ID:{couponId} теперь твой: {BotHelpers.formatCouponValue coupon}, истекает {d}",
-                        replyMarkup = BotHelpers.singleTakenKeyboard coupon)
-                    |> taskIgnore
+                do! BotHelpers.sendPhotoWithCaption tg chatId coupon.photo_file_id
+                        $"Купон ID:{couponId} теперь твой: {BotHelpers.formatCouponValue coupon}, истекает {d}"
+                        (BotHelpers.singleTakenKeyboard coupon)
         }
 
     let handleUsed (user: DbUser) (chatId: int64) (couponId: int) =
@@ -191,13 +183,8 @@ type CommandHandler(
                 Utils.TimeZones.dublinToday time
                 |> BotHelpers.formatUiDate
             if taken.Length = 0 then
-                do!
-                    botClient.SendMessage(
-                        ChatId chatId,
-                        $"{todayStr}\n\nМои купоны:\n—",
-                        replyMarkup = InlineKeyboardMarkup(seq { seq { InlineKeyboardButton.WithCallbackData("Мои добавленные", "myAdded") } })
-                    )
-                    |> taskIgnore
+                let kb = InlineKeyboardMarkup.Create [| [| InlineKeyboardButton.Create("Мои добавленные", callbackData = "myAdded") |] |]
+                do! BotHelpers.sendTextMarkup tg chatId $"{todayStr}\n\nМои купоны:\n—" kb
             else
                 // Clamp to Telegram's media group limit of 10; always show at least 1 coupon when there are taken coupons.
                 let maxShown = max 1 (min options.Value.MaxTakenCoupons 10)
@@ -205,14 +192,9 @@ type CommandHandler(
 
                 // 1) Photo(s) — SendPhoto for single item, SendMediaGroup for 2–10 (Telegram requires 2–10 items in a media group)
                 if shown.Length = 1 then
-                    do! botClient.SendPhoto(ChatId chatId, InputFileId shown[0].photo_file_id) |> taskIgnore
+                    do! BotHelpers.sendPhoto tg chatId shown[0].photo_file_id
                 else
-                    let media =
-                        shown
-                        |> Array.map (fun c -> InputMediaPhoto(InputFileId c.photo_file_id) :> IAlbumInputMedia)
-                        |> Seq.ofArray
-
-                    do! botClient.SendMediaGroup(ChatId chatId, media) |> taskIgnore
+                    do! BotHelpers.sendMediaGroupPhotos tg chatId (shown |> Array.map (fun c -> c.photo_file_id))
 
                 // 2) Text + inline buttons
                 let truncationNote =
@@ -234,20 +216,15 @@ type CommandHandler(
                     let couponRows =
                         shown
                         |> Array.map (fun c ->
-                            seq {
-                                InlineKeyboardButton.WithCallbackData($"Вернуть ID:{c.id}", $"return:{c.id}")
-                                InlineKeyboardButton.WithCallbackData($"Использован ID:{c.id}", $"used:{c.id}")
-                            })
-                    let addedRow = [| seq { InlineKeyboardButton.WithCallbackData("Мои добавленные", "myAdded") } |]
-                    InlineKeyboardMarkup(Array.append couponRows addedRow)
+                            [| InlineKeyboardButton.Create($"Вернуть ID:{c.id}", callbackData = $"return:{c.id}")
+                               InlineKeyboardButton.Create($"Использован ID:{c.id}", callbackData = $"used:{c.id}") |])
+                    let addedRow = [| [| InlineKeyboardButton.Create("Мои добавленные", callbackData = "myAdded") |] |]
+                    InlineKeyboardMarkup.Create(Array.append couponRows addedRow)
 
                 do!
-                    botClient.SendMessage(
-                        ChatId chatId,
-                        $"{todayStr}\n\nМои купоны:\n{text}{truncationNote}",
-                        replyMarkup = kb
-                    )
-                    |> taskIgnore
+                    BotHelpers.sendTextMarkup tg chatId
+                        $"{todayStr}\n\nМои купоны:\n{text}{truncationNote}"
+                        kb
         }
 
     let handleAdded (user: DbUser) (chatId: int64) =
@@ -283,20 +260,13 @@ type CommandHandler(
                 let kb =
                     coupons
                     |> Array.map (fun c ->
-                        seq { InlineKeyboardButton.WithCallbackData($"Аннулировать ID:{c.id}", $"void:{c.id}") })
-                    |> Seq.ofArray
-                    |> InlineKeyboardMarkup
+                        [| InlineKeyboardButton.Create($"Аннулировать ID:{c.id}", callbackData = $"void:{c.id}") |])
+                    |> fun rows -> InlineKeyboardMarkup.Create(rows)
 
-                do!
-                    botClient.SendMessage(
-                        ChatId chatId,
-                        $"Мои добавленные купоны:\n{text}",
-                        replyMarkup = kb
-                    )
-                    |> taskIgnore
+                do! BotHelpers.sendTextMarkup tg chatId $"Мои добавленные купоны:\n{text}" kb
         }
 
-    let handleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgToDelete: Message option) =
+    let handleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgIdToDelete: int64 option) =
         task {
             match! db.VoidCoupon(couponId, user.id, isAdmin) with
             | VoidCouponResult.NotFoundOrNotAllowed ->
@@ -315,10 +285,10 @@ type CommandHandler(
                 let confirmText = $"Купон ID:{couponId} аннулирован.{notifyWarning}"
                 do! sendText chatId confirmText
                 if deleteMsg then
-                    match msgToDelete with
-                    | Some msg ->
+                    match msgIdToDelete with
+                    | Some msgId ->
                         try
-                            do! botClient.DeleteMessage(ChatId chatId, msg.MessageId)
+                            do! BotHelpers.deleteMessage tg chatId msgId
                         with _ -> ()
                     | None -> ()
         }
@@ -337,7 +307,7 @@ type CommandHandler(
     member _.HandleTake (taker: DbUser) (chatId: int64) (couponId: int) = handleTake taker chatId couponId
     member _.HandleReturn (user: DbUser) (chatId: int64) (couponId: int) = handleReturn user chatId couponId
     member _.HandleUsed (user: DbUser) (chatId: int64) (couponId: int) = handleUsed user chatId couponId
-    member _.HandleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgToDelete: Message option) = handleVoid user chatId couponId isAdmin deleteMsg msgToDelete
+    member _.HandleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgIdToDelete: int64 option) = handleVoid user chatId couponId isAdmin deleteMsg msgIdToDelete
     member _.HandleAdded (user: DbUser) (chatId: int64) = handleAdded user chatId
     member _.HandleUndo (adminId: int64) (chatId: int64) (couponId: int) = handleUndo adminId chatId couponId
 
@@ -346,96 +316,101 @@ type CommandHandler(
             let recordCommand cmd =
                 Metrics.commandTotal.Add(1L, KeyValuePair("command", box cmd))
 
+            // user.id always equals msg.From.Id here: BotService only dispatches private
+            // messages whose From is present, and `user` is upserted from that From.
             match msg.Text with
-            | "/start" ->
+            | Some "/start" ->
                 recordCommand "start"
                 do! handleStart msg.Chat.Id
-            | "/help" ->
+            | Some "/help" ->
                 recordCommand "help"
                 do! handleHelp msg.Chat.Id
-            | "/list" ->
+            | Some "/list" ->
                 recordCommand "list"
                 do! handleCoupons msg.Chat.Id
-            | "/l" ->
+            | Some "/l" ->
                 recordCommand "list"
                 do! handleCoupons msg.Chat.Id
-            | "/coupons" ->
+            | Some "/coupons" ->
                 recordCommand "list"
                 do! handleCoupons msg.Chat.Id // legacy alias
-            | "/take" ->
+            | Some "/take" ->
                 recordCommand "list"
                 do! handleCoupons msg.Chat.Id // legacy alias (list)
-            | "/my" ->
+            | Some "/my" ->
                 recordCommand "my"
                 do! handleMy user msg.Chat.Id
-            | "/m" ->
+            | Some "/m" ->
                 recordCommand "my"
                 do! handleMy user msg.Chat.Id
-            | "/added" ->
+            | Some "/added" ->
                 recordCommand "added"
                 do! handleAdded user msg.Chat.Id
-            | "/ad" ->
+            | Some "/ad" ->
                 recordCommand "added"
                 do! handleAdded user msg.Chat.Id
-            | "/stats" ->
+            | Some "/stats" ->
                 recordCommand "stats"
                 do! handleStats user msg.Chat.Id
-            | "/s" ->
+            | Some "/s" ->
                 recordCommand "stats"
                 do! handleStats user msg.Chat.Id
-            | "/feedback" ->
+            | Some "/feedback" ->
                 recordCommand "feedback"
                 do! handleFeedback user msg.Chat.Id
-            | "/f" ->
+            | Some "/f" ->
                 recordCommand "feedback"
                 do! handleFeedback user msg.Chat.Id
-            | "/add" ->
+            | Some "/add" ->
                 recordCommand "add"
                 do! couponFlow.HandleAddWizardStart user msg.Chat.Id
-            | "/a" ->
+            | Some "/a" ->
                 recordCommand "add"
                 do! couponFlow.HandleAddWizardStart user msg.Chat.Id
-            | t when not (isNull t) && t.StartsWith("/take ") ->
+            | Some t when t.StartsWith("/take ") ->
                 recordCommand "take"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId -> do! handleTake user msg.Chat.Id couponId
                 | None -> do! sendText msg.Chat.Id "Формат: /take <id>"
-            | t when not (isNull t) && t.StartsWith("/used ") ->
+            | Some t when t.StartsWith("/used ") ->
                 recordCommand "used"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId ->
                     let! _ = handleUsed user msg.Chat.Id couponId
                     ()
                 | None -> do! sendText msg.Chat.Id "Формат: /used <id>"
-            | t when not (isNull t) && t.StartsWith("/return ") ->
+            | Some t when t.StartsWith("/return ") ->
                 recordCommand "return"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId ->
                     let! _ = handleReturn user msg.Chat.Id couponId
                     ()
                 | None -> do! sendText msg.Chat.Id "Формат: /return <id>"
-            | t when not (isNull t) && (t.StartsWith("/add ") || t.StartsWith("/a ")) ->
+            | Some t when t.StartsWith("/add ") || t.StartsWith("/a ") ->
                 recordCommand "add_manual"
                 do! sendText msg.Chat.Id "Для ручного добавления пришли фото с подписью: /add <discount> <min_check> <date>"
-            | t when not (isNull t) && t.StartsWith("/void ") ->
+            | Some t when t.StartsWith("/void ") ->
                 recordCommand "void"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId ->
-                    let isAdmin = options.Value.FeedbackAdminIds |> Array.contains msg.From.Id
+                    let isAdmin = options.Value.FeedbackAdminIds |> Array.contains user.id
                     do! handleVoid user msg.Chat.Id couponId isAdmin false None
                 | None -> do! sendText msg.Chat.Id "Формат: /void <id>"
-            | t when not (isNull t) && t.StartsWith("/debug ") ->
+            | Some t when t.StartsWith("/debug ") ->
                 recordCommand "debug"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
-                | Some couponId -> do! handleDebug msg.From.Id msg.Chat.Id couponId
+                | Some couponId -> do! handleDebug user.id msg.Chat.Id couponId
                 | None -> ()
-            | t when not (isNull t) && t.StartsWith("/undo ") ->
+            | Some t when t.StartsWith("/undo ") ->
                 recordCommand "undo"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
-                | Some couponId -> do! handleUndo msg.From.Id msg.Chat.Id couponId
+                | Some couponId -> do! handleUndo user.id msg.Chat.Id couponId
                 | None -> ()
             | _ ->
-                if msg.Photo <> null && msg.Photo.Length > 0 && not (isNull msg.Caption) && (msg.Caption.StartsWith("/add") || msg.Caption.StartsWith("/a")) then
+                let hasPhoto = msg.Photo |> Option.exists (fun p -> p.Length > 0)
+                let captionIsAdd =
+                    msg.Caption |> Option.exists (fun c -> c.StartsWith("/add") || c.StartsWith("/a"))
+                if hasPhoto && captionIsAdd then
                     recordCommand "add_photo"
                     do! couponFlow.HandleAddManual user msg
                 else

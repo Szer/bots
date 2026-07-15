@@ -2,7 +2,6 @@ namespace CouponHubBot
 
 open System
 open System.Text.Json.Serialization
-open Telegram.Bot.Types
 open CouponHubBot
 
 [<CLIMutable>]
