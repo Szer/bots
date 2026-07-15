@@ -1,10 +1,29 @@
 module VahterBanBot.Tests.MLBanTests
 
+open System.Net
+open System.Text.Json
+open System.Threading.Tasks
 open VahterBanBot.Tests.ContainerTestBase
 open BotTestInfra
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open Xunit
+
+/// Channel posts can be fire-and-forget (e.g. the Detected Spam card and its
+/// AllLogs mirror), so poll for the matching sendMessage call instead of
+/// asserting on a single snapshot.
+let private tryFindChannelPost (fixture: MlEnabledVahterTestContainers) (channelId: int64) (marker: string) = task {
+    let mutable found = None
+    let mutable attempts = 0
+    while found.IsNone && attempts < 40 do
+        let! calls = fixture.GetFakeCalls "sendMessage"
+        found <- calls |> Array.tryFind (fun c ->
+            c.Body.Contains $"\"chat_id\":{channelId}" && c.Body.Contains marker)
+        if found.IsNone then
+            attempts <- attempts + 1
+            do! Task.Delay 250
+    return found
+}
 
 type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture) =
 
@@ -136,6 +155,83 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
         Assert.False userBanned
     }
     
+    [<Fact>]
+    let ``False-positive log post carries a ref token and can be re-marked as spam`` () = task {
+        // The exact flow vahters reported: a NOT-a-spam click was wrong, and they want
+        // to reverse it by forwarding the resulting false-positive log post and
+        // replying /vahter markspam to it.
+        // NOTE: uses "77777777" (8 sevens, spam-trained per test_seed.sql) and not the
+        // usual "7777777": this test marks the text ham via the NotASpam click, and
+        // IsMessageFalsePositive matches MessageMarkedHam events by text — reusing
+        // "7777777" would contaminate the other false-positive button tests.
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77777777")
+        let! _ = fixture.SendMessage msgUpdate
+        let! msgDeleted = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
+        Assert.True msgDeleted
+
+        // vahter clicks "NOT a spam" on the detected-spam card
+        let! callbackId = fixture.GetCallbackId msgUpdate.Message.Value "NotASpam"
+        let! _ = fixture.SendMessage(Tg.callback(string callbackId, from = fixture.Vahters[0]))
+
+        // the false-positive log post in AllLogs carries the #ref token
+        let chatId = msgUpdate.Message.Value.Chat.Id
+        let messageId = msgUpdate.Message.Value.MessageId
+        let token = $"#ref:{chatId}:{messageId}"
+        let! logPost = tryFindChannelPost fixture fixture.AllLogsChannel.Id $"marked message {messageId}"
+        Assert.True logPost.IsSome
+        Assert.Contains("false-positive", logPost.Value.Body)
+        Assert.Contains(token, logPost.Value.Body)
+
+        // simulate forwarding that post into the admin channel and replying /vahter markspam
+        let logText = JsonDocument.Parse(logPost.Value.Body).RootElement.GetProperty("text").GetString()
+        let forwarded = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
+        let! resp =
+            Tg.replyMsg(forwarded.Message.Value, "/vahter markspam", fixture.Vahters[0])
+            |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+        let! spam = fixture.MessageMarkedSpam(chatId, messageId)
+        Assert.True spam
+    }
+
+    [<Fact>]
+    let ``Detected spam card carries no ref token but its AllLogs mirror does`` () = task {
+        let user = Tg.user()
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "7777777", from = user)
+        let! _ = fixture.SendMessage msgUpdate
+        let! msgDeleted = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
+        Assert.True msgDeleted
+
+        // both posts are fire-and-forget; find them by the unique sender id
+        let marker = $"({user.Id})"
+        let! cardPost = tryFindChannelPost fixture fixture.DetectedSpamChannel.Id marker
+        let! logPost = tryFindChannelPost fixture fixture.AllLogsChannel.Id marker
+        Assert.True cardPost.IsSome
+        Assert.True logPost.IsSome
+
+        // the button carries the identity for the card; only the AllLogs mirror needs the token
+        Assert.DoesNotContain("#ref:", cardPost.Value.Body)
+        let token = $"#ref:{msgUpdate.Message.Value.Chat.Id}:{msgUpdate.Message.Value.MessageId}"
+        Assert.Contains(token, logPost.Value.Body)
+    }
+
+    [<Fact>]
+    let ``Potential spam card carries no ref token but its AllLogs mirror does`` () = task {
+        // firstName contains "spam" so the fake LLM returns SPAM → routes to human triage (potential spam channel)
+        let user = Tg.user(firstName = "spam test user")
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77", from = user)
+        let! _ = fixture.SendMessage msgUpdate
+
+        let marker = $"({user.Id})"
+        let! cardPost = tryFindChannelPost fixture fixture.PotentialSpamChannel.Id marker
+        let! logPost = tryFindChannelPost fixture fixture.AllLogsChannel.Id marker
+        Assert.True cardPost.IsSome
+        Assert.True logPost.IsSome
+
+        Assert.DoesNotContain("#ref:", cardPost.Value.Body)
+        let token = $"#ref:{msgUpdate.Message.Value.Chat.Id}:{msgUpdate.Message.Value.MessageId}"
+        Assert.Contains(token, logPost.Value.Body)
+    }
+
     [<Fact>]
     let ``Potential spam NOT SPAM button does not ban user`` () = task {
         // For potential spam, we need a text that gives score >= 0 but < 1.0 (ML_SPAM_THRESHOLD)
