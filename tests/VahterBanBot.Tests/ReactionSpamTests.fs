@@ -318,12 +318,11 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
                 && c.Body.Contains $"@{userWithHandle.Username}")
         Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
         let withHandleBody = alertsForWithHandle[0].Body
-        // Telegram.Bot 22.x serializes ParseMode via .NET enum name → "Html"; Telegram
-        // accepts case-insensitively. Tolerate either casing so the test isn't tied to
-        // the SDK's enum serialization style.
+        // Telegram accepts parse_mode case-insensitively; SDKs disagree on casing
+        // (Telegram.Bot 22.x emitted "Html", Funogram's DU converter emits "html").
+        // Assert case-insensitively so the test isn't tied to the SDK's style.
         Assert.True(
-            withHandleBody.Contains "\"parse_mode\":\"HTML\""
-            || withHandleBody.Contains "\"parse_mode\":\"Html\"",
+            withHandleBody.Contains("\"parse_mode\":\"html\"", System.StringComparison.OrdinalIgnoreCase),
             "Alert must be sent with parse_mode=HTML")
         Assert.Contains($"@{userWithHandle.Username} ({userWithHandle.Id})", withHandleBody)
         Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
