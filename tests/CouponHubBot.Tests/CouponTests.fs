@@ -2027,7 +2027,7 @@ VALUES (@owner_id, @photo_file_id, @value, @min_check, @expires_at::date, 'avail
 
             let mutable capturedEx: exn = null
             try
-                // take:99999999 → coupon not found → sendText → sendMessage fails → ApiRequestException thrown
+                // take:99999999 → coupon not found → sendText → sendMessage fails → TelegramApiException thrown
                 let! _ = fixture.SendUpdate(Tg.dmCallback("take:99999999", user))
 
                 // Verify that sendMessage was attempted (i.e., the failure path was actually exercised)

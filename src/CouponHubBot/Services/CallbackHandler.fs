@@ -6,9 +6,7 @@ open System.Diagnostics
 open System.Runtime.ExceptionServices
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types
-open Telegram.Bot.Types.Enums
+open Funogram.Telegram.Types
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
@@ -16,7 +14,7 @@ open CouponHubBot.Utils
 open BotInfra
 
 type CallbackHandler(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
     db: DbService,
     membership: TelegramMembershipService,
@@ -25,19 +23,14 @@ type CallbackHandler(
     time: TimeProvider,
     logger: ILogger<CallbackHandler>
 ) =
-    let sendText = BotHelpers.sendText botClient
+    let sendText = BotHelpers.sendText tg
     let ensureCommunityMember = BotHelpers.ensureCommunityMember membership sendText
 
     member private _.EditBulkOrSend (batch: PendingAddBatch) (text: string) =
         task {
             if batch.bulk_message_id.HasValue then
                 try
-                    do!
-                        botClient.EditMessageText(
-                            ChatId batch.bulk_chat_id,
-                            int batch.bulk_message_id.Value,
-                            text)
-                        |> taskIgnore
+                    do! BotHelpers.editMessageText tg batch.bulk_chat_id batch.bulk_message_id.Value text
                 with _ ->
                     do! sendText batch.bulk_chat_id text
             else
@@ -121,19 +114,19 @@ type CallbackHandler(
             do! this.EditBulkOrSend batch summary
         }
 
-    member private this.HandleBulkCallback (user: DbUser) (cq: CallbackQuery) =
+    member private this.HandleBulkCallback (user: DbUser) (chatId: int64) (data: string) =
         task {
             Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "addflow_bulk"))
-            Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box cq.Data))
+            Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box data))
 
             // parts: [| "addflow"; "bulk"; "confirm" | "cancel"; "<batchId>" |]
-            let parts = cq.Data.Split(':', StringSplitOptions.RemoveEmptyEntries)
+            let parts = data.Split(':', StringSplitOptions.RemoveEmptyEntries)
             if parts.Length < 4 then
-                do! sendText cq.Message.Chat.Id "Не понял действие."
+                do! sendText chatId "Не понял действие."
             else
                 match Int64.TryParse(parts[3]) with
                 | false, _ ->
-                    do! sendText cq.Message.Chat.Id "Не понял идентификатор пакета."
+                    do! sendText chatId "Не понял идентификатор пакета."
                 | true, batchId ->
                     // Tag the parent handleCallbackQuery span so the trace is
                     // searchable by batchId in Tempo (mirrors finalizeBatch's tag).
@@ -151,58 +144,62 @@ type CallbackHandler(
                         let! claimed = db.TryClaimAwaitingBatch(batchId, user.id)
                         match claimed with
                         | None ->
-                            do! sendText cq.Message.Chat.Id "Этот пакет уже устарел, отправь альбом заново."
+                            do! sendText chatId "Этот пакет уже устарел, отправь альбом заново."
                         | Some batch ->
                             if parts[2] = "cancel" then do! this.BulkBatchCancel batch
                             else do! this.BulkBatchConfirm user batch
                     | _ ->
-                        do! sendText cq.Message.Chat.Id "Не понял действие."
+                        do! sendText chatId "Не понял действие."
         }
 
     member this.HandleCallbackQuery (cq: CallbackQuery) =
         task {
             use a = botActivity.StartActivity("handleCallbackQuery")
             %a.SetTag("callbackQueryId", cq.Id)
-            if not (isNull a) then %a.SetTag("callbackData", cq.Data)
+            if not (isNull a) then %a.SetTag("callbackData", Option.toObj cq.Data)
             let mutable caughtExn = ValueNone
             try
-                if cq.Message <> null && cq.From <> null then
-                    %a.SetTag("chatId", cq.Message.Chat.Id)
+                match Tg.callbackMessage cq with
+                | None -> ()
+                | Some (chat, messageId) ->
+                    let chatId = chat.Id
+                    %a.SetTag("chatId", chatId)
                     %a.SetTag("fromId", cq.From.Id)
-                    let! ok = ensureCommunityMember cq.From.Id cq.Message.Chat.Id
+                    let! ok = ensureCommunityMember cq.From.Id chatId
                     if not ok then () else
 
                     let! user =
                         { id = cq.From.Id
-                          username = cq.From.Username
+                          username = Option.toObj cq.From.Username
                           first_name = cq.From.FirstName
-                          last_name = cq.From.LastName
+                          last_name = Option.toObj cq.From.LastName
                           created_at = time.GetUtcNow().UtcDateTime
                           updated_at = time.GetUtcNow().UtcDateTime }
                         |> db.UpsertUser
 
-                    let isPrivateChat = cq.Message.Chat.Type = ChatType.Private
-                    let hasData = not (isNull cq.Data)
+                    let isPrivateChat = chat.Type = ChatType.Private
+                    let data = cq.Data |> Option.defaultValue ""
+                    let hasData = cq.Data.IsSome
 
-                    if isPrivateChat && hasData && cq.Data.StartsWith("take:") then
+                    if isPrivateChat && hasData && data.StartsWith("take:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "take"))
                         Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box "take"))
-                        let idStr = cq.Data.Substring("take:".Length)
+                        let idStr = data.Substring("take:".Length)
                         match BotHelpers.parseInt idStr with
                         | Some couponId ->
-                            do! commandHandler.HandleTake user cq.Message.Chat.Id couponId
+                            do! commandHandler.HandleTake user chatId couponId
                         | None ->
                             ()
-                    elif isPrivateChat && hasData && cq.Data.StartsWith("addflow:bulk:") then
-                        do! this.HandleBulkCallback user cq
-                    elif isPrivateChat && hasData && cq.Data.StartsWith("addflow:") then
+                    elif isPrivateChat && hasData && data.StartsWith("addflow:bulk:") then
+                        do! this.HandleBulkCallback user chatId data
+                    elif isPrivateChat && hasData && data.StartsWith("addflow:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "addflow"))
-                        Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box cq.Data))
+                        Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box data))
                         match! db.GetPendingAddFlow user.id with
                         | None ->
-                            do! sendText cq.Message.Chat.Id "Этот шаг добавления уже устарел. Начни заново: /add"
+                            do! sendText chatId "Этот шаг добавления уже устарел. Начни заново: /add"
                         | Some flow ->
-                            match cq.Data with
+                            match data with
                             | d when d.StartsWith("addflow:disc:") ->
                                 // addflow:disc:<value>:<min_check>
                                 let parts = d.Split(':', StringSplitOptions.RemoveEmptyEntries)
@@ -218,7 +215,7 @@ type CallbackHandler(
                                                     updated_at = time.GetUtcNow().UtcDateTime }
                                             do! db.UpsertPendingAddFlow next
                                             let vf = if flow.valid_from.HasValue then Some flow.valid_from.Value else None
-                                            do! couponFlow.HandleAddWizardSendConfirm cq.Message.Chat.Id v mc flow.expires_at.Value flow.barcode_text vf
+                                            do! couponFlow.HandleAddWizardSendConfirm chatId v mc flow.expires_at.Value flow.barcode_text vf
                                         else
                                             let next =
                                                 { flow with
@@ -227,11 +224,11 @@ type CallbackHandler(
                                                     min_check = Nullable(mc)
                                                     updated_at = time.GetUtcNow().UtcDateTime }
                                             do! db.UpsertPendingAddFlow next
-                                            do! couponFlow.HandleAddWizardAskDate cq.Message.Chat.Id
+                                            do! couponFlow.HandleAddWizardAskDate chatId
                                     | _ ->
-                                        do! sendText cq.Message.Chat.Id "Не понял значения. Попробуй ещё раз: /add"
+                                        do! sendText chatId "Не понял значения. Попробуй ещё раз: /add"
                                 else
-                                    do! sendText cq.Message.Chat.Id "Не понял значения. Попробуй ещё раз: /add"
+                                    do! sendText chatId "Не понял значения. Попробуй ещё раз: /add"
                             | "addflow:date:today" ->
                                 if flow.value.HasValue && flow.min_check.HasValue then
                                     let expiresAt = DateOnly.FromDateTime(time.GetUtcNow().UtcDateTime)
@@ -242,9 +239,9 @@ type CallbackHandler(
                                             updated_at = time.GetUtcNow().UtcDateTime }
                                     do! db.UpsertPendingAddFlow next
                                     let vf = if flow.valid_from.HasValue then Some flow.valid_from.Value else None
-                                    do! couponFlow.HandleAddWizardSendConfirm cq.Message.Chat.Id flow.value.Value flow.min_check.Value expiresAt flow.barcode_text vf
+                                    do! couponFlow.HandleAddWizardSendConfirm chatId flow.value.Value flow.min_check.Value expiresAt flow.barcode_text vf
                                 else
-                                    do! sendText cq.Message.Chat.Id "Сначала выбери скидку. Начни заново: /add"
+                                    do! sendText chatId "Сначала выбери скидку. Начни заново: /add"
                             | "addflow:date:tomorrow" ->
                                 if flow.value.HasValue && flow.min_check.HasValue then
                                     let expiresAt = DateOnly.FromDateTime(time.GetUtcNow().UtcDateTime.AddDays(1.0))
@@ -255,9 +252,9 @@ type CallbackHandler(
                                             updated_at = time.GetUtcNow().UtcDateTime }
                                     do! db.UpsertPendingAddFlow next
                                     let vf = if flow.valid_from.HasValue then Some flow.valid_from.Value else None
-                                    do! couponFlow.HandleAddWizardSendConfirm cq.Message.Chat.Id flow.value.Value flow.min_check.Value expiresAt flow.barcode_text vf
+                                    do! couponFlow.HandleAddWizardSendConfirm chatId flow.value.Value flow.min_check.Value expiresAt flow.barcode_text vf
                                 else
-                                    do! sendText cq.Message.Chat.Id "Сначала выбери скидку. Начни заново: /add"
+                                    do! sendText chatId "Сначала выбери скидку. Начни заново: /add"
                             | "addflow:ocr:yes" ->
                                 // If OCR fully recognized and user confirms, add immediately (no extra confirm screen).
                                 if
@@ -284,18 +281,18 @@ type CallbackHandler(
                                         let v = coupon.value.ToString("0.##")
                                         let mc = coupon.min_check.ToString("0.##")
                                         let d = BotHelpers.formatUiDate coupon.expires_at
-                                        do! sendText cq.Message.Chat.Id $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
+                                        do! sendText chatId $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
                                     | AddCouponResult.Expired ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
+                                        do! sendText chatId "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
                                     | AddCouponResult.DuplicatePhoto existingId ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id $"Похоже, этот купон уже был добавлен ранее (та же фотография). Уже есть купон ID:{existingId}. Начни заново: /add"
+                                        do! sendText chatId $"Похоже, этот купон уже был добавлен ранее (та же фотография). Уже есть купон ID:{existingId}. Начни заново: /add"
                                     | AddCouponResult.DuplicateBarcode existingId ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id $"Купон с таким штрихкодом уже есть в базе и ещё не истёк. Уже есть купон ID:{existingId}. Начни заново: /add"
+                                        do! sendText chatId $"Купон с таким штрихкодом уже есть в базе и ещё не истёк. Уже есть купон ID:{existingId}. Начни заново: /add"
                                 else
-                                    do! sendText cq.Message.Chat.Id "Этот шаг уже неактуален. Начни заново: /add"
+                                    do! sendText chatId "Этот шаг уже неактуален. Начни заново: /add"
                             | "addflow:ocr:no" ->
                                 // Clear OCR suggestion and continue manually; keep barcode (already validated at photo upload).
                                 let next =
@@ -307,12 +304,9 @@ type CallbackHandler(
                                         updated_at = time.GetUtcNow().UtcDateTime }
                                 do! db.UpsertPendingAddFlow next
                                 do!
-                                    botClient.SendMessage(
-                                        ChatId cq.Message.Chat.Id,
-                                        "Ок, выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
-                                        replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                                    )
-                                    |> taskIgnore
+                                    BotHelpers.sendTextMarkup tg chatId
+                                        "Ок, выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
+                                        (BotHelpers.addWizardDiscountKeyboard())
                             | "addflow:confirm" ->
                                 if flow.photo_file_id <> null && flow.value.HasValue && flow.min_check.HasValue && flow.expires_at.HasValue then
                                     let vf = if flow.valid_from.HasValue then Some flow.valid_from.Value else None
@@ -332,66 +326,66 @@ type CallbackHandler(
                                         let v = coupon.value.ToString("0.##")
                                         let mc = coupon.min_check.ToString("0.##")
                                         let d = BotHelpers.formatUiDate coupon.expires_at
-                                        do! sendText cq.Message.Chat.Id $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
+                                        do! sendText chatId $"Добавлен купон ID:{coupon.id}: {v}€ из {mc}€, до {d}"
                                     | AddCouponResult.Expired ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
+                                        do! sendText chatId "Нельзя добавить истёкший купон (дата в прошлом). Начни заново: /add"
                                     | AddCouponResult.DuplicatePhoto existingId ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id $"Похоже, этот купон уже был добавлен ранее (та же фотография). Уже есть купон ID:{existingId}. Начни заново: /add"
+                                        do! sendText chatId $"Похоже, этот купон уже был добавлен ранее (та же фотография). Уже есть купон ID:{existingId}. Начни заново: /add"
                                     | AddCouponResult.DuplicateBarcode existingId ->
                                         do! db.ClearPendingAddFlow user.id
-                                        do! sendText cq.Message.Chat.Id $"Купон с таким штрихкодом уже есть в базе и ещё не истёк. Уже есть купон ID:{existingId}. Начни заново: /add"
+                                        do! sendText chatId $"Купон с таким штрихкодом уже есть в базе и ещё не истёк. Уже есть купон ID:{existingId}. Начни заново: /add"
                                 else
-                                    do! sendText cq.Message.Chat.Id "Не хватает данных для добавления. Начни заново: /add"
+                                    do! sendText chatId "Не хватает данных для добавления. Начни заново: /add"
                             | "addflow:cancel" ->
                                 do! db.ClearPendingAddFlow user.id
-                                do! sendText cq.Message.Chat.Id "Ок, добавление купона отменено."
+                                do! sendText chatId "Ок, добавление купона отменено."
                             | _ ->
-                                do! sendText cq.Message.Chat.Id "Не понял действие. Начни заново: /add"
-                    elif isPrivateChat && hasData && cq.Data.StartsWith("return:") then
+                                do! sendText chatId "Не понял действие. Начни заново: /add"
+                    elif isPrivateChat && hasData && data.StartsWith("return:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "return"))
-                        let deleteOnSuccess = cq.Data.EndsWith(":del")
-                        let baseData = if deleteOnSuccess then cq.Data.Substring(0, cq.Data.Length - 4) else cq.Data
+                        let deleteOnSuccess = data.EndsWith(":del")
+                        let baseData = if deleteOnSuccess then data.Substring(0, data.Length - 4) else data
                         let idStr = baseData.Substring("return:".Length)
                         match BotHelpers.parseInt idStr with
                         | Some couponId ->
-                            let! ok = commandHandler.HandleReturn user cq.Message.Chat.Id couponId
-                            if ok && deleteOnSuccess && cq.Message <> null then
+                            let! ok = commandHandler.HandleReturn user chatId couponId
+                            if ok && deleteOnSuccess then
                                 try
-                                    do! botClient.DeleteMessage(ChatId cq.Message.Chat.Id, cq.Message.MessageId)
+                                    do! BotHelpers.deleteMessage tg chatId messageId
                                 with _ -> ()
                         | None -> ()
-                    elif isPrivateChat && hasData && cq.Data.StartsWith("used:") then
+                    elif isPrivateChat && hasData && data.StartsWith("used:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "used"))
-                        let deleteOnSuccess = cq.Data.EndsWith(":del")
-                        let baseData = if deleteOnSuccess then cq.Data.Substring(0, cq.Data.Length - 4) else cq.Data
+                        let deleteOnSuccess = data.EndsWith(":del")
+                        let baseData = if deleteOnSuccess then data.Substring(0, data.Length - 4) else data
                         let idStr = baseData.Substring("used:".Length)
                         match BotHelpers.parseInt idStr with
                         | Some couponId ->
-                            let! ok = commandHandler.HandleUsed user cq.Message.Chat.Id couponId
-                            if ok && deleteOnSuccess && cq.Message <> null then
+                            let! ok = commandHandler.HandleUsed user chatId couponId
+                            if ok && deleteOnSuccess then
                                 try
-                                    do! botClient.DeleteMessage(ChatId cq.Message.Chat.Id, cq.Message.MessageId)
+                                    do! BotHelpers.deleteMessage tg chatId messageId
                                 with _ -> ()
                         | None -> ()
-                    elif isPrivateChat && hasData && cq.Data.StartsWith("void:") then
+                    elif isPrivateChat && hasData && data.StartsWith("void:") then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "void"))
-                        let deleteOnSuccess = cq.Data.EndsWith(":del")
-                        let baseData = if deleteOnSuccess then cq.Data.Substring(0, cq.Data.Length - 4) else cq.Data
+                        let deleteOnSuccess = data.EndsWith(":del")
+                        let baseData = if deleteOnSuccess then data.Substring(0, data.Length - 4) else data
                         let idStr = baseData.Substring("void:".Length)
                         match BotHelpers.parseInt idStr with
                         | Some couponId ->
                             let isAdmin = options.Value.FeedbackAdminIds |> Array.contains user.id
-                            do! commandHandler.HandleVoid user cq.Message.Chat.Id couponId isAdmin deleteOnSuccess (Some cq.Message)
+                            do! commandHandler.HandleVoid user chatId couponId isAdmin deleteOnSuccess (Some messageId)
                         | None -> ()
-                    elif isPrivateChat && hasData && cq.Data = "myAdded" then
+                    elif isPrivateChat && hasData && data = "myAdded" then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "myAdded"))
-                        do! commandHandler.HandleAdded user cq.Message.Chat.Id
+                        do! commandHandler.HandleAdded user chatId
             with ex ->
                 caughtExn <- ValueSome (ExceptionDispatchInfo.Capture(ex))
             try
-                do! botClient.AnswerCallbackQuery(cq.Id)
+                do! tg.CallExn(Funogram.Telegram.Req.AnswerCallbackQuery.Make(cq.Id)) |> taskIgnore
             with _ -> ()
             match caughtExn with
             | ValueSome edi -> edi.Throw()

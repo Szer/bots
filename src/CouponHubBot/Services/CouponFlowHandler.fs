@@ -8,9 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types
-open Telegram.Bot.Types.ReplyMarkups
+open Funogram.Telegram.Types
 open CouponHubBot
 open CouponHubBot.Services
 open CouponHubBot.Telemetry
@@ -18,7 +16,7 @@ open CouponHubBot.Utils
 open BotInfra
 
 type CouponFlowHandler(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     botOptions: IOptions<BotConfiguration>,
     ocrOptions: IOptions<BotOcrConfig>,
     db: DbService,
@@ -27,20 +25,20 @@ type CouponFlowHandler(
     time: TimeProvider,
     logger: ILogger<CouponFlowHandler>
 ) =
-    let sendText = BotHelpers.sendText botClient
+    let sendText = BotHelpers.sendText tg
 
     // Best-effort wrappers for cosmetic Telegram calls whose failure should
     // never fail the surrounding flow (e.g. deleting an already-gone placeholder).
     let tryDeleteMessage (chatId: int64) (messageId: int64) : Task =
         task {
-            try do! botClient.DeleteMessage(ChatId chatId, int messageId)
+            try do! BotHelpers.deleteMessage tg chatId messageId
             with _ -> ()
         } :> Task
 
     let tryEditMessage (chatId: int64) (messageId: int64) (text: string) : Task<bool> =
         task {
             try
-                do! botClient.EditMessageText(ChatId chatId, int messageId, text) |> taskIgnore
+                do! BotHelpers.editMessageText tg chatId messageId text
                 return true
             with _ -> return false
         }
@@ -104,11 +102,12 @@ type CouponFlowHandler(
             %a.SetTag("userId", user.id)
 
             let chatId = msg.Chat.Id
-            let caption = msg.Caption
-            let hasPhoto = not (isNull msg.Photo) && msg.Photo.Length > 0
+            let photos = msg.Photo |> Option.defaultValue [||]
+            let hasPhoto = photos.Length > 0
             let parts =
-                if isNull caption then [||]
-                else caption.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries)
+                match msg.Caption with
+                | None -> [||]
+                | Some caption -> caption.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries)
 
             if not hasPhoto then
                 do! sendText chatId "Для ручного добавления пришли фото купона с подписью:\n/add <discount> <min_check> <date>\nНапример: /add 10 50 25.01.2026 (или просто день: /add 10 50 25)"
@@ -121,8 +120,8 @@ type CouponFlowHandler(
                 match valueOpt, minCheckOpt, dateOpt with
                 | Some value, Some minCheck, Some expiresAt ->
                     let largestPhoto =
-                        msg.Photo
-                        |> Array.maxBy (fun p -> if p.FileSize.HasValue then p.FileSize.Value else 0)
+                        photos
+                        |> Array.maxBy (fun p -> p.FileSize |> Option.defaultValue 0L)
                     match! db.TryAddCoupon(user.id, largestPhoto.FileId, value, minCheck, expiresAt, null) with
                     | AddCouponResult.Added coupon ->
                         let v = coupon.value.ToString("0.##")
@@ -177,37 +176,27 @@ type CouponFlowHandler(
             if not ocrConfig.OcrEnabled then
                 logger.LogInformation("OCR disabled; falling back to manual entry for user {UserId}", user.id)
                 do!
-                    botClient.SendMessage(
-                        ChatId chatId,
-                        "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
-                        replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                    )
-                    |> taskIgnore
+                    BotHelpers.sendTextMarkup tg chatId
+                        "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
+                        (BotHelpers.addWizardDiscountKeyboard())
             else
                 // Attempt OCR prefill (optional). Download photo into memory, then run OCR engine.
-                let! file = botClient.GetFile(photoFileId)
-                if String.IsNullOrWhiteSpace(file.FilePath) then
+                let! file = tg.CallExn(Funogram.Telegram.Req.GetFile.Make(photoFileId))
+                let filePath = file.FilePath |> Option.defaultValue ""
+                if String.IsNullOrWhiteSpace filePath then
                     logger.LogWarning("Telegram file.FilePath missing for {FileId}; falling back to manual entry", photoFileId)
                     do!
-                        botClient.SendMessage(
-                            ChatId chatId,
-                            "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
-                            replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                        )
-                        |> taskIgnore
+                        BotHelpers.sendTextMarkup tg chatId
+                            "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
+                            (BotHelpers.addWizardDiscountKeyboard())
                 else
-                    use ms = new System.IO.MemoryStream()
-                    do! botClient.DownloadFile(file.FilePath, ms)
-                    let bytes = ms.ToArray()
+                    let! bytes = tg.DownloadFile filePath
 
                     if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                         do!
-                            botClient.SendMessage(
-                                ChatId chatId,
-                                "Картинка слишком большая для распознавания. Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\".",
-                                replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                            )
-                            |> taskIgnore
+                            BotHelpers.sendTextMarkup tg chatId
+                                "Картинка слишком большая для распознавания. Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
+                                (BotHelpers.addWizardDiscountKeyboard())
                     else
                         // OCR runs synchronously inside the webhook update handler, but
                         // Recognize degrades a transient/timeout failure (retried by the
@@ -278,12 +267,9 @@ type CouponFlowHandler(
                             let mc = minCheck.ToString("0.##")
                             let d = BotHelpers.formatUiDate expiresAt
                             do!
-                                botClient.SendMessage(
-                                    ChatId chatId,
-                                    $"Я распознал: {v}€ из {mc}€, до {d}, штрихкод: {barcodeText}. Всё верно?",
-                                    replyMarkup = BotHelpers.addWizardOcrKeyboard()
-                                )
-                                |> taskIgnore
+                                BotHelpers.sendTextMarkup tg chatId
+                                    $"Я распознал: {v}€ из {mc}€, до {d}, штрихкод: {barcodeText}. Всё верно?"
+                                    (BotHelpers.addWizardOcrKeyboard())
                         | Some value, Some minCheck, None ->
                             do! db.UpsertPendingAddFlow(
                                     { user_id = user.id
@@ -299,12 +285,9 @@ type CouponFlowHandler(
                             let v = value.ToString("0.##")
                             let mc = minCheck.ToString("0.##")
                             do!
-                                botClient.SendMessage(
-                                    ChatId chatId,
-                                    $"Я распознал скидку: {v}€ из {mc}€. Теперь выбери дату истечения (или напиши \"25\", \"25.01.2026\", \"2026-01-25\"):",
-                                    replyMarkup = BotHelpers.addWizardDateKeyboard()
-                                )
-                                |> taskIgnore
+                                BotHelpers.sendTextMarkup tg chatId
+                                    $"Я распознал скидку: {v}€ из {mc}€. Теперь выбери дату истечения (или напиши \"25\", \"25.01.2026\", \"2026-01-25\"):"
+                                    (BotHelpers.addWizardDateKeyboard())
                         | _ ->
                             do! db.UpsertPendingAddFlow(
                                     { user_id = user.id
@@ -326,30 +309,25 @@ type CouponFlowHandler(
                                     let d = BotHelpers.formatUiDate expiresAt
                                     $"Я распознал дату истечения {d}. Теперь выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
                                 | None -> "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
-                            do!
-                                botClient.SendMessage(
-                                    ChatId chatId,
-                                    text,
-                                    replyMarkup = BotHelpers.addWizardDiscountKeyboard()
-                                )
-                                |> taskIgnore
+                            do! BotHelpers.sendTextMarkup tg chatId text (BotHelpers.addWizardDiscountKeyboard())
         }
 
     member _.HandleAddWizardAskDate (chatId: int64) =
-        botClient.SendMessage(ChatId chatId, "Выбери дату истечения (или напиши \"25\", \"25.01.2026\", \"2026-01-25\"):", replyMarkup = BotHelpers.addWizardDateKeyboard())
-        |> taskIgnore
+        BotHelpers.sendTextMarkup tg chatId
+            "Выбери дату истечения (или напиши \"25\", \"25.01.2026\", \"2026-01-25\"):"
+            (BotHelpers.addWizardDateKeyboard())
 
     member _.HandleAddWizardSendConfirm (chatId: int64) (value: decimal) (minCheck: decimal) (expiresAt: DateOnly) (barcodeText: string | null) (validFrom: DateOnly option) =
         let text, kb = buildConfirmTextAndKeyboard value minCheck expiresAt barcodeText validFrom
-        botClient.SendMessage(ChatId chatId, text, replyMarkup = kb) |> taskIgnore
+        BotHelpers.sendTextMarkup tg chatId text kb
 
-    member _.HandleAddWizardEditConfirm (chatId: int64) (messageId: int) (value: decimal) (minCheck: decimal) (expiresAt: DateOnly) (barcodeText: string | null) (validFrom: DateOnly option) =
+    member _.HandleAddWizardEditConfirm (chatId: int64) (messageId: int64) (value: decimal) (minCheck: decimal) (expiresAt: DateOnly) (barcodeText: string | null) (validFrom: DateOnly option) =
         let text, kb = buildConfirmTextAndKeyboard value minCheck expiresAt barcodeText validFrom
         task {
             try
-                do! botClient.EditMessageText(ChatId chatId, messageId, text, replyMarkup = kb) |> taskIgnore
+                do! BotHelpers.editMessageTextMarkup tg chatId messageId text kb
             with _ ->
-                do! botClient.SendMessage(ChatId chatId, text, replyMarkup = kb) |> taskIgnore
+                do! BotHelpers.sendTextMarkup tg chatId text kb
         }
 
     /// Tries to advance the add wizard for a non-command message.
@@ -362,7 +340,7 @@ type CouponFlowHandler(
                 // UX: if no pending flow is active, a plain photo starts /add implicitly.
                 // Do NOT override explicit /add manual flow via caption.
                 match BotHelpers.getLargestPhotoFileId msg with
-                | Some photoFileId when isNull msg.Caption || (not (msg.Caption.StartsWith("/add")) && not (msg.Caption.StartsWith("/a"))) ->
+                | Some photoFileId when msg.Caption |> Option.forall (fun c -> not (c.StartsWith("/add")) && not (c.StartsWith("/a"))) ->
                     do! this.HandleAddWizardPhoto user msg.Chat.Id photoFileId
                     return true
                 | _ -> return false
@@ -372,8 +350,8 @@ type CouponFlowHandler(
                     do! this.HandleAddWizardPhoto user msg.Chat.Id photoFileId
                     return true
                 | None -> return false
-            | Some flow when flow.stage = "awaiting_discount_choice" && not (isNull msg.Text) ->
-                match BotHelpers.tryParseTwoDecimals msg.Text with
+            | Some flow when flow.stage = "awaiting_discount_choice" && msg.Text.IsSome ->
+                match BotHelpers.tryParseTwoDecimals msg.Text.Value with
                 | Some (v, mc) ->
                     if flow.expires_at.HasValue then
                         do! db.UpsertPendingAddFlow(
@@ -398,8 +376,8 @@ type CouponFlowHandler(
                 | None ->
                     do! sendText msg.Chat.Id "Не понял. Пришли два числа: скидка и минимальный чек. Например: 10 50 или 10/50"
                     return true
-            | Some flow when flow.stage = "awaiting_date_choice" && not (isNull msg.Text) ->
-                match BotHelpers.tryParseDateOnly time msg.Text with
+            | Some flow when flow.stage = "awaiting_date_choice" && msg.Text.IsSome ->
+                match BotHelpers.tryParseDateOnly time msg.Text.Value with
                 | Some expiresAt ->
                     if flow.value.HasValue && flow.min_check.HasValue then
                         let todayUtc = DateOnly.FromDateTime(time.GetUtcNow().UtcDateTime)
@@ -419,7 +397,7 @@ type CouponFlowHandler(
             | Some _ ->
                 // If user sends a photo at a stage where we don't expect photos (e.g. awaiting_confirm),
                 // don't silently ignore: warn how to proceed.
-                if msg.Photo <> null && msg.Photo.Length > 0 then
+                if msg.Photo |> Option.exists (fun p -> p.Length > 0) then
                     do! sendText msg.Chat.Id "Сейчас идёт добавление купона. Закончи текущий шаг или начни заново: /add"
                     return true
                 else
@@ -497,13 +475,12 @@ type CouponFlowHandler(
                 if not ocrConfig.OcrEnabled then
                     do! writeNeedsInput "OCR disabled"
                 else
-                    let! file = botClient.GetFile(photoFileId)
-                    if isNull file || String.IsNullOrWhiteSpace file.FilePath then
+                    let! file = tg.CallExn(Funogram.Telegram.Req.GetFile.Make(photoFileId))
+                    let filePath = file.FilePath |> Option.defaultValue ""
+                    if String.IsNullOrWhiteSpace filePath then
                         do! writeNeedsInput "OCR failed"
                     else
-                        use ms = new System.IO.MemoryStream()
-                        do! botClient.DownloadFile(file.FilePath, ms)
-                        let bytes = ms.ToArray()
+                        let! bytes = tg.DownloadFile filePath
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                             do! writeNeedsInput "OCR failed"
                         else
@@ -569,16 +546,8 @@ type CouponFlowHandler(
             let needsInput = items |> Array.filter (fun i -> i.status = "needs_input")
             for item in needsInput do
                 let replyText = this.NeedsInputReplyText item.failure_note
-                let replyParams =
-                    ReplyParameters(
-                        MessageId = int item.photo_message_id,
-                        AllowSendingWithoutReply = true)
                 try
-                    do! botClient.SendMessage(
-                            ChatId batch.bulk_chat_id,
-                            replyText,
-                            replyParameters = replyParams)
-                        |> taskIgnore
+                    do! BotHelpers.sendTextReply tg batch.bulk_chat_id replyText item.photo_message_id
                 with _ ->
                     try do! sendText batch.bulk_chat_id replyText with _ -> ()
         } :> Task
@@ -594,12 +563,12 @@ type CouponFlowHandler(
             if batch.bulk_message_id.HasValue then
                 do! tryDeleteMessage batch.bulk_chat_id batch.bulk_message_id.Value
 
-            let! sent = botClient.SendMessage(ChatId batch.bulk_chat_id, text, replyMarkup = kb)
-            let! linked = db.SetBatchBulkMessageId(batchId, int64 sent.MessageId)
+            let! sent = BotHelpers.sendMessageMarkup tg batch.bulk_chat_id text kb
+            let! linked = db.SetBatchBulkMessageId(batchId, sent.MessageId)
             if not linked then
                 // Batch was abandoned between SendMessage and SetBatchBulkMessageId.
                 // The bulk-confirm message has no batch to act on; delete the orphan.
-                do! tryDeleteMessage batch.bulk_chat_id (int64 sent.MessageId)
+                do! tryDeleteMessage batch.bulk_chat_id sent.MessageId
 
             do! this.SendPerPhotoReplies batch items
         } :> Task
@@ -683,7 +652,7 @@ type CouponFlowHandler(
                 %a.SetTag("userId", user.id)
                 %a.SetTag("chatId", msg.Chat.Id)
 
-            let mediaGroupId = msg.MediaGroupId
+            let mediaGroupId = msg.MediaGroupId |> Option.defaultValue ""
             if String.IsNullOrWhiteSpace mediaGroupId then return false else
 
             match BotHelpers.getLargestPhotoFileId msg with
@@ -718,32 +687,27 @@ type CouponFlowHandler(
                 for stale in abandoned do
                     if stale.bulk_message_id.HasValue then
                         try
-                            do! botClient.EditMessageText(
-                                    ChatId stale.bulk_chat_id,
-                                    int stale.bulk_message_id.Value,
-                                    "Отменено: пришёл новый альбом.")
-                                |> taskIgnore
+                            do! BotHelpers.editMessageText tg stale.bulk_chat_id stale.bulk_message_id.Value
+                                    "Отменено: пришёл новый альбом."
                         with _ -> ()
 
                 if isNew then
                     try
                         let! placeholder =
-                            botClient.SendMessage(
-                                ChatId chatId,
-                                "Получил, обрабатываю купоны, подожди немного…")
-                        let! linked = db.SetBatchBulkMessageId(batchId, int64 placeholder.MessageId)
+                            BotHelpers.sendMessage tg chatId "Получил, обрабатываю купоны, подожди немного…"
+                        let! linked = db.SetBatchBulkMessageId(batchId, placeholder.MessageId)
                         if not linked then
                             // Batch was abandoned (by /add, /my, or a fresh album
                             // for a different media_group_id) during the
                             // SendMessage RPC. The placeholder we just sent is an
                             // orphan — clean it up so it doesn't sit in chat.
                             try
-                                do! botClient.DeleteMessage(ChatId chatId, placeholder.MessageId)
+                                do! BotHelpers.deleteMessage tg chatId placeholder.MessageId
                             with _ -> ()
                     with ex ->
                         logger.LogWarning(ex, "Failed to send album placeholder for batch {BatchId}", batchId)
 
-                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, int64 msg.MessageId)
+                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, msg.MessageId)
                 match itemIdOpt with
                 | None ->
                     // Either a Telegram redelivery (same photo_file_id) or the batch
