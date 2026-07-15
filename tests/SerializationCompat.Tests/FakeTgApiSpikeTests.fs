@@ -33,6 +33,7 @@ type FakeTgApiSpikeTests() =
                 let a = builder.Build()
                 %a.MapPost("/bot{token}/{method}", Func<HttpContext, Task>(fun ctx -> FakeTgApi.Handlers.handleTelegramMethod ctx))
                 %a.MapPost("/bot{token}/{method}/{rest}", Func<HttpContext, Task>(fun ctx -> FakeTgApi.Handlers.handleTelegramMethod ctx))
+                %a.MapGet("/file/bot{token}/{*path}", Func<HttpContext, Task>(fun ctx -> FakeTgApi.Handlers.handleFileDownload ctx))
                 a.Urls.Add "http://127.0.0.1:0"
                 do! a.StartAsync()
                 let addr =
@@ -83,6 +84,24 @@ type FakeTgApiSpikeTests() =
             match result with
             | Ok ok -> Assert.True ok
             | Error e -> Assert.Fail $"FakeTgApi rejected Funogram deleteMessage: {e.ErrorCode} {e.Description}"
+        }
+
+    [<Fact>]
+    member _.``ITelegramApi wrapper: CallExn returns the payload and DownloadFile fetches bytes`` () =
+        task {
+            let tg =
+                BotInfra.TelegramApi(
+                    config,
+                    Microsoft.Extensions.Logging.Abstractions.NullLogger<BotInfra.TelegramApi>.Instance)
+                :> ITelegramApi
+
+            let! sent = tg.CallExn(Req.SendMessage.Make(321L, "via wrapper"))
+            Assert.Equal(321L, sent.Chat.Id)
+
+            // FakeTgApi echoes the request path for unknown file ids — enough to prove
+            // the {origin}/file/bot{token}/{path} URL derivation and byte download work.
+            let! bytes = tg.DownloadFile "photos/some-file.jpg"
+            Assert.NotEmpty bytes
         }
 
     [<Fact>]

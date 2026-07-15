@@ -16,6 +16,7 @@
     <Compile Include="AdminHooks.fs" />
     <Compile Include="DapperSetup.fs" />
     <Compile Include="Observability.fs" />
+    <Compile Include="TelegramApi.fs" />
     <Compile Include="WebhookHost.fs" />
   </ItemGroup>
 
@@ -33,6 +34,8 @@
     <PackageReference Include="Serilog.Enrichers.Span" />
     <PackageReference Include="Serilog.Formatting.Compact" />
     <PackageReference Include="Telegram.Bot" />
+    <PackageReference Include="Funogram" />
+    <PackageReference Include="Funogram.Telegram" />
   </ItemGroup>
 
 </Project>
