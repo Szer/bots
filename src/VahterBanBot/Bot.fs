@@ -101,8 +101,10 @@ module private BotHelpers =
          let first = trimmed.Split([| ' '; '\n'; '\t' |]).[0]
          stripBotMention first = "/vahter")
 
-    /// Stable, machine-parseable reference embedded in spam-deletion log posts so
-    /// that `/vahter unmarkspam` can recover the original (chatId, messageId).
+    /// Stable, machine-parseable reference embedded in logs-channel posts so that
+    /// `/vahter markspam` / `unmarkspam` can recover the original (chatId, messageId).
+    /// Button-bearing channel posts don't carry it — their identity travels in the
+    /// persisted callback payload.
     let msgRefToken (chatId: int64) (messageId: int64) = $"#ref:{chatId}:{messageId}"
 
     let private msgRefRegex = System.Text.RegularExpressions.Regex(@"#ref:(-?\d+):(\d+)")
@@ -125,8 +127,8 @@ module private BotHelpers =
             "/vahter removevahter <@username | id> — revoke vahter rights"
             "/vahter retrain — force ML model retrain (runs in background)"
             "/vahter cleanup — force cleanup job (runs in background)"
-            "/vahter unmarkspam — reply to a forwarded bot spam-deletion log post to undo it"
-            "/vahter markspam — reply to a forwarded bot log post to (re-)mark it as spam"
+            "/vahter unmarkspam — reply to a bot post forwarded from the logs channel to undo the spam mark"
+            "/vahter markspam — reply to a bot post forwarded from the logs channel to (re-)mark it as spam"
             "/vahter help — show this help"
         ]
 
@@ -231,6 +233,7 @@ module private BotHelpers =
         %logMsgBuilder.Append $"softbanned {prependUsername msg.SenderUsername}({msg.SenderId}) "
         %logMsgBuilder.Append $"in {prependUsername msg.ChatUsername}({msg.ChatId}) "
         %logMsgBuilder.Append $"until {untilDate}"
+        %logMsgBuilder.Append $"\n{msgRefToken msg.ChatId msg.MessageId}"
         string logMsgBuilder
 
     let formatReasonStr (reason: AutoDeleteReason) (actor: Actor option) =
@@ -429,6 +432,7 @@ type BotService(
                 (LoggedAction.Ban {| chat = msg.Chat; actor = actor; target = updatedUser; deletedUserMessages = deletedUserMessages |})
                 logger
                 banResults
+        let logMsg = $"{logMsg.TrimEnd()}\n{msgRefToken msg.ChatId msg.MessageId}"
 
         // metrics: count banned user per vahter for successful bans
         bannedUsersCounter.Add(1L, tagsForVahter actor)
@@ -555,7 +559,7 @@ type BotService(
             if double socialScore <= botConfig.Value.MlSpamAutobanScoreThreshold then
                 // ban user in all monitored chats
                 do! this.TotalBan(msg, actor)
-                let logStr = $"Auto-banned user {prependUsername msg.SenderUsername} ({msg.SenderId}) due to the low social score {socialScore}"
+                let logStr = $"Auto-banned user {prependUsername msg.SenderUsername} ({msg.SenderId}) due to the low social score {socialScore}\n{msgRefToken msg.ChatId msg.MessageId}"
                 logger.LogInformation logStr
                 fireAndForget logger "autoBanLogPost" (fun () ->
                     tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logStr)) :> Task
@@ -584,7 +588,10 @@ type BotService(
         // RecordCallbackCreated runs synchronously so a button click is always routable;
         // the channel post + RecordCallbackMessagePosted run in background. The cleanup
         // path tolerates action_message_id = NULL, so the brief race window is safe.
-        let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}\n{msgRefToken msg.ChatId msg.MessageId}"
+        // Button post carries no #ref (identity travels in the callback payload);
+        // the AllLogs mirror gets the token so it can be forward-actioned via /vahter markspam.
+        let baseMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
+        let logMsg = $"{baseMsg}\n{msgRefToken msg.ChatId msg.MessageId}"
         let callbackId = Guid.NewGuid()
         do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.DetectedSpamChannelId)
         let markup = InlineKeyboardMarkup.Create [|
@@ -594,7 +601,7 @@ type BotService(
             task {
                 let! sent = tg.CallExn(Req.SendMessage.Make(
                                 botConfig.Value.DetectedSpamChannelId,
-                                logMsg,
+                                baseMsg,
                                 replyMarkup = Markup.InlineKeyboardMarkup markup
                             ))
                 do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
@@ -620,7 +627,10 @@ type BotService(
             .SetTag("spammerId", msg.SenderId)
             .SetTag("spammerUsername", msg.SenderUsername)
 
-        let logMsg = $"Detected spam ({formatReasonStr reason None}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}\n{msgRefToken msg.ChatId msg.MessageId}"
+        // Button post carries no #ref (identity travels in the callback payloads);
+        // the AllLogs mirror gets the token so it can be forward-actioned via /vahter markspam.
+        let baseMsg = $"Detected spam ({formatReasonStr reason None}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}"
+        let logMsg = $"{baseMsg}\n{msgRefToken msg.ChatId msg.MessageId}"
 
         // Create three callbacks for human triage
         let killId = Guid.NewGuid()
@@ -636,7 +646,7 @@ type BotService(
         |]
         let! sent = tg.CallExn(Req.SendMessage.Make(
                         botConfig.Value.PotentialSpamChannelId,
-                        logMsg,
+                        baseMsg,
                         replyMarkup = Markup.InlineKeyboardMarkup markup
                     ))
         for callbackId in [killId; softSpamId; notSpamId] do
@@ -722,6 +732,8 @@ type BotService(
 
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let allChatsOk = banResults |> Array.forall Result.isOk
+        // No #ref here on purpose: the triggering message is the *victim's* reacted-to message
+        // (or 0 on the callback path); a token would let /vahter markspam label an innocent message.
         let logMsgBuilder = StringBuilder()
         %logMsgBuilder.Append $"🤖 Reaction-triage BAN of {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName}"
         %logMsgBuilder.AppendLine $" — removed {removedReactions} reactions, deleted {allUserMessages.Length} messages, banned in all chats"
@@ -1445,33 +1457,33 @@ type BotService(
         do! this.ReplyAdmin(msg, "🧹 Cleanup started (running in background).")
     }
 
-    /// Reply to a forwarded bot spam-deletion log post to reverse the spam mark
+    /// Reply to a bot log post forwarded from the logs channel to reverse the spam mark
     /// (records MessageMarkedHam). For a hard KILL ban, unbanning stays /unban.
     member private this.VahterUnmarkSpam(vahter: User, msg: TgMessage) = task {
         match msg.ReplyToMessage with
         | None ->
-            do! this.ReplyAdmin(msg, "Reply to a forwarded bot spam-deletion log post with /vahter unmarkspam.")
+            do! this.ReplyAdmin(msg, "Reply to a forwarded bot log post from the logs channel with /vahter unmarkspam.")
         | Some replied ->
             match tryParseMsgRef replied.Text with
             | None ->
-                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot spam-deletion log message and reply /vahter unmarkspam to it.")
+                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot log message from the logs channel and reply /vahter unmarkspam to it.")
             | Some(chatId, messageId) ->
                 do! db.RecordMessageMarkedHam(chatId, messageId, "", Some vahter.Id)
                 do! this.ReplyAdmin(msg, $"✅ Reversed: message {messageId} in chat {chatId} marked as NOT spam (ham).")
                 logger.LogInformation($"Vahter {vahter.Id} reversed spam mark for {chatId}:{messageId}")
     }
 
-    /// Reply to a forwarded bot log post to (re-)mark the referenced message as spam
-    /// (records MessageMarkedSpam). Classification only — no deletion or ban; the
-    /// ⚠️ SPAM inline button covers delete+ban for live messages.
+    /// Reply to a bot log post forwarded from the logs channel to (re-)mark the referenced
+    /// message as spam (records MessageMarkedSpam). Classification only — no deletion or ban;
+    /// the ⚠️ SPAM inline button covers delete+ban for live messages.
     member private this.VahterMarkSpam(vahter: User, msg: TgMessage) = task {
         match msg.ReplyToMessage with
         | None ->
-            do! this.ReplyAdmin(msg, "Reply to a forwarded bot log post with /vahter markspam.")
+            do! this.ReplyAdmin(msg, "Reply to a forwarded bot log post from the logs channel with /vahter markspam.")
         | Some replied ->
             match tryParseMsgRef replied.Text with
             | None ->
-                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot log message and reply /vahter markspam to it.")
+                do! this.ReplyAdmin(msg, "Could not find a message reference in that post. Forward a bot log message from the logs channel and reply /vahter markspam to it.")
             | Some(chatId, messageId) ->
                 do! db.RecordMessageMarkedSpam(chatId, messageId, Some vahter.Id)
                 do! this.ReplyAdmin(msg, $"✅ Message {messageId} in chat {chatId} marked as spam.")
@@ -1765,7 +1777,7 @@ type BotService(
 
         let vahterUsername = vahter.Username |> Option.defaultValue null
 
-        let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as false-positive (NOT A SPAM)\n{tgMsg.Text}"
+        let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as false-positive (NOT A SPAM)\n{tgMsg.Text}\n{msgRefToken chatId msgId}"
         do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }

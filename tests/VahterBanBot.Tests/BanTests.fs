@@ -25,6 +25,43 @@ type BanTests(fixture: MlDisabledVahterTestContainers) =
     }
 
     [<Fact>]
+    let ``Ban log post carries a ref token for the banned message`` () = task {
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0])
+        let! _ = fixture.SendMessage msgUpdate
+
+        do! fixture.ClearFakeCalls()
+        let! banResp =
+            Tg.replyMsg(msgUpdate.Message.Value, "/ban", fixture.Vahters[0])
+            |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, banResp.StatusCode)
+
+        // the AllLogs ban post can be forward-actioned via /vahter markspam|unmarkspam
+        let token = $"#ref:{msgUpdate.Message.Value.Chat.Id}:{msgUpdate.Message.Value.MessageId}"
+        let! calls = fixture.GetFakeCalls "sendMessage"
+        Assert.True(calls |> Array.exists (fun c ->
+            c.Body.Contains $"\"chat_id\":{fixture.AllLogsChannel.Id}" && c.Body.Contains token))
+    }
+
+    [<Fact>]
+    let ``Softban log post carries a ref token for the removed message`` () = task {
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0])
+        let! _ = fixture.SendMessage msgUpdate
+
+        do! fixture.ClearFakeCalls()
+        let! sbanResp =
+            Tg.replyMsg(msgUpdate.Message.Value, "/sban 12", fixture.Vahters[0])
+            |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, sbanResp.StatusCode)
+
+        let token = $"#ref:{msgUpdate.Message.Value.Chat.Id}:{msgUpdate.Message.Value.MessageId}"
+        let! calls = fixture.GetFakeCalls "sendMessage"
+        Assert.True(calls |> Array.exists (fun c ->
+            c.Body.Contains $"\"chat_id\":{fixture.AllLogsChannel.Id}"
+            && c.Body.Contains "softbanned"
+            && c.Body.Contains token))
+    }
+
+    [<Fact>]
     let ``NON Vahter can't ban on reply`` () = task {
         // record a message
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0])
