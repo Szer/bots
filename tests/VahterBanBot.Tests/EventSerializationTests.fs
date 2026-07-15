@@ -279,9 +279,8 @@ let ``moderationSnapshot with only a bot auto-delete has no verdict but flags bo
     Assert.Equal(Some true, prop json "botAutoDeleted" |> Option.map (fun v -> v.GetBoolean()))
     Assert.Equal(None, prop json "verdict")   // no vahter action -> absent -> NULL column
 
-// rawMessage exists in production as BOTH a JSON string (live app) and a JSON object (legacy
-// backfill) — issue #166. Folding must tolerate both, otherwise rebuild / mark-ham on old
-// messages throws "Cannot get the value of a token type 'StartObject' as a string".
+// rawMessage is stored as a JSON *string* — the single canonical shape since the V40
+// migration normalized the V27 backfill's '{}' object rows (issue #166).
 
 [<Fact>]
 let ``MessageReceived with rawMessage as a JSON string deserializes`` () =
@@ -291,16 +290,18 @@ let ``MessageReceived with rawMessage as a JSON string deserializes`` () =
     | MessageReceived e ->
         Assert.Equal(-666L, e.chatId)
         Assert.Equal(Some "hi", e.text)
+        Assert.Equal("""{"text":"hi"}""", e.rawMessage)
     | other -> Assert.Fail $"Expected MessageReceived but got {other}"
 
 [<Fact>]
-let ``MessageReceived with rawMessage as a JSON object deserializes (legacy backfill shape)`` () =
+let ``MessageReceived with V40-normalized empty rawMessage deserializes`` () =
+    // The V27 spam backfill rows carry no raw JSON; after V40 they are the string "{}".
     let json =
-        """{"Case":"MessageReceived","chatId":-666,"messageId":2,"userId":42,"text":"hi","rawMessage":{"text":"hi","entities":[]}}"""
+        """{"Case":"MessageReceived","chatId":-666,"messageId":2,"userId":42,"text":"hi","rawMessage":"{}"}"""
     match JsonSerializer.Deserialize<MessageEvent>(json, eventJsonOpts) with
     | MessageReceived e ->
         Assert.Equal(-666L, e.chatId)
-        Assert.Equal(Some "hi", e.text)
+        Assert.Equal("{}", e.rawMessage)
     | other -> Assert.Fail $"Expected MessageReceived but got {other}"
 
 
@@ -310,8 +311,7 @@ let ``MessageReceived with rawMessage as a JSON object deserializes (legacy back
 // Pure: the caller feeds events already ordered by (created_at, id).
 // ---------------------------------------------------------------------------
 
-let private rawEl () = JsonSerializer.SerializeToElement("{}")
-let private recv () = FromMessage (MessageReceived {| chatId = -1L; messageId = 1; userId = 5L; text = Some "x"; rawMessage = rawEl () |})
+let private recv () = FromMessage (MessageReceived {| chatId = -1L; messageId = 1; userId = 5L; text = Some "x"; rawMessage = "{}" |})
 let private botDeleted () = FromModeration (BotAutoDeleted {| chatId = -1L; messageId = 1; userId = 5L; reason = MlSpam {| score = 4.0 |} |})
 let private vahter (act: VahterAction) = FromModeration (VahterActed {| vahterId = 34L; actionType = act; targetUserId = 5L; chatId = -1L; messageId = 1 |})
 let private markSpam () = FromMessage (MessageMarkedSpam {| chatId = -1L; messageId = 1; markedBy = Some 34L |})

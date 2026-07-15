@@ -148,12 +148,12 @@ type SpamClassification =
     | Ham
 
 type MessageEvent =
-    // rawMessage is a JsonElement (not string) on purpose: production has it stored BOTH as a JSON
-    // string (live app) and as a JSON object (legacy backfill) — see issue #166. JsonElement reads
-    // either shape, so folding a stream never breaks; the field is write-only (folds/reads use JSONB
-    // operators, never the DU), and we keep writing a string (see DB.recordMessage*).
-    | MessageReceived    of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: JsonElement |}
-    | MessageEdited      of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: JsonElement |}
+    // rawMessage is the wire-format Telegram message JSON, stored as a JSON *string*.
+    // This is the single canonical shape since V40 normalized the V27 backfill rows
+    // (which were '{}' objects) — see issue #166. Readers use JSONB operators with a
+    // (data->>'rawMessage')::jsonb cast (see DB.MlData), never the DU field.
+    | MessageReceived    of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: string |}
+    | MessageEdited      of {| chatId: int64; messageId: int64; userId: int64; text: string option; rawMessage: string |}
     | MessageDeleted     of {| chatId: int64; messageId: int64; deletedBy: int64 |}
     | MessageMarkedSpam  of {| chatId: int64; messageId: int64; markedBy: int64 option |}
     | MessageMarkedHam   of {| chatId: int64; messageId: int64; text: string; markedBy: int64 option |}

@@ -199,9 +199,7 @@ UPDATE snapshot_message
             let! _ = EventStore.appendEventWithProjection store $"message:{chatId}:{messageId}" (fun (state: Message) ->
                 if state.Received then [], None
                 else
-                    // Store rawMessage as a JSON string (the live wire shape); JsonElement just makes
-                    // *reading* tolerant of the legacy object shape too (issue #166).
-                    let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |}
+                    let evt = MessageReceived {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |}
                     // One TX: optional text-index upsert, then the snapshot recompute.
                     let projection (conn: NpgsqlConnection) (tx: NpgsqlTransaction) =
                         task {
@@ -225,7 +223,7 @@ ON CONFLICT DO NOTHING
     let recordMessageEdited (chatId: int64) (messageId: int64) (userId: int64) (text: string option) (rawMessage: string) : Task<unit> =
         task {
             let! _ = appendMessageEvents chatId messageId (fun (_: Message) ->
-                [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = JsonSerializer.SerializeToElement(rawMessage, eventJsonOpts) |} ])
+                [ MessageEdited {| chatId = chatId; messageId = messageId; userId = userId; text = text; rawMessage = rawMessage |} ])
             return ()
         }
 
@@ -949,7 +947,9 @@ WITH final_messages AS (
         (data->>'messageId')::BIGINT              AS message_id,
         (data->>'userId')::BIGINT              AS user_id,
         data->>'text'                          AS text,
-        data->'rawMessage'->'entities'         AS entities,
+        -- rawMessage is a JSON *string* (canonical since V40, issue #166): unwrap
+        -- with ->> then cast, or entity extraction silently yields NULL.
+        (data->>'rawMessage')::jsonb->'entities' AS entities,
         created_at
     FROM event
     WHERE event_type IN ('MessageReceived', 'MessageEdited')
