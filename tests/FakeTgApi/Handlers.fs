@@ -15,6 +15,22 @@ module Handlers =
         task {
             if ctx.Request.ContentLength.HasValue && ctx.Request.ContentLength.Value = 0L then
                 return ""
+            elif ctx.Request.HasFormContentType then
+                // Real Telegram accepts multipart/form-data and urlencoded forms for every
+                // method (Funogram sends multipart for all requests; Telegram.Bot uses it
+                // for file uploads). Fold form fields into a JSON object so the JSON-based
+                // handlers below work for both encodings. Field values that parse as JSON
+                // (numbers, bools, nested objects like reply_markup) are embedded as-is;
+                // everything else becomes a JSON string. Uploaded files are ignored.
+                let! form = ctx.Request.ReadFormAsync()
+                let obj = Json.Nodes.JsonObject()
+                for kv in form do
+                    let raw = kv.Value.ToString()
+                    let node =
+                        try Json.Nodes.JsonNode.Parse raw
+                        with _ -> Json.Nodes.JsonValue.Create raw :> Json.Nodes.JsonNode
+                    obj[kv.Key] <- node
+                return obj.ToJsonString()
             else
                 use reader = new IO.StreamReader(ctx.Request.Body, Encoding.UTF8)
                 return! reader.ReadToEndAsync()

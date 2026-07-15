@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Fixtures.fs" />
+    <Compile Include="MessageCompatTests.fs" />
+    <Compile Include="CallbackCompatTests.fs" />
+    <Compile Include="FakeTgApiSpikeTests.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Both stacks on purpose: this project proves old (Telegram.Bot) JSON is
+         readable by new (Funogram) code and vice versa during the migration.
+         The Telegram.Bot reference is dropped in the final cutover PR. -->
+    <ProjectReference Include="..\..\src\VahterBanBot\VahterBanBot.fsproj" />
+    <ProjectReference Include="..\FakeTgApi\FakeTgApi.fsproj" />
+    <PackageReference Include="Funogram" />
+    <PackageReference Include="Funogram.Telegram" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="fixtures\**\*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+  </ItemGroup>
+
+</Project>
