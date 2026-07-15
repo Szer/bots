@@ -14,10 +14,9 @@ open Xunit
 // reconstructs everything from the log.
 
 // Helpers for the controlled-timeline status tests (module-level: F# class `let`s must precede members).
-let private raw () = JsonSerializer.SerializeToElement("{}")
 let private t (min: int) = DateTime(2026, 1, 1, 0, min, 0, DateTimeKind.Utc)
 let private received chat mId user =
-    MessageReceived {| chatId = chat; messageId = mId; userId = user; text = Some "x"; rawMessage = raw () |}
+    MessageReceived {| chatId = chat; messageId = mId; userId = user; text = Some "x"; rawMessage = "{}" |}
 
 type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
 
