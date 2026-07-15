@@ -34,7 +34,10 @@ module FunogramJson =
         task {
             try
                 let! update = JsonSerializer.DeserializeAsync<Funogram.Telegram.Types.Update>(body, options)
-                return Some update
+                // The JSON literal "null" deserializes to a null reference (F# records are
+                // classes under the hood) rather than throwing — map it to None -> 400.
+                if isNull (box update) then return None
+                else return Some update
             with :? JsonException ->
                 return None
         }
