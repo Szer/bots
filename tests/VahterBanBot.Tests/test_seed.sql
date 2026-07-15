@@ -913,22 +913,20 @@ FROM "user"
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
 -- 2. MessageReceived — from message table.
--- NOTE (issue #166): this mirrors the legacy V23 backfill, which stored rawMessage as a JSON
--- *object* (raw_message::jsonb). The live app instead writes a JSON *string*. Production has both
--- shapes; keeping the object shape here exercises the legacy path. A string-shaped sample is added
--- in step 2b below so fold/rebuild is covered on both.
+-- rawMessage is a JSON *string* — the single canonical shape since V40 normalized the
+-- old object-form backfill rows (issue #166). to_jsonb(raw_message::text) produces the
+-- exact shape the live app writes and V40 leaves behind.
 INSERT INTO event(stream_id, stream_version, data, created_at)
 SELECT
     'message:' || chat_id || ':' || message_id,
     1,
     jsonb_build_object('Case', 'MessageReceived', 'chatId', chat_id, 'messageId', message_id,
-                       'userId', user_id, 'text', text, 'rawMessage', raw_message::jsonb),
+                       'userId', user_id, 'text', text, 'rawMessage', to_jsonb(raw_message::text)),
     created_at
 FROM message
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
--- 2b. Dual-shape coverage for issue #166: one MessageReceived with rawMessage as a JSON STRING
--- (the live-app shape), alongside the object-shaped rows above. Both must fold/deserialize cleanly.
+-- 2b. One hand-written string-shaped MessageReceived kept for fold/rebuild coverage.
 INSERT INTO event(stream_id, stream_version, data, created_at)
 VALUES
     ('message:-666:20001', 1,
