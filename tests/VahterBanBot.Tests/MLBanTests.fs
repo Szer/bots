@@ -160,7 +160,11 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
         // The exact flow vahters reported: a NOT-a-spam click was wrong, and they want
         // to reverse it by forwarding the resulting false-positive log post and
         // replying /vahter markspam to it.
-        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "7777777")
+        // NOTE: uses "77777777" (8 sevens, spam-trained per test_seed.sql) and not the
+        // usual "7777777": this test marks the text ham via the NotASpam click, and
+        // IsMessageFalsePositive matches MessageMarkedHam events by text — reusing
+        // "7777777" would contaminate the other false-positive button tests.
+        let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77777777")
         let! _ = fixture.SendMessage msgUpdate
         let! msgDeleted = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
         Assert.True msgDeleted
