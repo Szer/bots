@@ -32,7 +32,7 @@ type FeedbackFlowTests(fixture: DefaultCouponHubTestContainers) =
             // Step 2: Send feedback message
             do! fixture.ClearFakeCalls()
             let feedbackUpdate = Tg.dmMessage("The bot is great but needs dark mode", user)
-            let feedbackMsgId = feedbackUpdate.Message.Id
+            let feedbackMsgId = feedbackUpdate.Message.Value.MessageId
             let! _ = fixture.SendUpdate(feedbackUpdate)
 
             // Verify saved in database

@@ -215,11 +215,9 @@ type BotContainerBase(config: BotContainerConfig) =
             return sb.ToString()
         }
 
-    member _.SendUpdate(update: Telegram.Bot.Types.Update) =
+    member _.SendUpdate(update: Funogram.Telegram.Types.Update) =
         task {
-            let jsonOptions = JsonSerializerOptions(JsonSerializerDefaults.Web)
-            Telegram.Bot.JsonBotAPI.Configure(jsonOptions)
-            let json = JsonSerializer.Serialize(update, jsonOptions)
+            let json = Encoding.UTF8.GetString(Funogram.Tools.toJson update)
             use content = new StringContent(json, Encoding.UTF8, "application/json")
             return! botHttp.PostAsync(config.WebhookRoute, content)
         }

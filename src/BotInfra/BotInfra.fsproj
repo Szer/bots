@@ -7,7 +7,6 @@
   <ItemGroup>
     <Compile Include="Utils.fs" />
     <Compile Include="Time.fs" />
-    <Compile Include="TelegramHelpers.fs" />
     <Compile Include="JsonSetup.fs" />
     <Compile Include="EventStore.fs" />
     <Compile Include="LiveOptions.fs" />
@@ -33,7 +32,6 @@
     <PackageReference Include="Serilog.AspNetCore" />
     <PackageReference Include="Serilog.Enrichers.Span" />
     <PackageReference Include="Serilog.Formatting.Compact" />
-    <PackageReference Include="Telegram.Bot" />
     <PackageReference Include="Funogram" />
     <PackageReference Include="Funogram.Telegram" />
   </ItemGroup>

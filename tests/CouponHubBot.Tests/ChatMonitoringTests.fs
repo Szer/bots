@@ -23,7 +23,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
         task {
             let user = Tg.user(id = 2001L, username = "chat_user", firstName = "Chat")
             let update = Tg.groupMessage("Hello community!", user, fixture.CommunityChatId)
-            let msgId = update.Message.Id
+            let msgId = update.Message.Value.MessageId
 
             let! _ = fixture.SendUpdate(update)
 
@@ -47,7 +47,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
         task {
             let user = Tg.user(id = 2002L, username = "photo_user", firstName = "Photo")
             let update = Tg.groupPhotoMessage(user, fixture.CommunityChatId, caption = "Check this out")
-            let msgId = update.Message.Id
+            let msgId = update.Message.Value.MessageId
 
             let! _ = fixture.SendUpdate(update)
 
@@ -67,7 +67,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
         task {
             let user = Tg.user(id = 2003L, username = "doc_user", firstName = "Doc")
             let update = Tg.groupDocumentMessage(user, fixture.CommunityChatId, caption = "A file")
-            let msgId = update.Message.Id
+            let msgId = update.Message.Value.MessageId
 
             let! _ = fixture.SendUpdate(update)
 
@@ -89,7 +89,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
             let replyToId = 99999
 
             let update = Tg.groupMessage("Replying to that", user, fixture.CommunityChatId, replyToMessageId = replyToId)
-            let msgId = update.Message.Id
+            let msgId = update.Message.Value.MessageId
 
             let! _ = fixture.SendUpdate(update)
 
@@ -109,7 +109,7 @@ type ChatMonitoringTests(fixture: DefaultCouponHubTestContainers) =
             let user = Tg.user(id = 2005L, username = "other_user", firstName = "Other")
             let otherChatId = -999L
             let update = Tg.groupMessage("Not community", user, otherChatId)
-            let msgId = update.Message.Id
+            let msgId = update.Message.Value.MessageId
 
             let! _ = fixture.SendUpdate(update)
 

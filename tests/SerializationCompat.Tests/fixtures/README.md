@@ -17,7 +17,7 @@ Structure, field names, entity offsets/lengths, dates, and message_id values are
 - `url-entities.json` — text with `mention` + `url` entities and populated `link_preview_options.url`.
 - `document.json` — `document` + parallel `animation` (video/mp4) with `thumbnail`.
 - `forward-origin.json` — forwarded channel video: `forward_origin` (type channel), `video` with `qualities` array, caption.
-- `legacy-object-form.json` — the object-shaped (`jsonb_typeof = 'object'`) legacy backfill form. NOTE: every object-form rawMessage in prod is the empty object `{}` (no non-empty object-form rows exist); the live app always stores rawMessage as a JSON string.
+- `empty-raw-message.json` — the `{}` CONTENT that post-V40 backfill rows (issue #166) carry as their rawMessage (a JSON-string-wrapped empty object; since V40 there is no object-*shaped* rawMessage anymore). The live app always stores rawMessage as a JSON string.
 - `plain-text.json` — simple text-only message, no entities/media/reply.
 
 ## callbacks/ — `data->>'data'` from CallbackCreated, exactly as stored (compact, ASCII-escaped)

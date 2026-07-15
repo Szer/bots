@@ -21,9 +21,6 @@ module Fixtures =
                 .GetProperty("options", BindingFlags.Static ||| BindingFlags.NonPublic ||| BindingFlags.Public)
         prop.GetValue(null) :?> JsonSerializerOptions
 
-    /// Telegram.Bot's STJ options as configured by the bots today (JsonBotAPI + hack).
-    let telegramBotOptions = BotInfra.TelegramHelpers.telegramJsonOptions
-
     let private fixturesRoot =
         Path.Combine(AppContext.BaseDirectory, "fixtures")
 
@@ -32,14 +29,14 @@ module Fixtures =
         |> Array.map (fun f -> Path.GetFileNameWithoutExtension f, File.ReadAllText f)
         |> Array.sortBy fst
 
-    /// All message fixtures except legacy-object-form: prod's backfilled object-form
-    /// rawMessage rows are all literally {} (no fields), so that fixture gets its own
-    /// dedicated tolerance test instead of the field-level theories.
+    /// All message fixtures except empty-raw-message: post-V40 backfill rows carry
+    /// "{}" as their rawMessage CONTENT (no fields at all), so that fixture gets its
+    /// own dedicated tolerance test instead of the field-level theories.
     let messageFixtures () =
-        loadDir "messages" |> Array.filter (fun (n, _) -> n <> "legacy-object-form")
+        loadDir "messages" |> Array.filter (fun (n, _) -> n <> "empty-raw-message")
 
-    let legacyObjectFormFixture () =
-        loadDir "messages" |> Array.find (fun (n, _) -> n = "legacy-object-form") |> snd
+    let emptyRawMessageFixture () =
+        loadDir "messages" |> Array.find (fun (n, _) -> n = "empty-raw-message") |> snd
     let callbackFixtures () = loadDir "callbacks"
 
     let messageFixture name =

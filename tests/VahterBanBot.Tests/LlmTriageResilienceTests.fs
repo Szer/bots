@@ -42,9 +42,9 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
         let msg = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77", from = spammer)
         let! _ = fixture.SendMessage msg
 
-        let! verdict = fixture.TryGetLlmTriageVerdict msg.Message
+        let! verdict = fixture.TryGetLlmTriageVerdict msg.Message.Value
         Assert.Equal(Some "SPAM", verdict)
-        let! deleted = fixture.MessageIsAutoDeleted msg.Message
+        let! deleted = fixture.MessageIsAutoDeleted msg.Message.Value
         Assert.True(deleted, "Spam message should be auto-deleted")
         let! calls = fixture.GetAzureLlmCalls()
         Assert.Equal(1, calls.Length)
@@ -62,12 +62,12 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
 
         let m1 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77", from = spammer)
         let! _ = fixture.SendMessage m1
-        let! d1 = fixture.MessageIsAutoDeleted m1.Message
+        let! d1 = fixture.MessageIsAutoDeleted m1.Message.Value
         Assert.True(d1, "first copy deleted")
 
         let m2 = Tg.quickMsg(chat = fixture.ChatsToMonitor[1], text = "77", from = spammer)
         let! _ = fixture.SendMessage m2
-        let! d2 = fixture.MessageIsAutoDeleted m2.Message
+        let! d2 = fixture.MessageIsAutoDeleted m2.Message.Value
         Assert.True(d2, "second (cached) copy still deleted from the cached verdict")
 
         let! calls = fixture.GetAzureLlmCalls()
@@ -108,7 +108,7 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
 
         // Every copy is still handled (deleted) from the shared verdict.
         for m in msgs do
-            let! deleted = fixture.MessageIsAutoDeleted m.Message
+            let! deleted = fixture.MessageIsAutoDeleted m.Message.Value
             Assert.True(deleted, "each concurrent copy should be auto-deleted")
     }
 
@@ -127,9 +127,9 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
         // Retry happened and produced a real verdict.
         let! calls = fixture.GetAzureLlmCalls()
         Assert.True(calls.Length >= 2, $"expected a retry (>=2 Azure calls), got {calls.Length}")
-        let! verdict = fixture.TryGetLlmTriageVerdict msg.Message
+        let! verdict = fixture.TryGetLlmTriageVerdict msg.Message.Value
         Assert.Equal(Some "SPAM", verdict)
-        let! deleted = fixture.MessageIsAutoDeleted msg.Message
+        let! deleted = fixture.MessageIsAutoDeleted msg.Message.Value
         Assert.True(deleted, "after retry the spam is deleted, not leaked")
 
         // A successful (retried) SPAM goes to the detected-spam channel, never the action channel.
@@ -152,7 +152,7 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
         Assert.True(calls.Length >= 2, $"expected retries (>=2 Azure calls), got {calls.Length}")
 
         // Persistent failure is fail-safe: not auto-deleted, surfaced to the vahter action channel.
-        let! deleted = fixture.MessageIsAutoDeleted msg.Message
+        let! deleted = fixture.MessageIsAutoDeleted msg.Message.Value
         Assert.False(deleted, "must NOT auto-delete when the LLM never succeeded")
         let! sends = fixture.GetFakeCalls "sendMessage"
         Assert.NotEmpty(leaksToActionChannel sends)

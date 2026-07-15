@@ -69,7 +69,7 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let! chats = fixture.GetBotSetting "CHATS_TO_MONITOR"
         Assert.False(chats.Value.Contains "-555222")
         // and the text was treated as an ordinary message
-        let! dbMsg = fixture.TryGetDbMessage msg.Message
+        let! dbMsg = fixture.TryGetDbMessage msg.Message.Value
         Assert.True dbMsg.IsSome
     }
 
@@ -233,15 +233,15 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let spammer = Tg.user()
         let firstMsg = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], from = spammer)
         let! _ = fixture.SendMessage firstMsg
-        let! _ = Tg.replyMsg(firstMsg.Message, "/ban", fixture.Vahters[0]) |> fixture.SendMessage
-        let! banned = fixture.MessageBanned firstMsg.Message
+        let! _ = Tg.replyMsg(firstMsg.Message.Value, "/ban", fixture.Vahters[0]) |> fixture.SendMessage
+        let! banned = fixture.MessageBanned firstMsg.Message.Value
         Assert.True banned
 
         do! fixture.ClearFakeCalls()
         let secondMsg = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], from = spammer)
         let! _ = fixture.SendMessage secondMsg
         let! calls = fixture.GetFakeCalls "sendMessage"
-        let token = $"#ref:{secondMsg.Message.Chat.Id}:{secondMsg.Message.Id}"
+        let token = $"#ref:{secondMsg.Message.Value.Chat.Id}:{secondMsg.Message.Value.MessageId}"
         Assert.True(calls |> Array.exists (fun c -> c.Body.Contains token))
     }
 
@@ -253,7 +253,7 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let logText = $"Deleted spam (ml) in @pro.hell ({chatId}) from @bad (999) with text:\nbuy now\n#ref:{chatId}:{messageId}"
         let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
         let! resp =
-            Tg.replyMsg(logMsg.Message, "/vahter unmarkspam", fixture.Vahters[0])
+            Tg.replyMsg(logMsg.Message.Value, "/vahter unmarkspam", fixture.Vahters[0])
             |> fixture.SendMessage
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
         let! ham = fixture.MessageMarkedHam(chatId, messageId)
@@ -275,7 +275,7 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let plain = Tg.quickMsg(text = "just a normal message, no reference here", chat = fixture.AdminChannel, from = fixture.Vahters[0])
         do! fixture.ClearFakeCalls()
         let! _ =
-            Tg.replyMsg(plain.Message, "/vahter unmarkspam", fixture.Vahters[0])
+            Tg.replyMsg(plain.Message.Value, "/vahter unmarkspam", fixture.Vahters[0])
             |> fixture.SendMessage
         let! calls = fixture.GetFakeCalls "sendMessage"
         Assert.True(calls |> Array.exists (fun c -> c.Body.Contains "Could not find"))
@@ -291,7 +291,7 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let logText = $"Deleted spam (ml) in @pro.hell ({chatId}) from @bad (999) with text:\nbuy now\n#ref:{chatId}:{messageId}"
         let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
         let! resp =
-            Tg.replyMsg(logMsg.Message, "/vahter markspam", fixture.Vahters[0])
+            Tg.replyMsg(logMsg.Message.Value, "/vahter markspam", fixture.Vahters[0])
             |> fixture.SendMessage
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
         let! spam = fixture.MessageMarkedSpam(chatId, messageId)
@@ -305,10 +305,10 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let logText = $"Deleted spam (ml) in @pro.hell ({chatId}) from @bad (999) with text:\nbuy now\n#ref:{chatId}:{messageId}"
         let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
         let! _ =
-            Tg.replyMsg(logMsg.Message, "/vahter unmarkspam", fixture.Vahters[0])
+            Tg.replyMsg(logMsg.Message.Value, "/vahter unmarkspam", fixture.Vahters[0])
             |> fixture.SendMessage
         let! _ =
-            Tg.replyMsg(logMsg.Message, "/vahter markspam", fixture.Vahters[0])
+            Tg.replyMsg(logMsg.Message.Value, "/vahter markspam", fixture.Vahters[0])
             |> fixture.SendMessage
         let! ham = fixture.MessageMarkedHam(chatId, messageId)
         let! spam = fixture.MessageMarkedSpam(chatId, messageId)
@@ -331,7 +331,7 @@ type AdminCommandTests(fixture: MlDisabledVahterTestContainers) =
         let plain = Tg.quickMsg(text = "just a normal message, no reference here", chat = fixture.AdminChannel, from = fixture.Vahters[0])
         do! fixture.ClearFakeCalls()
         let! _ =
-            Tg.replyMsg(plain.Message, "/vahter markspam", fixture.Vahters[0])
+            Tg.replyMsg(plain.Message.Value, "/vahter markspam", fixture.Vahters[0])
             |> fixture.SendMessage
         let! calls = fixture.GetFakeCalls "sendMessage"
         Assert.True(calls |> Array.exists (fun c -> c.Body.Contains "Could not find"))
