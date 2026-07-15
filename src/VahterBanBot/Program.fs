@@ -259,7 +259,7 @@ let startupBotConf = botConfOptions.Value
     }))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg (fun ctx update ->
+WebhookHost.mapWebhookEndpoints webhookCfg WebhookHost.parseTelegramBotUpdate (fun ctx update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
 
