@@ -25,14 +25,14 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
         let sender = Tg.user(username = "snap_sender")
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], from = sender, text = "hello snapshot")
         let! _ = fixture.SendMessage msgUpdate
-        let msg = msgUpdate.Message
+        let msg = msgUpdate.Message.Value
 
         // snapshot_message — every message_data generated column touched
         let! snap = fixture.TryGetSnapshotMessage(msg.Chat.Id, msg.MessageId)
         Assert.True(snap.IsSome, "snapshot_message row should exist after MessageReceived")
         let s = snap.Value
         Assert.Equal("hello snapshot", s.text)
-        Assert.Equal(System.Nullable msg.From.Id, s.user_id)
+        Assert.Equal(System.Nullable msg.From.Value.Id, s.user_id)
         Assert.Equal("Unknown", s.spam_status)          // no verdict yet
         Assert.Equal(System.Nullable false, s.deleted)
         Assert.Equal(System.Nullable 1, s.msg_version)  // single MessageReceived
@@ -40,7 +40,7 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
         Assert.True(s.created_at.HasValue)              // receipt time recorded
 
         // snapshot_user INSERTed by the same flow (UpsertUser); non-ban generated columns touched
-        let! userSnap = fixture.TryGetSnapshotUser(msg.From.Id)
+        let! userSnap = fixture.TryGetSnapshotUser(msg.From.Value.Id)
         Assert.True(userSnap.IsSome, "snapshot_user row should exist after the sender is upserted")
         Assert.Equal("snap_sender", userSnap.Value.username)
         Assert.Equal(System.Nullable false, userSnap.Value.banned)
@@ -53,7 +53,7 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
         // 1) spam message recorded -> message_data populated
         let msgUpdate = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "buy crypto now")
         let! _ = fixture.SendMessage msgUpdate
-        let msg = msgUpdate.Message
+        let msg = msgUpdate.Message.Value
 
         // 2) vahter bans on reply -> UserBanned (user stream) + VahterActed/ManualBan (moderation stream)
         let! banResp =
@@ -62,7 +62,7 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
         Assert.Equal(HttpStatusCode.OK, banResp.StatusCode)
 
         // user snapshot reflects the ban (UPDATE path; banned_at exercises the IMMUTABLE timestamptz column)
-        let! userSnap = fixture.TryGetSnapshotUser(msg.From.Id)
+        let! userSnap = fixture.TryGetSnapshotUser(msg.From.Value.Id)
         Assert.True(userSnap.IsSome, "snapshot_user row should exist for the banned user")
         Assert.Equal(System.Nullable true, userSnap.Value.banned)
         Assert.True(userSnap.Value.banned_at.HasValue, "banned_at generated column should be populated")
@@ -90,20 +90,20 @@ type SnapshotTests(fixture: MlDisabledVahterTestContainers) =
 
         // wipe the read models, then rebuild purely from events
         do! fixture.ClearSnapshots()
-        let! gone = fixture.TryGetSnapshotMessage(m1.Message.Chat.Id, m1.Message.MessageId)
+        let! gone = fixture.TryGetSnapshotMessage(m1.Message.Value.Chat.Id, m1.Message.Value.MessageId)
         Assert.True(gone.IsNone, "snapshot should be empty after clear")
 
         let! count1 = fixture.RebuildSnapshots()
         Assert.True(count1 > 0, "rebuild should process at least the streams we created")
 
-        let! snap = fixture.TryGetSnapshotMessage(m1.Message.Chat.Id, m1.Message.MessageId)
+        let! snap = fixture.TryGetSnapshotMessage(m1.Message.Value.Chat.Id, m1.Message.Value.MessageId)
         Assert.True(snap.IsSome, "snapshot_message should be reconstructed by rebuild")
         Assert.Equal("rebuild me one", snap.Value.text)
 
         // second run is a no-op in effect (idempotent): same stream count, guards prevent regress
         let! count2 = fixture.RebuildSnapshots()
         Assert.Equal(count1, count2)
-        let! snap2 = fixture.TryGetSnapshotMessage(m1.Message.Chat.Id, m1.Message.MessageId)
+        let! snap2 = fixture.TryGetSnapshotMessage(m1.Message.Value.Chat.Id, m1.Message.Value.MessageId)
         Assert.Equal("rebuild me one", snap2.Value.text)
     }
 

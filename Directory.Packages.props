@@ -10,7 +10,6 @@
     <PackageVersion Include="FSharp.Core" Version="10.1.201" />
 
     <!-- Telegram -->
-    <PackageVersion Include="Telegram.Bot" Version="22.10.0" />
     <PackageVersion Include="Funogram" Version="3.0.4" />
     <PackageVersion Include="Funogram.Telegram" Version="10.1.0" />
 

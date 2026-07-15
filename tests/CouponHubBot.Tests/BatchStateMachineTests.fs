@@ -22,7 +22,7 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
 
     let goodFile = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
 
-    let sendOnePhotoAlbum (user: Telegram.Bot.Types.User) (mgid: string) (fid: string) (messageId: int) =
+    let sendOnePhotoAlbum (user: Funogram.Telegram.Types.User) (mgid: string) (fid: string) (messageId: int64) =
         task {
             do! fixture.SetTelegramFile(fid, readImageBytes goodFile)
             do! fixture.SetAzureOcrResponse(200, readAzureCacheJson goodFile)

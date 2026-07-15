@@ -20,9 +20,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Both stacks on purpose: this project proves old (Telegram.Bot) JSON is
-         readable by new (Funogram) code and vice versa during the migration.
-         The Telegram.Bot reference is dropped in the final cutover PR. -->
+    <!-- Pins forever that pre-migration wire JSON persisted in prod (event.data->
+         'rawMessage' and callback payloads) stays readable by Funogram code. -->
     <ProjectReference Include="..\..\src\VahterBanBot\VahterBanBot.fsproj" />
     <ProjectReference Include="..\FakeTgApi\FakeTgApi.fsproj" />
     <PackageReference Include="Funogram" />

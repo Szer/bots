@@ -8,23 +8,23 @@ open System.Text.Json
 open System.Threading.Tasks
 open DotNet.Testcontainers.Builders
 open Npgsql
-open Telegram.Bot.Types
 open BotTestInfra
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open BotInfra
-open BotInfra.TelegramHelpers
 open Xunit
 open Dapper
 
-// Telegram.Bot.Types.Message is shadowed by VahterBanBot.Types.Message
-type TgMsg = Telegram.Bot.Types.Message
+// Funogram.Telegram.Types.Message is shadowed by VahterBanBot.Types.Message
+type TgMsg = Funogram.Telegram.Types.Message
+type TgUpdate = Funogram.Telegram.Types.Update
+type TgUser = Funogram.Telegram.Types.User
 
 /// Lightweight DTO for test assertions on message events.
 [<CLIMutable>]
 type TestMessage =
     { chat_id: int64
-      message_id: int
+      message_id: int64
       user_id: int64
       text: string
       raw_message: string
@@ -196,8 +196,8 @@ type VahterTestContainers(mlEnabled: bool) =
                 |> Seq.length
     }
 
-    member this.SendMessage(update: Update) = task {
-        let json = JsonSerializer.Serialize(update, options = telegramJsonOptions)
+    member this.SendMessage(update: TgUpdate) = task {
+        let json = Encoding.UTF8.GetString(Funogram.Tools.toJson update)
         return! this.SendMessage(json)
     }
 
@@ -231,7 +231,7 @@ type VahterTestContainers(mlEnabled: bool) =
         let sql =
             """
 SELECT (data->>'chatId')::BIGINT AS chat_id,
-       (data->>'messageId')::INT  AS message_id,
+       (data->>'messageId')::BIGINT AS message_id,
        (data->>'userId')::BIGINT  AS user_id,
        data->>'text'              AS text,
        (data->>'rawMessage')::JSONB::TEXT AS raw_message,
@@ -286,7 +286,7 @@ WHERE stream_id   = 'user:' || @userId
         return count > 0
     }
 
-    member this.MessageEditedRecorded(chatId: int64, messageId: int) = task {
+    member this.MessageEditedRecorded(chatId: int64, messageId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
@@ -343,19 +343,20 @@ WHERE event_type = 'CallbackCreated'
     }
 
     member this.IsMessageFalsePositive(msg: TgMsg) = task {
-        if String.IsNullOrWhiteSpace(msg.Text) then return false else
-
-        use conn = new NpgsqlConnection(this.DbConnectionString)
-        //language=postgresql
-        let sql =
-            """
+        match msg.Text with
+        | Some text when not (String.IsNullOrWhiteSpace text) ->
+            use conn = new NpgsqlConnection(this.DbConnectionString)
+            //language=postgresql
+            let sql =
+                """
 SELECT EXISTS (
     SELECT 1 FROM event
     WHERE event_type = 'MessageMarkedHam'
       AND data->>'text' = @text
 )
-            """
-        return! conn.QuerySingleAsync<bool>(sql, {| text = msg.Text |})
+                """
+            return! conn.QuerySingleAsync<bool>(sql, {| text = text |})
+        | _ -> return false
     }
 
     member this.UserBannedByBot(userId: int64) = task {
@@ -462,20 +463,18 @@ LIMIT 1
     }
 
     /// Clicks an inline-keyboard callback as the given vahter (sends a CallbackQuery webhook).
-    member this.ClickCallback(callbackId: Guid, vahter: Telegram.Bot.Types.User) = task {
+    member this.ClickCallback(callbackId: Guid, vahter: TgUser) = task {
         let update =
-            Update(
-                Id = (Guid.NewGuid().GetHashCode()),
-                CallbackQuery = CallbackQuery(
-                    Id = (string callbackId),
-                    Data = (string callbackId),
-                    From = vahter,
-                    ChatInstance = "test"
+            TgUpdate.Create(
+                updateId = int64 (Guid.NewGuid().GetHashCode()),
+                callbackQuery = Funogram.Telegram.Types.CallbackQuery.Create(
+                    id = string callbackId,
+                    data = string callbackId,
+                    from = vahter,
+                    chatInstance = "test"
                 )
             )
-        let json = JsonSerializer.Serialize(update, options = telegramJsonOptions)
-        let content = new StringContent(json, Encoding.UTF8, "application/json")
-        return! this.BotHttp.PostAsync("/bot", content)
+        return! this.SendMessage(update)
     }
 
     /// True if a ReactionTriageNotSpamSet event exists for this user (cooldown has been set at some point).
@@ -696,7 +695,7 @@ ON CONFLICT (key) DO UPDATE SET value = @value
     }
 
     /// True if a MessageMarkedHam event exists for the given (chatId, messageId).
-    member this.MessageMarkedHam(chatId: int64, messageId: int) = task {
+    member this.MessageMarkedHam(chatId: int64, messageId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
@@ -711,7 +710,7 @@ WHERE event_type = 'MessageMarkedHam'
     }
 
     /// True if a MessageMarkedSpam event exists for the given (chatId, messageId).
-    member this.MessageMarkedSpam(chatId: int64, messageId: int) = task {
+    member this.MessageMarkedSpam(chatId: int64, messageId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =
@@ -740,7 +739,7 @@ WHERE user_id = @userId
     }
 
     /// Reads the snapshot_message row (None if absent).
-    member this.TryGetSnapshotMessage(chatId: int64, messageId: int) = task {
+    member this.TryGetSnapshotMessage(chatId: int64, messageId: int64) = task {
         use conn = new NpgsqlConnection(this.DbConnectionString)
         //language=postgresql
         let sql =

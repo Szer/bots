@@ -5,7 +5,6 @@ open VahterBanBot.Tests.ContainerTestBase
 open BotTestInfra
 open Xunit
 
-type TgUser = Telegram.Bot.Types.User
 
 /// Reaction-spam triage tests. After PR #?? the threshold no longer auto-bans —
 /// it builds a dossier, runs a vision LLM in shadow mode (records verdict but defers to
@@ -41,7 +40,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let chat = fixture.ChatsToMonitor[0]
         for i in 1..5 do
             let! resp =
-                Tg.quickReaction(chat, msgIdBase + i, user)
+                Tg.quickReaction(chat, int64 (msgIdBase + i), user)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
     }
@@ -131,7 +130,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{allLogsId}"
                 && c.Body.Contains "Reaction-triage BAN"
-                && c.Body.Contains $"@{vahter.Username}")
+                && c.Body.Contains $"@{vahter.Username.Value}")
         Assert.True(banAuditLogs.Length >= 1, "AllLogs should record the BAN action with the vahter's name")
     }
 
@@ -188,8 +187,8 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{allLogsId}"
                 && c.Body.Contains "Reaction-triage SPAM"
-                && c.Body.Contains $"@{vahter.Username}"
-                && c.Body.Contains $"@{originatingChat.Username}")
+                && c.Body.Contains $"@{vahter.Username.Value}"
+                && c.Body.Contains $"@{originatingChat.Username.Value}")
         Assert.True(spamAuditLogs.Length >= 1, "AllLogs should record the SPAM action with the vahter's name and originating chat")
     }
 
@@ -222,7 +221,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{allLogsId}"
                 && c.Body.Contains "Reaction-triage NOT SPAM"
-                && c.Body.Contains $"@{vahter.Username}")
+                && c.Body.Contains $"@{vahter.Username.Value}")
         Assert.True(notSpamAuditLogs.Length >= 1, "AllLogs should record the NOT SPAM action with the vahter's name")
 
         let! isBanned = fixture.UserBanned user.Id
@@ -315,7 +314,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
             |> Array.filter (fun c ->
                 c.Body.Contains $"\"chat_id\":{potentialSpamId}"
                 && c.Body.Contains "Reaction-spam triage"
-                && c.Body.Contains $"@{userWithHandle.Username}")
+                && c.Body.Contains $"@{userWithHandle.Username.Value}")
         Assert.True(alertsForWithHandle.Length >= 1, "Expected interactive alert for user with handle")
         let withHandleBody = alertsForWithHandle[0].Body
         // Telegram accepts parse_mode case-insensitively; SDKs disagree on casing
@@ -324,12 +323,12 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         Assert.True(
             withHandleBody.Contains("\"parse_mode\":\"html\"", System.StringComparison.OrdinalIgnoreCase),
             "Alert must be sent with parse_mode=HTML")
-        Assert.Contains($"@{userWithHandle.Username} ({userWithHandle.Id})", withHandleBody)
+        Assert.Contains($"@{userWithHandle.Username.Value} ({userWithHandle.Id})", withHandleBody)
         Assert.DoesNotContain($"tg://user?id={userWithHandle.Id}", withHandleBody)
 
         // Now the no-username path: must fall back to an HTML profile link
         let userNoHandle = Tg.user()  // Tg.user() defaults username to null
-        Assert.Null(userNoHandle.Username)
+        Assert.True(userNoHandle.Username.IsNone)
         do! fixture.ClearFakeCalls()
         do! tripThreshold fixture userNoHandle 15000
 
@@ -365,7 +364,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // window of #5), so backdate #5's triage event to force #6 to re-trip — this test is about
         // the sibling-callback sweep, which needs two real alerts to exist.
         for i in 1..5 do
-            let! resp = Tg.quickReaction(chat, 30000 + i, user) |> fixture.SendMessage
+            let! resp = Tg.quickReaction(chat, int64 (30000 + i), user) |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
         use backdateConn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
@@ -375,7 +374,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
                 "UPDATE event SET created_at = created_at - interval '1 hour' WHERE stream_id = 'detection:reaction:' || @userId",
                 {| userId = user.Id |})
 
-        let! resp6 = Tg.quickReaction(chat, 30000 + 6, user) |> fixture.SendMessage
+        let! resp6 = Tg.quickReaction(chat, int64 (30000 + 6), user) |> fixture.SendMessage
         Assert.Equal(HttpStatusCode.OK, resp6.StatusCode)
 
         let countActiveSql =
@@ -424,7 +423,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let fireEmoji = "\U0001F525"  // 🔥
         for i in 1..5 do
             let! resp =
-                Tg.quickReaction(chat, 17000 + i, user, emoji = fireEmoji)
+                Tg.quickReaction(chat, int64 (17000 + i), user, emoji = fireEmoji)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -454,7 +453,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
         let msgIdBase = 18000
         for i in 1..5 do
-            let! resp = Tg.quickReaction(chat, msgIdBase + i, user) |> fixture.SendMessage
+            let! resp = Tg.quickReaction(chat, int64 (msgIdBase + i), user) |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
         let! sendCalls = fixture.GetFakeCalls("sendMessage")
@@ -471,7 +470,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         // (only the top-10 most recent events are rendered, so all 5 are guaranteed here).
         let hasAnyMessageLink =
             [ msgIdBase + 1 .. msgIdBase + 5 ]
-            |> List.exists (fun mid -> body.Contains $"https://t.me/{chat.Username}/{mid}")
+            |> List.exists (fun mid -> body.Contains $"https://t.me/{chat.Username.Value}/{mid}")
         Assert.True(hasAnyMessageLink, $"Dossier should deep-link a reacted-to message; body: {body}")
     }
 
@@ -526,7 +525,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let body = interactive[0].Body
 
         let originatingChat = fixture.ChatsToMonitor[0]   // tripThreshold uses ChatsToMonitor[0]
-        Assert.Contains($"@{originatingChat.Username} ({originatingChat.Id})", body)
+        Assert.Contains($"@{originatingChat.Username.Value} ({originatingChat.Id})", body)
         // The literal numeric-only "[chat -666]" form must NOT appear (we use @name (id) instead)
         Assert.DoesNotContain($"[chat {originatingChat.Id}]", body)
     }
@@ -549,7 +548,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         let chat = fixture.ChatsToMonitor[0]
         for i in 1..5 do
             let! resp =
-                Tg.quickReaction(chat, 4100 + i, user)
+                Tg.quickReaction(chat, int64 (4100 + i), user)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -570,7 +569,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
         for i in 1..10 do
             let! resp =
-                Tg.quickReaction(randomChat, 5000 + i, user)
+                Tg.quickReaction(randomChat, int64 (5000 + i), user)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -596,7 +595,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
 
         for i in 1..6 do
             let! resp =
-                Tg.quickChannelReaction(chat, 6000 + i, actorChannel)
+                Tg.quickChannelReaction(chat, int64 (6000 + i), actorChannel)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
@@ -623,7 +622,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
         do! fixture.ClearFakeCalls()
 
         for i in 1..8 do
-            let! resp = Tg.quickReaction(chat, 40000 + i, user) |> fixture.SendMessage
+            let! resp = Tg.quickReaction(chat, int64 (40000 + i), user) |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
         let! triageCount = countTriageEvents user.Id
@@ -660,7 +659,7 @@ type ReactionSpamTriageTests(fixture: MlEnabledVahterTestContainers) =
                 {| userId = user.Id |})
 
         // A further reaction now falls outside the (backdated) window → re-triages.
-        let! resp = Tg.quickReaction(chat, 41100, user) |> fixture.SendMessage
+        let! resp = Tg.quickReaction(chat, int64 (41100), user) |> fixture.SendMessage
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
         let! after = countTriageEvents user.Id
@@ -709,7 +708,7 @@ type ReactionSpamDisabledTests(fixture: MlDisabledVahterTestContainers) =
 
         for i in 1..10 do
             let! resp =
-                Tg.quickReaction(chat, 9000 + i, user)
+                Tg.quickReaction(chat, int64 (9000 + i), user)
                 |> fixture.SendMessage
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
