@@ -4,9 +4,9 @@ open System
 open System.Collections.Generic
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Text.Json.Serialization
 open Dapper
-open Telegram.Bot.Types
 open Utils
 open BotInfra
 
@@ -134,8 +134,8 @@ type User =
         | UserReactionRecorded e     -> { state with Id = e.userId; ReactionCount = state.ReactionCount + e.delta }
         | ReactionTriageNotSpamSet e -> { state with Id = e.userId; NotSpamUntil = Some e.until }
 
-    static member fromTgUser (user: Telegram.Bot.Types.User) =
-        { User.Zero with Id = user.Id; Username = Option.ofObj user.Username }
+    static member fromTgUser (user: Funogram.Telegram.Types.User) =
+        { User.Zero with Id = user.Id; Username = user.Username }
 
     static member fromTgMessage (msg: TgMessage) =
         { User.Zero with Id = msg.SenderId; Username = Option.ofObj msg.SenderUsername }
@@ -410,7 +410,7 @@ type VahterStats =
         sb.ToString()
 
 // used as aux type to possibly extend in future without breaking changes
-type MessageWrapper= { message: Telegram.Bot.Types.Message }
+type MessageWrapper= { message: Funogram.Telegram.Types.Message }
 
 /// Carries everything a reaction-spam callback handler needs. There is no "message
 /// authored by the suspect" in this flow (the suspect *reacted* to someone else's
@@ -483,17 +483,83 @@ let moderationSnapshot (s: Moderation) =     // -> snapshot_message.moderation_d
        vahterActedCount    = s.VahterActedCount
        botAutoDeletedCount = s.BotAutoDeletedCount |}
 
-// Callback data serialization uses different JSON options (Telegram-aware)
-let private callbackJsonOpts =
-    let opts = JsonFSharpOptions.Default().ToJsonSerializerOptions()
-    Telegram.Bot.JsonBotAPI.Configure(opts)
-    opts
+// ---------------------------------------------------------------------------
+// CallbackMessage wire shell — hand-rolled JSON (de)serialization.
+//
+// Must stay byte-compatible with the payloads the pre-Funogram binary wrote via
+// FSharp.SystemTextJson + Telegram.Bot converters (persisted in callback:{guid}
+// event streams and referenced by in-flight inline buttons):
+//   {"Case":"<CaseName>","Fields":[<one payload object>]}
+// MessageWrapper cases embed the Telegram message as a PLAIN NESTED OBJECT in
+// wire format (snake_case); ReactionContext cases embed a snake_case object with
+// user_id/chat_id and optional llm_verdict/llm_reason (omitted when None, missing
+// or null reads as None). Pinned by tests/SerializationCompat.Tests/CallbackCompatTests.fs.
+// ---------------------------------------------------------------------------
+
+let private serializeMessageWrapper (w: MessageWrapper) : JsonNode =
+    let payload = JsonObject()
+    payload["message"] <- JsonNode.Parse(FunogramJson.serialize w.message)
+    payload
+
+let private serializeReactionContext (ctx: ReactionContext) : JsonNode =
+    let payload = JsonObject()
+    payload["user_id"] <- JsonValue.Create ctx.userId
+    payload["chat_id"] <- JsonValue.Create ctx.chatId
+    match ctx.llmVerdict with
+    | Some v -> payload["llm_verdict"] <- JsonValue.Create v
+    | None -> ()
+    match ctx.llmReason with
+    | Some r -> payload["llm_reason"] <- JsonValue.Create r
+    | None -> ()
+    payload
 
 let serializeCallbackData (data: CallbackMessage) : string =
-    JsonSerializer.Serialize(data, callbackJsonOpts)
+    let case, payload =
+        match data with
+        | NotASpam w        -> "NotASpam",        serializeMessageWrapper w
+        | Spam w            -> "Spam",            serializeMessageWrapper w
+        | MarkAsSpam w      -> "MarkAsSpam",      serializeMessageWrapper w
+        | ReactionBan ctx     -> "ReactionBan",     serializeReactionContext ctx
+        | ReactionSpam ctx    -> "ReactionSpam",    serializeReactionContext ctx
+        | ReactionNotSpam ctx -> "ReactionNotSpam", serializeReactionContext ctx
+    let root = JsonObject()
+    root["Case"] <- JsonValue.Create case
+    root["Fields"] <- JsonArray(payload)
+    root.ToJsonString()
 
 let deserializeCallbackData (json: string) : CallbackMessage =
-    JsonSerializer.Deserialize<CallbackMessage>(json, callbackJsonOpts)
+    use doc = JsonDocument.Parse json
+    let root = doc.RootElement
+    let case = root.GetProperty("Case").GetString()
+    let field = root.GetProperty("Fields").[0]
+
+    let readMessageWrapper () =
+        let messageEl = field.GetProperty "message"
+        let messageJson =
+            match messageEl.ValueKind with
+            // defensive: tolerate a string-encoded (double-serialized) message
+            | JsonValueKind.String -> messageEl.GetString()
+            | _ -> messageEl.GetRawText()
+        { message = FunogramJson.deserialize<Funogram.Telegram.Types.Message> messageJson }
+
+    let readReactionContext () =
+        let optionalString (name: string) =
+            match field.TryGetProperty name with
+            | true, v when v.ValueKind = JsonValueKind.String -> Some (v.GetString())
+            | _ -> None
+        { userId     = field.GetProperty("user_id").GetInt64()
+          chatId     = field.GetProperty("chat_id").GetInt64()
+          llmVerdict = optionalString "llm_verdict"
+          llmReason  = optionalString "llm_reason" }
+
+    match case with
+    | "NotASpam"        -> NotASpam (readMessageWrapper())
+    | "Spam"            -> Spam (readMessageWrapper())
+    | "MarkAsSpam"      -> MarkAsSpam (readMessageWrapper())
+    | "ReactionBan"     -> ReactionBan (readReactionContext())
+    | "ReactionSpam"    -> ReactionSpam (readReactionContext())
+    | "ReactionNotSpam" -> ReactionNotSpam (readReactionContext())
+    | other             -> failwith $"Unknown CallbackMessage case: {other}"
 
 /// Lightweight DTO for callback queries (projected from events).
 [<CLIMutable>]

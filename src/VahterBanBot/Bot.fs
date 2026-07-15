@@ -1,32 +1,29 @@
 // VahterBanBot — Telegram moderation bot
-namespace VahterBanBot
+module VahterBanBot.Bot
 
 open System
 open System.Diagnostics
-open System.IO
 open System.Text
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
-open Telegram.Bot
-open Telegram.Bot.Types
-open Telegram.Bot.Types.Enums
-open Telegram.Bot.Types.ReplyMarkups
+open Funogram.Telegram.Types
 open VahterBanBot.ML
 open VahterBanBot.ComputerVision
 open VahterBanBot.LlmTriage
 open VahterBanBot.ProfileFetcher
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
-open BotInfra.TelegramExtensions
 open VahterBanBot.Utils
 open BotInfra
 open VahterBanBot.UpdateChatAdmins
 open VahterBanBot.Metrics
 
-// Telegram.Bot.Types.User is shadowed by VahterBanBot.Types.User
-type TgUser = Telegram.Bot.Types.User
+module Req = Funogram.Telegram.Req
+
+// Funogram.Telegram.Types.User is shadowed by VahterBanBot.Types.User
+type TgUser = Funogram.Telegram.Types.User
 
 // ---------------------------------------------------------------------------
 // Pure helper functions — no service dependencies, kept at module level
@@ -160,11 +157,15 @@ module private BotHelpers =
             logger.LogWarning $"User {fromUsername} ({fromUserId}) tried to ban user {prependUsername targetUsername} ({targetUserId}) without being admin in chat {chatUsername} ({chatId})"
             false
 
-    let safeTaskAwait onError (task: Task) =
-        task.ContinueWith(fun (t: Task) ->
+    let safeTaskAwait onError (t: #Task) =
+        (t :> Task).ContinueWith(fun (t: Task) ->
             if t.IsFaulted then
                 onError t.Exception
         )
+
+    /// Telegram API until_date fields are unix timestamps (seconds).
+    let toUnixTime (dt: DateTime) =
+        DateTimeOffset(dt, TimeSpan.Zero).ToUnixTimeSeconds()
 
     let aggregateResultInLogMsg
         (loggedAction: LoggedAction)
@@ -190,7 +191,7 @@ module private BotHelpers =
             | Some id -> $"({id})"
             | None -> ""
 
-        let chatName = loggedAction.Chat.Username
+        let chatName = loggedAction.Chat.Username |> Option.toObj
         let chatId = loggedAction.Chat.Id
 
         let logMsgBuilder = StringBuilder()
@@ -240,7 +241,7 @@ module private BotHelpers =
         | AutoDeleteReason.InvisibleMention   -> $"{prefix}invisible mention"
 
     let selectLargestPhoto (photos: PhotoSize array) =
-        let withSize = photos |> Array.filter (fun p -> p.FileSize.HasValue)
+        let withSize = photos |> Array.filter (fun p -> p.FileSize.IsSome)
         if withSize.Length > 0 then
             withSize |> Array.maxBy (fun p -> p.FileSize.Value)
         else
@@ -248,7 +249,7 @@ module private BotHelpers =
 
 
 type BotService(
-    botClient: ITelegramBotClient,
+    tg: ITelegramApi,
     botConfig: IOptions<BotConfiguration>,
     db: DbService,
     ml: MachineLearning,
@@ -273,7 +274,8 @@ type BotService(
             botConfig.Value.ChatsToMonitor
             |> Seq.map (fun (KeyValue(chatUserName, chatId)) -> task {
                 try
-                    do! botClient.BanChatMember(ChatId chatId, targetUserId, utcNow().AddMonths 13)
+                    do! tg.CallExn(Req.BanChatMember.Make(chatId, targetUserId, untilDate = toUnixTime (utcNow().AddMonths 13)))
+                        |> taskIgnore
                     return Ok(chatUserName, chatId)
                 with e ->
                     return Error (chatUserName, chatId, e)
@@ -281,26 +283,27 @@ type BotService(
         return! Task.WhenAll banTasks
     }
 
-    member private _.SoftBanInChat(chatId: ChatId, targetUserId, duration: int) = task {
-        let permissions = ChatPermissions(
-            CanSendMessages = false,
-            CanSendAudios = false,
-            CanSendDocuments = false,
-            CanSendPhotos = false,
-            CanSendVideos = false,
-            CanSendVideoNotes = false,
-            CanSendVoiceNotes = false,
-            CanSendPolls = false,
-            CanSendOtherMessages = false,
-            CanAddWebPagePreviews = false,
-            CanChangeInfo = false,
-            CanInviteUsers = false,
-            CanPinMessages = false,
-            CanManageTopics = false
+    member private _.SoftBanInChat(chatId: int64, targetUserId, duration: int) = task {
+        let permissions = ChatPermissions.Create(
+            canSendMessages = false,
+            canSendAudios = false,
+            canSendDocuments = false,
+            canSendPhotos = false,
+            canSendVideos = false,
+            canSendVideoNotes = false,
+            canSendVoiceNotes = false,
+            canSendPolls = false,
+            canSendOtherMessages = false,
+            canAddWebPagePreviews = false,
+            canChangeInfo = false,
+            canInviteUsers = false,
+            canPinMessages = false,
+            canManageTopics = false
             )
-        let untilDate = utcNow().AddHours duration
+        let untilDate = toUnixTime (utcNow().AddHours duration)
         try
-            do! botClient.RestrictChatMember(chatId, targetUserId, permissions, untilDate = untilDate)
+            do! tg.CallExn(Req.RestrictChatMember.Make(chatId, targetUserId, permissions, untilDate = untilDate))
+                |> taskIgnore
             return Ok(chatId, targetUserId)
         with e ->
             return Error(chatId, targetUserId, e)
@@ -311,7 +314,8 @@ type BotService(
             botConfig.Value.ChatsToMonitor
             |> Seq.map (fun (KeyValue(chatUserName, chatId)) -> task {
                 try
-                    do! botClient.UnbanChatMember(ChatId chatId, targetUserId, true)
+                    do! tg.CallExn(Req.UnbanChatMember.Make(chatId, targetUserId, onlyIfBanned = true))
+                        |> taskIgnore
                     return Ok(chatUserName, chatId)
                 with e ->
                     return Error (chatUserName, chatId, e)
@@ -325,7 +329,7 @@ type BotService(
 
     member private _.Ping(msg: TgMessage) = task {
         use _ = botActivity.StartActivity("ping")
-        do! botClient.SendMessage(ChatId(msg.ChatId), "pong") |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(msg.ChatId, "pong")) |> taskIgnore
     }
 
     member private this.TotalBan(msg: TgMessage, actor: Actor) = task {
@@ -352,7 +356,7 @@ type BotService(
                     .SetTag("chatId", msg.ChatId)
                     .SetTag("chatUsername", msg.ChatUsername)
             recordDeletedMessage msg.ChatId msg.ChatUsername "totalBan_initial"
-            do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
+            do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
         }
 
@@ -376,7 +380,7 @@ type BotService(
                                 .SetTag("msgId", m.message_id)
                                 .SetTag("chatId", m.chat_id)
                         recordDeletedMessage m.chat_id null "totalBan_history"
-                        do! botClient.DeleteMessage(ChatId(m.chat_id), int m.message_id)
+                        do! tg.CallExn(Req.DeleteMessage.Make(m.chat_id, m.message_id)) |> taskIgnore
                     with e ->
                         logger.LogWarning ($"Failed to delete message {m.message_id} from chat {m.chat_id}", e)
                 })
@@ -402,7 +406,7 @@ type BotService(
                         // Delete message from action channel
                         match callback.action_message_id with
                         | Some msgId ->
-                            do! botClient.DeleteMessage(ChatId(callback.action_channel_id), int msgId)
+                            do! tg.CallExn(Req.DeleteMessage.Make(callback.action_channel_id, msgId))
                                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
                         | None -> ()
                         // Expire callback
@@ -437,10 +441,7 @@ type BotService(
         do! db.RecordUserBanned(actor, msg, botConfig.Value.BanExpiryDays)
 
         // log both to logger and to All Logs channel
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
 
         do! deleteMsgTask
@@ -487,7 +488,7 @@ type BotService(
                     .SetTag("chatId", messageToRemove.ChatId)
                     .SetTag("chatUsername", messageToRemove.ChatUsername)
             recordDeletedMessage messageToRemove.ChatId messageToRemove.ChatUsername "softBan"
-            do! botClient.DeleteMessage(ChatId(messageToRemove.ChatId), int messageToRemove.MessageId)
+            do! tg.CallExn(Req.DeleteMessage.Make(messageToRemove.ChatId, messageToRemove.MessageId))
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete reply message {messageToRemove.MessageId} from chat {messageToRemove.ChatId}", e))
         }
 
@@ -500,13 +501,10 @@ type BotService(
 
         let logText = softBanResultInLogMsg messageToRemove vahter duration (utcNow())
 
-        do! this.SoftBanInChat(ChatId messageToRemove.ChatId, messageToRemove.SenderId, duration) |> taskIgnore
+        do! this.SoftBanInChat(messageToRemove.ChatId, messageToRemove.SenderId, duration) |> taskIgnore
         do! deleteMsgTask
 
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logText
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logText)) |> taskIgnore
         logger.LogInformation logText
     }
 
@@ -534,10 +532,7 @@ type BotService(
                 unbanResults
 
         // log both to logger and to All Logs channel
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }
 
@@ -563,10 +558,7 @@ type BotService(
                 let logStr = $"Auto-banned user {prependUsername msg.SenderUsername} ({msg.SenderId}) due to the low social score {socialScore}"
                 logger.LogInformation logStr
                 fireAndForget logger "autoBanLogPost" (fun () ->
-                    botClient.SendMessage(
-                        chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                        text = logStr
-                    ) :> Task
+                    tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logStr)) :> Task
                 )
                 return true
             else
@@ -584,7 +576,7 @@ type BotService(
 
         // 1. Delete message + record BotAutoDeleted
         recordDeletedMessage msg.ChatId msg.ChatUsername "spamDeletion"
-        do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
+        do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
             |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
         do! db.RecordBotAutoDeleted(msg.ChatId, msg.MessageId, msg.SenderId, reason)
 
@@ -595,26 +587,23 @@ type BotService(
         let logMsg = $"Deleted spam ({formatReasonStr reason (Some actor)}) in {prependUsername msg.ChatUsername} ({msg.ChatId}) from {prependUsername msg.SenderUsername} ({msg.SenderId}) with text:\n{msg.Text}\n{msgRefToken msg.ChatId msg.MessageId}"
         let callbackId = Guid.NewGuid()
         do! db.RecordCallbackCreated(callbackId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.DetectedSpamChannelId)
-        let markup = InlineKeyboardMarkup [
-            InlineKeyboardButton.WithCallbackData("✅ NOT a spam", string callbackId)
-        ]
+        let markup = InlineKeyboardMarkup.Create [|
+            [| InlineKeyboardButton.Create("✅ NOT a spam", callbackData = string callbackId) |]
+        |]
         fireAndForget logger "detectedSpamChannelPost" (fun () ->
             task {
-                let! sent = botClient.SendMessage(
-                    chatId = ChatId(botConfig.Value.DetectedSpamChannelId),
-                    text = logMsg,
-                    replyMarkup = markup
-                )
+                let! sent = tg.CallExn(Req.SendMessage.Make(
+                                botConfig.Value.DetectedSpamChannelId,
+                                logMsg,
+                                replyMarkup = Markup.InlineKeyboardMarkup markup
+                            ))
                 do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
             } :> Task
         )
 
         // 3. All logs channel (readonly, no buttons)
         fireAndForget logger "allLogsChannelPost" (fun () ->
-            botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) :> Task
+            tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) :> Task
         )
         logger.LogInformation logMsg
 
@@ -640,24 +629,21 @@ type BotService(
         do! db.RecordCallbackCreated(killId, CallbackMessage.Spam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
         do! db.RecordCallbackCreated(softSpamId, CallbackMessage.MarkAsSpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
         do! db.RecordCallbackCreated(notSpamId, CallbackMessage.NotASpam { message = msg.RawMessage }, msg.SenderId, botConfig.Value.PotentialSpamChannelId)
-        let markup = InlineKeyboardMarkup [|
-            InlineKeyboardButton.WithCallbackData("🚫 KILL", string killId);
-            InlineKeyboardButton.WithCallbackData("⚠️ SPAM", string softSpamId);
-            InlineKeyboardButton.WithCallbackData("✅ NOT SPAM", string notSpamId)
+        let markup = InlineKeyboardMarkup.Create [|
+            [| InlineKeyboardButton.Create("🚫 KILL", callbackData = string killId)
+               InlineKeyboardButton.Create("⚠️ SPAM", callbackData = string softSpamId)
+               InlineKeyboardButton.Create("✅ NOT SPAM", callbackData = string notSpamId) |]
         |]
-        let! sent = botClient.SendMessage(
-            chatId = ChatId(botConfig.Value.PotentialSpamChannelId),
-            text = logMsg,
-            replyMarkup = markup
-        )
+        let! sent = tg.CallExn(Req.SendMessage.Make(
+                        botConfig.Value.PotentialSpamChannelId,
+                        logMsg,
+                        replyMarkup = Markup.InlineKeyboardMarkup markup
+                    ))
         for callbackId in [killId; softSpamId; notSpamId] do
             do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
 
         // All logs channel (readonly, no buttons)
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }
 
@@ -673,7 +659,7 @@ type BotService(
             targets
             |> Seq.map (fun t -> task {
                 try
-                    do! botClient.DeleteMessageReaction(ChatId t.chat_id, int t.message_id, userId)
+                    do! tg.CallExn(Req.DeleteMessageReaction.Make(t.chat_id, t.message_id, userId = userId)) |> taskIgnore
                 with e ->
                     logger.LogInformation(e, "DeleteMessageReaction failed for user {U} msg {C}/{M} (likely already gone)", userId, t.chat_id, t.message_id)
             })
@@ -687,8 +673,8 @@ type BotService(
     /// `actor` flows into the AllLogs audit message so vahters can see who decided.
     member private this.ReactionAct_Spam(chatId: int64, targetUser: User, actor: Actor) = task {
         try
-            let perms = ChatPermissions(CanReactToMessages = false)
-            do! botClient.RestrictChatMember(ChatId chatId, targetUser.Id, perms)
+            let perms = ChatPermissions.Create(canReactToMessages = false)
+            do! tg.CallExn(Req.RestrictChatMember.Make(chatId, targetUser.Id, perms)) |> taskIgnore
         with e ->
             logger.LogWarning(e, "RestrictChatMember(can_react=false) failed for user {U} in chat {C}", targetUser.Id, chatId)
         let! removed = this.RemoveRecordedReactions(targetUser.Id, Some chatId)
@@ -701,7 +687,7 @@ type BotService(
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let logMsg =
             $"⚠️ Reaction-triage SPAM on {sanitizedUsername} ({targetUser.Id}) in {chatLabel} by {prependUsername actor.DisplayName} — restricted reactions, removed {removed} existing"
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
         return removed
     }
@@ -710,7 +696,7 @@ type BotService(
     /// `actor` is whoever triggered the ban — Actor.LLM in autonomous mode, Actor.User when a
     /// vahter clicked the button. The actor flows into the UserBanned event so analytics /
     /// stats queries can attribute the kill correctly.
-    member private this.ReactionAct_Ban(triggeringChatId: int64, triggeringMessageId: int, targetUser: User, actor: Actor) = task {
+    member private this.ReactionAct_Ban(triggeringChatId: int64, triggeringMessageId: int64, targetUser: User, actor: Actor) = task {
         let! removedReactions = this.RemoveRecordedReactions(targetUser.Id, None)
 
         // delete all recorded messages from user in all chats
@@ -720,7 +706,7 @@ type BotService(
             |> Seq.map (fun msg -> task {
                 try
                     recordDeletedMessage msg.chat_id null "reactionTriage_ban_history"
-                    do! botClient.DeleteMessage(ChatId msg.chat_id, int msg.message_id)
+                    do! tg.CallExn(Req.DeleteMessage.Make(msg.chat_id, msg.message_id)) |> taskIgnore
                 with e ->
                     logger.LogWarning(e, "Failed to delete message {M} from chat {C}", msg.message_id, msg.chat_id)
             })
@@ -746,7 +732,7 @@ type BotService(
                 | Ok(chatName, _) -> %logMsgBuilder.AppendLine $"  ✅ {prependUsername chatName}"
                 | Error(chatName, _, e) -> %logMsgBuilder.AppendLine $"  ❌ {prependUsername chatName}: {e.Message}"
         let logMsg = string logMsgBuilder
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }
 
@@ -760,7 +746,7 @@ type BotService(
         let sanitizedUsername = defaultArg targetUser.Username null |> prependUsername
         let logMsg =
             $"✅ Reaction-triage NOT SPAM on {sanitizedUsername} ({targetUser.Id}) by {prependUsername actor.DisplayName} — cooldown for {cooldownDays}d, no destructive action"
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, logMsg) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }
 
@@ -788,7 +774,7 @@ type BotService(
             do!
                 uniqueMessages
                 |> Seq.map (fun (chId, msgId) -> task {
-                    do! botClient.DeleteMessage(ChatId chId, int msgId)
+                    do! tg.CallExn(Req.DeleteMessage.Make(chId, msgId))
                         |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete reaction-triage alert {msgId} in chat {chId}", e))
                 })
                 |> Task.WhenAll
@@ -802,19 +788,19 @@ type BotService(
 
     /// Builds the dossier shown to both the LLM and (in shadow / UNSURE) the vahter.
     /// Privacy-strict users return None photo and empty bio — both downstream consumers handle that.
-    member private _.BuildReactionTriageDossier(reaction: MessageReactionUpdated, targetUser: User) = task {
-        let! profile = profileFetcher.Fetch(reaction.User.Id)
-        let! totalMessages = db.GetTotalMessagesByUser(reaction.User.Id)
-        let! firstSeen = db.GetUserFirstSeenAt(reaction.User.Id)
-        let! events = db.GetRecentDossierEvents(reaction.User.Id, 10)
+    member private _.BuildReactionTriageDossier(reaction: MessageReactionUpdated, reactionUser: TgUser, targetUser: User) = task {
+        let! profile = profileFetcher.Fetch(reactionUser.Id)
+        let! totalMessages = db.GetTotalMessagesByUser(reactionUser.Id)
+        let! firstSeen = db.GetUserFirstSeenAt(reactionUser.Id)
+        let! events = db.GetRecentDossierEvents(reactionUser.Id, 10)
         let displayName =
             let parts = [
-                Option.ofObj reaction.User.FirstName |> Option.defaultValue ""
-                Option.ofObj reaction.User.LastName  |> Option.defaultValue ""
+                reactionUser.FirstName
+                defaultArg reactionUser.LastName ""
             ]
             parts |> String.concat " " |> fun s -> s.Trim()
         return
-            { UserId                   = reaction.User.Id
+            { UserId                   = reactionUser.Id
               Username                 = targetUser.Username
               DisplayName              = displayName
               Bio                      = profile.Bio
@@ -941,10 +927,10 @@ type BotService(
         do! db.RecordCallbackCreated(spamId,    CallbackMessage.ReactionSpam ctx,    dossier.UserId, actionChannelId)
         do! db.RecordCallbackCreated(notSpamId, CallbackMessage.ReactionNotSpam ctx, dossier.UserId, actionChannelId)
 
-        let markup = InlineKeyboardMarkup [|
-            InlineKeyboardButton.WithCallbackData("🚫 BAN",      string banId)
-            InlineKeyboardButton.WithCallbackData("⚠️ SPAM",     string spamId)
-            InlineKeyboardButton.WithCallbackData("✅ NOT SPAM", string notSpamId)
+        let markup = InlineKeyboardMarkup.Create [|
+            [| InlineKeyboardButton.Create("🚫 BAN",      callbackData = string banId)
+               InlineKeyboardButton.Create("⚠️ SPAM",     callbackData = string spamId)
+               InlineKeyboardButton.Create("✅ NOT SPAM", callbackData = string notSpamId) |]
         |]
 
         // Telegram caption limit is 1024 chars; sendMessage limit is 4096. With the trimmed
@@ -952,35 +938,35 @@ type BotService(
         // chars, comfortably under the photo-caption cap. If a freakishly long bio pushes us
         // over, fall back to text-only (sendMessage with link preview disabled) so vahter still
         // sees everything.
-        let actionChatId = ChatId actionChannelId
         let captionFits = header.Length <= 1000
         let! sent =
             match dossier.PhotoBytes with
             | Some bytes when captionFits ->
-                use ms = new MemoryStream(bytes)
-                let inputFile = InputFileStream(ms, "profile.jpg")
-                botClient.SendPhoto(actionChatId, inputFile, caption = header, parseMode = ParseMode.Html, replyMarkup = markup)
+                tg.CallExn(Req.SendPhoto.Make(actionChannelId, InputFile.FileBytes("profile.jpg", bytes),
+                                              caption = header, parseMode = ParseMode.HTML,
+                                              replyMarkup = Markup.InlineKeyboardMarkup markup))
             | _ ->
-                botClient.SendMessage(actionChatId, header, parseMode = ParseMode.Html, replyMarkup = markup)
+                tg.CallExn(Req.SendMessage.Make(actionChannelId, header, parseMode = ParseMode.HTML,
+                                                replyMarkup = Markup.InlineKeyboardMarkup markup))
 
         for callbackId in [banId; spamId; notSpamId] do
             do! db.RecordCallbackMessagePosted(callbackId, sent.MessageId)
 
         // Mirror the full alert text (no buttons, no photo) to AllLogsChannel for audit.
-        do! botClient.SendMessage(ChatId botConfig.Value.AllLogsChannelId, header, parseMode = ParseMode.Html) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, header, parseMode = ParseMode.HTML)) |> taskIgnore
 
         logger.LogInformation("Reaction triage alert posted for user {U} chat {C} (LLM verdict: {V})", dossier.UserId, dossier.OriginatingChatId, defaultArg llmVerdict "(none)")
     }
 
     /// Top-level orchestrator: builds dossier, calls LLM (if enabled), records the verdict event,
     /// then either acts autonomously or posts the vahter alert.
-    member private this.RunReactionTriagePipeline(reaction: MessageReactionUpdated, targetUser: User) = task {
+    member private this.RunReactionTriagePipeline(reaction: MessageReactionUpdated, reactionUser: TgUser, targetUser: User) = task {
         use activity = botActivity.StartActivity("reactionTriagePipeline")
         %activity
             .SetTag("user_id", targetUser.Id)
             .SetTag("chat_id", reaction.Chat.Id)
 
-        let! dossier = this.BuildReactionTriageDossier(reaction, targetUser)
+        let! dossier = this.BuildReactionTriageDossier(reaction, reactionUser, targetUser)
 
         let shadowDisabled = botConfig.Value.LlmReactionTriageShadowDisable
         let autoAct        = botConfig.Value.LlmReactionTriageAutoAct
@@ -1077,7 +1063,7 @@ type BotService(
             // Old user immunity: skip triage when ML score is positive but user has enough history
             if prediction.Score > 0f && usrMsgCount >= botConfig.Value.MlOldUserMsgCount then
                 let logMsg = $"User {prependUsername msg.SenderUsername} ({msg.SenderId}) has {usrMsgCount} msgs (score: {prediction.Score}) — ML god shows mercy today, skipping triage"
-                do! botClient.SendMessage(ChatId(botConfig.Value.AllLogsChannelId), text = logMsg) |> taskIgnore
+                do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
                 logger.LogInformation logMsg
                 return Some (AutoVerdict.NotSpam Actor.ML)
             elif prediction.Score >= botConfig.Value.MlSpamThreshold then
@@ -1127,9 +1113,9 @@ type BotService(
 
             let checkEntity (text: string) (entity: MessageEntity) =
                 match entity.Type with
-                | MessageEntityType.TextMention | MessageEntityType.Mention ->
-                    let startIdx = entity.Offset
-                    let endIdx = entity.Offset + entity.Length - 1
+                | "text_mention" | "mention" ->
+                    let startIdx = int entity.Offset
+                    let endIdx = int entity.Offset + int entity.Length - 1
 
                     if startIdx < 0 || endIdx >= text.Length then
                         false
@@ -1141,7 +1127,7 @@ type BotService(
                         )
                 | _ -> false
 
-            match Option.ofObj msg.OriginalText, Option.ofObj msg.Entities with
+            match Option.ofObj msg.OriginalText, msg.Entities with
             | Some text, Some entities ->
                 entities |> Array.exists (checkEntity text)
             | _ -> false
@@ -1152,13 +1138,10 @@ type BotService(
         let hasPendingAzureOcr =
             botConfig.Value.OcrEnabled
             && ((not msg.OwnPhotoOcrApplied
-                 && not (isNull msg.Photos)
                  && msg.Photos.Length > 0)
                 || (botConfig.Value.ForwardSpamDetectionEnabled
                     && not msg.ExternalReplyPhotoOcrApplied
-                    && not (isNull msg.ExternalReply)
-                    && not (isNull msg.ExternalReply.Photo)
-                    && msg.ExternalReply.Photo.Length > 0))
+                    && msg.ExternalReplyPhotos.Length > 0))
 
         if containsInvisibleMention then
             do! recordMsg()
@@ -1263,12 +1246,9 @@ type BotService(
             // just delete message and move on
             let logMsg = $"Bot deleted message {msg.MessageId} from {prependUsername msg.SenderUsername}({msg.SenderId}) in {prependUsername msg.ChatUsername}({msg.ChatId}) because user was already banned\n{msgRefToken msg.ChatId msg.MessageId}"
             logger.LogInformation logMsg
-            do! botClient.SendMessage(
-                    chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                    text = logMsg
-                ) |> taskIgnore
+            do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
             recordDeletedMessage msg.ChatId msg.ChatUsername "alreadyAutoBanned"
-            do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
+            do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
 
         else do! this.ProcessMessage(msg)
@@ -1322,7 +1302,7 @@ type BotService(
                         .SetTag("chatId", msg.ChatId)
                         .SetTag("chatUsername", msg.ChatUsername)
                 recordDeletedMessage msg.ChatId msg.ChatUsername "adminCommand"
-                do! botClient.DeleteMessage(ChatId(msg.ChatId), int msg.MessageId)
+                do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
                     |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete command message {msg.MessageId} from chat {msg.ChatId}", e))
             }
             // check that user is allowed to (un)ban others
@@ -1344,21 +1324,22 @@ type BotService(
 
     /// Sends a feedback message into the admin channel, quoting the command.
     member private _.ReplyAdmin(msg: TgMessage, text: string) =
-        botClient.SendMessage(
-            chatId = ChatId(botConfig.Value.AdminChannelId),
-            text = text,
-            replyParameters = ReplyParameters(MessageId = int msg.MessageId, AllowSendingWithoutReply = true))
+        tg.CallExn(Req.SendMessage.Make(
+            botConfig.Value.AdminChannelId,
+            text,
+            replyParameters = ReplyParameters.Create(msg.MessageId, allowSendingWithoutReply = true)))
         |> taskIgnore
 
     /// Resolves a public chat/channel by @username via Telegram getChat.
     member private _.ResolveChatByUsername(username: string) = task {
         try
             let handle = if username.StartsWith "@" then username else "@" + username
-            let! chat = botClient.GetChat(ChatId handle)
+            let! chat = tg.CallExn(Req.GetChat.Make handle)
             let key =
-                if not (isNull chat.Username) then chat.Username
-                elif not (isNull chat.Title) then chat.Title
-                else username.TrimStart('@')
+                match chat.Username, chat.Title with
+                | Some username, _ -> username
+                | None, Some title -> title
+                | None, None -> username.TrimStart('@')
             return Ok(key, chat.Id)
         with e ->
             return Error e.Message
@@ -1554,14 +1535,18 @@ type BotService(
     // -----------------------------------------------------------------------
 
     member private this.OcrFresh(largestPhoto: PhotoSize, fileUniqueId: string) = task {
-        let! file = botClient.GetFile(largestPhoto.FileId)
+        let! file = tg.CallExn(Req.GetFile.Make largestPhoto.FileId)
 
-        if String.IsNullOrWhiteSpace file.FilePath then
+        match file.FilePath with
+        | None ->
             logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
             return None
-        else
+        | Some filePath when String.IsNullOrWhiteSpace filePath ->
+            logger.LogWarning("Failed to resolve file path for photo {PhotoId}", largestPhoto.FileId)
+            return None
+        | Some filePath ->
             let apiBase = if isNull botConfig.Value.TelegramApiBaseUrl then "https://api.telegram.org" else botConfig.Value.TelegramApiBaseUrl
-            let fileUrl = $"{apiBase}/file/bot{botConfig.Value.BotToken}/{file.FilePath}"
+            let fileUrl = $"{apiBase}/file/bot{botConfig.Value.BotToken}/{filePath}"
             let! analysis = computerVision.AnalyzeImageUrl fileUrl
             match analysis with
             | null ->
@@ -1579,7 +1564,7 @@ type BotService(
         let candidates =
             photos
             |> Array.filter (fun p ->
-                let size = int64 p.FileSize
+                let size = p.FileSize |> Option.defaultValue 0L
                 size = 0L || size <= botConfig.Value.OcrMaxFileSizeBytes)
         if candidates.Length = 0 then None
         else Some (selectLargestPhoto candidates)
@@ -1616,13 +1601,15 @@ type BotService(
 
     /// Cheap, synchronous, no I/O. Safe to call at the top of OnUpdate.
     member private _.TryEnrichWithForwardedQuoteText(msg: TgMessage) =
-        if botConfig.Value.ForwardSpamDetectionEnabled
-           && isMessageFromAllowedChats botConfig.Value msg
-           && not (isNull msg.Quote)
-           && not (String.IsNullOrWhiteSpace msg.Quote.Text) then
+        match msg.Quote with
+        | Some quote when
+            botConfig.Value.ForwardSpamDetectionEnabled
+            && isMessageFromAllowedChats botConfig.Value msg
+            && not (String.IsNullOrWhiteSpace quote.Text) ->
             use activity = botActivity.StartActivity("forwardedQuoteEnrichment")
-            msg.PrependText(msg.Quote.Text)
-            %activity.SetTag("quoteTextLength", msg.Quote.Text.Length)
+            msg.PrependText(quote.Text)
+            %activity.SetTag("quoteTextLength", quote.Text.Length)
+        | _ -> ()
 
     /// Cache-only OCR enrichment for any photos on the message — both the
     /// message's own photos and external-reply quote photos. No Azure calls.
@@ -1638,12 +1625,10 @@ type BotService(
             // External-reply quote photo (prepend, to match the order produced
             // by the previous TryEnrichWithForwardedContent: quote + ocr).
             if botConfig.Value.ForwardSpamDetectionEnabled
-               && not (isNull msg.ExternalReply)
-               && not (isNull msg.ExternalReply.Photo)
-               && msg.ExternalReply.Photo.Length > 0 then
+               && msg.ExternalReplyPhotos.Length > 0 then
                 %activity.SetTag("externalReplyCacheLookup", true)
                 try
-                    let! cached = this.OcrLookupCache(msg.ExternalReply.Photo)
+                    let! cached = this.OcrLookupCache(msg.ExternalReplyPhotos)
                     match cached with
                     | Some text ->
                         if not (String.IsNullOrWhiteSpace text) then
@@ -1660,7 +1645,7 @@ type BotService(
                     %activity.SetTag("externalReplyCacheHit", "error")
 
             // Message's own photos (append).
-            if not (isNull msg.Photos) && msg.Photos.Length > 0 then
+            if msg.Photos.Length > 0 then
                 %activity.SetTag("ownPhotoCacheLookup", true)
                 try
                     let! cached = this.OcrLookupCache(msg.Photos)
@@ -1689,12 +1674,10 @@ type BotService(
         elif botConfig.Value.ForwardSpamDetectionEnabled
              && botConfig.Value.OcrEnabled
              && isMessageFromAllowedChats botConfig.Value msg
-             && not (isNull msg.ExternalReply)
-             && not (isNull msg.ExternalReply.Photo)
-             && msg.ExternalReply.Photo.Length > 0 then
+             && msg.ExternalReplyPhotos.Length > 0 then
             use activity = botActivity.StartActivity("forwardedPhotoOcrEnrichment")
             try
-                let! ocrText = this.OcrPhotosFresh(msg.ExternalReply.Photo, msg.MessageId)
+                let! ocrText = this.OcrPhotosFresh(msg.ExternalReplyPhotos, msg.MessageId)
                 match ocrText with
                 | Some text ->
                     msg.PrependText(text)
@@ -1714,7 +1697,7 @@ type BotService(
     member private this.TryEnrichWithOcr(msg: TgMessage) = task {
         if msg.OwnPhotoOcrApplied then ()
         elif botConfig.Value.OcrEnabled
-             && not (isNull msg.Photos) && msg.Photos.Length > 0
+             && msg.Photos.Length > 0
              && isMessageFromAllowedChats botConfig.Value msg then
             use activity = botActivity.StartActivity("ocrEnrichment")
             try
@@ -1733,19 +1716,22 @@ type BotService(
     }
 
     member private _.TryEnrichWithInlineKeyboardText(msg: TgMessage) = task {
-        if botConfig.Value.InlineKeyboardSpamDetectionEnabled
-           && not (isNull msg.ReplyMarkup)
-           && not (isNull msg.ReplyMarkup.InlineKeyboard)
-           && isMessageFromAllowedChats botConfig.Value msg then
+        match msg.ReplyMarkup with
+        | Some replyMarkup when
+            botConfig.Value.InlineKeyboardSpamDetectionEnabled
+            && not (isNull replyMarkup.InlineKeyboard)
+            && isMessageFromAllowedChats botConfig.Value msg ->
             use activity = botActivity.StartActivity("inlineKeyboardEnrichment")
             try
                 let sb = StringBuilder()
-                for row in msg.ReplyMarkup.InlineKeyboard do
+                for row in replyMarkup.InlineKeyboard do
                     for button in row do
                         if not (String.IsNullOrWhiteSpace button.Text) then
                             %sb.AppendLine(button.Text)
-                        if not (isNull button.Url) && not (String.IsNullOrWhiteSpace button.Url) then
-                            %sb.AppendLine(button.Url)
+                        match button.Url with
+                        | Some url when not (String.IsNullOrWhiteSpace url) ->
+                            %sb.AppendLine(url)
+                        | _ -> ()
 
                 let buttonText = sb.ToString().TrimEnd([|'\r'; '\n'|])
                 if not (String.IsNullOrWhiteSpace buttonText) then
@@ -1759,6 +1745,7 @@ type BotService(
                     %activity.SetTag("enrichedTextLength", msg.Text.Length)
             with ex ->
                 logger.LogError(ex, "Failed to process inline keyboard text for message {MessageId}", msg.MessageId)
+        | _ -> ()
     }
 
     // -----------------------------------------------------------------------
@@ -1779,10 +1766,7 @@ type BotService(
         let vahterUsername = vahter.Username |> Option.defaultValue null
 
         let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as false-positive (NOT A SPAM)\n{tgMsg.Text}"
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
     }
 
@@ -1814,7 +1798,7 @@ type BotService(
 
         // 1. Delete the message from original chat
         recordDeletedMessage chatId chatName "softSpam"
-        do! botClient.DeleteMessage(ChatId(chatId), int msgId)
+        do! tg.CallExn(Req.DeleteMessage.Make(chatId, msgId))
             |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete message {msgId} from chat {chatId}", e))
 
         // 2. Mark as spam (for ML training + karma)
@@ -1823,10 +1807,7 @@ type BotService(
         // 3. Log the action
         let vahterUsername = vahter.Username |> Option.defaultValue null
         let logMsg = $"Vahter {prependUsername vahterUsername} ({vahter.Id}) marked message {msgId} in {prependUsername chatName}({chatId}) as SPAM (soft, no ban)\n{tgMsg.Text}\n{msgRefToken chatId msgId}"
-        do! botClient.SendMessage(
-                chatId = ChatId(botConfig.Value.AllLogsChannelId),
-                text = logMsg
-            ) |> taskIgnore
+        do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
         logger.LogInformation logMsg
 
         // 4. Check auto-ban using shared logic (karma system)
@@ -1841,14 +1822,14 @@ type BotService(
         // they have different action keys for dedup (TryRecordVahterAction wants chatId+messageId for
         // a real message, but reaction-spam triage has no spam-message authored by the suspect).
         let answer (text: string) =
-            botClient.AnswerCallbackQuery(callbackQuery.Id, text)
+            tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = text))
             |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
 
         let cleanupActionMessage () = task {
             match callbackState.ActionMessageId with
             | Some msgId ->
                 do! db.ExpireCallbacksByMessageId(msgId)
-                do! botClient.DeleteMessage(ChatId callbackState.ActionChannelId, int msgId)
+                do! tg.CallExn(Req.DeleteMessage.Make(callbackState.ActionChannelId, msgId))
                     |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msgId} from action channel", e))
             | None -> ()
         }
@@ -1909,7 +1890,7 @@ type BotService(
                 | Some u -> return u
                 | None   -> return { User.Zero with Id = ctx.userId }
             }
-            do! this.ReactionAct_Ban(ctx.chatId, 0, u, actor)
+            do! this.ReactionAct_Ban(ctx.chatId, 0L, u, actor)
             do! answer "Banned 🚫"
             do! this.CleanupReactionTriageCallbacksForUser(ctx.userId)
 
@@ -1946,16 +1927,17 @@ type BotService(
 
     member private this.OnCallback(callbackQuery: CallbackQuery) = task {
         use onCallbackActivity = botActivity.StartActivity("onCallback")
-        %onCallbackActivity.SetTag("callbackId", callbackQuery.Data)
+        %onCallbackActivity.SetTag("callbackId", Option.toObj callbackQuery.Data)
 
-        let callbackId = Guid.Parse callbackQuery.Data
+        let fromUsername = Option.toObj callbackQuery.From.Username
+        let callbackId = Guid.Parse (Option.toObj callbackQuery.Data)
 
         // Level 1: Atomically resolve callback (protection between button clicks)
         match! db.ResolveCallback(callbackId) with
         | None ->
             // Callback already processed by another vahter
             logger.LogInformation $"Callback {callbackId} already processed"
-            do! botClient.AnswerCallbackQuery(callbackQuery.Id, "Already processed")
+            do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "Already processed"))
                 |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
         | Some callbackState ->
             let callbackData = deserializeCallbackData callbackState.Data.Value
@@ -1963,8 +1945,8 @@ type BotService(
 
             match! db.GetUserById(callbackQuery.From.Id) with
             | None ->
-                logger.LogWarning $"User {callbackQuery.From.Username} ({callbackQuery.From.Id}) tried to press callback button while not being in DB"
-                do! botClient.AnswerCallbackQuery(callbackQuery.Id, "You are not in DB")
+                logger.LogWarning $"User {fromUsername} ({callbackQuery.From.Id}) tried to press callback button while not being in DB"
+                do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "You are not in DB"))
                     |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
             | Some vahter ->
                 %onCallbackActivity.SetTag("vahterUsername", vahter.Username)
@@ -1973,8 +1955,8 @@ type BotService(
                 // only vahters should be able to press message buttons
                 let isAuthed = botConfig.Value.AllowedUsers.ContainsValue vahter.Id
                 if not isAuthed then
-                    logger.LogWarning $"User {callbackQuery.From.Username} ({callbackQuery.From.Id}) tried to press callback button while not being a certified vahter"
-                    do! botClient.AnswerCallbackQuery(callbackQuery.Id, "Not authorized")
+                    logger.LogWarning $"User {fromUsername} ({callbackQuery.From.Id}) tried to press callback button while not being a certified vahter"
+                    do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "Not authorized"))
                         |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
                 else
                     do! this.OnCallbackAux(onCallbackActivity, vahter, callbackState, callbackData, callbackQuery)
@@ -1989,21 +1971,20 @@ type BotService(
             botActivity
                 .StartActivity("messageReaction")
                 .SetTag("chatId", reaction.Chat.Id)
-                .SetTag("chatUsername", reaction.Chat.Username)
+                .SetTag("chatUsername", Option.toObj reaction.Chat.Username)
                 .SetTag("messageId", reaction.MessageId)
 
         // A reaction can be authored by an actor_chat (a channel reacting on its own behalf, or an
         // anonymous channel admin) instead of a user. Telegram then sends `actor_chat` and no `user`,
-        // so reaction.User is null — there's no real user to triage. Skip. This also guards the
-        // user tagging and the whole downstream pipeline against a NullReferenceException.
-        if isNull reaction.User then
+        // so reaction.User is None — there's no real user to triage. Skip.
+        match reaction.User with
+        | None ->
             %activity.SetTag("skipped", "noUser")
-            return ()
-        else
+        | Some reactionUser ->
 
         %activity
-            .SetTag("userId", reaction.User.Id)
-            .SetTag("userUsername", reaction.User.Username)
+            .SetTag("userId", reactionUser.Id)
+            .SetTag("userUsername", Option.toObj reactionUser.Username)
 
         // Check if reaction spam detection is enabled
         if not botConfig.Value.ReactionSpamEnabled then
@@ -2013,8 +1994,8 @@ type BotService(
             %activity.SetTag("skipped", "chatNotMonitored")
         else
             // Calculate added reactions (new - old)
-            let oldCount = if isNull reaction.OldReaction then 0 else reaction.OldReaction.Length
-            let newCount = if isNull reaction.NewReaction then 0 else reaction.NewReaction.Length
+            let oldCount = reaction.OldReaction.Length
+            let newCount = reaction.NewReaction.Length
             let added = newCount - oldCount
 
             %activity.SetTag("oldReactionCount", oldCount)
@@ -2026,21 +2007,19 @@ type BotService(
                 // Extract the joined emoji string from NewReaction for the dossier display.
                 // Premium custom emojis don't render as plain text — fall back to a tag.
                 let emojiStr =
-                    if isNull reaction.NewReaction then None
-                    else
-                        let parts =
-                            reaction.NewReaction
-                            |> Array.choose (fun r ->
-                                match r with
-                                | :? ReactionTypeEmoji as e       -> Option.ofObj e.Emoji
-                                | :? ReactionTypeCustomEmoji as _ -> Some "[custom]"
-                                | _                                -> None)
-                        if parts.Length = 0 then None else Some (String.Concat parts)
+                    let parts =
+                        reaction.NewReaction
+                        |> Array.choose (fun r ->
+                            match r with
+                            | ReactionType.Emoji e       -> Option.ofObj e.Emoji
+                            | ReactionType.CustomEmoji _ -> Some "[custom]"
+                            | ReactionType.Paid _        -> None)
+                    if parts.Length = 0 then None else Some (String.Concat parts)
 
                 // Upsert user and increment reaction count atomically (records chatId/messageId
                 // and the emoji so the vahter alert dossier can show what they reacted with)
                 let! updatedUser =
-                    db.UpsertUserAndIncrementReactions(reaction.User.Id, Option.ofObj reaction.User.Username, reaction.Chat.Id, reaction.MessageId, emojiStr, added)
+                    db.UpsertUserAndIncrementReactions(reactionUser.Id, reactionUser.Username, reaction.Chat.Id, reaction.MessageId, emojiStr, added)
 
                 %activity.SetTag("totalReactionCount", updatedUser.ReactionCount)
 
@@ -2071,13 +2050,13 @@ type BotService(
                         else
                             logger.LogWarning(
                                 "Reaction spam threshold tripped: {Username} ({UserId}) has {MsgCount} messages but {ReactionCount} reactions",
-                                reaction.User.Username,
-                                reaction.User.Id,
+                                Option.toObj reactionUser.Username,
+                                reactionUser.Id,
                                 msgCount,
                                 updatedUser.ReactionCount
                             )
                             %activity.SetTag("action", "triage")
-                            do! this.RunReactionTriagePipeline(reaction, updatedUser)
+                            do! this.RunReactionTriagePipeline(reaction, reactionUser, updatedUser)
                     else
                         %activity.SetTag("action", "none")
     }
@@ -2088,21 +2067,23 @@ type BotService(
 
     member this.OnUpdate(update: Update) = task {
         use _ = botActivity.StartActivity("onUpdate")
-        if update.CallbackQuery <> null then
-            do! this.OnCallback(update.CallbackQuery)
-        elif update.MessageReaction <> null then
-            do! this.OnMessageReaction(update.MessageReaction)
-        elif update.EditedOrMessage <> null then
-            let isEdit = update.EditedMessage <> null
-            let msg = TgMessage.Create(update.EditedOrMessage, isEdit = isEdit)
+        match update.CallbackQuery, update.MessageReaction, update.EditedOrMessage with
+        | Some callbackQuery, _, _ ->
+            do! this.OnCallback(callbackQuery)
+        | None, Some reaction, _ ->
+            do! this.OnMessageReaction(reaction)
+        | None, None, Some message ->
+            let isEdit = update.EditedMessage.IsSome
+            let msg = TgMessage.Create(message, isEdit = isEdit)
             this.TryEnrichWithForwardedQuoteText(msg)
             do! this.TryEnrichWithInlineKeyboardText(msg)
             do! this.TryEnrichOcrFromCache(msg)
             do! this.OnMessage(msg)
-        elif update.ChatMember <> null || update.MyChatMember <> null then
-            // expected update type, nothing to do
-            ()
-        else
-            // unknown update type, just log and ignore
-            logger.LogWarning("Unknown update type: {UpdateType}", update.Type)
+        | None, None, None ->
+            if update.ChatMember.IsSome || update.MyChatMember.IsSome then
+                // expected update type, nothing to do
+                ()
+            else
+                // unknown update type, just log and ignore
+                logger.LogWarning("Unknown update type: update {UpdateId}", update.UpdateId)
     }

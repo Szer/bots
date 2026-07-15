@@ -1,11 +1,13 @@
 module VahterBanBot.ProfileFetcher
 
 open System
-open System.IO
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
-open Telegram.Bot
+open Funogram.Telegram.Types
 open VahterBanBot
+open BotInfra
+
+module Req = Funogram.Telegram.Req
 
 /// Fetched user profile data used by reaction-spam triage. Either field can be empty:
 /// privacy-strict users return no photo and an empty bio. Don't ban based on absence.
@@ -18,10 +20,10 @@ type IUserProfileFetcher =
     /// On any Telegram error, returns an empty profile (None photo, empty bio) — never throws.
     abstract member Fetch: userId: int64 -> Task<UserProfile>
 
-type UserProfileFetcher(botClient: ITelegramBotClient, db: DbService, logger: ILogger<UserProfileFetcher>) =
+type UserProfileFetcher(tg: ITelegramApi, db: DbService, logger: ILogger<UserProfileFetcher>) =
     let cacheTtl = TimeSpan.FromDays 7.0
 
-    let pickLargestPhoto (photos: Telegram.Bot.Types.PhotoSize[][]) =
+    let pickLargestPhoto (photos: PhotoSize[][]) =
         if isNull photos || photos.Length = 0 then None
         else
             let firstPhoto = photos[0]
@@ -30,10 +32,14 @@ type UserProfileFetcher(botClient: ITelegramBotClient, db: DbService, logger: IL
 
     let downloadPhoto (fileId: string) = task {
         try
-            let! file = botClient.GetFile(fileId)
-            use ms = new MemoryStream()
-            do! botClient.DownloadFile(file.FilePath, ms)
-            return Some (ms.ToArray())
+            let! file = tg.CallExn(Req.GetFile.Make fileId)
+            match file.FilePath with
+            | Some filePath ->
+                let! bytes = tg.DownloadFile filePath
+                return Some bytes
+            | None ->
+                logger.LogWarning("No file path resolved for profile photo {FileId}", fileId)
+                return None
         with ex ->
             logger.LogWarning(ex, "Failed to download profile photo {FileId}", fileId)
             return None
@@ -51,9 +57,8 @@ type UserProfileFetcher(botClient: ITelegramBotClient, db: DbService, logger: IL
                 let! bio =
                     task {
                         try
-                            let! chat = botClient.GetChat(Telegram.Bot.Types.ChatId userId)
-                            let raw = chat.Bio
-                            return (if isNull raw then "" else raw)
+                            let! chat = tg.CallExn(Req.GetChat.Make userId)
+                            return defaultArg chat.Bio ""
                         with ex ->
                             logger.LogInformation(ex, "GetChat failed for user {UserId} (likely privacy-strict)", userId)
                             return ""
@@ -63,7 +68,7 @@ type UserProfileFetcher(botClient: ITelegramBotClient, db: DbService, logger: IL
                 let! photoBytes =
                     task {
                         try
-                            let! photos = botClient.GetUserProfilePhotos(userId, limit = 1)
+                            let! photos = tg.CallExn(Req.GetUserProfilePhotos.Make(userId, limit = 1L))
                             match pickLargestPhoto photos.Photos with
                             | None -> return None
                             | Some largest -> return! downloadPhoto largest.FileId

@@ -1,19 +1,14 @@
 open System
 open System.Diagnostics
 open System.Net.Http
-open System.Text.Json
-open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.Logging
-open Telegram.Bot
-open Telegram.Bot.Polling
-open Telegram.Bot.Types
-open Telegram.Bot.Types.Enums
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Options
 open VahterBanBot
+open VahterBanBot.Bot
 open VahterBanBot.Cleanup
 open VahterBanBot.ML
 open VahterBanBot.ComputerVision
@@ -26,8 +21,9 @@ open VahterBanBot.Types
 open VahterBanBot.StartupMessage
 open VahterBanBot.UpdateChatAdmins
 open BotInfra
-open BotInfra.TelegramHelpers
 open BotInfra.JsonSetup
+
+module Req = Funogram.Telegram.Req
 
 type Root = class end
 
@@ -259,12 +255,12 @@ let startupBotConf = botConfOptions.Value
     }))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg WebhookHost.parseTelegramBotUpdate (fun ctx update ->
+WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
 
         let updateBodyJson =
-            try JsonSerializer.Serialize(update, options = telegramJsonOptions)
+            try FunogramJson.serialize update
             with e -> e.Message
         use topActivity =
             botActivity
@@ -290,21 +286,26 @@ WebhookHost.mapWebhookEndpoints webhookCfg WebhookHost.parseTelegramBotUpdate (f
 
 let server = app.RunAsync()
 
-// Dev mode only
+// Dev mode only: long-poll getUpdates in the background instead of the webhook.
 if botConfOptions.Value.UsePolling then
-    let telegramClient = app.Services.GetRequiredService<ITelegramBotClient>()
-    let pollingHandler = {
-        new IUpdateHandler with
-          member x.HandleUpdateAsync (botClient: ITelegramBotClient, update: Update, cancellationToken: CancellationToken) =
-            task {
-                if update.Message <> null && update.Message.Type = MessageType.Text then
-                    let bot = app.Services.GetRequiredService<BotService>()
-                    use _ = app.Services.GetRequiredService<DbService>().BeginEventScope()
-                    do! bot.OnUpdate(update)
-            }
-          member this.HandleErrorAsync(botClient, ``exception``, source, cancellationToken) =
-              Task.CompletedTask
+    let tg = app.Services.GetRequiredService<ITelegramApi>()
+    let logger = app.Services.GetRequiredService<ILogger<Root>>()
+    let pollingLoop () = task {
+        let mutable offset = 0L
+        while true do
+            try
+                let! updates = tg.CallExn(Req.GetUpdates.Make(offset = offset, timeout = 30L))
+                for update in updates do
+                    offset <- max offset (update.UpdateId + 1L)
+                    if update.Message |> Option.exists _.Text.IsSome then
+                        let bot = app.Services.GetRequiredService<BotService>()
+                        use _ = app.Services.GetRequiredService<DbService>().BeginEventScope()
+                        do! bot.OnUpdate(update)
+            with e ->
+                // polling is dev-only; log and keep the loop alive
+                logger.LogWarning(e, "Polling getUpdates iteration failed")
+                do! Task.Delay 1000
     }
-    telegramClient.StartReceiving(pollingHandler, null, CancellationToken.None)
+    %(pollingLoop() : Task<unit>)
 
 server.Wait()
