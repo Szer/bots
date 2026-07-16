@@ -350,6 +350,8 @@ type BotConfiguration =
       ForwardSpamDetectionEnabled: bool
       // Inline keyboard spam detection
       InlineKeyboardSpamDetectionEnabled: bool
+      // Rich message (Bot API 10.1) spam detection
+      RichMessageSpamDetectionEnabled: bool
       // LLM shadow triage
       LlmTriageEnabled: bool
       AzureOpenAiEndpoint: string

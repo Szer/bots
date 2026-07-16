@@ -123,9 +123,38 @@ type Tg() =
             ?chat = chat
         )
 
+    // ── Rich message helpers (Bot API 10.1) ─────────────────────────────────
+
+    static member richParagraph(text: string) : RichBlock =
+        RichBlock.Paragraph { Type = "paragraph"; Text = RichText.Plain text }
+
+    static member richLinkParagraph(text: string, url: string) : RichBlock =
+        RichBlock.Paragraph
+            { Type = "paragraph"
+              Text = RichText.Url { Type = "url"; Text = RichText.Plain text; Url = url } }
+
+    /// Single-column table with one cell per given text.
+    static member richTable(cellTexts: string list) : RichBlock =
+        let cell text : RichBlockTableCell =
+            { Text = Some(RichText.Plain text)
+              IsHeader = None
+              Colspan = None
+              Rowspan = None
+              Align = "left"
+              Valign = "top" }
+        RichBlock.Table
+            { Type = "table"
+              Cells = [| for t in cellTexts -> [| cell t |] |]
+              IsBordered = None
+              IsStriped = None
+              Caption = None }
+
+    static member richMessage(blocks: RichBlock list) : RichMessage =
+        { Blocks = List.toArray blocks; IsRtl = None }
+
     // ── Message factories (VahterBanBot-style) ───────────────────────────────
 
-    static member quickMsg (?text: string, ?chat: Chat, ?from: User, ?date: DateTime, ?caption: string, ?editedText: string, ?entities: MessageEntity[], ?photos: PhotoSize[], ?isAutomaticForward: bool, ?senderChat: Chat, ?quote: TextQuote, ?externalReply: ExternalReplyInfo, ?replyMarkup: InlineKeyboardMarkup, ?sticker: Sticker, ?ephemeralMessageId: int64) =
+    static member quickMsg (?text: string, ?chat: Chat, ?from: User, ?date: DateTime, ?caption: string, ?editedText: string, ?entities: MessageEntity[], ?photos: PhotoSize[], ?isAutomaticForward: bool, ?senderChat: Chat, ?quote: TextQuote, ?externalReply: ExternalReplyInfo, ?replyMarkup: InlineKeyboardMarkup, ?sticker: Sticker, ?ephemeralMessageId: int64, ?richMessage: RichMessage) =
         let msgId = next()
         let msgChat = chat |> Option.defaultWith (fun () -> Tg.chat())
         let msgFrom = from |> Option.defaultWith (fun () -> Tg.user())
@@ -148,7 +177,8 @@ type Tg() =
                     ?externalReply = externalReply,
                     ?replyMarkup = replyMarkup,
                     ?sticker = sticker,
-                    ?ephemeralMessageId = ephemeralMessageId
+                    ?ephemeralMessageId = ephemeralMessageId,
+                    ?richMessage = richMessage
                 ),
             ?editedMessage =
                 (editedText

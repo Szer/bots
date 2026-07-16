@@ -723,6 +723,61 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
     }
 
     [<Fact>]
+    let ``Rich-only message with spam in table cell triggers auto-delete`` () = task {
+        // Real-world shape: rich_message table, no text/caption at all —
+        // without rich enrichment such a message never reaches the ML gate.
+        let msgUpdate = Tg.quickMsg(
+            chat = fixture.ChatsToMonitor[0],
+            text = null,
+            richMessage = Tg.richMessage [ Tg.richTable [ "2222222" ] ]
+        )
+        let! _ = fixture.SendMessage msgUpdate
+
+        let! msgBanned = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
+        Assert.True msgBanned
+    }
+
+    [<Fact>]
+    let ``Rich-only message with non-spam table cell does NOT trigger auto-delete`` () = task {
+        let msgUpdate = Tg.quickMsg(
+            chat = fixture.ChatsToMonitor[0],
+            text = null,
+            richMessage = Tg.richMessage [ Tg.richTable [ "b" ] ]
+        )
+        let! _ = fixture.SendMessage msgUpdate
+
+        let! msgBanned = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
+        Assert.False msgBanned
+    }
+
+    [<Fact>]
+    let ``Rich message text is appended to message text`` () = task {
+        let msgUpdate = Tg.quickMsg(
+            chat = fixture.ChatsToMonitor[0],
+            text = "hello",
+            richMessage = Tg.richMessage [ Tg.richParagraph "b" ]
+        )
+        let! _ = fixture.SendMessage msgUpdate
+
+        let! dbMsg = fixture.TryGetDbMessage msgUpdate.Message.Value
+        Assert.True dbMsg.IsSome
+        Assert.Equal("hello\nb", dbMsg.Value.text)
+    }
+
+    [<Fact>]
+    let ``Rich message with spam in link URL triggers auto-delete`` () = task {
+        let msgUpdate = Tg.quickMsg(
+            chat = fixture.ChatsToMonitor[0],
+            text = "hello",
+            richMessage = Tg.richMessage [ Tg.richLinkParagraph("click", "https://2222222.example.com") ]
+        )
+        let! _ = fixture.SendMessage msgUpdate
+
+        let! msgBanned = fixture.MessageIsAutoDeleted msgUpdate.Message.Value
+        Assert.True msgBanned
+    }
+
+    [<Fact>]
     let ``Unbanned user messages are not deleted`` () = task {
         // Regression: isAutoBanned checked for existence of UserBanned events,
         // ignoring subsequent UserUnbanned events. After auto-ban + unban,
