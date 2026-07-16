@@ -212,7 +212,7 @@ let app = builder.Build()
 ))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx update ->
+WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx _rawBody update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
         try

@@ -371,7 +371,7 @@ type BotService(
                     .SetTag("chatUsername", msg.ChatUsername)
             recordDeletedMessage msg.ChatId msg.ChatUsername "totalBan_initial"
             do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
-                |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
+                |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", msg.MessageId, msg.ChatId))
         }
 
         // update user in DB
@@ -396,7 +396,7 @@ type BotService(
                         recordDeletedMessage m.chat_id null "totalBan_history"
                         do! tg.CallExn(Req.DeleteMessage.Make(m.chat_id, m.message_id)) |> taskIgnore
                     with e ->
-                        logger.LogWarning ($"Failed to delete message {m.message_id} from chat {m.chat_id}", e)
+                        logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", m.message_id, m.chat_id)
                 })
                 |> Task.WhenAll
                 |> taskIgnore
@@ -421,7 +421,7 @@ type BotService(
                         match callback.action_message_id with
                         | Some msgId ->
                             do! tg.CallExn(Req.DeleteMessage.Make(callback.action_channel_id, msgId))
-                                |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete callback message {msgId} from action channel", e))
+                                |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete callback message {MessageId} from action channel {ChatId}", msgId, callback.action_channel_id))
                         | None -> ()
                         // Expire callback
                         do! db.ExpireCallback(callback.id)
@@ -504,7 +504,7 @@ type BotService(
                     .SetTag("chatUsername", messageToRemove.ChatUsername)
             recordDeletedMessage messageToRemove.ChatId messageToRemove.ChatUsername "softBan"
             do! tg.CallExn(Req.DeleteMessage.Make(messageToRemove.ChatId, messageToRemove.MessageId))
-                |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete reply message {messageToRemove.MessageId} from chat {messageToRemove.ChatId}", e))
+                |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete reply message {MessageId} from chat {ChatId}", messageToRemove.MessageId, messageToRemove.ChatId))
         }
 
         let duration = softBanDuration commandMessage
@@ -587,7 +587,7 @@ type BotService(
         // 1. Delete message + record BotAutoDeleted
         recordDeletedMessage msg.ChatId msg.ChatUsername "spamDeletion"
         do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
-            |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
+            |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", msg.MessageId, msg.ChatId))
         do! db.RecordBotAutoDeleted(msg.ChatId, msg.MessageId, msg.SenderId, reason)
 
         // 2. Post to detected spam channel with "NOT a spam" override button.
@@ -724,7 +724,7 @@ type BotService(
                     recordDeletedMessage msg.chat_id null "reactionTriage_ban_history"
                     do! tg.CallExn(Req.DeleteMessage.Make(msg.chat_id, msg.message_id)) |> taskIgnore
                 with e ->
-                    logger.LogWarning(e, "Failed to delete message {M} from chat {C}", msg.message_id, msg.chat_id)
+                    logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", msg.message_id, msg.chat_id)
             })
             |> Task.WhenAll
             |> taskIgnore
@@ -793,7 +793,7 @@ type BotService(
                 uniqueMessages
                 |> Seq.map (fun (chId, msgId) -> task {
                     do! tg.CallExn(Req.DeleteMessage.Make(chId, msgId))
-                        |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete reaction-triage alert {msgId} in chat {chId}", e))
+                        |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete reaction-triage alert {MessageId} in chat {ChatId}", msgId, chId))
                 })
                 |> Task.WhenAll
                 |> taskIgnore
@@ -1267,7 +1267,7 @@ type BotService(
             do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
             recordDeletedMessage msg.ChatId msg.ChatUsername "alreadyAutoBanned"
             do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
-                |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msg.MessageId} from chat {msg.ChatId}", e))
+                |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", msg.MessageId, msg.ChatId))
 
         else do! this.ProcessMessage(msg)
     }
@@ -1337,7 +1337,7 @@ type BotService(
                             .SetTag("chatUsername", msg.ChatUsername)
                     recordDeletedMessage msg.ChatId msg.ChatUsername "adminCommand"
                     do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
-                        |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete command message {msg.MessageId} from chat {msg.ChatId}", e))
+                        |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete command message {MessageId} from chat {ChatId}", msg.MessageId, msg.ChatId))
             }
             // check that user is allowed to (un)ban others
             if isBanOnReplyCommand msg then
@@ -1833,7 +1833,7 @@ type BotService(
         // 1. Delete the message from original chat
         recordDeletedMessage chatId chatName "softSpam"
         do! tg.CallExn(Req.DeleteMessage.Make(chatId, msgId))
-            |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to delete message {msgId} from chat {chatId}", e))
+            |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete message {MessageId} from chat {ChatId}", msgId, chatId))
 
         // 2. Mark as spam (for ML training + karma)
         do! db.RecordMessageMarkedSpam(chatId, msgId, None)
@@ -1857,14 +1857,14 @@ type BotService(
         // a real message, but reaction-spam triage has no spam-message authored by the suspect).
         let answer (text: string) =
             tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = text))
-            |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
+            |> safeTaskAwait (fun e -> logger.LogWarning(e, "Failed to answer callback query {CallbackQueryId}", callbackQuery.Id))
 
         let cleanupActionMessage () = task {
             match callbackState.ActionMessageId with
             | Some msgId ->
                 do! db.ExpireCallbacksByMessageId(msgId)
                 do! tg.CallExn(Req.DeleteMessage.Make(callbackState.ActionChannelId, msgId))
-                    |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete message {msgId} from action channel", e))
+                    |> safeTaskAwait (fun e -> logger.LogDebug(e, "Failed to delete message {MessageId} from action channel {ChatId}", msgId, callbackState.ActionChannelId))
             | None -> ()
         }
 
@@ -1972,7 +1972,7 @@ type BotService(
             // Callback already processed by another vahter
             logger.LogInformation $"Callback {callbackId} already processed"
             do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "Already processed"))
-                |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
+                |> safeTaskAwait (fun e -> logger.LogWarning(e, "Failed to answer callback query {CallbackQueryId}", callbackQuery.Id))
         | Some callbackState ->
             let callbackData = deserializeCallbackData callbackState.Data.Value
             %onCallbackActivity.SetTag("callbackData", callbackData)
@@ -1981,7 +1981,7 @@ type BotService(
             | None ->
                 logger.LogWarning $"User {fromUsername} ({callbackQuery.From.Id}) tried to press callback button while not being in DB"
                 do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "You are not in DB"))
-                    |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
+                    |> safeTaskAwait (fun e -> logger.LogWarning(e, "Failed to answer callback query {CallbackQueryId}", callbackQuery.Id))
             | Some vahter ->
                 %onCallbackActivity.SetTag("vahterUsername", vahter.Username)
                 %onCallbackActivity.SetTag("vahterId", vahter.Id)
@@ -1991,7 +1991,7 @@ type BotService(
                 if not isAuthed then
                     logger.LogWarning $"User {fromUsername} ({callbackQuery.From.Id}) tried to press callback button while not being a certified vahter"
                     do! tg.CallExn(Req.AnswerCallbackQuery.Make(callbackQuery.Id, text = "Not authorized"))
-                        |> safeTaskAwait (fun e -> logger.LogWarning($"Failed to answer callback query {callbackQuery.Id}", e))
+                        |> safeTaskAwait (fun e -> logger.LogWarning(e, "Failed to answer callback query {CallbackQueryId}", callbackQuery.Id))
                 else
                     do! this.OnCallbackAux(onCallbackActivity, vahter, callbackState, callbackData, callbackQuery)
     }

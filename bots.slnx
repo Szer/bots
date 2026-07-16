@@ -12,5 +12,6 @@
     <Project Path="tests/FakeTgApi/FakeTgApi.fsproj" />
     <Project Path="tests/SerializationCompat.Tests/SerializationCompat.Tests.fsproj" />
     <Project Path="tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj" />
+    <Project Path="tests/VahterBanBot.Unit.Tests/VahterBanBot.Unit.Tests.fsproj" />
   </Folder>
 </Solution>

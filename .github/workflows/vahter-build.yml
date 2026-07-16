@@ -10,5 +10,6 @@ jobs:
     uses: ./.github/workflows/_bot-build.yml
     with:
       test-command: >-
+        dotnet test tests/VahterBanBot.Unit.Tests/VahterBanBot.Unit.Tests.fsproj -c Release --logger "trx;LogFileName=unit-test-results.trx" --logger "console;verbosity=detailed" &&
         dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
-      bot-paths-regex: '^(src/(BotInfra|VahterBanBot)/|src/Dockerfile\.bot$|tests/(VahterBanBot\.Tests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'
+      bot-paths-regex: '^(src/(BotInfra|VahterBanBot)/|src/Dockerfile\.bot$|tests/(VahterBanBot\.Tests|VahterBanBot\.Unit\.Tests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'
