@@ -3,25 +3,16 @@ namespace BotInfra
 open System
 open System.IO
 open System.Net.Http
-open System.Reflection
 open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Funogram.Types
 
 /// Funogram's composed JsonSerializerOptions (snake_case wire format + DU/unix-date/
-/// option converters). Internal in Funogram 3.0.4, so grabbed once via reflection —
-/// using the exact instance the library serializes with means our reads can never
-/// drift from its writes. Swap for the public accessor once Funogram exposes one.
+/// option converters) — using the exact instance the library serializes with means
+/// our reads can never drift from its writes.
 module FunogramJson =
-    let options =
-        let prop =
-            Assembly.Load("Funogram")
-                .GetType("Funogram.Tools")
-                .GetProperty("options", BindingFlags.Static ||| BindingFlags.NonPublic ||| BindingFlags.Public)
-        match prop with
-        | null -> failwith "Funogram.Tools.options not found — Funogram internals changed, update FunogramJson"
-        | p -> p.GetValue(null) :?> JsonSerializerOptions
+    let options = Funogram.Tools.options
 
     let serialize<'a> (value: 'a) : string =
         JsonSerializer.Serialize(value, options)

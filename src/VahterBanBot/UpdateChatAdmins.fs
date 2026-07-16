@@ -34,8 +34,6 @@ type UpdateChatAdmins(
                 do! Task.Delay 100
 
                 for admin in admins do
-                    // status/user read via Tg helpers — the ChatMember DU cases are
-                    // misdiscriminated by Funogram's converter (see Utils.Tg).
                     let user = Tg.chatMemberUser admin
                     if result.Add user.Id then
                         %sb.AppendJoin(",", $"{prependUsername (Option.toObj user.Username)} ({user.Id})")

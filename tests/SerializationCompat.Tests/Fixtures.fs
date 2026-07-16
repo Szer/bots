@@ -2,24 +2,15 @@ namespace SerializationCompat.Tests
 
 open System
 open System.IO
-open System.Reflection
-open System.Text.Json
 open Xunit
 
 /// Shared helpers: fixture loading + the two JSON stacks under test.
 module Fixtures =
 
     /// Funogram's composed JsonSerializerOptions (snake_case + DU/unix-date/option
-    /// converters). Internal in Funogram 3.0.4, so we grab it via reflection once.
-    /// Using the exact same instance the library serializes with guarantees these
-    /// tests can never drift from Funogram's real behavior. If a future Funogram
-    /// exposes it publicly, swap this for the public accessor.
-    let funogramOptions =
-        let prop =
-            Assembly.Load("Funogram")
-                .GetType("Funogram.Tools")
-                .GetProperty("options", BindingFlags.Static ||| BindingFlags.NonPublic ||| BindingFlags.Public)
-        prop.GetValue(null) :?> JsonSerializerOptions
+    /// converters). Using the exact same instance the library serializes with
+    /// guarantees these tests can never drift from Funogram's real behavior.
+    let funogramOptions = Funogram.Tools.options
 
     let private fixturesRoot =
         Path.Combine(AppContext.BaseDirectory, "fixtures")

@@ -105,7 +105,7 @@ type FakeTgApiSpikeTests() =
         }
 
     [<Fact>]
-    member _.``getChatMember: response parses and carries the wire status`` () =
+    member _.``getChatMember: status discriminates the ChatMember DU case`` () =
         task {
             let! result =
                 Req.GetChatMember.Make(123L, 456L)
@@ -113,21 +113,13 @@ type FakeTgApiSpikeTests() =
                 |> Async.StartAsTask
             match result with
             | Ok member' ->
-                // KNOWN Funogram 3.0.4 BUG: the DU converter picks ChatMember cases by
-                // field-shape overlap, not by the "status" discriminator — {"status":"member"}
-                // deserializes as ChatMember.Owner. The Status STRING is populated correctly
-                // on whichever case gets chosen, so migrated code must branch on Status, not
-                // on DU cases, until the converter is fixed upstream (Szer owns Funogram).
-                let status, userId =
-                    match member' with
-                    | ChatMember.Owner m -> m.Status, m.User.Id
-                    | ChatMember.Administrator m -> m.Status, m.User.Id
-                    | ChatMember.Member m -> m.Status, m.User.Id
-                    | ChatMember.Restricted m -> m.Status, m.User.Id
-                    | ChatMember.Left m -> m.Status, m.User.Id
-                    | ChatMember.Banned m -> m.Status, m.User.Id
-                // FakeTgApi defaults unknown users to "member"
-                Assert.Equal("member", status)
-                Assert.Equal(456L, userId)
+                // Funogram 3.0.5+ picks the DU case from the "status" discriminator
+                // (the 3.0.4 converter misdiscriminated by field-shape overlap).
+                // FakeTgApi defaults unknown users to "member".
+                match member' with
+                | ChatMember.Member m ->
+                    Assert.Equal("member", m.Status)
+                    Assert.Equal(456L, m.User.Id)
+                | other -> Assert.Fail $"status \"member\" deserialized as %A{other} instead of ChatMember.Member"
             | Error e -> Assert.Fail $"FakeTgApi rejected Funogram getChatMember: {e.ErrorCode} {e.Description}"
         }
