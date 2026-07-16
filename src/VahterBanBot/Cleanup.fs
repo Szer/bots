@@ -51,7 +51,7 @@ type CleanupService(
                         )) |> taskIgnore
                     deletedFromChannel <- deletedFromChannel + 1
                 with ex ->
-                    logger.LogWarning(ex, $"Failed to delete message {msgId} from Detected Spam channel")
+                    logger.LogDebug(ex, "Failed to delete message {MessageId} from Detected Spam channel", msgId)
             | None -> ()
             do! db.ExpireCallback(callback.id)
         if oldDetectedSpam.Length > 0 then

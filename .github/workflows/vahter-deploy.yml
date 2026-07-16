@@ -12,6 +12,7 @@ on:
       - '!src/vahter-bot/**/*.md'
       - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
+      - 'tests/VahterBanBot.Unit.Tests/**'
       - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
       - 'tests/FakeAzureOcrApi/**'
@@ -32,6 +33,9 @@ jobs:
     uses: ./.github/workflows/_bot-deploy.yml
     with:
       test-command: >-
+        dotnet test tests/VahterBanBot.Unit.Tests/VahterBanBot.Unit.Tests.fsproj
+        -c Release --logger "trx;LogFileName=unit-test-results.trx"
+        --logger "console;verbosity=detailed" &&
         dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj
         -c Release --logger "trx;LogFileName=test-results.trx"
         --logger "console;verbosity=detailed"

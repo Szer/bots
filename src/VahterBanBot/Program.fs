@@ -260,31 +260,29 @@ let startupBotConf = botConfOptions.Value
     }))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx update ->
+WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx rawBody update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
-
-        let updateBodyJson =
-            try FunogramJson.serialize update
-            with e -> e.Message
-        use topActivity =
-            botActivity
-              .StartActivity("postUpdate")
-              .SetTag("updateBodyObject", update)
-              .SetTag("updateBodyJson", updateBodyJson)
-
-        let bot = ctx.RequestServices.GetRequiredService<BotService>()
-        // Request-scoped event-stream cache: collapses the repeated per-stream reads one update
-        // would otherwise issue (e.g. the user stream loaded 3× per message). Scoped to this
-        // handle and disposed below; concurrent updates are isolated via AsyncLocal.
-        let db = ctx.RequestServices.GetRequiredService<DbService>()
-        use _ = db.BeginEventScope()
+        use topActivity = botActivity.StartActivity("postUpdate")
+        Telemetry.setUpdateIdentityTags topActivity update
+        // The raw update is logged exactly once per update, before anything that can
+        // fail — even a DI-resolution error below still leaves the payload in Loki.
+        // RawJson makes it a real nested JSON property (not an escaped blob), and the
+        // TraceId enricher ties the line to this trace; error logs don't repeat the body.
+        JsonLogging.withRawJsonProperty "RawUpdate" rawBody (fun () ->
+            logger.LogInformation("Received Telegram update {UpdateId}", update.UpdateId))
         try
+            let bot = ctx.RequestServices.GetRequiredService<BotService>()
+            // Request-scoped event-stream cache: collapses the repeated per-stream reads one update
+            // would otherwise issue (e.g. the user stream loaded 3× per message). Scoped to this
+            // handle and disposed below; concurrent updates are isolated via AsyncLocal.
+            let db = ctx.RequestServices.GetRequiredService<DbService>()
+            use _ = db.BeginEventScope()
             do! bot.OnUpdate(update)
             %topActivity.SetTag("update-error", false)
             %topActivity.SetStatus(ActivityStatusCode.Ok)
         with e ->
-            logger.LogError(e, $"Unexpected error while processing update: {updateBodyJson}")
+            logger.LogError(e, "Unexpected error while processing update {UpdateId}", update.UpdateId)
             %topActivity.SetStatus(ActivityStatusCode.Error)
             %topActivity.SetTag("update-error", true)
     }) app

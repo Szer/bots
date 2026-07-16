@@ -21,17 +21,15 @@ module FunogramJson =
         JsonSerializer.Deserialize<'a>(json, options)
 
     /// Webhook-body deserializer for Funogram-based bots. Returns None on malformed input.
-    let parseUpdate (body: Stream) : Task<Funogram.Telegram.Types.Update option> =
-        task {
-            try
-                let! update = JsonSerializer.DeserializeAsync<Funogram.Telegram.Types.Update>(body, options)
-                // The JSON literal "null" deserializes to a null reference (F# records are
-                // classes under the hood) rather than throwing — map it to None -> 400.
-                if isNull (box update) then return None
-                else return Some update
-            with :? JsonException ->
-                return None
-        }
+    let parseUpdate (json: string) : Funogram.Telegram.Types.Update option =
+        try
+            let update = JsonSerializer.Deserialize<Funogram.Telegram.Types.Update>(json, options)
+            // The JSON literal "null" deserializes to a null reference (F# records are
+            // classes under the hood) rather than throwing — map it to None -> 400.
+            if isNull (box update) then None
+            else Some update
+        with :? JsonException ->
+            None
 
 /// Raised by ITelegramApi.CallExn on a Telegram API error — preserves Telegram.Bot's
 /// throwing semantics so existing try/with guards and per-update catch-alls keep

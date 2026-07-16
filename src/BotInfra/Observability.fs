@@ -24,6 +24,7 @@ module Observability =
                 .MinimumLevel.Override("System.Net.Http.HttpClient", Serilog.Events.LogEventLevel.Warning)
                 .Enrich.FromLogContext()
                 .Enrich.WithSpan()
+                .Destructure.With<RawJsonDestructuringPolicy>()
                 .WriteTo.Console(RenderedCompactJsonFormatter())
         )
 

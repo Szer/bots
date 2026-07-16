@@ -69,10 +69,12 @@ module WebhookHost =
     /// Maps GET /health -> "OK" and POST {webhookRoute} -> validate + parseUpdate + onUpdate.
     /// Generic over the update type (bots pass FunogramJson.parseUpdate);
     /// parseUpdate returns None for malformed bodies (-> 400).
+    /// onUpdate also receives the raw request body — the original Telegram JSON,
+    /// which can carry fields the deserialized update type doesn't model yet.
     let mapWebhookEndpoints
         (cfg: WebhookConfig)
-        (parseUpdate: Stream -> Task<'u option>)
-        (onUpdate: HttpContext -> 'u -> Task<unit>)
+        (parseUpdate: string -> 'u option)
+        (onUpdate: HttpContext -> string -> 'u -> Task<unit>)
         (app: WebApplication) =
 
         %app.MapGet("/health", Func<string>(fun () -> "OK"))
@@ -82,9 +84,11 @@ module WebhookHost =
                 if not (validateApiKey cfg.SecretToken ctx) then
                     return Results.Text("Access Denied", statusCode = 401)
                 else
-                    match! parseUpdate ctx.Request.Body with
+                    use reader = new StreamReader(ctx.Request.Body)
+                    let! rawBody = reader.ReadToEndAsync()
+                    match parseUpdate rawBody with
                     | None -> return Results.BadRequest()
                     | Some update ->
-                        do! onUpdate ctx update
+                        do! onUpdate ctx rawBody update
                         return Results.Ok()
             }))
