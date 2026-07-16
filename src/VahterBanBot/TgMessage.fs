@@ -71,6 +71,11 @@ type TgMessage private (raw: Message, isEdit: bool) =
     // ── Message identity ───────────────────────────────────────────
 
     member _.MessageId = raw.MessageId
+    /// Set for ephemeral messages (Bot API 10.2) instead of a regular MessageId.
+    member _.EphemeralMessageId = raw.EphemeralMessageId
+    /// True for ephemeral messages (e.g. commands registered with is_ephemeral) —
+    /// invisible to other chat members, auto-expiring, not deletable via DeleteMessage.
+    member _.IsEphemeral = raw.EphemeralMessageId.IsSome
     member _.ChatId    = raw.Chat.Id
     member _.ChatUsername : string = raw.Chat.Username |> Option.toObj
     member _.Chat      = raw.Chat

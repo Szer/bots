@@ -19,6 +19,7 @@ open VahterBanBot.ProfileFetcher
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
 open VahterBanBot.StartupMessage
+open VahterBanBot.BotCommandsSetup
 open VahterBanBot.UpdateChatAdmins
 open BotInfra
 open BotInfra.JsonSetup
@@ -133,7 +134,10 @@ let buildBotConf () =
       LlmReactionTriageShadowDisable = getSettingOr "LLM_REACTION_TRIAGE_SHADOW_DISABLE" "false" |> bool.Parse
       ReactionNotSpamCooldownDays    = getSettingOr "REACTION_NOT_SPAM_COOLDOWN_DAYS" "30" |> int
       ReactionTriageDebounce         = getSettingOr "REACTION_TRIAGE_DEBOUNCE_SECONDS" "5" |> int64 |> TimeSpan.FromSeconds
-      BanExpiryDays         = getSettingOr "BAN_EXPIRY_DAYS" "7" |> int }
+      BanExpiryDays         = getSettingOr "BAN_EXPIRY_DAYS" "7" |> int
+      // Ephemeral commands & confirmations (Bot API 10.2)
+      EphemeralCommandsEnabled     = getSettingOr "EPHEMERAL_COMMANDS_ENABLED" "false" |> bool.Parse
+      EphemeralConfirmationEnabled = getSettingOr "EPHEMERAL_CONFIRMATION_ENABLED" "false" |> bool.Parse }
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
@@ -185,6 +189,7 @@ WebhookHost.configureSharedServices webhookCfg builder
         let cs = sp.GetRequiredService<CleanupService>()
         { new IForcedCleanup with member _.Run() = cs.ForceCleanup() :> Task })
     .AddHostedService<StartupMessage>()
+    .AddHostedService<BotCommandsSetupService>()
     .AddHostedService<UpdateChatAdmins>()
 
 // OCR: register shared IBotOcr (Azure AI Vision SDK; SDK-native retry), then the VahterBanBot

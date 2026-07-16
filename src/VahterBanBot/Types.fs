@@ -371,7 +371,14 @@ type BotConfiguration =
       /// reaction, but we run triage at most once per this window. Default: 5s.
       ReactionTriageDebounce: TimeSpan
       /// Bans older than this many days are considered expired. Default: 7.
-      BanExpiryDays: int }
+      BanExpiryDays: int
+      // Ephemeral commands & confirmations (Bot API 10.2)
+      /// When true, public commands (/ban, /unban, /sban) are registered with is_ephemeral,
+      /// so clients send them invisibly to other chat members. Re-registration happens on restart.
+      EphemeralCommandsEnabled: bool
+      /// When true, the issuing vahter gets a short self-dismissing ephemeral confirmation
+      /// in the chat after /ban, /sban, /unban. Visible only to the issuer.
+      EphemeralConfirmationEnabled: bool }
     member this.BotActor =
         Actor.Bot (Some {| botUserId = this.BotUserId; botUsername = this.BotUserName |})
 
