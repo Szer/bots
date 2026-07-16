@@ -11,6 +11,7 @@
     <Compile Include="Fixtures.fs" />
     <Compile Include="MessageCompatTests.fs" />
     <Compile Include="CallbackCompatTests.fs" />
+    <Compile Include="ChatMemberCompatTests.fs" />
     <Compile Include="FakeTgApiSpikeTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
