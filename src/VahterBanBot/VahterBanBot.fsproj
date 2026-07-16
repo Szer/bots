@@ -21,6 +21,7 @@
     <Compile Include="Bot.fs" />
     <Compile Include="Cleanup.fs" />
     <Compile Include="StartupMessage.fs" />
+    <Compile Include="BotCommandsSetup.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

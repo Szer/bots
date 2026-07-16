@@ -125,7 +125,7 @@ type Tg() =
 
     // ── Message factories (VahterBanBot-style) ───────────────────────────────
 
-    static member quickMsg (?text: string, ?chat: Chat, ?from: User, ?date: DateTime, ?caption: string, ?editedText: string, ?entities: MessageEntity[], ?photos: PhotoSize[], ?isAutomaticForward: bool, ?senderChat: Chat, ?quote: TextQuote, ?externalReply: ExternalReplyInfo, ?replyMarkup: InlineKeyboardMarkup, ?sticker: Sticker) =
+    static member quickMsg (?text: string, ?chat: Chat, ?from: User, ?date: DateTime, ?caption: string, ?editedText: string, ?entities: MessageEntity[], ?photos: PhotoSize[], ?isAutomaticForward: bool, ?senderChat: Chat, ?quote: TextQuote, ?externalReply: ExternalReplyInfo, ?replyMarkup: InlineKeyboardMarkup, ?sticker: Sticker, ?ephemeralMessageId: int64) =
         let msgId = next()
         let msgChat = chat |> Option.defaultWith (fun () -> Tg.chat())
         let msgFrom = from |> Option.defaultWith (fun () -> Tg.user())
@@ -147,7 +147,8 @@ type Tg() =
                     ?quote = quote,
                     ?externalReply = externalReply,
                     ?replyMarkup = replyMarkup,
-                    ?sticker = sticker
+                    ?sticker = sticker,
+                    ?ephemeralMessageId = ephemeralMessageId
                 ),
             ?editedMessage =
                 (editedText
@@ -176,7 +177,7 @@ type Tg() =
                 )
         )
 
-    static member replyMsg (msg: Message, ?text: string, ?from: User, ?date: DateTime) =
+    static member replyMsg (msg: Message, ?text: string, ?from: User, ?date: DateTime, ?ephemeralMessageId: int64) =
         Update.Create(
             updateId = next(),
             message =
@@ -186,7 +187,8 @@ type Tg() =
                     chat = msg.Chat,
                     from = (from |> Option.defaultWith (fun () -> Tg.user())),
                     text = (text |> Option.defaultValue (Guid.NewGuid().ToString())),
-                    replyToMessage = msg
+                    replyToMessage = msg,
+                    ?ephemeralMessageId = ephemeralMessageId
                 )
             )
 

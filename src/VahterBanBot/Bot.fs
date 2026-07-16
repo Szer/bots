@@ -68,6 +68,12 @@ module private BotHelpers =
         isBanCommand msg &&
         msg.ReplyToMessage.IsSome
 
+    /// Soft-ban duration in hours from "/sban [hours]"; defaults to 24.
+    let softBanDuration (msg: TgMessage) =
+        match Int32.TryParse(msg.Text.Split " " |> Seq.last) with
+        | true, x -> x
+        | _ -> 24 // 1 day should be enough
+
     let isMessageFromAllowedChats (cfg: BotConfiguration) (msg: TgMessage) =
         cfg.ChatsToMonitor.ContainsValue msg.ChatId
 
@@ -332,7 +338,12 @@ type BotService(
 
     member private _.Ping(msg: TgMessage) = task {
         use _ = botActivity.StartActivity("ping")
-        do! tg.CallExn(Req.SendMessage.Make(msg.ChatId, "pong")) |> taskIgnore
+        // an ephemeral /ban ping gets an ephemeral pong — a public reply to an
+        // invisible command would look like noise to the rest of the chat
+        if msg.IsEphemeral then
+            do! tg.CallExn(Req.SendMessage.Make(msg.ChatId, "pong", receiverUserId = msg.SenderId)) |> taskIgnore
+        else
+            do! tg.CallExn(Req.SendMessage.Make(msg.ChatId, "pong")) |> taskIgnore
     }
 
     member private this.TotalBan(msg: TgMessage, actor: Actor) = task {
@@ -496,12 +507,7 @@ type BotService(
                 |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete reply message {messageToRemove.MessageId} from chat {messageToRemove.ChatId}", e))
         }
 
-        let maybeDurationString = commandMessage.Text.Split " " |> Seq.last
-        // use last value as soft ban duration
-        let duration =
-            match Int32.TryParse maybeDurationString with
-            | true, x -> x
-            | _ -> 24 // 1 day should be enough
+        let duration = softBanDuration commandMessage
 
         let logText = softBanResultInLogMsg messageToRemove vahter duration (utcNow())
 
@@ -1271,16 +1277,26 @@ type BotService(
     // -----------------------------------------------------------------------
 
     member private this.AdminCommand(vahter: User, msg: TgMessage) =
+        // Self-dismissing ephemeral confirmation in the same chat, visible only to the
+        // issuing vahter (Bot API 10.2). Best-effort: delivery is not guaranteed and a
+        // failure must never fail the command itself, hence CallIgnore.
+        let confirm (text: string) : Task<unit> =
+            if botConfig.Value.EphemeralConfirmationEnabled then
+                tg.CallIgnore(Req.SendMessage.Make(msg.ChatId, text, receiverUserId = vahter.Id))
+            else Task.FromResult ()
+
         // aux functions to overcome annoying FS3511: This state machine is not statically compilable.
         let banOnReplyAux() = task {
+            let target = msg.ReplyToMessage.Value
             let authed =
                 isBanAuthorized
                     botConfig.Value
-                    msg.ReplyToMessage.Value
+                    target
                     vahter
                     logger
             if authed then
                 do! this.BanOnReply(msg, vahter)
+                do! confirm $"✅ Banned {prependUsername target.SenderUsername}({target.SenderId})"
         }
         let unbanAux() = task {
             if isUserVahter botConfig.Value vahter then
@@ -1289,33 +1305,39 @@ type BotService(
                 match userToUnban with
                 | None ->
                     logger.LogWarning $"User {vahter.Username} ({vahter.Id}) tried to unban non-existing user {targetUserId}"
+                    do! confirm $"⚠️ User {targetUserId} not found"
                 | Some userToUnban ->
                     do! this.Unban(msg, vahter, userToUnban)
+                    do! confirm $"✅ Unbanned {prependUsername (defaultArg userToUnban.Username null)}({userToUnban.Id})"
         }
         let softBanOnReplyAux() = task {
+            let target = msg.ReplyToMessage.Value
             let authed =
                 isBanAuthorized
                     botConfig.Value
-                    msg.ReplyToMessage.Value
+                    target
                     vahter
                     logger
             if authed then
                 do! this.SoftBanMsg(msg, vahter)
+                do! confirm $"✅ Soft-banned {prependUsername target.SenderUsername}({target.SenderId}) for {softBanDuration msg}h"
         }
 
         task {
             use _ = botActivity.StartActivity("adminCommand")
-            // delete command message
+            // delete command message; an ephemeral command is invisible to the chat and
+            // auto-expires — there is no regular message to delete
             let deleteCmdTask = task {
-                use _ =
-                    botActivity
-                        .StartActivity("deleteCmdMsg")
-                        .SetTag("msgId", msg.MessageId)
-                        .SetTag("chatId", msg.ChatId)
-                        .SetTag("chatUsername", msg.ChatUsername)
-                recordDeletedMessage msg.ChatId msg.ChatUsername "adminCommand"
-                do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
-                    |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete command message {msg.MessageId} from chat {msg.ChatId}", e))
+                if not msg.IsEphemeral then
+                    use _ =
+                        botActivity
+                            .StartActivity("deleteCmdMsg")
+                            .SetTag("msgId", msg.MessageId)
+                            .SetTag("chatId", msg.ChatId)
+                            .SetTag("chatUsername", msg.ChatUsername)
+                    recordDeletedMessage msg.ChatId msg.ChatUsername "adminCommand"
+                    do! tg.CallExn(Req.DeleteMessage.Make(msg.ChatId, msg.MessageId))
+                        |> safeTaskAwait (fun e -> logger.LogWarning ($"Failed to delete command message {msg.MessageId} from chat {msg.ChatId}", e))
             }
             // check that user is allowed to (un)ban others
             if isBanOnReplyCommand msg then

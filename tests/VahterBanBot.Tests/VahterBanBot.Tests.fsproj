@@ -18,6 +18,7 @@
         <Compile Include="MLScoreDeterminismTests.fs" />
         <Compile Include="MLTrainingPipelineTests.fs" />
         <Compile Include="BanTests.fs" />
+        <Compile Include="EphemeralTests.fs" />
         <Compile Include="ChannelSenderTests.fs" />
         <Compile Include="ReactionSpamTests.fs" />
         <Compile Include="PingTests.fs" />
