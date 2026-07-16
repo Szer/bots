@@ -24,11 +24,10 @@ type TelegramMembershipService(
     let isFresh (cachedAt: DateTime) =
         time.GetUtcNow().UtcDateTime - cachedAt < expiry
 
-    // Telegram wire statuses: "creator", "administrator", "member", "restricted", "left", "kicked".
-    let statusIsMember (status: string) =
-        match status with
-        | "member" | "administrator" | "creator" -> true
-        | _ -> false
+    let isMemberOfChat (cm: ChatMember) =
+        match cm with
+        | ChatMember.Owner _ | ChatMember.Administrator _ | ChatMember.Member _ -> true
+        | ChatMember.Restricted _ | ChatMember.Left _ | ChatMember.Banned _ -> false
 
     member _.InvalidateCache() = cache.Clear()
 
@@ -39,7 +38,7 @@ type TelegramMembershipService(
         if update.Chat.Id = options.Value.CommunityChatId then
             let uid = (Tg.chatMemberUser update.NewChatMember).Id
             let status = Tg.chatMemberStatus update.NewChatMember
-            let isMember = statusIsMember status
+            let isMember = isMemberOfChat update.NewChatMember
             cache[uid] <- (isMember, time.GetUtcNow().UtcDateTime)
             %span.SetTag("userId", uid)
             %span.SetTag("isMember", isMember)
@@ -52,7 +51,7 @@ type TelegramMembershipService(
             | _ ->
                 try
                     let! cm = tg.CallExn(Funogram.Telegram.Req.GetChatMember.Make(options.Value.CommunityChatId, userId))
-                    let isMember = statusIsMember (Tg.chatMemberStatus cm)
+                    let isMember = isMemberOfChat cm
                     cache[userId] <- (isMember, time.GetUtcNow().UtcDateTime)
                     return isMember
                 with ex ->

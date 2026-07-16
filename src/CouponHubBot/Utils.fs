@@ -80,10 +80,7 @@ module Utils =
         open Funogram.Telegram.Types
 
         /// Extracts the wire status string ("creator" | "administrator" | "member" |
-        /// "restricted" | "left" | "kicked") from a ChatMember.
-        /// NEVER branch on the ChatMember DU cases directly: Funogram 3.x's DU JSON
-        /// converter misdiscriminates them (e.g. {"status":"member"} parses as Owner),
-        /// so the case identity is unreliable — only the payload fields survive intact.
+        /// "restricted" | "left" | "kicked") from a ChatMember, e.g. for telemetry.
         let chatMemberStatus (member': ChatMember) : string =
             match member' with
             | ChatMember.Owner m -> m.Status
@@ -93,8 +90,7 @@ module Utils =
             | ChatMember.Left m -> m.Status
             | ChatMember.Banned m -> m.Status
 
-        /// The affected user of a ChatMember, extracted case-agnostically
-        /// (see chatMemberStatus for why matching on DU cases is unsafe).
+        /// The affected user of a ChatMember — every case carries one.
         let chatMemberUser (member': ChatMember) : User =
             match member' with
             | ChatMember.Owner m -> m.User
