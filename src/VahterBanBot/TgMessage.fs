@@ -116,6 +116,7 @@ type TgMessage private (raw: Message, isEdit: bool) =
     member _.ExternalReplyPhotos : PhotoSize[] =
         raw.ExternalReply |> Option.bind _.Photo |> Option.defaultValue [||]
     member _.ReplyMarkup  = raw.ReplyMarkup
+    member _.RichMessage  = raw.RichMessage
 
     /// Wrapped reply-to message (if present).
     member _.ReplyToMessage =

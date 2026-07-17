@@ -122,6 +122,8 @@ let buildBotConf () =
       ForwardSpamDetectionEnabled = getSettingOr "FORWARD_SPAM_DETECTION_ENABLED" "true" |> bool.Parse
       // Inline keyboard spam detection
       InlineKeyboardSpamDetectionEnabled = getSettingOr "INLINE_KEYBOARD_SPAM_DETECTION_ENABLED" "true" |> bool.Parse
+      // Rich message (Bot API 10.1) spam detection
+      RichMessageSpamDetectionEnabled = getSettingOr "RICH_MESSAGE_SPAM_DETECTION_ENABLED" "true" |> bool.Parse
       // LLM shadow triage
       LlmTriageEnabled      = getSettingOr "LLM_TRIAGE_ENABLED" "false" |> bool.Parse
       AzureOpenAiEndpoint   = getSettingOr "AZURE_OPENAI_ENDPOINT" ""

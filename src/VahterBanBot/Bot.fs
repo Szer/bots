@@ -1645,6 +1645,24 @@ type BotService(
             %activity.SetTag("quoteTextLength", quote.Text.Length)
         | _ -> ()
 
+    /// Rich messages (Bot API 10.1) can carry their whole body in RichMessage
+    /// blocks with no Text/Caption at all. Flatten all visible text and
+    /// URL/payload strings so the ML classifier sees it.
+    /// Cheap, synchronous, no I/O. Safe to call at the top of OnUpdate.
+    member private _.TryEnrichWithRichMessageText(msg: TgMessage) =
+        match msg.RichMessage with
+        | Some richMessage when botConfig.Value.RichMessageSpamDetectionEnabled ->
+            use activity = botActivity.StartActivity("richMessageEnrichment")
+            try
+                let flattened = RichMessageText.flatten richMessage
+                if not (String.IsNullOrWhiteSpace flattened) then
+                    msg.AppendText(flattened)
+                    %activity.SetTag("richTextLength", flattened.Length)
+                    %activity.SetTag("enrichedTextLength", msg.Text.Length)
+            with ex ->
+                logger.LogError(ex, "Failed to flatten rich message for message {MessageId}", msg.MessageId)
+        | _ -> ()
+
     /// Cache-only OCR enrichment for any photos on the message — both the
     /// message's own photos and external-reply quote photos. No Azure calls.
     /// On a hit, marks the corresponding `…OcrApplied` flag so the deferred
@@ -2110,6 +2128,7 @@ type BotService(
             let isEdit = update.EditedMessage.IsSome
             let msg = TgMessage.Create(message, isEdit = isEdit)
             this.TryEnrichWithForwardedQuoteText(msg)
+            this.TryEnrichWithRichMessageText(msg)
             do! this.TryEnrichWithInlineKeyboardText(msg)
             do! this.TryEnrichOcrFromCache(msg)
             do! this.OnMessage(msg)
