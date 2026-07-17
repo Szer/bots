@@ -28,7 +28,7 @@ let ``table spam: all cell text is extracted`` () =
 [<Fact>]
 let ``table spam: url payloads of link runs are extracted`` () =
     let flattened = fixtureUpdate "table-spam-update.json" |> richMessageOf |> RichMessageText.flatten
-    Assert.Contains("tg://resolve?domain=Jupiters_VPN_bot", flattened)
+    Assert.Contains("tg://resolve?domain=Some_VPN_bot", flattened)
 
 [<Fact>]
 let ``table spam: custom emoji alternative text is extracted`` () =

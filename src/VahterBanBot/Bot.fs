@@ -1651,9 +1651,7 @@ type BotService(
     /// Cheap, synchronous, no I/O. Safe to call at the top of OnUpdate.
     member private _.TryEnrichWithRichMessageText(msg: TgMessage) =
         match msg.RichMessage with
-        | Some richMessage when
-            botConfig.Value.RichMessageSpamDetectionEnabled
-            && isMessageFromAllowedChats botConfig.Value msg ->
+        | Some richMessage when botConfig.Value.RichMessageSpamDetectionEnabled ->
             use activity = botActivity.StartActivity("richMessageEnrichment")
             try
                 let flattened = RichMessageText.flatten richMessage
