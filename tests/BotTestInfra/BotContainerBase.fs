@@ -58,27 +58,30 @@ type BotContainerBase(config: BotContainerConfig) =
     let flywayContainer = createFlywayContainer network migrationsPath dbAlias config.DbName dbContainer
 
     let fakeTgImage, fakeTgBuildLogger =
-        buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-tg-api" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"]
+        getOrCreateImageSpec $"{config.AppImageName}-fake-tg-api" (fun () ->
+            buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-tg-api" true true ["FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080"])
     let fakeTgContainer = createFakeTgApiContainer fakeTgImage network fakeAlias
 
     let fakeAzureImage, fakeAzureBuildLogger =
-        buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-azure-ocr" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"]
+        getOrCreateImageSpec $"{config.AppImageName}-fake-azure-ocr" (fun () ->
+            buildImageSpec solutionDir "./tests/Dockerfile.fake" $"{config.AppImageName}-fake-azure-ocr" true true ["FAKE_PROJECT", "FakeAzureOcrApi"; "FAKE_PORT", "8081"])
     let fakeAzureContainer = createFakeAzureOcrContainer fakeAzureImage network fakeAzureAlias
 
     let botImage, botBuildLogger =
-        let logger = StringLogger()
-        let img =
-            ImageFromDockerfileBuilder()
-                .WithDockerfileDirectory(solutionDir, String.Empty)
-                .WithDockerfile("./src/Dockerfile.bot")
-                .WithName(config.AppImageName)
-                .WithBuildArgument("BOT_PROJECT", config.BotProject)
-                .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
-                .WithDeleteIfExists(true)
-                .WithCleanUp(true)
-                .WithLogger(logger)
-                .Build()
-        (img, logger)
+        getOrCreateImageSpec config.AppImageName (fun () ->
+            let logger = StringLogger()
+            let img =
+                ImageFromDockerfileBuilder()
+                    .WithDockerfileDirectory(solutionDir, String.Empty)
+                    .WithDockerfile("./src/Dockerfile.bot")
+                    .WithName(config.AppImageName)
+                    .WithBuildArgument("BOT_PROJECT", config.BotProject)
+                    .WithBuildArgument("RESOURCE_REAPER_SESSION_ID", ResourceReaper.DefaultSessionId.ToString("D"))
+                    .WithDeleteIfExists(true)
+                    .WithCleanUp(true)
+                    .WithLogger(logger)
+                    .Build()
+            (img, logger))
 
     let botContainer =
         let mutable b =
@@ -126,15 +129,20 @@ type BotContainerBase(config: BotContainerConfig) =
 
                 // run migrations
                 do! flywayContainer.StartAsync()
+                let! flywayExitCode = flywayContainer.GetExitCodeAsync()
+                if flywayExitCode <> 0L then
+                    let! struct (stdout, stderr) = flywayContainer.GetLogsAsync()
+                    failwith $"Flyway migrations failed (exit code {flywayExitCode})\n=== STDOUT ===\n{stdout}\n=== STDERR ===\n{stderr}"
 
                 // seed database (subclass hook)
                 do! this.SeedDatabase(publicConnectionString)
 
-                // build images in parallel
-                let botBuildTask = buildImageWithLogs testArtifactsDir "bot" botImage botBuildLogger
-                let fakeTgBuildTask = buildImageWithLogs testArtifactsDir "fake-tg-api" fakeTgImage fakeTgBuildLogger
+                // build images in parallel (each image name at most once per process — the
+                // parallel-initializing fixtures share the same image names)
+                let botBuildTask = buildImageOncePerProcess config.AppImageName testArtifactsDir "bot" botImage botBuildLogger
+                let fakeTgBuildTask = buildImageOncePerProcess $"{config.AppImageName}-fake-tg-api" testArtifactsDir "fake-tg-api" fakeTgImage fakeTgBuildLogger
                 let fakeAzureBuildTask =
-                    if config.OcrEnabled then buildImageWithLogs testArtifactsDir "fake-azure-ocr" fakeAzureImage fakeAzureBuildLogger
+                    if config.OcrEnabled then buildImageOncePerProcess $"{config.AppImageName}-fake-azure-ocr" testArtifactsDir "fake-azure-ocr" fakeAzureImage fakeAzureBuildLogger
                     else Task.CompletedTask
                 do! Task.WhenAll([| botBuildTask; fakeTgBuildTask; fakeAzureBuildTask |])
 
