@@ -73,9 +73,9 @@ let getOrCreateImageSpec (imageName: string) (mk: unit -> IFutureDockerImage * S
     sharedImageSpecs.GetOrAdd(imageName, fun _ -> Lazy<IFutureDockerImage * StringLogger>(valueFactory = Func<_>(mk))).Value
 
 /// Builds each uniquely-named image at most once per test process, sharing the task across
-/// assembly fixtures. Per-fixture delete-and-rebuild both triplicates build work and races:
-/// podman refuses to delete an image while another fixture's in-flight build holds it
-/// (409 Conflict).
+/// assembly fixtures. Per-fixture delete-and-rebuild of the same tags duplicated build work
+/// and raced: not every container engine allows deleting an image that another fixture's
+/// in-flight build still holds (409 Conflict).
 let buildImageOncePerProcess (imageName: string) (artifactsDir: string) (name: string) (image: IFutureDockerImage) (logger: StringLogger) : Task =
     imageBuilds.GetOrAdd(imageName, fun _ ->
         Lazy<Task>(fun () -> buildImageWithLogs artifactsDir name image logger)).Value
@@ -95,12 +95,10 @@ let createFlywayContainer (network: INetwork) (migrationsPath: string) (dbAlias:
     ContainerBuilder("flyway/flyway")
         .WithNetwork(network)
         .WithBindMount(migrationsPath, "/flyway/sql", AccessMode.ReadOnly)
-        // On SELinux-enforcing hosts (Fedora/Bazzite + podman) the container can't read
-        // user_home_t-labeled repo files, so flyway silently skips /flyway/sql. Turn off
-        // label confinement for this one container; no-op branch on CI/macOS/Windows.
-        .WithCreateParameterModifier(fun p ->
-            if File.Exists("/sys/fs/selinux/enforce") then
-                p.HostConfig.SecurityOpt <- ResizeArray ["label=disable"])
+        // Without label=disable, hosts with SELinux enforcing block the container from
+        // reading the bind-mounted repo files, and flyway silently skips /flyway/sql.
+        // The option is a no-op where SELinux isn't in use (Ubuntu CI, Docker Desktop).
+        .WithCreateParameterModifier(fun p -> p.HostConfig.SecurityOpt <- ResizeArray ["label=disable"])
         .WithEnvironment("FLYWAY_URL", $"jdbc:postgresql://{dbAlias}:5432/{dbName}")
         .WithEnvironment("FLYWAY_USER", "admin")
         .WithEnvironment("FLYWAY_PASSWORD", "admin")

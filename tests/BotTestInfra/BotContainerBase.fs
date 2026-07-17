@@ -129,6 +129,9 @@ type BotContainerBase(config: BotContainerConfig) =
 
                 // run migrations
                 do! flywayContainer.StartAsync()
+                // The wait strategy only waits for flyway to exit; without this check a failed
+                // migration run only surfaces later as a cryptic "relation does not exist"
+                // during seeding, with the actual cause hidden in the flyway container log.
                 let! flywayExitCode = flywayContainer.GetExitCodeAsync()
                 if flywayExitCode <> 0L then
                     let! struct (stdout, stderr) = flywayContainer.GetLogsAsync()
