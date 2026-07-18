@@ -40,7 +40,7 @@ type BotContainerBase(config: BotContainerConfig) =
     let dbAlias = config.MigrationsSubdir + "-db"
     let fakeAlias = "fake-tg-api"
     let fakeAzureAlias = "fake-azure-ocr"
-    let pgImage = "postgres:15.6"
+    let pgImage = "postgres:17.10"
 
     let internalConnectionString =
         $"Server={dbAlias};Database={config.DbName};Port=5432;User Id={config.DbUser};Password={config.DbPassword};Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"

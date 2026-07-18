@@ -9,7 +9,7 @@ Docker-based E2E tests require significant resources and will hang/timeout on th
 
 E2E tests live in `tests/CouponHubBot.Tests/`. They use Testcontainers to spin up:
 
-- **PostgreSQL 15.6** — application database
+- **PostgreSQL 17.10** — application database
 - **Flyway** — runs migrations against the test database
 - **Bot container** — the application itself (built from `./Dockerfile`)
 - **FakeTgApi** — mock Telegram Bot API (built from `tests/FakeTgApi/Dockerfile`)

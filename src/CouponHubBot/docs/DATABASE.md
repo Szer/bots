@@ -2,7 +2,7 @@
 
 ## Engine
 
-PostgreSQL 15.6. Migrations managed by Flyway.
+PostgreSQL 17.10. Migrations managed by Flyway.
 
 ## Schema Notes
 
