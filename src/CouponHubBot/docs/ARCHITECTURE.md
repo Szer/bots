@@ -33,7 +33,7 @@ src/CouponHubBot/
 
 ## Infrastructure
 
-- **Database**: PostgreSQL 15.6 with Flyway migrations
+- **Database**: PostgreSQL 17.10 with Flyway migrations
 - **Container**: Docker image pushed to GHCR (`ghcr.io/szer/coupon-bot`)
 - **Orchestration**: ArgoCD with image-reloader (polls GHCR every ~5 min)
 - **Observability**: Serilog → Loki, OpenTelemetry → Prometheus

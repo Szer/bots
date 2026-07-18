@@ -6,7 +6,7 @@
 
 services:
   postgres:
-    image: postgres:15.6
+    image: postgres:17.10
     container_name: coupon-hub-postgres-dev
     environment:
       POSTGRES_PASSWORD: postgres
@@ -37,7 +37,7 @@ services:
     restart: "no"
 
   seed-bot-settings:
-    image: postgres:15.6
+    image: postgres:17.10
     container_name: coupon-hub-seed-bot-settings-dev
     depends_on:
       flyway:
