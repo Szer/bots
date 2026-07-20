@@ -200,7 +200,7 @@ type AutoVerdict =
     /// Spam detected — delete message, reduce karma, check autoban
     | Spam of score: float * actor: Actor
     /// Not spam — no action
-    | NotSpam of actor: Actor
+    | NotSpam of score: float * actor: Actor
     /// Uncertain — route to human triage channel
     | Uncertain of score: float
 
