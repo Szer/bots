@@ -4,6 +4,8 @@
 .env
 **/.env.local
 **/.env.*.local
+.env.alita.real
+*.session
 flyway.conf
 *sln.DotSettings.user
 TestResults
