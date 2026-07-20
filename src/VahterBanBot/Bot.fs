@@ -1083,7 +1083,7 @@ type BotService(
                 let logMsg = $"User {prependUsername msg.SenderUsername} ({msg.SenderId}) has {usrMsgCount} msgs (score: {prediction.Score}) — ML god shows mercy today, skipping triage"
                 do! tg.CallExn(Req.SendMessage.Make(botConfig.Value.AllLogsChannelId, logMsg)) |> taskIgnore
                 logger.LogInformation logMsg
-                return Some (AutoVerdict.NotSpam Actor.ML)
+                return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.ML))
             elif prediction.Score >= botConfig.Value.MlSpamThreshold then
                 return Some (AutoVerdict.Spam (float prediction.Score, Actor.ML))
             elif prediction.Score >= botConfig.Value.MlWarningThreshold then
@@ -1094,11 +1094,11 @@ type BotService(
                     let actor = Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}
                     return Some (AutoVerdict.Spam (float prediction.Score, actor))
                 | LlmVerdict.NotSpam ->
-                    return Some (AutoVerdict.NotSpam (Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}))
+                    return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}))
                 | LlmVerdict.Skip | LlmVerdict.Error ->
                     return Some (AutoVerdict.Uncertain (float prediction.Score))
             else
-                return Some (AutoVerdict.NotSpam Actor.ML)
+                return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.ML))
     }
 
     member private this.ProcessMessage(msg: TgMessage) = task {
@@ -1206,6 +1206,7 @@ type BotService(
                 | Some score ->
                     %mlActivity.SetTag("spamScoreMl", score)
                     %mlActivity.SetTag("preOcrShortCircuit", true)
+                    %mlActivity.SetTag("autoVerdict", "spam")
                     logger.LogInformation(
                         "Pre-OCR short-circuit: classified message {MessageId} as spam from text alone (score={Score:F3}); skipping Azure OCR",
                         msg.MessageId, score)
@@ -1230,6 +1231,7 @@ type BotService(
                     match autoVerdict with
                     | Some (AutoVerdict.Spam (score, actor)) ->
                         %mlActivity.SetTag("spamScoreMl", score)
+                        %mlActivity.SetTag("autoVerdict", "spam")
                         let reason = MlSpam {| score = score |}
                         if botConfig.Value.MlSpamDeletionEnabled then
                             do! this.DeleteSpam(msg, actor, reason)
@@ -1237,9 +1239,13 @@ type BotService(
                             do! this.ReportPotentialSpam(msg, reason)
                     | Some (AutoVerdict.Uncertain score) ->
                         %mlActivity.SetTag("spamScoreMl", score)
+                        %mlActivity.SetTag("autoVerdict", "uncertain")
                         do! this.ReportPotentialSpam(msg, MlSpam {| score = score |})
-                    | Some (AutoVerdict.NotSpam _) | None ->
-                        ()
+                    | Some (AutoVerdict.NotSpam (score, _)) ->
+                        %mlActivity.SetTag("spamScoreMl", score)
+                        %mlActivity.SetTag("autoVerdict", "notSpam")
+                    | None ->
+                        %mlActivity.SetTag("autoVerdict", "noPrediction")
 
         // Catch-all: every message that reached ProcessMessage must be recorded.
         // Idempotent — already-recorded branches above no-op here.
