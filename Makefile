@@ -40,5 +40,8 @@ probe-draft:
 	dotnet run --project tests/AlitaBot.RealTests -c Release -- probe-draft
 
 alita-clean:
-	$(COMPOSE) down -v
+	# --profile smoke: `down` only tears down containers belonging to profiles
+	# passed on this invocation, so the `smoke` target's `bot` container (and the
+	# network it pins in use) survives a plain `down` if `make smoke` ran earlier.
+	$(COMPOSE) --profile smoke down -v
 	. $(ALITA_ENV) && curl -s "https://api.telegram.org/bot$$ALITA_TEST_BOT_TOKEN/deleteWebhook?drop_pending_updates=true" > /dev/null && echo "webhook deleted"
