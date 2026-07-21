@@ -21,6 +21,16 @@ module VoiceRealTimeouts =
     /// Voice-note round trip: Telegram upload + bot download + real STT + reply.
     let transcriptionReply = TimeSpan.FromSeconds 150.
 
+/// The 3-word test phrase — real Azure STT has, once, misrecognized one word of it
+/// ("проверка" -> "previarka" in a flake). Assertions accept ANY of the three words
+/// (case-insensitive) rather than requiring the exact one that happened to survive.
+module VoicePhrase =
+    let words = [ "проверка"; "связи"; "алита" ]
+
+    let containsAnyWord (text: string) =
+        let lower = text.ToLowerInvariant()
+        words |> List.exists lower.Contains
+
 type VoiceRealTests(fx: RealAssemblyFixture) =
     let env = fx.Env
 
@@ -151,13 +161,17 @@ ORDER BY message_id LIMIT 1;
             let! reply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, VoiceRealTimeouts.transcriptionReply)
 
             Assert.False(String.IsNullOrWhiteSpace reply.message)
-            Assert.Contains("проверка", reply.message.ToLowerInvariant())
+            Assert.True(
+                VoicePhrase.containsAnyWord reply.message,
+                $"Expected reply to contain one of {VoicePhrase.words}: {reply.message}")
 
             match! awaitVoiceSenderRow () with
             | None -> Assert.Fail "sender's voice transcript ('[voice] ...') never landed in message_log"
             | Some senderRow ->
                 Assert.False senderRow.is_bot
-                Assert.Contains("проверка", senderRow.text.ToLowerInvariant())
+                Assert.True(
+                    VoicePhrase.containsAnyWord senderRow.text,
+                    $"Expected sender transcript to contain one of {VoicePhrase.words}: {senderRow.text}")
 
                 match! awaitBotReplyRow senderRow.message_id with
                 | None ->
@@ -166,5 +180,7 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
-                    Assert.Contains("проверка", botRow.text.ToLowerInvariant())
+                    Assert.True(
+                        VoicePhrase.containsAnyWord botRow.text,
+                        $"Expected bot reply row to contain one of {VoicePhrase.words}: {botRow.text}")
         }
