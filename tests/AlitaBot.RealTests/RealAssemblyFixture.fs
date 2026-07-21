@@ -41,6 +41,20 @@ type RealAssemblyFixture() =
                 failwith $"{url} did not become healthy within {timeout.TotalSeconds}s"
         }
 
+    /// Remote mode only — see RealEnv.ReloadSettingsUrl: the pod was already
+    /// running before applyRealSettingsAsync upserted TARGET_CHAT_IDS etc.,
+    /// so its cached IOptions<BotConfiguration> is stale until this is called.
+    static let reloadSettingsAsync (env: RealEnv) =
+        task {
+            use http = new HttpClient(Timeout = TimeSpan.FromSeconds 10.)
+            http.DefaultRequestHeaders.Add("X-Telegram-Bot-Api-Secret-Token", env.WebhookSecret)
+            let! resp = http.PostAsync(env.ReloadSettingsUrl, null)
+
+            if not resp.IsSuccessStatusCode then
+                let! body = resp.Content.ReadAsStringAsync()
+                failwith $"POST {env.ReloadSettingsUrl} -> {int resp.StatusCode}: {body}"
+        }
+
     let env = RealEnv.load ()
 
     let mutable tunnel: NgrokTunnel option = None
@@ -86,6 +100,9 @@ type RealAssemblyFixture() =
 
                     if env.IsRemote then
                         do! waitHealthyAsync env.HealthUrl
+                        // Pod was already running before the upsert above —
+                        // make it pick up TARGET_CHAT_IDS/BOT_USERNAME/etc. now.
+                        do! reloadSettingsAsync env
                     else
                         let! t = NgrokTunnel.ConnectAsync(env.NgrokDomain, env.NgrokAuthtoken)
                         tunnel <- Some t

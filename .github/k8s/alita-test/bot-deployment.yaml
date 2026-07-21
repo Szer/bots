@@ -55,9 +55,16 @@ spec:
             port: 5010
           initialDelaySeconds: 10
           periodSeconds: 10
+        # Explicit + minimal: the cluster is a single ARM node with tight
+        # headroom (measured 2026-07-21: ~428m CPU / ~4.4Gi memory free
+        # after steady-state workloads — see README's M7 doc section). CPU
+        # request matches what the production bots actually use on this
+        # node (20m); the 500m limit is just a safety cap — limits don't
+        # count against scheduling quota, only requests do.
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "50m"
+            memory: "192Mi"
+            cpu: "20m"
           limits:
             memory: "512Mi"
+            cpu: "500m"

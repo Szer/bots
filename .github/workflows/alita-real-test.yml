@@ -54,6 +54,9 @@ jobs:
       with:
         global-json-file: global.json
 
+    - name: Install ffmpeg (VoiceRealTests re-encodes to ogg/opus)
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
     - name: Login to GHCR
       uses: docker/login-action@v3
       with:
@@ -91,6 +94,11 @@ jobs:
       run: kubectl auth can-i create deployments -n "$NAMESPACE"
 
     - name: Deploy Postgres
+      # Flyway/the seed step below run `docker run ... --network host` on
+      # this runner directly, NOT as in-cluster Jobs — they consume zero
+      # AKS node capacity. Only these two Deployments (postgres, bot) do;
+      # see their explicit requests/limits — the single ARM node has tight
+      # headroom (~428m CPU / ~4.4Gi memory free measured 2026-07-21).
       run: |
         kubectl create configmap alita-test-postgres-init \
           -n "$NAMESPACE" --from-file=init.sql=src/alita-bot/init.sql \
@@ -98,7 +106,17 @@ jobs:
         | kubectl label -f - alita-ci=transient --local -o yaml \
         | kubectl apply -f -
         kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/postgres.yaml
-        kubectl rollout status deployment/alita-test-postgres -n "$NAMESPACE" --timeout=120s
+
+        # Fast-fail: an unschedulable/crashlooping pod should fail the job
+        # in well under 180s, not sit until the 30-minute job timeout and
+        # block the singleton queue behind it.
+        if ! kubectl wait --for=condition=Ready pod -l app=alita-test-postgres \
+              -n "$NAMESPACE" --timeout=120s; then
+          echo "::error::postgres pod not Ready within 120s"
+          kubectl describe pod -l app=alita-test-postgres -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
 
     - name: Port-forward Postgres to localhost:15433
       run: |
@@ -169,7 +187,16 @@ jobs:
           | kubectl apply -n "$NAMESPACE" -f -
         kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/bot-service.yaml
         kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/httproute.yaml
-        kubectl rollout status deployment/alita-bot -n "$NAMESPACE" --timeout=180s
+
+    - name: Fast-fail if the transient stack isn't Ready
+      run: |
+        if ! kubectl wait --for=condition=Ready pod -l alita-ci=transient \
+              -n "$NAMESPACE" --timeout=180s; then
+          echo "::error::transient pod(s) not Ready within 180s"
+          kubectl describe pod -l alita-ci=transient -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
 
     - name: Wait for public healthz (DNS/cert already live via my-infra PR #83)
       run: |
@@ -233,14 +260,20 @@ jobs:
 
     - name: Teardown transient workload
       if: always()
+      # Explicit kinds only — NOT `all` (kubectl expands that to every kind
+      # k8s knows, including several the alita-ci Role was never granted,
+      # e.g. replicasets/daemonsets/statefulsets/cronjobs/hpas; those show up
+      # as noisy "Forbidden" errors and, under `bash -e`, fail this step even
+      # though every actual transient object was already deleted cleanly).
       run: |
         kill "$(cat "$RUNNER_TEMP/pg-port-forward.pid" 2>/dev/null)" 2>/dev/null || true
 
-        kubectl delete all,httproute,secret,configmap \
+        kubectl delete deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
           -n "$NAMESPACE" -l alita-ci=transient --wait --timeout=60s || true
 
         echo "Leftover transient objects (should be empty):"
-        kubectl get all,httproute,secret,configmap -n "$NAMESPACE" -l alita-ci=transient
+        kubectl get deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
+          -n "$NAMESPACE" -l alita-ci=transient || true
 
     - name: Delete webhook (safety net — the harness already does this on normal exit)
       if: always()

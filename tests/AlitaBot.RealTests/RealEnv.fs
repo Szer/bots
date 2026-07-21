@@ -57,13 +57,24 @@ type RealEnv =
         else
             $"https://{this.NgrokDomain}/bot"
 
-    /// The bot's public /healthz — same host as WebhookUrl, "/bot" swapped for "/healthz".
-    member this.HealthUrl =
+    /// The public base URL (WebhookUrl with the trailing "/bot" stripped) —
+    /// used to derive HealthUrl/ReloadSettingsUrl.
+    member private this.PublicBase =
         if this.IsRemote then
             let u = this.WebhookPublicUrl.TrimEnd '/'
-            (if u.EndsWith "/bot" then u.Substring(0, u.Length - "/bot".Length) else u) + "/healthz"
+            if u.EndsWith "/bot" then u.Substring(0, u.Length - "/bot".Length) else u
         else
-            $"https://{this.NgrokDomain}/healthz"
+            $"https://{this.NgrokDomain}"
+
+    /// The bot's public /healthz — same host as WebhookUrl, "/bot" swapped for "/healthz".
+    member this.HealthUrl = this.PublicBase + "/healthz"
+
+    /// Remote mode only: the already-running pod's bot_setting cache is stale
+    /// until this is POSTed (X-Telegram-Bot-Api-Secret-Token: WebhookSecret) —
+    /// unlike local mode, where DevDb.applyRealSettingsAsync runs *before*
+    /// BotProcess ever starts, so a fresh process reads correct settings at
+    /// boot and no reload is needed.
+    member this.ReloadSettingsUrl = this.PublicBase + "/reload-settings"
 
     /// Everything the webhook plumbing needs (bot token + chat id + secret, plus
     /// either an ngrok domain (local) or ALITA_WEBHOOK_PUBLIC_URL (remote)).

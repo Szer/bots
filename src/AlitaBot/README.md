@@ -322,6 +322,23 @@ pruning, and if the transient bot/Postgres carried it, ArgoCD's `selfHeal`/`prun
 them mid-run. Teardown (`always()` in the workflow) deletes exactly `-l alita-ci=transient`,
 never anything ArgoCD-tracked.
 
+**Node capacity is tight — the cluster is a single ARM node.** Measured via `kubectl describe
+node` on 2026-07-21: `Allocatable` 1900m CPU / 12039300Ki (~11.5Gi) memory; steady-state
+workloads (everything outside `alita-test`) already request ~1472m CPU / ~7212Mi memory, leaving
+**~428m CPU / ~4.4Gi memory free**. `postgres`/`bot` request CPU at 20m each (matching what the
+production bots actually use on this node, not a guess) and modest memory (256Mi/192Mi) —
+40m/448Mi total, a ~90% CPU margin and ~90% memory margin against measured free capacity; 500m
+CPU / 512Mi memory limits are just safety caps (limits don't count against scheduling quota, only
+requests do). Flyway/the `bot_setting` seed run as `docker run --network host` **on the GitHub
+Actions runner itself**, not as in-cluster Jobs, so they consume zero AKS node capacity (the
+`jobs` RBAC permission is provisioned for future use, unused today). Both Deployments also carry
+a `kubectl wait --for=condition=Ready pod -l alita-ci=transient --timeout=180s` fast-fail right
+after apply (dumps `kubectl describe pod`/`kubectl get events` on timeout) so an unschedulable
+pod fails the run in under 3 minutes instead of riding out the 30-minute job timeout and blocking
+the singleton queue behind it. Teardown (`-l alita-ci=transient`, `always()`) runs regardless of
+where a run failed, so a half-applied stack — including a stuck `Pending` pod that would
+otherwise permanently eat into this already-thin quota — never survives past one run.
+
 ## Tech debt
 
 See [`docs/TECH-DEBT.md`](docs/TECH-DEBT.md).
