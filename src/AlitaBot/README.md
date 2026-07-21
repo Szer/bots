@@ -277,6 +277,8 @@ container too. A full real-Telegram conversation against the *containerized* bot
 `make real-test`'s bare-process path already covers that; this check exists to prove the
 container itself is wired correctly, not to duplicate the conversational test suite.
 
-## Tech debt
+## Further docs
 
-See [`docs/TECH-DEBT.md`](docs/TECH-DEBT.md).
+- [`docs/TESTING.md`](docs/TESTING.md) — fake vs. real test suites, `make` targets, required env vars.
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — spans, metrics, logging conventions specific to AlitaBot.
+- [`docs/TECH-DEBT.md`](docs/TECH-DEBT.md) — known gaps and deferrals.
