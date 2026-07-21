@@ -1,7 +1,9 @@
 namespace AlitaBot.Services
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
+open System.Diagnostics
 open System.Text.RegularExpressions
 open System.Threading
 open System.Threading.Tasks
@@ -40,6 +42,24 @@ type BotService(
 
     let countOutcome (outcome: string) =
         Metrics.messagesTotal.Add(1L, KeyValuePair("outcome", box outcome))
+
+    /// Serializes all processing for one chat (SemaphoreSlim, count 1): a burst of
+    /// rapid triggers in the same chat — or a webhook redelivery racing the original
+    /// attempt — runs one at a time instead of two concurrent LLM streams reading the
+    /// same message_log snapshot and posting overlapping replies. Bounded by
+    /// TargetChatIds (the bot only ever locks chats it's configured to listen to), so
+    /// the dictionary can't grow unbounded over the process lifetime.
+    let chatLocks = ConcurrentDictionary<int64, SemaphoreSlim>()
+
+    let withChatLock (chatId: int64) (work: unit -> Task<'a>) : Task<'a> =
+        task {
+            let sem = chatLocks.GetOrAdd(chatId, fun _ -> new SemaphoreSlim(1, 1))
+            do! sem.WaitAsync()
+            try
+                return! work()
+            finally
+                %sem.Release()
+        }
 
     let displayNameOf (u: User) =
         match u.LastName with
@@ -162,16 +182,26 @@ type BotService(
             %a.SetTag("chatId", msg.Chat.Id)
             %a.SetTag("fromId", from.Id)
 
-            do! db.LogMessage(
+            let! inserted =
+                db.LogMessage(
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) logText)
 
-            if isTriggered conf triggerText msg then
+            if not inserted then
+                // A webhook redelivery of an update we already fully handled (e.g. Telegram
+                // retried after a slow LLM reply held the connection open past its timeout).
+                // message_log's UNIQUE(chat_id, message_id) is the idempotency source of
+                // truth: skip re-triggering the responder so the retry can't send a second,
+                // distinct reply on top of the one already sent.
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif isTriggered conf triggerText msg then
                 match! responder.Respond(msg) with
                 | Some(sent, replyText) ->
                     do! db.LogMessage(
                             logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                 (Some msg.MessageId) replyText)
+                        |> taskIgnore
                     %a.SetTag("outcome", "replied")
                     countOutcome "replied"
                 | None ->
@@ -206,32 +236,58 @@ type BotService(
             %a.SetTag("chatId", msg.Chat.Id)
             %a.SetTag("fromId", from.Id)
 
+            let countVoice (outcome: string) =
+                Metrics.voiceTranscribeTotal.Add(1L, KeyValuePair("outcome", box outcome))
+
             if not conf.VoiceTranscribeEnabled then
                 %a.SetTag("outcome", "voice_disabled")
+                countVoice "disabled"
             else
+                // Covers Telegram file download + the STT call — not recorded for the
+                // voice_disabled case above, since no transcription is attempted there.
+                let sw = Stopwatch.StartNew()
                 let! file = tg.CallExn(Req.GetFile.Make(fileId))
                 match file.FilePath with
                 | None ->
                     logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
                     %a.SetTag("outcome", "voice_no_filepath")
+                    countVoice "no_filepath"
                 | Some filePath when String.IsNullOrWhiteSpace filePath ->
                     logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
                     %a.SetTag("outcome", "voice_no_filepath")
+                    countVoice "no_filepath"
                 | Some filePath ->
                     let! bytes = tg.DownloadFile filePath
                     match! speech.Transcribe(bytes, CancellationToken.None) with
                     | Error err ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
                         logger.LogWarning("Voice transcription failed: {Error}", string err)
                         %a.SetTag("outcome", "voice_transcribe_failed")
+                        countVoice "failed"
                     | Ok transcript when String.IsNullOrWhiteSpace transcript ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
                         %a.SetTag("outcome", "voice_empty_transcript")
+                        countVoice "empty_transcript"
                     | Ok transcript ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
+                        countVoice "transcribed"
+
                         // Sender's voice content enters the conversational log verbatim
                         // (prefixed) so it feeds later LLM context like any text message.
-                        do! db.LogMessage(
+                        let! inserted =
+                            db.LogMessage(
                                 logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                                     (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                                     $"[voice] {transcript}")
+
+                        if not inserted then
+                            // Webhook redelivery: the STT call above is unavoidably repeated
+                            // (the log text is only known after transcribing), but
+                            // message_log's UNIQUE constraint still stops a second reply
+                            // from going out for the same voice message.
+                            %a.SetTag("outcome", "voice_duplicate_update")
+                            countOutcome "voice_duplicate_update"
+                        else
 
                         let! tldr = tryTldr conf transcript
                         let quoted = $"🎙️ {transcript}"
@@ -245,6 +301,7 @@ type BotService(
                         do! db.LogMessage(
                                 logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                     (Some msg.MessageId) fullText)
+                            |> taskIgnore
 
                         // Transcription itself never triggers the responder — but a
                         // transcript that independently matches the normal trigger rules
@@ -256,6 +313,7 @@ type BotService(
                                 do! db.LogMessage(
                                         logRow msg.Chat.Id replySent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                             (Some msg.MessageId) replyText)
+                                    |> taskIgnore
                                 %a.SetTag("outcome", "voice_transcribed_and_triggered")
                                 countOutcome "voice_transcribed_and_triggered"
                             | None ->
@@ -304,19 +362,28 @@ type BotService(
             use a = botActivity.StartActivity("handleImageCommand")
             %a.SetTag("chatId", msg.Chat.Id)
             %a.SetTag("fromId", from.Id)
+            Metrics.commandTotal.Add(1L, KeyValuePair("command", box "img"))
 
-            do! db.LogMessage(
+            let! inserted =
+                db.LogMessage(
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                         $"[img-cmd] {prompt}")
 
-            if String.IsNullOrWhiteSpace prompt then
+            if not inserted then
+                // Webhook redelivery of a command we already handled (image generation is
+                // the slowest path in the bot — the one most likely to outlast Telegram's
+                // webhook timeout and trigger a retry). Skip re-generating and re-sending.
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif String.IsNullOrWhiteSpace prompt then
                 let hint =
                     "Напиши, что нарисовать: `/img рыжий кот на подоконнике`. Ответь этой командой на фото — перерисую его по описанию."
                 let! sent = BotHelpers.sendTextReply tg msg.Chat.Id hint msg.MessageId
                 do! db.LogMessage(
                         logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                             (Some msg.MessageId) hint)
+                    |> taskIgnore
                 %a.SetTag("outcome", "image_empty_prompt")
                 countOutcome "image_empty_prompt"
             elif not conf.ImageGenEnabled then
@@ -325,6 +392,7 @@ type BotService(
                 do! db.LogMessage(
                         logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                             (Some msg.MessageId) disabledText)
+                    |> taskIgnore
                 %a.SetTag("outcome", "image_disabled")
                 countOutcome "image_disabled"
             else
@@ -346,6 +414,7 @@ type BotService(
                     do! db.LogMessage(
                             logRow msg.Chat.Id sentPhoto.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                 (Some msg.MessageId) $"[image] {truncated}")
+                        |> taskIgnore
                     do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
                     let outcome = if sourceImage.IsSome then "image_edited" else "image_generated"
                     %a.SetTag("outcome", outcome)
@@ -364,27 +433,35 @@ type BotService(
             | Some msg ->
                 match msg.From with
                 | Some from ->
-                    match msg.Text with
-                    | Some text ->
-                        if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                            match tryParseCommand conf text with
-                            | Some prompt -> do! handleImageCommand conf msg from prompt
-                            | None -> do! handleMessage conf msg from text
-                        else
-                            countOutcome "ignored"
-                    | None ->
-                        match BotHelpers.largestPhoto msg with
-                        | Some _ ->
-                            if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                                do! handlePhotoMessage conf msg from
-                            // else: silently ignored — same privacy gate as text messages.
-                        | None ->
-                            match voiceSource msg with
-                            | Some fileId ->
-                                if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                                    do! handleVoiceMessage conf msg from fileId
-                                // else: silently ignored — same privacy gate as text messages.
-                            | None -> ()
+                    // Serializes everything below per chat: two rapid triggers (or a
+                    // webhook retry racing the original attempt) in the same chat no
+                    // longer run concurrently — see withChatLock. Different chats still
+                    // process fully in parallel.
+                    do!
+                        withChatLock msg.Chat.Id (fun () ->
+                            task {
+                                match msg.Text with
+                                | Some text ->
+                                    if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                        match tryParseCommand conf text with
+                                        | Some prompt -> do! handleImageCommand conf msg from prompt
+                                        | None -> do! handleMessage conf msg from text
+                                    else
+                                        countOutcome "ignored"
+                                | None ->
+                                    match BotHelpers.largestPhoto msg with
+                                    | Some _ ->
+                                        if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                            do! handlePhotoMessage conf msg from
+                                        // else: silently ignored — same privacy gate as text messages.
+                                    | None ->
+                                        match voiceSource msg with
+                                        | Some fileId ->
+                                            if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                                do! handleVoiceMessage conf msg from fileId
+                                            // else: silently ignored — same privacy gate as text messages.
+                                        | None -> ()
+                            })
                 | None -> ()
             | None -> ()
         }

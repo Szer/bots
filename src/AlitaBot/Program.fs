@@ -1,5 +1,6 @@
 // AlitaBot — conversational Telegram chatbot
 open System
+open System.Diagnostics
 open System.Globalization
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -165,14 +166,26 @@ let app = builder.Build()
 ))
 
 // Main webhook endpoint with bot-specific update handling
-WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx _rawBody update ->
+WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx rawBody update ->
     task {
         let logger = ctx.RequestServices.GetRequiredService<ILogger<Root>>()
+        use topActivity = botActivity.StartActivity("postUpdate")
+        Telemetry.setUpdateIdentityTags topActivity update
+        // The raw update is logged exactly once per update, before anything that can
+        // fail — even a DI-resolution error below still leaves the payload in Loki.
+        // RawJson makes it a real nested JSON property (not an escaped blob), and the
+        // TraceId enricher ties the line to this trace; error logs don't repeat the body.
+        JsonLogging.withRawJsonProperty "RawUpdate" rawBody (fun () ->
+            logger.LogInformation("Received Telegram update {UpdateId}", update.UpdateId))
         try
             let bot = ctx.RequestServices.GetRequiredService<BotService>()
             do! bot.OnUpdate(update)
+            %topActivity.SetTag("update-error", false)
+            %topActivity.SetStatus(ActivityStatusCode.Ok)
         with ex ->
             logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.UpdateId)
+            %topActivity.SetStatus(ActivityStatusCode.Error)
+            %topActivity.SetTag("update-error", true)
     }) app
 
 app.Run()

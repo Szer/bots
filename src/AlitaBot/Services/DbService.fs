@@ -23,7 +23,13 @@ type DbService(connString: string) =
         return conn
     }
 
-    /// Idempotent insert: webhook redelivery of the same (chat_id, message_id) is a no-op.
+    /// Idempotent insert: webhook redelivery of the same (chat_id, message_id) is a
+    /// no-op. Returns true when this call actually inserted the row (first delivery),
+    /// false when it was already there (a duplicate delivery) — callers use this to
+    /// skip re-running the LLM/voice/image work a retry would otherwise repeat, which
+    /// the INSERT's own idempotency does not prevent by itself (a webhook retry would
+    /// re-run the whole handler and send a second, distinct Telegram reply even though
+    /// the log row itself collapses to one).
     member _.LogMessage(row: MessageLogRow) =
         task {
             use! conn = openConn()
@@ -34,8 +40,8 @@ INSERT INTO message_log (chat_id, message_id, user_id, username, display_name, i
 VALUES (@chat_id, @message_id, @user_id, @username, @display_name, @is_bot, @reply_to_message_id, @text, @sent_at)
 ON CONFLICT (chat_id, message_id) DO NOTHING;
 """
-            let! _ = conn.ExecuteAsync(sql, row)
-            return ()
+            let! rowsAffected = conn.ExecuteAsync(sql, row)
+            return rowsAffected > 0
         }
 
     /// Last `n` messages of the chat, returned in chronological order.
