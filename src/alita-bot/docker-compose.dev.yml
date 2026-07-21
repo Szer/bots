@@ -1,8 +1,11 @@
-# Default `docker compose up` brings only Postgres + Flyway — matches the
-# workflow where the bot runs on the host with a debugger attached.
-# For the end-to-end smoke test (bot inside Docker, ngrok in front, real Telegram):
-#   docker compose -f src/alita-bot/docker-compose.dev.yml --profile smoke up -d --build
+# Default `podman compose up` (or `docker compose`, where `docker` is a real
+# binary) brings only Postgres + Flyway — matches the workflow where the bot
+# runs on the host with a debugger attached.
+# For the end-to-end smoke test (bot inside a container, ngrok in front, real Telegram):
+#   podman compose -f src/alita-bot/docker-compose.dev.yml --profile smoke up -d --build
 # The `bot` service reads its secrets from ./.env.local (gitignored).
+# Bind mounts use the `z` SELinux relabel flag — required for rootless podman
+# on enforcing hosts (Fedora); harmless under Docker.
 
 services:
   postgres:
@@ -14,7 +17,7 @@ services:
       - "15433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -28,7 +31,7 @@ services:
       postgres:
         condition: service_healthy
     volumes:
-      - ./migrations:/flyway/sql:ro
+      - ./migrations:/flyway/sql:ro,z
     environment:
       FLYWAY_URL: jdbc:postgresql://postgres:5432/alita_bot
       FLYWAY_USER: admin
@@ -43,7 +46,7 @@ services:
       flyway:
         condition: service_completed_successfully
     volumes:
-      - ./dev-bot-settings.sql:/seed.sql:ro
+      - ./dev-bot-settings.sql:/seed.sql:ro,z
     environment:
       PGPASSWORD: admin
     command: psql -h postgres -U admin -d alita_bot -v ON_ERROR_STOP=1 -f /seed.sql

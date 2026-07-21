@@ -6,6 +6,7 @@
     <Project Path="src/VahterBanBot/VahterBanBot.fsproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/AlitaBot.RealTests/AlitaBot.RealTests.fsproj" />
     <Project Path="tests/AlitaBot.Tests/AlitaBot.Tests.fsproj" />
     <Project Path="tests/BotTestInfra/BotTestInfra.fsproj" />
     <Project Path="tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj" />
