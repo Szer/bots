@@ -16,7 +16,9 @@ module Timeouts =
     /// Streaming settles once no edit arrived for this long.
     let editQuiet = TimeSpan.FromSeconds 5.
     /// The bot logs its own reply just after sending it — allow the row to land.
-    let dbSettle = TimeSpan.FromSeconds 10.
+    /// In practice the insert lands within ~100-300ms; 15s leaves comfortable margin
+    /// without materially slowing failing-test feedback.
+    let dbSettle = TimeSpan.FromSeconds 15.
 
 [<CLIMutable>]
 type LogRow =
@@ -27,42 +29,80 @@ type LogRow =
       text: string }
 
 /// The four M3 smoke tests from the plan + one user-client-free plumbing test.
-/// Correlation is primarily via reply_to msg id, GUID markers secondary.
+///
+/// DB correlation is done ENTIRELY within the Bot-API message_id domain (marker
+/// text, then reply_to_message_id chaining) — never against MTProto message ids.
+/// For this test chat (a basic "group", not a supergroup/channel) Telegram's Bot
+/// API message_id and WTelegramClient's (MTProto) message.id are DIFFERENT
+/// numbering domains with a constant-but-drifting offset (empirically observed:
+/// +4 in one run, +5 the next, for the identical physical messages — some
+/// invisible/service update consumes an MTProto id between runs). Comparing an
+/// MTProto id against a Postgres-logged message_id — as earlier code did — reads
+/// as "no matching row" even though the row is there, seconds after being
+/// written; it looks like a slow/missing DB write but isn't one. Marker-text +
+/// reply_to_message_id correlation sidesteps the mismatch and also survives LLM
+/// mode, where the bot's reply text won't echo the marker back verbatim.
 type SmokeTests(fx: RealAssemblyFixture) =
 
     let env = fx.Env
 
-    let queryLog (param: obj) =
+    let queryOne (sql: string) (param: obj) =
         task {
             use conn = new NpgsqlConnection(fx.DbConnectionString)
-
-            let! rows =
-                conn.QueryAsync<LogRow>(
-                    """
-SELECT message_id, user_id, is_bot, reply_to_message_id, text
-FROM message_log
-WHERE chat_id = @chat_id AND message_id = ANY(@message_ids)
-ORDER BY message_id;
-""",
-                    param)
-
-            return rows |> Seq.toArray
+            let! rows = conn.QueryAsync<LogRow>(sql, param)
+            return rows |> Seq.tryHead
         }
 
-    /// Polls message_log until `expected` rows for `messageIds` exist (or dbSettle elapses).
-    let awaitLogRows (messageIds: int64[]) (expected: int) =
+    /// Polls for the user's own logged row (is_bot = false) whose text contains
+    /// `marker` — reliable in both echo and LLM mode, since it's verbatim what we sent.
+    let awaitUserRow (marker: string) =
         task {
             let deadline = DateTime.UtcNow + Timeouts.dbSettle
-            let mutable rows = [||]
+            let mutable found = None
 
-            while rows.Length < expected && DateTime.UtcNow < deadline do
-                let! found = queryLog {| chat_id = env.TestChatId; message_ids = messageIds |}
-                rows <- found
+            while found.IsNone && DateTime.UtcNow < deadline do
+                let! row =
+                    queryOne
+                        """
+SELECT message_id, user_id, is_bot, reply_to_message_id, text
+FROM message_log
+WHERE chat_id = @chat_id AND is_bot = false AND text LIKE '%' || @marker || '%'
+ORDER BY message_id LIMIT 1;
+"""
+                        {| chat_id = env.TestChatId; marker = marker |}
 
-                if rows.Length < expected then
+                found <- row
+
+                if found.IsNone then
                     do! Task.Delay 500
 
-            return rows
+            return found
+        }
+
+    /// Polls for the bot's reply row attributed (via reply_to_message_id, Bot-API
+    /// domain) to `userMessageId` — not by text, since an LLM reply won't contain the marker.
+    let awaitBotReplyRow (userMessageId: int64) =
+        task {
+            let deadline = DateTime.UtcNow + Timeouts.dbSettle
+            let mutable found = None
+
+            while found.IsNone && DateTime.UtcNow < deadline do
+                let! row =
+                    queryOne
+                        """
+SELECT message_id, user_id, is_bot, reply_to_message_id, text
+FROM message_log
+WHERE chat_id = @chat_id AND is_bot = true AND reply_to_message_id = @rid
+ORDER BY message_id LIMIT 1;
+"""
+                        {| chat_id = env.TestChatId; rid = userMessageId |}
+
+                found <- row
+
+                if found.IsNone then
+                    do! Task.Delay 500
+
+            return found
         }
 
     [<Fact>]
@@ -97,19 +137,21 @@ ORDER BY message_id;
 
             let marker = Guid.NewGuid().ToString "N"
             let! msgId = fx.UserClient.SendText(env.TestChatId, $"@{env.BotUsername} лог {marker}")
-            let! reply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
+            let! _reply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
 
-            let! rows = awaitLogRows [| int64 msgId; int64 reply.id |] 2
-            Assert.Equal(2, rows.Length)
+            match! awaitUserRow marker with
+            | None -> Assert.Fail $"user's own message (marker {marker}) never landed in message_log"
+            | Some userRow ->
+                Assert.False userRow.is_bot
+                Assert.Contains(marker, userRow.text)
 
-            let userRow = rows |> Array.find (fun r -> r.message_id = int64 msgId)
-            Assert.False userRow.is_bot
-            Assert.Contains(marker, userRow.text)
-
-            let botRow = rows |> Array.find (fun r -> r.message_id = int64 reply.id)
-            Assert.True botRow.is_bot
-            Assert.Equal(env.BotUserId, botRow.user_id)
-            Assert.Equal(Nullable(int64 msgId), botRow.reply_to_message_id)
+                match! awaitBotReplyRow userRow.message_id with
+                | None ->
+                    Assert.Fail
+                        $"no message_log row replying (reply_to_message_id={userRow.message_id}) to the marker {marker} message"
+                | Some botRow ->
+                    Assert.True botRow.is_bot
+                    Assert.Equal(env.BotUserId, botRow.user_id)
         }
 
     [<Fact>]
@@ -124,10 +166,11 @@ ORDER BY message_id;
             let! reply = fx.UserClient.TryAwaitReplyTo(env.TestChatId, msgId, Timeouts.noReply)
             Assert.True(reply.IsNone, "bot must not answer a non-mention")
 
-            let! rows = awaitLogRows [| int64 msgId |] 1
-            let row = Assert.Single rows
-            Assert.False row.is_bot
-            Assert.Contains(marker, row.text)
+            match! awaitUserRow marker with
+            | None -> Assert.Fail $"message (marker {marker}) never landed in message_log"
+            | Some row ->
+                Assert.False row.is_bot
+                Assert.Contains(marker, row.text)
         }
 
     [<Fact>]
