@@ -277,6 +277,51 @@ container too. A full real-Telegram conversation against the *containerized* bot
 `make real-test`'s bare-process path already covers that; this check exists to prove the
 container itself is wired correctly, not to duplicate the conversational test suite.
 
+## CI real-test flow (M7): `ALITA_REAL_MODE=remote`
+
+`make real-test`/`make smoke` (above) are the local loops — bare-process or containerized,
+always against a tunnel and a dev-machine Postgres. `.github/workflows/alita-real-test.yml` runs
+the *same* `tests/AlitaBot.RealTests` suite in CI, but against a real deployment: it builds and
+pushes `ghcr.io/szer/alita-bot:test-<sha>`, `kubectl apply`s Postgres + the bot into the
+`alita-test` AKS namespace (persistent namespace/cert/gateway-listener/RBAC from `my-infra` PR
+\#83/\#84; the bot/Postgres/Service/HTTPRoute themselves are transient — applied and deleted by
+this workflow every run, **not** GitOps), waits for `https://alita-test.szer.dev/healthz`, then
+runs `dotnet test tests/AlitaBot.RealTests` with `ALITA_REAL_MODE=remote`.
+
+`RealAssemblyFixture` branches on `env.IsRemote` (`RealEnv.fs`): in remote mode it skips
+`DevDb.upAsync()` (the local compose stack), `NgrokTunnel`, and `BotProcess` entirely — Postgres
+is already reachable at `localhost:15433` via a `kubectl port-forward` the *workflow* starts
+(not the fixture), and the bot is already running in the cluster. What it still does, unchanged:
+`DevDb.applyRealSettingsAsync` (same upsert, same connection string, works identically against
+the port-forward), a `/healthz` poll (against `ALITA_WEBHOOK_PUBLIC_URL`'s host instead of
+`127.0.0.1:5010`), and `setWebhook`/`deleteWebhook` (URL is `ALITA_WEBHOOK_PUBLIC_URL` verbatim
+instead of `https://{ngrok domain}/bot`). The local path (`ALITA_REAL_MODE` unset or `local`) is
+byte-identical to before this milestone — every new branch is `if env.IsRemote then ... else
+<the exact previous code>`.
+
+**Env contract (remote mode only):** `ALITA_REAL_MODE=remote`, `ALITA_WEBHOOK_PUBLIC_URL` (e.g.
+`https://alita-test.szer.dev/bot`) replaces `ALITA_NGROK_DOMAIN` as the webhook-URL source;
+everything else (`ALITA_TEST_BOT_TOKEN`, `ALITA_TEST_BOT_USERNAME`, `ALITA_WEBHOOK_SECRET`,
+`ALITA_TEST_CHAT_ID`, `ALITA_TG_API_*`, `AZURE_FOUNDRY_*`, `ALITA_*_DEPLOYMENT`) is the same
+variable name the local flow already reads — CI just sources the *values* from GH secrets scoped
+to a dedicated CI bot/chat/session (`ALITA_CI_BOT_TOKEN`/`ALITA_CI_BOT_USERNAME`/
+`ALITA_CI_CHAT_ID`/`ALITA_CI_TG_SESSION_B64`, gzip-then-base64-encoded), never the dev-machine's
+`ALITA_TEST_*`/`ALITA_TG_SESSION_B64` — so a developer's `make real-test` and a CI run can never
+fight over `setWebhook` (one bot account = one active webhook) or the MTProto session file.
+
+**Singleton queueing contract.** The workflow's `concurrency` block is
+`group: alita-aks-real-test, cancel-in-progress: false` — the `alita-test` namespace and its
+transient workload are a single shared resource, so a second PR's run queues behind the first
+rather than racing it for the same Postgres/bot/HTTPRoute. Expect PRs to serialize through this
+gate; it is not parallelized per-PR.
+
+**No-ArgoCD-labels rule.** Everything the workflow applies under `.github/k8s/alita-test/` is
+labeled `alita-ci: transient` and **never** `app.kubernetes.io/instance` — that's the label
+ArgoCD's own `alita-test` Application (persistent namespace/cert/RBAC, GitOps-managed) uses for
+pruning, and if the transient bot/Postgres carried it, ArgoCD's `selfHeal`/`prune` could delete
+them mid-run. Teardown (`always()` in the workflow) deletes exactly `-l alita-ci=transient`,
+never anything ArgoCD-tracked.
+
 ## Tech debt
 
 See [`docs/TECH-DEBT.md`](docs/TECH-DEBT.md).

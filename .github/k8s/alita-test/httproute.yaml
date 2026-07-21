@@ -1,0 +1,26 @@
+---
+# Routes alita-test.szer.dev (the alita-test-https listener on the shared
+# main-gateway, provisioned persistently by my-infra PR #83) to the
+# transient bot Service. Applied/torn down every run alongside the rest of
+# this directory.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: alita-test-route
+  namespace: alita-test
+  labels:
+    alita-ci: transient
+spec:
+  parentRefs:
+  - name: main-gateway
+    namespace: gateway-system
+  hostnames:
+  - "alita-test.szer.dev"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: alita-bot
+      port: 5010

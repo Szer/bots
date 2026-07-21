@@ -1,0 +1,16 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alita-bot
+  namespace: alita-test
+  labels:
+    alita-ci: transient
+spec:
+  selector:
+    app: alita-bot
+  ports:
+  - name: http
+    port: 5010
+    targetPort: 5010
+  type: ClusterIP

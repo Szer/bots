@@ -112,11 +112,11 @@ ORDER BY message_id LIMIT 1;
 
             use http = new HttpClient(Timeout = TimeSpan.FromSeconds 15.)
             http.DefaultRequestHeaders.Add("ngrok-skip-browser-warning", "1")
-            let! body = http.GetStringAsync $"https://{env.NgrokDomain}/healthz"
+            let! body = http.GetStringAsync env.HealthUrl
             Assert.Equal("OK", body)
 
             let! info = fx.Webhook.GetInfoAsync()
-            Assert.Equal($"https://{env.NgrokDomain}/bot", info.GetProperty("url").GetString())
+            Assert.Equal(env.WebhookUrl, info.GetProperty("url").GetString())
         }
 
     [<Fact>]

@@ -5,9 +5,15 @@ open System.IO
 
 /// Typed view over ~/.alita-test/env (KEY=VALUE lines). Process env vars override the file.
 type RealEnv =
-    { NgrokDomain: string
+    { /// local (default, zero behavior change) | remote (CI: bot deployed to AKS,
+      /// no ngrok/BotProcess/DevDb-compose — see RealAssemblyFixture).
+      Mode: string
+      NgrokDomain: string
       NgrokApiKey: string
       NgrokAuthtoken: string
+      /// remote mode only — full webhook URL (e.g. https://alita-test.szer.dev/bot),
+      /// used verbatim instead of deriving one from NgrokDomain.
+      WebhookPublicUrl: string
       BotToken: string
       BotUsername: string
       WebhookSecret: string
@@ -38,9 +44,33 @@ type RealEnv =
             | true, v -> v
             | _ -> 0L
 
-    /// Everything the webhook plumbing needs (ngrok + bot token + chat id + secret).
+    /// CI mode: bot already deployed to AKS (alita-test namespace) by the workflow —
+    /// fixture skips NgrokTunnel/BotProcess/DevDb-compose and talks to the public URL.
+    member this.IsRemote =
+        this.Mode.Trim().Equals("remote", StringComparison.OrdinalIgnoreCase)
+
+    /// The webhook URL Telegram should POST to: ALITA_WEBHOOK_PUBLIC_URL verbatim in
+    /// remote mode, or derived from the ngrok domain locally.
+    member this.WebhookUrl =
+        if this.IsRemote then
+            this.WebhookPublicUrl
+        else
+            $"https://{this.NgrokDomain}/bot"
+
+    /// The bot's public /healthz — same host as WebhookUrl, "/bot" swapped for "/healthz".
+    member this.HealthUrl =
+        if this.IsRemote then
+            let u = this.WebhookPublicUrl.TrimEnd '/'
+            (if u.EndsWith "/bot" then u.Substring(0, u.Length - "/bot".Length) else u) + "/healthz"
+        else
+            $"https://{this.NgrokDomain}/healthz"
+
+    /// Everything the webhook plumbing needs (bot token + chat id + secret, plus
+    /// either an ngrok domain (local) or ALITA_WEBHOOK_PUBLIC_URL (remote)).
     member this.HasCore =
-        [ this.NgrokDomain; this.BotToken; this.BotUsername; this.WebhookSecret ]
+        let transport = if this.IsRemote then this.WebhookPublicUrl else this.NgrokDomain
+
+        [ transport; this.BotToken; this.BotUsername; this.WebhookSecret ]
         |> List.forall (String.IsNullOrWhiteSpace >> not)
         && this.TestChatId <> 0L
 
@@ -91,9 +121,11 @@ module RealEnv =
         getVar key |> Option.defaultValue defaultValue
 
     let load () =
-        { NgrokDomain = getVarOr "ALITA_NGROK_DOMAIN" ""
+        { Mode = getVarOr "ALITA_REAL_MODE" "local"
+          NgrokDomain = getVarOr "ALITA_NGROK_DOMAIN" ""
           NgrokApiKey = getVarOr "ALITA_NGROK_API_KEY" ""
           NgrokAuthtoken = getVarOr "ALITA_NGROK_AUTHTOKEN" ""
+          WebhookPublicUrl = getVarOr "ALITA_WEBHOOK_PUBLIC_URL" ""
           BotToken = getVarOr "ALITA_TEST_BOT_TOKEN" ""
           BotUsername = getVarOr "ALITA_TEST_BOT_USERNAME" ""
           WebhookSecret = getVarOr "ALITA_WEBHOOK_SECRET" ""
