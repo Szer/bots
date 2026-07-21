@@ -54,16 +54,23 @@ type BotService(
             | true, v -> v
             | _ -> 0L
 
+    /// Checks a `@username` mention against whichever entity array corresponds to
+    /// `text` — `Entities` for a text message, `CaptionEntities` for a photo's caption
+    /// (Telegram never populates both on the same message, so trying both is safe).
     let mentionsBot (conf: BotConfiguration) (text: string) (msg: Message) =
         let mention = "@" + conf.BotUsername
-        match msg.Entities with
-        | Some entities ->
+        let matchesIn (entities: MessageEntity[]) =
             entities
             |> Array.exists (fun e ->
                 e.Type = "mention"
                 && int e.Offset + int e.Length <= text.Length
                 && text.Substring(int e.Offset, int e.Length) = mention)
-        | None -> false
+        match msg.Entities with
+        | Some entities when matchesIn entities -> true
+        | _ ->
+            match msg.CaptionEntities with
+            | Some entities -> matchesIn entities
+            | None -> false
 
     let isReplyToBot (conf: BotConfiguration) (msg: Message) =
         match msg.ReplyToMessage with
@@ -128,7 +135,10 @@ type BotService(
                     return None
         }
 
-    let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
+    /// Shared by plain text messages and photo messages: logs `logText` to message_log,
+    /// checks `triggerText` (raw text/caption, matching whatever entity array the mention
+    /// offsets are relative to) for a trigger, and dispatches to the responder.
+    let handleTriggerableMessage (conf: BotConfiguration) (msg: Message) (from: User) (logText: string) (triggerText: string) =
         task {
             use a = botActivity.StartActivity("handleMessage")
             %a.SetTag("chatId", msg.Chat.Id)
@@ -136,9 +146,9 @@ type BotService(
 
             do! db.LogMessage(
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
-                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) text)
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) logText)
 
-            if isTriggered conf text msg then
+            if isTriggered conf triggerText msg then
                 match! responder.Respond(msg) with
                 | Some(sent, replyText) ->
                     do! db.LogMessage(
@@ -153,6 +163,20 @@ type BotService(
                 %a.SetTag("outcome", "logged")
                 countOutcome "logged"
         }
+
+    let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
+        handleTriggerableMessage conf msg from text text
+
+    /// Photo message flow: logs as `[photo] {caption}` (bare `[photo]` for no caption,
+    /// mirroring S1's `[voice]` convention) and checks the RAW caption — not the logged
+    /// text — against CaptionEntities for a mention, since entity offsets are relative to
+    /// the caption Telegram sent, not our logging prefix. The image itself is fetched by
+    /// ResponderService at respond time (from msg.Photo directly, via ITelegramApi), not
+    /// stored here — message_log only ever holds text.
+    let handlePhotoMessage (conf: BotConfiguration) (msg: Message) (from: User) =
+        let caption = msg.Caption |> Option.defaultValue ""
+        let logText = if caption = "" then "[photo]" else $"[photo] {caption}"
+        handleTriggerableMessage conf msg from logText caption
 
     /// Voice/VideoNote/Audio flow: download -> transcribe -> reply as an expandable
     /// blockquote (+ TL;DR when long) -> log both the sender's transcript and the bot's
@@ -238,12 +262,18 @@ type BotService(
                         else
                             countOutcome "ignored"
                     | None ->
-                        match voiceSource msg with
-                        | Some fileId ->
+                        match BotHelpers.largestPhoto msg with
+                        | Some _ ->
                             if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                                do! handleVoiceMessage conf msg from fileId
+                                do! handlePhotoMessage conf msg from
                             // else: silently ignored — same privacy gate as text messages.
-                        | None -> ()
+                        | None ->
+                            match voiceSource msg with
+                            | Some fileId ->
+                                if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                    do! handleVoiceMessage conf msg from fileId
+                                // else: silently ignored — same privacy gate as text messages.
+                            | None -> ()
                 | None -> ()
             | None -> ()
         }

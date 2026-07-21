@@ -12,7 +12,9 @@ type ChatRole =
 [<RequireQualifiedAccess>]
 type ContentPart =
     | Text of string
-    | ImageUrl of url: string
+    /// `detail` is OpenAI's image_url detail hint ("low" | "high"); None omits the
+    /// field entirely (server default). See BotConfiguration.VisionDetail.
+    | ImageUrl of url: string * detail: string option
 
 type ToolCall =
     { Id: string

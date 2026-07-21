@@ -182,6 +182,18 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             return msg.id
         }
 
+    /// Sends an on-disk image file as a photo with a caption (used by VisionRealTests to
+    /// exercise the vision feature — the caption carries the "@bot <question> <guid>" trigger).
+    /// Returns the sent message id.
+    member _.SendPhoto(chatId: int64, imagePath: string, caption: string) : Task<int> =
+        task {
+            let! peer = resolvePeer chatId
+            let! uploaded = client.UploadFileAsync(imagePath)
+            let media = InputMediaUploadedPhoto(file = uploaded)
+            let! msg = client.SendMessageAsync(peer, caption, media)
+            return msg.id
+        }
+
     /// First incoming message in `chatId` that replies to `repliedMsgId`, or None on timeout.
     member _.TryAwaitReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
         task {

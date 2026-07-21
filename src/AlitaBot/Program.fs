@@ -64,6 +64,8 @@ let buildBotConf () =
       StreamMode = getSettingOr "STREAM_MODE" "edit"
       ContextWindowMessages = getSettingOr "CONTEXT_WINDOW_MESSAGES" "30" |> int
       VoiceTranscribeEnabled = getSettingOr "VOICE_TRANSCRIBE_ENABLED" "true" |> bool.Parse
+      VisionEnabled = getSettingOr "VISION_ENABLED" "true" |> bool.Parse
+      VisionDetail = getSettingOr "VISION_DETAIL" "low"
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())

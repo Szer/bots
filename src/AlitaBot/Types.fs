@@ -26,4 +26,10 @@ type BotConfiguration =
       ContextWindowMessages: int
       /// FEATURE_FLAG VOICE_TRANSCRIBE_ENABLED — auto-transcribe Voice/VideoNote/Audio messages in target chats. Default true.
       VoiceTranscribeEnabled: bool
+      /// FEATURE_FLAG VISION_ENABLED — attach photos (the triggering message's own, and/or
+      /// its reply target's) as image_url parts on LLM requests. Default true.
+      VisionEnabled: bool
+      /// VISION_DETAIL bot_setting: OpenAI image_url detail hint ("low" | "high"), controls
+      /// vision token cost. Default "low".
+      VisionDetail: string
       TestMode: bool }

@@ -23,5 +23,7 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('TTS_DEPLOYMENT',          'alita-tts',                                              'FREE_FORM',    'llm',         'Text-to-speech deployment name (audio/speech)'),
     ('LLM_PRICING',             '{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}', 'JSON_BLOB', 'llm',         'USD prices per 1M tokens by model, for cost telemetry'),
     ('VOICE_TRANSCRIBE_ENABLED', 'true',                                                  'FEATURE_FLAG', 'llm',        'Auto-transcribe Voice/VideoNote/Audio messages in target chats'),
+    ('VISION_ENABLED',          'true',                                                   'FEATURE_FLAG', 'llm',        'Attach photos (triggering message and/or its reply target) as image_url parts on LLM requests'),
+    ('VISION_DETAIL',           'low',                                                    'FREE_FORM',    'llm',        'OpenAI image_url detail hint: low | high — controls vision token cost'),
     ('TEST_MODE',               'false',                                                  'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/clock/advance)')
 ON CONFLICT (key) DO NOTHING;

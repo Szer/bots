@@ -79,10 +79,13 @@ module internal AzureWire =
                 | ContentPart.Text t ->
                     o["type"] <- JsonValue.Create "text"
                     o["text"] <- JsonValue.Create t
-                | ContentPart.ImageUrl url ->
+                | ContentPart.ImageUrl(url, detail) ->
                     o["type"] <- JsonValue.Create "image_url"
                     let img = JsonObject()
                     img["url"] <- JsonValue.Create url
+                    match detail with
+                    | Some d -> img["detail"] <- JsonValue.Create d
+                    | None -> ()
                     o["image_url"] <- img
                 arr.Add(o)
             arr

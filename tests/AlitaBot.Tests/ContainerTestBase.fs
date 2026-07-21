@@ -50,6 +50,8 @@ type AlitaTestContainers() =
                 "STT_DEPLOYMENT",          "alita-stt",                         "FREE_FORM", "llm"
                 "TTS_DEPLOYMENT",          "alita-tts",                         "FREE_FORM", "llm"
                 "VOICE_TRANSCRIBE_ENABLED", "true",                             "FEATURE_FLAG", "llm"
+                "VISION_ENABLED",          "true",                              "FEATURE_FLAG", "llm"
+                "VISION_DETAIL",           "low",                               "FREE_FORM", "llm"
                 "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}""", "JSON_BLOB", "llm"
                 "TEST_MODE",               "true",                              "FEATURE_FLAG", "diagnostics"
             ]

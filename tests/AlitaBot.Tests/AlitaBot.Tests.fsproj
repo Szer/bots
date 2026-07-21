@@ -12,6 +12,7 @@
     <Compile Include="SkeletonTests.fs" />
     <Compile Include="LlmTests.fs" />
     <Compile Include="VoiceTests.fs" />
+    <Compile Include="VisionTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

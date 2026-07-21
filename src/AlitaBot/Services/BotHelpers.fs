@@ -35,3 +35,11 @@ let sendTextReplyWithEntities
     : Task<Message> =
     let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
     tg.CallExn(Req.SendMessage.Make(chatId, text, entities = entities, replyParameters = replyParams))
+
+/// Largest PhotoSize of a message's Photo array (Telegram orders smallest -> largest),
+/// or None for a message with no photo. Shared by BotService (detecting a photo message)
+/// and ResponderService (the vision feature — fetching the image to attach to the LLM request).
+let largestPhoto (msg: Message) : PhotoSize option =
+    match msg.Photo with
+    | Some photos when photos.Length > 0 -> Some(photos |> Array.maxBy (fun p -> p.Width * p.Height))
+    | _ -> None
