@@ -412,6 +412,18 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the images/generations + images/edits endpoints (AlitaBot image generation, S3)
+    /// — one shared queue for both, dequeued per call. An empty array clears the script (calls
+    /// fall back to the fake's default scripted tiny PNG).
+    member _.SetAzureImageScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/image-script", payload)
+            return ()
+        }
+
     /// Returns only the Azure OpenAI chat-completions calls the fake recorded (filters out OCR).
     /// Tests count these to assert dedup/single-flight (e.g. "exactly 1 call for this content")
     /// and retry (e.g. ">= 2 calls" after a scripted 429).

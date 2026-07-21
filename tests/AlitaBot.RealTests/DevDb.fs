@@ -108,6 +108,7 @@ let applyRealSettingsAsync (env: RealEnv) =
               "STREAM_MODE", env.StreamMode, "FREE_FORM", "llm" ]
             @ (if String.IsNullOrWhiteSpace env.SttDeployment then [] else [ "STT_DEPLOYMENT", env.SttDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.TtsDeployment then [] else [ "TTS_DEPLOYMENT", env.TtsDeployment, "FREE_FORM", "llm" ])
+            @ (if String.IsNullOrWhiteSpace env.ImageDeployment then [] else [ "IMAGE_DEPLOYMENT", env.ImageDeployment, "FREE_FORM", "llm" ])
 
         for key, value, typ, grp in settings do
             let! _ = conn.ExecuteAsync(upsertSql, {| key = key; value = value; typ = typ; grp = grp |})

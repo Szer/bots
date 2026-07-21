@@ -22,6 +22,7 @@ type BotService(
     tg: ITelegramApi,
     speech: ISpeech,
     chat: IChatCompletion,
+    imageGen: IImageGen,
     logger: ILogger<BotService>,
     time: TimeProvider
 ) =
@@ -91,6 +92,23 @@ type BotService(
                 match msg.Audio with
                 | Some a -> Some a.FileId
                 | None -> None
+
+    /// Truncation length for the /img photo caption's echoed prompt (plan §B2).
+    [<Literal>]
+    let ImgCaptionPromptMaxLen = 100
+
+    /// Recognizes `/img`, `!img`, and `/img@{botUsername}` command prefixes (case-sensitive,
+    /// matching Telegram convention) at the start of a message. Returns the rest of the text,
+    /// trimmed, as the prompt — an empty string means "no prompt supplied" (caller replies with
+    /// a usage hint); `None` means the text isn't one of these commands at all. Deliberately
+    /// minimal/local parsing for this slice — Slice 4 grows this into a proper command
+    /// dispatcher shared across command types.
+    let tryParseCommand (conf: BotConfiguration) (text: string) : string option =
+        [ "/img@" + conf.BotUsername; "/img"; "!img" ]
+        |> List.tryFind (fun prefix ->
+            text.StartsWith(prefix, StringComparison.Ordinal)
+            && (text.Length = prefix.Length || Char.IsWhiteSpace text[prefix.Length]))
+        |> Option.map (fun prefix -> text.Substring(prefix.Length).Trim())
 
     let logRow (chatId: int64) (messageId: int64) (userId: int64) (username: string) (displayName: string) (isBot: bool) (replyTo: int64 option) (text: string) : MessageLogRow =
         { chat_id = chatId
@@ -248,6 +266,97 @@ type BotService(
                             countOutcome "voice_transcribed"
         }
 
+    /// Downloads the largest photo of `msg`'s reply target, if any — the img2img source
+    /// image for a `/img` reply-to-a-photo prompt. Best-effort: any failure (API error,
+    /// missing FilePath) logs a Warning and returns None, degrading to text-to-image
+    /// instead of failing the whole command (mirrors ResponderService's vision fetch).
+    let tryFetchReplySourceImage (msg: Message) : Task<byte[] option> =
+        task {
+            match msg.ReplyToMessage |> Option.bind BotHelpers.largestPhoto with
+            | None -> return None
+            | Some photo ->
+                try
+                    let! file = tg.CallExn(Req.GetFile.Make(photo.FileId))
+                    match file.FilePath with
+                    | None -> return None
+                    | Some fp when String.IsNullOrWhiteSpace fp -> return None
+                    | Some fp ->
+                        let! bytes = tg.DownloadFile fp
+                        return Some bytes
+                with ex ->
+                    logger.LogWarning(
+                        ex,
+                        "Image gen: failed to fetch reply-to photo {FileId} — falling back to text-to-image",
+                        photo.FileId)
+                    return None
+        }
+
+    /// `/img` / `!img` command flow (plan §B2). Always logs the command as
+    /// `[img-cmd] {prompt}` first, then branches: empty prompt -> RU usage hint;
+    /// IMAGE_GEN_ENABLED=false -> RU "disabled" reply; otherwise sends a "рисую..."
+    /// placeholder, resolves an optional img2img source image from the reply target,
+    /// generates, deletes the placeholder and sends the photo (or edits the placeholder
+    /// into an apology on failure). Never dispatches to ResponderService — a command
+    /// message is fully handled here, regardless of whether it also happens to contain
+    /// the bot's name/mention.
+    let handleImageCommand (conf: BotConfiguration) (msg: Message) (from: User) (prompt: string) =
+        task {
+            use a = botActivity.StartActivity("handleImageCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            do! db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        $"[img-cmd] {prompt}")
+
+            if String.IsNullOrWhiteSpace prompt then
+                let hint =
+                    "Напиши, что нарисовать: `/img рыжий кот на подоконнике`. Ответь этой командой на фото — перерисую его по описанию."
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id hint msg.MessageId
+                do! db.LogMessage(
+                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                            (Some msg.MessageId) hint)
+                %a.SetTag("outcome", "image_empty_prompt")
+                countOutcome "image_empty_prompt"
+            elif not conf.ImageGenEnabled then
+                let disabledText = "Генерация картинок сейчас выключена."
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id disabledText msg.MessageId
+                do! db.LogMessage(
+                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                            (Some msg.MessageId) disabledText)
+                %a.SetTag("outcome", "image_disabled")
+                countOutcome "image_disabled"
+            else
+                let! sourceImage = tryFetchReplySourceImage msg
+                let! placeholder = BotHelpers.sendTextReply tg msg.Chat.Id "рисую..." msg.MessageId
+
+                match! imageGen.Generate(prompt, sourceImage, CancellationToken.None) with
+                | Ok(bytes, _usage) ->
+                    let truncated =
+                        if prompt.Length > ImgCaptionPromptMaxLen then prompt.Substring(0, ImgCaptionPromptMaxLen)
+                        else prompt
+                    let caption =
+                        match ImagePricing.tryCost logger conf.LlmPricingJson conf.ImageDeployment conf.ImageQuality with
+                        | Some cost ->
+                            let costStr = cost.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)
+                            $"{truncated}\n${costStr}"
+                        | None -> truncated
+                    let! sentPhoto = BotHelpers.sendPhotoReply tg msg.Chat.Id bytes caption msg.MessageId
+                    do! db.LogMessage(
+                            logRow msg.Chat.Id sentPhoto.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) $"[image] {truncated}")
+                    do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
+                    let outcome = if sourceImage.IsSome then "image_edited" else "image_generated"
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                | Error err ->
+                    logger.LogWarning("Image generation failed: {Error}", string err)
+                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось нарисовать 🙁"
+                    %a.SetTag("outcome", "image_failed")
+                    countOutcome "image_failed"
+        }
+
     member _.OnUpdate(update: Update) =
         task {
             let conf = options.Value
@@ -258,7 +367,9 @@ type BotService(
                     match msg.Text with
                     | Some text ->
                         if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                            do! handleMessage conf msg from text
+                            match tryParseCommand conf text with
+                            | Some prompt -> do! handleImageCommand conf msg from prompt
+                            | None -> do! handleMessage conf msg from text
                         else
                             countOutcome "ignored"
                     | None ->

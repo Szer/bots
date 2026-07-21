@@ -32,4 +32,15 @@ type BotConfiguration =
       /// VISION_DETAIL bot_setting: OpenAI image_url detail hint ("low" | "high"), controls
       /// vision token cost. Default "low".
       VisionDetail: string
+      /// Image-generation deployment name (Azure Foundry images/generations + images/edits).
+      /// Empty when unconfigured (e.g. quota denied at deploy time) — /img then fails
+      /// gracefully with a RU error reply instead of crashing.
+      ImageDeployment: string
+      /// FEATURE_FLAG IMAGE_GEN_ENABLED — the /img and !img commands. Default true.
+      ImageGenEnabled: bool
+      /// IMAGE_SIZE bot_setting: images/generations `size` param (e.g. "1024x1024"). Default "1024x1024".
+      ImageSize: string
+      /// IMAGE_QUALITY bot_setting: images/generations `quality` param ("low"|"medium"|"high").
+      /// Default "medium".
+      ImageQuality: string
       TestMode: bool }

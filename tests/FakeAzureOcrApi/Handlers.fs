@@ -301,6 +301,88 @@ module Handlers =
             | None -> do! respondJson ctx 200 """{"text":""}"""
         }
 
+    /// Fake Azure OpenAI images/generations handler (AlitaBot image generation, text->image).
+    let handleImagesGenerations (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.imageResponseScript.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondJson ctx 200 Store.defaultImageResponse
+        }
+
+    /// Fake Azure OpenAI images/edits handler (AlitaBot image generation, img2img).
+    /// Multipart request — reads the form so the source image's byte count can be logged
+    /// (tests assert on it via GetAzureOcrCalls/Body, e.g. "imageBytes=123") without the
+    /// fake needing to persist the actual image bytes anywhere.
+    let handleImagesEdits (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! form = ctx.Request.ReadFormAsync()
+            let field (name: string) = if form.ContainsKey name then string form[name] else ""
+            let promptField = field "prompt"
+            let sizeField = field "size"
+            let qualityField = field "quality"
+            let imageByteCount =
+                match form.Files.GetFile "image" with
+                | null -> 0
+                | f -> int f.Length
+            let bodyLog =
+                $"(multipart images/edits, prompt={promptField}, size={sizeField}, quality={qualityField}, imageBytes={imageByteCount})"
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} {bodyLog}")
+            Store.logCall ctx.Request.Method url bodyLog
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.imageResponseScript.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondJson ctx 200 Store.defaultImageResponse
+        }
+
+    /// Sets the scripted-response queue for the images/generations + images/edits endpoints
+    /// (shared — one control endpoint for both, per plan). An empty/absent `responses` array
+    /// clears it (calls fall back to the default scripted tiny PNG).
+    let setImageScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearImageScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.imageResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
     /// Sets the scripted-response queue for the audio/transcriptions (STT) endpoint.
     /// An empty/absent `responses` array clears it (calls fall back to an empty transcript).
     let setSttScript (ctx: HttpContext) =

@@ -23,6 +23,17 @@ let sendTextReply (tg: ITelegramApi) (chatId: int64) (text: string) (replyToMess
 let editMessageText (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) =
     tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text)) |> taskIgnore
 
+/// Best-effort delete (e.g. cleaning up the "рисую..." placeholder once the real photo
+/// is ready) — fire-and-forget, a failure here must never block the actual reply.
+let deleteMessage (tg: ITelegramApi) (chatId: int64) (messageId: int64) =
+    tg.CallIgnore(Req.DeleteMessage.Make(chatId, messageId))
+
+/// Sends a photo as a reply, with a caption, via multipart upload (Funogram's
+/// InputFile.FileBytes) — used by the /img command to deliver a generated image.
+let sendPhotoReply (tg: ITelegramApi) (chatId: int64) (bytes: byte[]) (caption: string) (replyToMessageId: int64) : Task<Message> =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(Req.SendPhoto.Make(chatId, InputFile.FileBytes("image.png", bytes), caption = caption, replyParameters = replyParams))
+
 /// Sends a text reply carrying explicit entities (e.g. expandable_blockquote for
 /// voice transcripts) — entities are mutually exclusive with parse_mode on the wire,
 /// so callers that need formatting without a parse_mode use this instead of sendTextReply.

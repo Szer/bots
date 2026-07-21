@@ -52,7 +52,11 @@ type AlitaTestContainers() =
                 "VOICE_TRANSCRIBE_ENABLED", "true",                             "FEATURE_FLAG", "llm"
                 "VISION_ENABLED",          "true",                              "FEATURE_FLAG", "llm"
                 "VISION_DETAIL",           "low",                               "FREE_FORM", "llm"
-                "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}""", "JSON_BLOB", "llm"
+                "IMAGE_DEPLOYMENT",        "alita-image",                       "FREE_FORM", "llm"
+                "IMAGE_GEN_ENABLED",       "true",                              "FEATURE_FLAG", "llm"
+                "IMAGE_SIZE",              "1024x1024",                         "FREE_FORM", "llm"
+                "IMAGE_QUALITY",           "medium",                            "FREE_FORM", "llm"
+                "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}""", "JSON_BLOB", "llm"
                 "TEST_MODE",               "true",                              "FEATURE_FLAG", "diagnostics"
             ]
             for (key, value, typ, group) in settings do

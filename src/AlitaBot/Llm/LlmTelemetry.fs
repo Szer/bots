@@ -57,6 +57,91 @@ module LlmPricing =
                 logger.LogWarning("No LLM_PRICING entry matches model '{Model}' — cost not recorded", modelName)
             None
 
+/// Cost lookup for image generation, driven by the same LLM_PRICING bot_setting as
+/// LlmPricing but a different shape: flat per-image price by quality tier (gpt-image-1
+/// bills by tokens, but Azure doesn't expose a stable per-token USD rate for it the way
+/// chat models do, so pricing here is per-image-per-quality instead):
+///   {"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}
+/// Keyed by the image DEPLOYMENT name (unlike LlmPricing, which matches the response's
+/// `model` field) — Azure's images API doesn't consistently echo a `model` field across
+/// gpt-image-1/dall-e-3, so the deployment name is the one thing always known here.
+module ImagePricing =
+    /// (deployment, quality) pairs already warned about — logs at most one Warning each.
+    let private warned = ConcurrentDictionary<string, byte>()
+
+    /// Substring match against `deployment`, same convention as LlmPricing.tryCost.
+    /// Missing entry (unknown deployment, or no per_image_<quality> field for it) -> None
+    /// + a one-time Warning, never an exception.
+    let tryCost (logger: ILogger) (pricingJson: string) (deployment: string) (quality: string) : float option =
+        try
+            use doc = JsonDocument.Parse(pricingJson)
+            if doc.RootElement.ValueKind <> JsonValueKind.Object then
+                None
+            else
+                let matched =
+                    doc.RootElement.EnumerateObject()
+                    |> Seq.tryFind (fun prop -> deployment.Contains(prop.Name, StringComparison.OrdinalIgnoreCase))
+                match matched with
+                | Some prop ->
+                    let field = $"per_image_{quality}"
+                    match prop.Value.TryGetProperty field with
+                    | true, v when v.ValueKind = JsonValueKind.Number -> Some(v.GetDouble())
+                    | _ ->
+                        if warned.TryAdd($"{deployment}:{quality}", 0uy) then
+                            logger.LogWarning(
+                                "No LLM_PRICING '{Field}' entry for image deployment '{Deployment}' — cost not recorded",
+                                field, deployment)
+                        None
+                | None ->
+                    if warned.TryAdd(deployment, 0uy) then
+                        logger.LogWarning("No LLM_PRICING entry matches image deployment '{Deployment}' — cost not recorded", deployment)
+                    None
+        with _ ->
+            None
+
+/// One image-generation call's span + metrics — same lifecycle shape as LlmCall
+/// (create at call start, mark the outcome exactly once, dispose at call end) but
+/// costed via ImagePricing (per-image-per-quality) instead of LlmPricing (per-token).
+type ImageCall(deployment: string, quality: string, size: string, pricingJson: string, logger: ILogger) =
+    let activity = Telemetry.botActivity.StartActivity("llm.image")
+    let startedAt = Stopwatch.GetTimestamp()
+
+    let setTag (key: string) (value: obj) =
+        if not (isNull activity) then %activity.SetTag(key, value)
+
+    do
+        setTag "gen_ai.system" "azure.ai.openai"
+        setTag "gen_ai.request.model" deployment
+        setTag "image.quality" quality
+        setTag "image.size" size
+
+    member _.Succeeded(usage: TokenUsage) =
+        if usage.TotalTokens > 0 then
+            setTag "gen_ai.usage.input_tokens" usage.PromptTokens
+            setTag "gen_ai.usage.output_tokens" usage.CompletionTokens
+            LlmMetrics.tokensTotal.Add(int64 usage.PromptTokens, KeyValuePair("direction", box "input"))
+            LlmMetrics.tokensTotal.Add(int64 usage.CompletionTokens, KeyValuePair("direction", box "output"))
+        match ImagePricing.tryCost logger pricingJson deployment quality with
+        | Some cost ->
+            setTag "llm.cost_usd" cost
+            LlmMetrics.costUsdTotal.Add(cost)
+        | None -> ()
+
+    member _.Failed(error: LlmError) =
+        let errorType =
+            match error with
+            | LlmError.RateLimited _ -> "rate_limited"
+            | LlmError.ContentFiltered _ -> "content_filtered"
+            | LlmError.ApiError _ -> "api_error"
+            | LlmError.NetworkError _ -> "network_error"
+        setTag "error.type" errorType
+        if not (isNull activity) then %activity.SetStatus(ActivityStatusCode.Error, errorType)
+
+    interface IDisposable with
+        member _.Dispose() =
+            LlmMetrics.latencyMs.Record(Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds)
+            if not (isNull activity) then activity.Dispose()
+
 /// One LLM call's span + metrics: create at call start, mark the outcome exactly once
 /// (Succeeded/Failed), dispose at call end (records the latency histogram). For streamed
 /// calls the scope spans the whole stream, so latency covers first byte to [DONE].

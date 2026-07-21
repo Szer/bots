@@ -224,6 +224,41 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
                     failwith $"No reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
         }
 
+    /// First incoming message in `chatId` that replies to `repliedMsgId` AND carries a photo
+    /// (TL.MessageMediaPhoto) — used by ImageGenRealTests to detect the bot's generated-image
+    /// reply, which never arrives as a plain text message so AwaitReplyTo alone can't see it.
+    member _.TryAwaitPhotoReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
+        task {
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                result <-
+                    snapshot ()
+                    |> Array.tryFind (fun m ->
+                        peerMatches chatId m.peer_id
+                        && (match m.ReplyTo with
+                            | :? MessageReplyHeader as h -> h.reply_to_msg_id = repliedMsgId
+                            | _ -> false)
+                        && (match m.media with
+                            | :? MessageMediaPhoto -> true
+                            | _ -> false))
+
+                if result.IsNone then
+                    do! Task.Delay pollInterval
+
+            return result
+        }
+
+    member this.AwaitPhotoReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
+        task {
+            match! this.TryAwaitPhotoReplyTo(chatId, repliedMsgId, timeout) with
+            | Some m -> return m
+            | None ->
+                return
+                    failwith $"No photo reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+        }
+
     /// First incoming message from someone else in `chatId` whose text contains `marker`.
     member _.AwaitContaining(chatId: int64, marker: string, timeout: TimeSpan) =
         task {

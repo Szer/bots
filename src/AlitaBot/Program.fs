@@ -66,6 +66,10 @@ let buildBotConf () =
       VoiceTranscribeEnabled = getSettingOr "VOICE_TRANSCRIBE_ENABLED" "true" |> bool.Parse
       VisionEnabled = getSettingOr "VISION_ENABLED" "true" |> bool.Parse
       VisionDetail = getSettingOr "VISION_DETAIL" "low"
+      ImageDeployment = getSettingOr "IMAGE_DEPLOYMENT" (getEnvOr "IMAGE_DEPLOYMENT" "")
+      ImageGenEnabled = getSettingOr "IMAGE_GEN_ENABLED" "true" |> bool.Parse
+      ImageSize = getSettingOr "IMAGE_SIZE" "1024x1024"
+      ImageQuality = getSettingOr "IMAGE_QUALITY" "medium"
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -120,6 +124,7 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<IChatCompletion, AzureFoundryChat>()
     .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
     .AddSingleton<ISpeech, AzureFoundrySpeech>()
+    .AddSingleton<IImageGen, AzureFoundryImageGen>()
     .AddSingleton<DbService>(fun _ -> DbService(connString))
 
 let app = builder.Build()

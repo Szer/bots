@@ -21,9 +21,13 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('EMBEDDING_DEPLOYMENT',    'alita-text-embedding-3-small',                           'FREE_FORM',    'llm',         'Embeddings deployment name'),
     ('STT_DEPLOYMENT',          'alita-stt',                                              'FREE_FORM',    'llm',         'Speech-to-text deployment name (audio/transcriptions)'),
     ('TTS_DEPLOYMENT',          'alita-tts',                                              'FREE_FORM',    'llm',         'Text-to-speech deployment name (audio/speech)'),
-    ('LLM_PRICING',             '{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}', 'JSON_BLOB', 'llm',         'USD prices per 1M tokens by model, for cost telemetry'),
+    ('LLM_PRICING',             '{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}', 'JSON_BLOB', 'llm', 'USD prices per 1M tokens by model (chat/embeddings) and per-image by quality tier (image gen), for cost telemetry'),
     ('VOICE_TRANSCRIBE_ENABLED', 'true',                                                  'FEATURE_FLAG', 'llm',        'Auto-transcribe Voice/VideoNote/Audio messages in target chats'),
     ('VISION_ENABLED',          'true',                                                   'FEATURE_FLAG', 'llm',        'Attach photos (triggering message and/or its reply target) as image_url parts on LLM requests'),
     ('VISION_DETAIL',           'low',                                                    'FREE_FORM',    'llm',        'OpenAI image_url detail hint: low | high — controls vision token cost'),
+    ('IMAGE_DEPLOYMENT',        '',                                                       'FREE_FORM',    'llm',        'images/generations + images/edits deployment name (fill in once quota is granted — see AlitaBot/docs/TECH-DEBT.md; /img fails gracefully while empty)'),
+    ('IMAGE_GEN_ENABLED',       'true',                                                   'FEATURE_FLAG', 'llm',        'Enables the /img and !img commands'),
+    ('IMAGE_SIZE',              '1024x1024',                                              'FREE_FORM',    'llm',        'images/generations size param'),
+    ('IMAGE_QUALITY',           'medium',                                                 'FREE_FORM',    'llm',        'images/generations quality param: low | medium | high'),
     ('TEST_MODE',               'false',                                                  'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/clock/advance)')
 ON CONFLICT (key) DO NOTHING;

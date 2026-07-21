@@ -5,6 +5,38 @@ what phase or trigger should pick it up. Infrastructure-side items (model deploy
 log-pipeline config, k8s manifests) are tracked in the private infra repo — this file only
 records that they exist and when they bite.
 
+## No real image-gen deployment yet (S3) — quota denied for every candidate model
+
+Slice 3 (`/img` image generation) ships fully implemented and flag-gated (`IMAGE_GEN_ENABLED`,
+default true), but with `IMAGE_DEPLOYMENT` seeded empty — there is no working Azure deployment
+to point it at. At deploy time, `az cognitiveservices usage list --location swedencentral`
+(run against the subscription that actually owns the `szer-foundry` account, not the CLI's
+default subscription — the two differ and querying the wrong one shows non-zero quota that
+doesn't apply) showed **0 quota** for every `gpt-image-*` variant (`gpt-image-1`,
+`gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`) and for `Dalle` in this
+subscription/region; `dall-e-3` itself isn't even offered as a deployable model there at all.
+A `terraform apply` for `alita_image` (azapi_resource, gpt-image-1, GlobalStandard, capacity 3)
+failed with `InsufficientQuota` before creating anything, so nothing was left half-applied —
+the terraform change was reverted rather than merged.
+
+With `IMAGE_DEPLOYMENT` empty, `/img` fails gracefully: `AzureFoundryImageGen` gets a 404 from
+Azure (unknown deployment name), surfaces it as `Result.Error`, and `BotService` edits the
+"рисую..." placeholder into a RU apology instead of crashing. `tests/AlitaBot.Tests/ImageGenTests.fs`
+covers the command/plumbing behavior against the fake suite; `tests/AlitaBot.RealTests/ImageGenRealTests.fs`
+self-skips (`Assert.Skip`) until `ALITA_IMAGE_DEPLOYMENT` is set.
+
+**Action:** once quota is granted (support ticket / quota-increase request — out of scope for
+the pre-authorized additive terraform workflow), re-add the `alita_image` resource to
+`terraform/alita-foundry.tf` in the infra repo (chained via `depends_on` after `alita_tts`,
+same serial-apply convention as the other `alita_*` deployments), apply, verify with a real
+curl generation, and fill in `IMAGE_DEPLOYMENT` (bot_setting) + `ALITA_IMAGE_DEPLOYMENT`
+(`~/.alita-test/env`). Also worth re-checking then: the images/generations and images/edits
+wire format in `AlitaBot/Llm/AzureFoundryProvider.fs` (`AzureWire.ImagesApiVersion`,
+`buildImageGenBody`, `newImageEditRequest`, `tryParseImageResponse`) was written from Azure's
+documented images API, not verified against a real response — the fake suite controls its own
+response shape so it can't catch a wire-format mismatch the way the STT/TTS/vision real tests
+caught issues in earlier slices.
+
 ## Orphan model deployments from the first Alita attempt
 
 The abandoned first attempt left two unused model deployments provisioned on another bot's

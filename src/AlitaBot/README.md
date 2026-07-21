@@ -38,6 +38,33 @@ failure after text started → finalize whatever text arrived.
 | `EditThrottleRenderer` | `edit` | Sends on the first chunk, then edits that message whenever ≥1.5s elapsed **and** ≥40 new chars accumulated, plus a final edit at completion. |
 | `DraftRenderer` | `draft` | Streams via `sendMessageDraft` (Bot API 10.2) throttled to ≥500ms per update, then sends **one real message** at the end. On the first `sendMessageDraft` rejection for a chat, permanently (process-lifetime) falls back to `EditThrottleRenderer` for that chat — see findings below. |
 
+## Image generation (`/img`, `!img`, Phase-1 Slice 3)
+
+`/img <prompt>`, `!img <prompt>`, or `/img@{BOT_USERNAME} <prompt>` in a target chat generates
+an image via Azure's images/generations endpoint and replies with it as a photo; the same
+command sent **as a reply to a photo message** switches to images/edits (img2img — the replied
+photo is downloaded and passed as the source image). Command messages are handled entirely by
+`BotService.tryParseCommand`/`handleImageCommand` and never reach `ResponderService` — they
+don't trigger the LLM responder even if the prompt also happens to contain the bot's name.
+
+Behavior: logs the command as `[img-cmd] {prompt}`, sends a "рисую..." placeholder, generates,
+deletes the placeholder and sends the photo captioned with the prompt (truncated 100 chars) plus
+cost (`$0.04`) when `LLM_PRICING` has a matching `per_image_<quality>` entry for `IMAGE_DEPLOYMENT`
+— logs the bot's reply as `[image] {truncated prompt}`. Empty prompt → RU usage hint, no Azure
+call. `IMAGE_GEN_ENABLED=false` (bot_setting, default `true`) → RU "выключено" reply, no Azure
+call. Any Azure failure (including an unconfigured/404 deployment) edits the placeholder into a
+RU apology instead of crashing or leaving the chat hanging.
+
+`IMAGE_SIZE` (default `1024x1024`) and `IMAGE_QUALITY` (default `medium`) are hot-reloadable
+bot_settings passed straight through to the images API. **`IMAGE_DEPLOYMENT` is empty by
+default** — every `gpt-image-*` model variant (and `dall-e-3`) had 0 quota in this
+subscription/region at S3 deploy time, so no real deployment exists yet; see
+[`docs/TECH-DEBT.md`](docs/TECH-DEBT.md) for the full story and what to do once quota is
+granted. `tests/AlitaBot.RealTests/ImageGenRealTests.fs` self-skips until `ALITA_IMAGE_DEPLOYMENT`
+is set; the fake-suite tests (`tests/AlitaBot.Tests/ImageGenTests.fs`) exercise the full
+command/plumbing behavior against `FakeAzureOcrApi`'s images/generations + images/edits routes
+in the meantime.
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

@@ -19,6 +19,12 @@ app.MapPost("/openai/deployments/{deployment}/chat/completions", Func<HttpContex
 app.MapPost("/openai/deployments/{deployment}/audio/transcriptions", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleAudioTranscriptions ctx))
 |> ignore
 
+// Azure OpenAI images/generations + images/edits (used by AlitaBot image generation, S3)
+app.MapPost("/openai/deployments/{deployment}/images/generations", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleImagesGenerations ctx))
+|> ignore
+app.MapPost("/openai/deployments/{deployment}/images/edits", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleImagesEdits ctx))
+|> ignore
+
 // Test endpoints (configure response / inspect calls)
 app.MapPost("/test/mock/reset",     Func<HttpContext, Threading.Tasks.Task>(fun ctx -> resetMock ctx))    |> ignore
 app.MapPost("/test/mock/response",  Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setResponse ctx))  |> ignore
@@ -29,6 +35,7 @@ app.MapPost("/test/mock/llm-script", Func<HttpContext, Threading.Tasks.Task>(fun
 app.MapPost("/test/mock/reaction-llm-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setReactionLlmScript ctx)) |> ignore
 app.MapPost("/test/mock/azure-llm-stream-options", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setLlmStreamOptions ctx)) |> ignore
 app.MapPost("/test/mock/stt-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setSttScript ctx)) |> ignore
+app.MapPost("/test/mock/image-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setImageScript ctx)) |> ignore
 app.MapGet("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> getCalls ctx)) |> ignore
 app.MapDelete("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> clearCalls ctx)) |> ignore
 

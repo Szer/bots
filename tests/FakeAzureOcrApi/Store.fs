@@ -35,6 +35,20 @@ module Store =
     /// script doesn't silently reuse a stale scripted transcript across tests.
     let sttResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// A tiny (1x1, transparent) but genuinely valid PNG, base64-encoded — the default
+    /// "generated image" for the images/generations and images/edits fakes below.
+    let tinyPngBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+    let defaultImageResponse =
+        $"""{{"created":1774736361,"data":[{{"b64_json":"{tinyPngBase64}"}}],"usage":{{"input_tokens":10,"output_tokens":1000,"total_tokens":1010}}}}"""
+
+    /// Scripted responses for the Azure OpenAI images/generations + images/edits endpoints
+    /// (AlitaBot image generation, S3). Kept separate from the other queues. If non-empty,
+    /// dequeue one per call (either endpoint); after it empties, both endpoints fall back to
+    /// `defaultImageResponse` (a scripted tiny PNG) rather than an error.
+    let imageResponseScript = ConcurrentQueue<ScriptedResponse>()
+
     /// Streaming knobs for the chat-completions SSE mode (see LlmStreamOptionsDto).
     /// Set via /test/mock/azure-llm-stream-options; all zeros = defaults.
     let mutable llmStreamChunkDelayMs = 0
@@ -72,6 +86,11 @@ module Store =
     let clearSttScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while sttResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearImageScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while imageResponseScript.TryDequeue(&item) do
             ()
 
     /// Resets the OCR mock to its pristine baseline: default 200 response, no delay,

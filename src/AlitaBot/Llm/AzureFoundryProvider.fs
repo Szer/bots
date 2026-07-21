@@ -38,6 +38,70 @@ module internal AzureWire =
     let speechUri (endpoint: string) (deployment: string) =
         $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/speech?api-version={ApiVersion}"
 
+    /// gpt-image-1 (images/generations, images/edits) needs a newer api-version than the
+    /// chat/embeddings/audio routes above. NOTE: unverified against a real deployment —
+    /// the alita-image deployment couldn't be created (quota denied for every gpt-image-*
+    /// variant in this subscription/region at S3 deploy time, see AlitaBot/docs/TECH-DEBT.md)
+    /// — so this api-version and the body shapes below are best-effort from Azure OpenAI's
+    /// documented images API, not empirically confirmed the way the other endpoints are.
+    [<Literal>]
+    let ImagesApiVersion = "2025-04-01-preview"
+
+    let imagesGenerationsUri (endpoint: string) (deployment: string) =
+        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/images/generations?api-version={ImagesApiVersion}"
+
+    let imagesEditsUri (endpoint: string) (deployment: string) =
+        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/images/edits?api-version={ImagesApiVersion}"
+
+    let buildImageGenBody (prompt: string) (size: string) (quality: string) =
+        let root = JsonObject()
+        root["prompt"] <- JsonValue.Create prompt
+        root["size"] <- JsonValue.Create size
+        root["quality"] <- JsonValue.Create quality
+        root["n"] <- JsonValue.Create 1
+        root.ToJsonString()
+
+    /// gpt-image-1's usage block uses input_tokens/output_tokens (not chat's
+    /// prompt_tokens/completion_tokens) — mapped onto the same TokenUsage shape.
+    let parseImageUsage (u: JsonElement) : TokenUsage =
+        let intOf (name: string) =
+            match u.TryGetProperty name with
+            | true, v when v.ValueKind = JsonValueKind.Number -> v.GetInt32()
+            | _ -> 0
+        { PromptTokens = intOf "input_tokens"
+          CompletionTokens = intOf "output_tokens"
+          TotalTokens = intOf "total_tokens" }
+
+    /// Parses `{"data":[{"b64_json":"..."}], "usage": {...}}` — dall-e-3 (the documented
+    /// fallback model) omits `usage` entirely, which decodes to a zeroed TokenUsage.
+    let tryParseImageResponse (body: string) : Result<byte[] * TokenUsage, string> =
+        try
+            use doc = JsonDocument.Parse(body)
+            let root = doc.RootElement
+            let b64 = root.GetProperty("data").[0].GetProperty("b64_json").GetString()
+            let bytes = Convert.FromBase64String b64
+            let usage =
+                match root.TryGetProperty "usage" with
+                | true, u when u.ValueKind = JsonValueKind.Object -> parseImageUsage u
+                | _ -> { PromptTokens = 0; CompletionTokens = 0; TotalTokens = 0 }
+            Ok(bytes, usage)
+        with ex ->
+            Error ex.Message
+
+    /// Multipart images/edits request: source image + prompt + size/quality fields.
+    let newImageEditRequest (apiKey: string) (uri: string) (prompt: string) (size: string) (quality: string) (sourceImage: byte[]) =
+        let req = new HttpRequestMessage(HttpMethod.Post, uri)
+        req.Headers.Add("api-key", apiKey)
+        let content = new MultipartFormDataContent()
+        let imageContent = new ByteArrayContent(sourceImage)
+        imageContent.Headers.ContentType <- MediaTypeHeaderValue("image/png")
+        content.Add(imageContent, "image", "source.png")
+        content.Add(new StringContent(prompt), "prompt")
+        content.Add(new StringContent(size), "size")
+        content.Add(new StringContent(quality), "quality")
+        req.Content <- content
+        req
+
     let buildSpeechBody (text: string) (voice: string) =
         let root = JsonObject()
         root["input"] <- JsonValue.Create text
@@ -636,5 +700,45 @@ type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotCo
                 | Error err ->
                     AzureWire.logLlmError logger err
                     call.Failed(err, retries)
+                    return Error err
+            }
+
+/// IImageGen against Azure AI Foundry's images endpoints — text->image via
+/// images/generations, img2img via images/edits (multipart, source image attached).
+/// Deployment/size/quality come from IOptions<BotConfiguration> (hot-reload).
+type AzureFoundryImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundryImageGen>) =
+
+    interface IImageGen with
+        member _.Generate(prompt: string, sourceImage: byte[] option, ct: CancellationToken) =
+            task {
+                let conf = options.Value
+                use call = new ImageCall(conf.ImageDeployment, conf.ImageQuality, conf.ImageSize, conf.LlmPricingJson, logger)
+                let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
+
+                let makeRequest () =
+                    match sourceImage with
+                    | Some src ->
+                        let uri = AzureWire.imagesEditsUri conf.AzureFoundryEndpoint conf.ImageDeployment
+                        AzureWire.newImageEditRequest conf.AzureFoundryKey uri prompt conf.ImageSize conf.ImageQuality src
+                    | None ->
+                        let uri = AzureWire.imagesGenerationsUri conf.AzureFoundryEndpoint conf.ImageDeployment
+                        let bodyJson = AzureWire.buildImageGenBody prompt conf.ImageSize conf.ImageQuality
+                        AzureWire.newRequest conf.AzureFoundryKey uri bodyJson
+
+                let! result, retries = AzureHttp.sendWithRetry client makeRequest ct
+                match result with
+                | Ok body ->
+                    match AzureWire.tryParseImageResponse body with
+                    | Ok(bytes, usage) ->
+                        call.Succeeded(usage)
+                        return Ok(bytes, usage)
+                    | Error parseError ->
+                        logger.LogError("Unparseable image generation response ({Error}): {Body}", parseError, body)
+                        let err = LlmError.ApiError(200, body)
+                        call.Failed(err)
+                        return Error err
+                | Error err ->
+                    AzureWire.logLlmError logger err
+                    call.Failed(err)
                     return Error err
             }

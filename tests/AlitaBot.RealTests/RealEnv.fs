@@ -21,6 +21,9 @@ type RealEnv =
       LlmDeployment: string
       SttDeployment: string
       TtsDeployment: string
+      /// Empty when unconfigured (quota denied at S3 deploy time, see AlitaBot/docs/TECH-DEBT.md)
+      /// — ImageGenRealTests self-skips rather than failing.
+      ImageDeployment: string
       /// echo | llm — forwarded to the spawned bot (default echo).
       ResponderMode: string
       /// draft | edit | plain — forwarded to the spawned bot (default edit, matches prod).
@@ -107,6 +110,7 @@ module RealEnv =
           LlmDeployment = getVarOr "ALITA_LLM_DEPLOYMENT" ""
           SttDeployment = getVarOr "ALITA_STT_DEPLOYMENT" ""
           TtsDeployment = getVarOr "ALITA_TTS_DEPLOYMENT" ""
+          ImageDeployment = getVarOr "ALITA_IMAGE_DEPLOYMENT" ""
           ResponderMode = getVarOr "RESPONDER_MODE" "echo"
           StreamMode = getVarOr "STREAM_MODE" "edit" }
 
