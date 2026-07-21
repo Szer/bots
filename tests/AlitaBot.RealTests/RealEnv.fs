@@ -20,7 +20,9 @@ type RealEnv =
       AzureFoundryKey: string
       LlmDeployment: string
       /// echo | llm — forwarded to the spawned bot (default echo).
-      ResponderMode: string }
+      ResponderMode: string
+      /// draft | edit | plain — forwarded to the spawned bot (default edit, matches prod).
+      StreamMode: string }
 
     /// Bot user id is the numeric prefix of the bot token ("123456:ABC-..." -> 123456).
     member this.BotUserId =
@@ -101,7 +103,8 @@ module RealEnv =
           AzureFoundryEndpoint = getVarOr "AZURE_FOUNDRY_ENDPOINT" ""
           AzureFoundryKey = getVarOr "AZURE_FOUNDRY_KEY" ""
           LlmDeployment = getVarOr "ALITA_LLM_DEPLOYMENT" ""
-          ResponderMode = getVarOr "RESPONDER_MODE" "echo" }
+          ResponderMode = getVarOr "RESPONDER_MODE" "echo"
+          StreamMode = getVarOr "STREAM_MODE" "edit" }
 
     /// Repo root = nearest ancestor of the test binary containing bots.slnx.
     let repoRoot =

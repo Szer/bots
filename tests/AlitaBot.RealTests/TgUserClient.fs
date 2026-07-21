@@ -34,6 +34,11 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
     let gate = obj ()
     let newMessages = ResizeArray<TL.Message>()
 
+    /// Probe-only hook: fires for every raw update, unfiltered (drafts surface as
+    /// UpdateUserTyping/UpdateChatUserTyping with a SendMessage*DraftAction, not as
+    /// UpdateNewMessage/UpdateEditMessage — the default `record` path never sees them).
+    let rawSinks = ResizeArray<UpdatesBase -> unit>()
+
     /// (peer id, message id) -> (last new/edit seen at UTC, latest text).
     let lastActivity = ConcurrentDictionary<struct (int64 * int), struct (DateTime * string)>()
 
@@ -66,6 +71,12 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             lock gate (fun () -> newMessages.Add msg)
 
     let onUpdates (updates: UpdatesBase) : Task =
+        for sink in rawSinks do
+            try
+                sink updates
+            with _ ->
+                () // probe logging must never break the update pump
+
         for u in updates.UpdateList do
             match u with
             | :? UpdateNewMessage as un -> // also covers UpdateNewChannelMessage
@@ -108,6 +119,38 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
 
     /// Logged-in user, or null before LoginAsync completed.
     member _.Me = me
+
+    /// Probe-only: registers a callback invoked with every raw update this client
+    /// receives (unfiltered — includes typing/draft-action updates that `record`
+    /// ignores). Handlers must not throw usefully; exceptions are swallowed.
+    member _.AddRawUpdateSink(sink: UpdatesBase -> unit) = rawSinks.Add sink
+
+    /// Resolves a public @username to a user id and caches its InputPeer, so a
+    /// chat the client has no prior dialog with (e.g. a bot never messaged before)
+    /// becomes usable with SendText/resolvePeer. Returns the resolved user id.
+    member _.ResolveUserByUsername(username: string) : Task<int64> =
+        task {
+            let! resolved = client.Contacts_ResolveUsername(username, "")
+
+            match resolved.peer with
+            | :? PeerUser as pu ->
+                match resolved.users.TryGetValue pu.user_id with
+                | true, user ->
+                    peers[pu.user_id] <- InputPeerUser(user.id, user.access_hash) :> InputPeer
+                    return pu.user_id
+                | _ -> return failwith $"resolved '@{username}' but its User object was missing from the response"
+            | other -> return failwith $"'@{username}' resolved to a non-user peer ({other.GetType().Name})"
+        }
+
+    /// Probe-only: the most recent message ids Telegram's history API returns for
+    /// `chatId` (server-side fetch, independent of the update pump) — used to check
+    /// whether a draft ever materializes as a fetchable message.
+    member _.RecentMessageIds(chatId: int64, limit: int) : Task<int[]> =
+        task {
+            let! peer = resolvePeer chatId
+            let! history = client.Messages_GetHistory(peer, limit = limit)
+            return history.Messages |> Array.map (fun m -> m.ID)
+        }
 
     member _.LoginAsync() =
         task {

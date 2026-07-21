@@ -52,4 +52,5 @@ let main argv =
     | [| "login" |] -> TgConsole.login().GetAwaiter().GetResult()
     | [| "list-dialogs" |] -> TgConsole.listDialogs().GetAwaiter().GetResult()
     | [| "selfcheck" |] -> SelfCheck.runAsync().GetAwaiter().GetResult()
+    | [| "probe-draft" |] -> DraftProbe.runAsync().GetAwaiter().GetResult()
     | _ -> Xunit.Runner.InProc.SystemConsole.ConsoleRunner.Run(argv).GetAwaiter().GetResult()

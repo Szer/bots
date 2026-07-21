@@ -14,7 +14,7 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('BOT_USERNAME',            'alita_test_bot',                                         'FREE_FORM',    'telegram',    'Bot username without @, used for mention trigger detection'),
     ('SYSTEM_PROMPT',           'Ты — Алита, дружелюбный участник чата. Отвечай кратко.', 'FREE_FORM',    'llm',         'System prompt for the LLM responder (placeholder)'),
     ('RESPONDER_MODE',          'echo',                                                   'FREE_FORM',    'llm',         'echo | llm'),
-    ('STREAM_MODE',             'edit',                                                   'FREE_FORM',    'llm',         'draft | edit | plain'),
+    ('STREAM_MODE',             'edit',                                                   'FREE_FORM',    'llm',         'draft | edit | plain — edit is the default: sendMessageDraft (Bot API 10.x) is rejected outright (400 TEXTDRAFT_PEER_INVALID) in basic groups, the bot''s primary surface; see src/AlitaBot/README.md'),
     ('CONTEXT_WINDOW_MESSAGES', '30',                                                     'FREE_FORM',    'llm',         'How many recent message_log rows feed the LLM context'),
     ('AZURE_FOUNDRY_ENDPOINT',  'https://szer-foundry.cognitiveservices.azure.com',       'FREE_FORM',    'llm',         'Azure AI Foundry resource base URL'),
     ('LLM_DEPLOYMENT',          'alita-gpt-5-mini',                                       'FREE_FORM',    'llm',         'Chat-completions deployment name'),

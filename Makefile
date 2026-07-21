@@ -7,7 +7,7 @@ COMPOSE   = $(DOCKER) compose -f src/alita-bot/docker-compose.dev.yml
 ALITA_ENV = $(HOME)/.alita-test/env
 ARTIFACTS = test-artifacts/AlitaBot.RealTests
 
-.PHONY: alita-db alita-build alita-test real-test selfcheck smoke alita-logs tg-login tg-chats alita-clean
+.PHONY: alita-db alita-build alita-test real-test selfcheck smoke alita-logs tg-login tg-chats probe-draft alita-clean
 
 alita-db:
 	$(COMPOSE) up -d
@@ -35,6 +35,9 @@ tg-login:
 
 tg-chats:
 	dotnet run --project tests/AlitaBot.RealTests -c Release -- list-dialogs
+
+probe-draft:
+	dotnet run --project tests/AlitaBot.RealTests -c Release -- probe-draft
 
 alita-clean:
 	$(COMPOSE) down -v

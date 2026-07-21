@@ -173,6 +173,11 @@ ORDER BY message_id LIMIT 1;
                 Assert.Contains(marker, row.text)
         }
 
+    /// Green under both STREAM_MODE=edit and STREAM_MODE=draft (M5, `make real-test`
+    /// run once per mode). The test chat is a basic group, where `sendMessageDraft`
+    /// is rejected outright (400 TEXTDRAFT_PEER_INVALID — see src/AlitaBot/README.md)
+    /// so DraftRenderer falls back to edit-throttle on the very first chunk; from
+    /// this test's perspective the two modes are behaviorally identical here.
     [<Fact>]
     member _.``streamed reply settles into a final text``() =
         task {
