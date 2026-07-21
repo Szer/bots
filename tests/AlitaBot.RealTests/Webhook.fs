@@ -46,7 +46,7 @@ type TelegramWebhook private (http: HttpClient, botToken: string, webhookUrl: st
     static member SetAsync(env: RealEnv) =
         task {
             let http = new HttpClient(Timeout = TimeSpan.FromSeconds 15.)
-            let url = $"https://{env.NgrokDomain}/bot"
+            let url = env.WebhookUrl
 
             let payload =
                 {| url = url

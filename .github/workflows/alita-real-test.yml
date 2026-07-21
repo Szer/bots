@@ -1,0 +1,293 @@
+name: "Alita: Real Telegram test (AKS)"
+
+# M7: every relevant PR builds AlitaBot, deploys it transiently into the
+# alita-test AKS namespace (kubectl apply, no GitOps for the workload — see
+# .github/k8s/alita-test/), runs the real-Telegram suite
+# (tests/AlitaBot.RealTests) against it over the public
+# https://alita-test.szer.dev endpoint, then tears everything it applied
+# back down. Singleton: only one run uses the shared alita-test namespace at
+# a time, so concurrent PRs queue rather than collide.
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - 'src/AlitaBot/**'
+      - 'src/alita-bot/**'
+      - 'src/Dockerfile.bot'
+      - 'tests/AlitaBot.Tests/**'
+      - 'tests/AlitaBot.RealTests/**'
+      - 'tests/BotTestInfra/**'
+      - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
+      - '.github/workflows/alita-real-test.yml'
+      - '.github/k8s/alita-test/**'
+  workflow_dispatch:
+
+concurrency:
+  group: alita-aks-real-test
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/szer/alita-bot
+  NAMESPACE: alita-test
+  PUBLIC_URL: https://alita-test.szer.dev
+
+jobs:
+  real-test:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - uses: actions/setup-dotnet@v4
+      with:
+        global-json-file: global.json
+
+    - name: Install ffmpeg (VoiceRealTests re-encodes to ogg/opus)
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push test image
+      uses: docker/build-push-action@v5
+      with:
+        push: true
+        tags: ${{ env.IMAGE }}:test-${{ github.sha }}
+        file: ./src/Dockerfile.bot
+        build-args: BOT_PROJECT=AlitaBot
+        platforms: linux/arm64
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Write kubeconfig
+      run: |
+        mkdir -p "$RUNNER_TEMP/kube"
+        echo "${{ secrets.ALITA_TEST_KUBECONFIG }}" | base64 -d > "$RUNNER_TEMP/kube/config"
+        chmod 600 "$RUNNER_TEMP/kube/config"
+        echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+
+    - name: Verify cluster access (scoped to alita-test)
+      run: kubectl auth can-i create deployments -n "$NAMESPACE"
+
+    - name: Deploy Postgres
+      # Flyway/the seed step below run `docker run ... --network host` on
+      # this runner directly, NOT as in-cluster Jobs — they consume zero
+      # AKS node capacity. Only these two Deployments (postgres, bot) do;
+      # see their explicit requests/limits — the single ARM node has tight
+      # headroom (~428m CPU / ~4.4Gi memory free measured 2026-07-21).
+      run: |
+        kubectl create configmap alita-test-postgres-init \
+          -n "$NAMESPACE" --from-file=init.sql=src/alita-bot/init.sql \
+          --dry-run=client -o yaml \
+        | kubectl label -f - alita-ci=transient --local -o yaml \
+        | kubectl apply -f -
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/postgres.yaml
+
+        # Fast-fail: an unschedulable/crashlooping pod should fail the job
+        # in well under 180s, not sit until the 30-minute job timeout and
+        # block the singleton queue behind it.
+        if ! kubectl wait --for=condition=Ready pod -l app=alita-test-postgres \
+              -n "$NAMESPACE" --timeout=120s; then
+          echo "::error::postgres pod not Ready within 120s"
+          kubectl describe pod -l app=alita-test-postgres -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
+
+    - name: Port-forward Postgres to localhost:15433
+      run: |
+        kubectl port-forward svc/alita-test-postgres -n "$NAMESPACE" 15433:5432 \
+          > "$RUNNER_TEMP/pg-port-forward.log" 2>&1 &
+        echo $! > "$RUNNER_TEMP/pg-port-forward.pid"
+
+        for i in $(seq 1 30); do
+          if (exec 3<>/dev/tcp/127.0.0.1/15433) 2>/dev/null; then
+            exec 3<&- 3>&-
+            echo "postgres reachable on localhost:15433 after ${i}0.5s-ish tries"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        echo "::error::port-forward to postgres never became reachable"
+        cat "$RUNNER_TEMP/pg-port-forward.log"
+        exit 1
+
+    - name: Flyway migrate
+      run: >-
+        docker run --rm --network host
+        --volume ${{ github.workspace }}/src/alita-bot/migrations:/flyway/sql:ro
+        flyway/flyway
+        -url="jdbc:postgresql://127.0.0.1:15433/alita_bot"
+        -user=admin -password=admin
+        migrate -schemas=public
+
+    - name: Seed bot_setting
+      run: >-
+        docker run --rm --network host
+        -e PGPASSWORD=admin
+        --volume ${{ github.workspace }}/src/alita-bot/dev-bot-settings.sql:/seed.sql:ro
+        postgres:17.10
+        psql -h 127.0.0.1 -p 15433 -U admin -d alita_bot -v ON_ERROR_STOP=1 -f /seed.sql
+
+    - name: Create bot env Secret
+      env:
+        # Dedicated CI bot/chat/session (@alita_llm_chat_ci_bot, "Alita CI
+        # Chat") — fully decoupled from the dev-machine `make real-test`
+        # bot/chat/session, so the two can run concurrently without
+        # setWebhook or MTProto-session contention.
+        BOT_TOKEN: ${{ secrets.ALITA_CI_BOT_TOKEN }}
+        BOT_USERNAME: ${{ secrets.ALITA_CI_BOT_USERNAME }}
+        WEBHOOK_SECRET: ${{ secrets.ALITA_WEBHOOK_SECRET }}
+        CHAT_ID: ${{ secrets.ALITA_CI_CHAT_ID }}
+        FOUNDRY_ENDPOINT: ${{ secrets.ALITA_AZURE_FOUNDRY_ENDPOINT }}
+        FOUNDRY_KEY: ${{ secrets.ALITA_AZURE_FOUNDRY_KEY }}
+      run: |
+        kubectl create secret generic alita-bot-env -n "$NAMESPACE" \
+          --from-literal=DATABASE_URL="Host=alita-test-postgres;Port=5432;Database=alita_bot;Username=alita_bot_service;Password=alita_bot_service;Include Error Detail=true" \
+          --from-literal=BOT_TELEGRAM_TOKEN="$BOT_TOKEN" \
+          --from-literal=BOT_AUTH_TOKEN="$WEBHOOK_SECRET" \
+          --from-literal=ASPNETCORE_URLS="http://0.0.0.0:5010" \
+          --from-literal=BOT_USERNAME="$BOT_USERNAME" \
+          --from-literal=TARGET_CHAT_IDS="$CHAT_ID" \
+          --from-literal=AZURE_FOUNDRY_ENDPOINT="$FOUNDRY_ENDPOINT" \
+          --from-literal=AZURE_FOUNDRY_KEY="$FOUNDRY_KEY" \
+          --dry-run=client -o yaml \
+        | kubectl label -f - alita-ci=transient --local -o yaml \
+        | kubectl apply -f -
+
+    - name: Deploy bot
+      run: |
+        sed "s|IMAGE_PLACEHOLDER|${{ env.IMAGE }}:test-${{ github.sha }}|" \
+          .github/k8s/alita-test/bot-deployment.yaml \
+          | kubectl apply -n "$NAMESPACE" -f -
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/bot-service.yaml
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/alita-test/httproute.yaml
+
+    - name: Fast-fail if the transient stack isn't Ready
+      run: |
+        if ! kubectl wait --for=condition=Ready pod -l alita-ci=transient \
+              -n "$NAMESPACE" --timeout=180s; then
+          echo "::error::transient pod(s) not Ready within 180s"
+          kubectl describe pod -l alita-ci=transient -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
+
+    - name: Wait for public healthz (DNS/cert already live via my-infra PR #83)
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS "$PUBLIC_URL/healthz"; then
+            echo
+            echo "healthy after $((i * 2))s"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "::error::$PUBLIC_URL/healthz never came up within 120s"
+        kubectl logs deployment/alita-bot -n "$NAMESPACE" --tail=200
+        exit 1
+
+    - name: Reconstruct MTProto session
+      run: |
+        mkdir -p "$HOME/.alita-test"
+        echo "${{ secrets.ALITA_CI_TG_SESSION_B64 }}" \
+          | base64 -d | gunzip > "$HOME/.alita-test/tg.session"
+
+    - name: Run real-Telegram suite
+      env:
+        ALITA_REAL_MODE: remote
+        ALITA_WEBHOOK_PUBLIC_URL: ${{ env.PUBLIC_URL }}/bot
+        # Exercise the LLM path (incl. vision) rather than the echo walking
+        # skeleton — mirrors DevDb.applyRealSettingsAsync's bot_setting
+        # upsert (RealEnv.ResponderMode/StreamMode), which reads these same
+        # env var names with "echo"/"edit" fallbacks.
+        RESPONDER_MODE: llm
+        STREAM_MODE: edit
+        # Dedicated CI bot/chat/session throughout (@alita_llm_chat_ci_bot,
+        # "Alita CI Chat", ALITA_CI_TG_SESSION_B64) — fully decoupled from
+        # the dev-machine ALITA_TEST_*/ALITA_TG_SESSION_B64 set used by
+        # `make real-test`, so the two can run concurrently.
+        ALITA_TEST_BOT_TOKEN: ${{ secrets.ALITA_CI_BOT_TOKEN }}
+        ALITA_TEST_BOT_USERNAME: ${{ secrets.ALITA_CI_BOT_USERNAME }}
+        ALITA_WEBHOOK_SECRET: ${{ secrets.ALITA_WEBHOOK_SECRET }}
+        ALITA_TEST_CHAT_ID: ${{ secrets.ALITA_CI_CHAT_ID }}
+        ALITA_TG_API_ID: ${{ secrets.ALITA_TG_API_ID }}
+        ALITA_TG_API_HASH: ${{ secrets.ALITA_TG_API_HASH }}
+        ALITA_TG_API_PHONE: ${{ secrets.ALITA_TG_API_PHONE }}
+        AZURE_FOUNDRY_ENDPOINT: ${{ secrets.ALITA_AZURE_FOUNDRY_ENDPOINT }}
+        AZURE_FOUNDRY_KEY: ${{ secrets.ALITA_AZURE_FOUNDRY_KEY }}
+        ALITA_LLM_DEPLOYMENT: ${{ secrets.ALITA_LLM_DEPLOYMENT }}
+        ALITA_STT_DEPLOYMENT: ${{ secrets.ALITA_STT_DEPLOYMENT }}
+        ALITA_TTS_DEPLOYMENT: ${{ secrets.ALITA_TTS_DEPLOYMENT }}
+      run: >-
+        dotnet test tests/AlitaBot.RealTests -c Release
+        --logger "trx;LogFileName=real-test-results.trx"
+        --logger "console;verbosity=detailed"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: real-test-results
+        path: "**/*.trx"
+
+    - name: Upload test-artifacts (bot/ngrok logs — n/a in remote mode, kept for parity)
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: real-test-artifacts
+        path: test-artifacts/
+        if-no-files-found: ignore
+
+    - name: Teardown transient workload
+      if: always()
+      # Explicit kinds only — NOT `all` (kubectl expands that to every kind
+      # k8s knows, including several the alita-ci Role was never granted,
+      # e.g. replicasets/daemonsets/statefulsets/cronjobs/hpas; those show up
+      # as noisy "Forbidden" errors and, under `bash -e`, fail this step even
+      # though every actual transient object was already deleted cleanly).
+      run: |
+        kill "$(cat "$RUNNER_TEMP/pg-port-forward.pid" 2>/dev/null)" 2>/dev/null || true
+
+        kubectl delete deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
+          -n "$NAMESPACE" -l alita-ci=transient --wait --timeout=60s || true
+
+        echo "Leftover transient objects (should be empty):"
+        kubectl get deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
+          -n "$NAMESPACE" -l alita-ci=transient || true
+
+    - name: Delete webhook (safety net — the harness already does this on normal exit)
+      if: always()
+      run: |
+        TOKEN="${{ secrets.ALITA_CI_BOT_TOKEN }}"
+        curl -s "https://api.telegram.org/bot${TOKEN}/deleteWebhook?drop_pending_updates=true" \
+          -o /dev/null -w "deleteWebhook: %{http_code}\n" || true
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true
