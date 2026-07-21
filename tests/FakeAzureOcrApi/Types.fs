@@ -45,3 +45,14 @@ type ScriptedResponse =
 type ResponseScriptDto =
     { responses: ScriptedResponse array }
 
+/// Global knobs for the chat-completions streaming (SSE) mode. All zeros = defaults:
+///   chunkDelayMs      — artificial delay before each SSE data line
+///   abortAfterChunks  — reset the connection after N data lines were written
+///                       (combine with chunkDelayMs so earlier chunks reach the client)
+///   retryAfterSeconds — adds a Retry-After header to scripted 429 responses
+[<CLIMutable>]
+type LlmStreamOptionsDto =
+    { chunkDelayMs: int
+      abortAfterChunks: int
+      retryAfterSeconds: int }
+

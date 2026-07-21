@@ -72,3 +72,11 @@ type AzureScriptedResponse =
 [<CLIMutable>]
 type AzureScriptMock =
     { responses: AzureScriptedResponse array }
+
+/// Mock payload for FakeAzureOcrApi /test/mock/azure-llm-stream-options.
+/// All zeros = reset (no chunk delay, no mid-stream abort, no Retry-After header).
+[<CLIMutable>]
+type AzureLlmStreamOptionsMock =
+    { chunkDelayMs: int
+      abortAfterChunks: int
+      retryAfterSeconds: int }

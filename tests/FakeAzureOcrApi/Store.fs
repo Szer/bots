@@ -29,6 +29,12 @@ module Store =
     /// reaction path fails fast (no retry) instead of storming.
     let reactionLlmResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Streaming knobs for the chat-completions SSE mode (see LlmStreamOptionsDto).
+    /// Set via /test/mock/azure-llm-stream-options; all zeros = defaults.
+    let mutable llmStreamChunkDelayMs = 0
+    let mutable llmStreamAbortAfterChunks = 0
+    let mutable llmRetryAfterSeconds = 0
+
     let logCall (methodName: string) (url: string) (body: string) =
         calls.Enqueue(
             { Method = methodName

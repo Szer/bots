@@ -13,6 +13,8 @@ type BotConfiguration =
       AzureFoundryKey: string
       LlmDeployment: string
       EmbeddingDeployment: string
+      /// LLM_PRICING bot_setting: {"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}
+      LlmPricingJson: string
       /// "echo" | "llm"
       ResponderMode: string
       /// "draft" | "edit" | "plain"

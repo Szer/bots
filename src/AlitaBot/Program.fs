@@ -9,6 +9,7 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Time.Testing
 open AlitaBot
+open AlitaBot.Llm
 open AlitaBot.Services
 open AlitaBot.Telemetry
 open BotInfra
@@ -56,6 +57,7 @@ let buildBotConf () =
       AzureFoundryKey = getEnvOr "AZURE_FOUNDRY_KEY" ""
       LlmDeployment = getSettingOr "LLM_DEPLOYMENT" ""
       EmbeddingDeployment = getSettingOr "EMBEDDING_DEPLOYMENT" ""
+      LlmPricingJson = getSettingOr "LLM_PRICING" "{}"
       ResponderMode = getSettingOr "RESPONDER_MODE" "echo"
       StreamMode = getSettingOr "STREAM_MODE" "edit"
       ContextWindowMessages = getSettingOr "CONTEXT_WINDOW_MESSAGES" "30" |> int
@@ -102,10 +104,16 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
+// Named HttpClient for Azure Foundry LLM calls (raw HTTP + SSE, decision D3).
+%builder.Services.AddHttpClient(AzureFoundry.HttpClientName)
+
 %builder
     .Services
     .AddSingleton<BotService>()
     .AddSingleton<ResponderService>()
+    .AddSingleton<ReplyRendererFactory>()
+    .AddSingleton<IChatCompletion, AzureFoundryChat>()
+    .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
     .AddSingleton<DbService>(fun _ -> DbService(connString))
 
 let app = builder.Build()

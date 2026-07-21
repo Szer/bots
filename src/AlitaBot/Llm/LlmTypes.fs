@@ -60,7 +60,7 @@ type ChatResponse =
 [<RequireQualifiedAccess>]
 type LlmError =
     | RateLimited of retryAfter: TimeSpan option
-    | ContentFiltered
+    | ContentFiltered of detail: string
     | ApiError of status: int * body: string
     | NetworkError of message: string
 
@@ -69,7 +69,10 @@ type LlmError =
 [<RequireQualifiedAccess>]
 type ChatChunk =
     /// Incremental text delta.
-    | Delta of string
+    | TextDelta of string
+    /// Partial tool-call fragment; `index` identifies the call being assembled.
+    /// The fully assembled calls arrive in `Completed`.
+    | ToolCallDelta of index: int * id: string option * name: string option * argsDelta: string
     /// Terminal: the fully assembled response.
     | Completed of ChatResponse
     /// Terminal: the stream failed.

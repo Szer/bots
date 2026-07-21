@@ -23,6 +23,7 @@ app.MapPost("/test/mock/errorMode", Func<HttpContext, Threading.Tasks.Task>(fun 
 app.MapPost("/test/mock/script",    Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setScript ctx))    |> ignore
 app.MapPost("/test/mock/llm-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setLlmScript ctx)) |> ignore
 app.MapPost("/test/mock/reaction-llm-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setReactionLlmScript ctx)) |> ignore
+app.MapPost("/test/mock/azure-llm-stream-options", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setLlmStreamOptions ctx)) |> ignore
 app.MapGet("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> getCalls ctx)) |> ignore
 app.MapDelete("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> clearCalls ctx)) |> ignore
 
