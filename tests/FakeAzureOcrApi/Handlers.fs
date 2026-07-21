@@ -275,6 +275,52 @@ module Handlers =
                 do! respondJson ctx 200 responseJson
         }
 
+    /// Fake Azure OpenAI audio/transcriptions handler (AlitaBot voice transcription).
+    /// Doesn't parse the multipart body (the fake doesn't need the audio bytes) — just
+    /// logs a placeholder call entry and returns the next scripted response, dequeued
+    /// same as the other script queues. An empty queue returns an empty transcript.
+    let handleAudioTranscriptions (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} (multipart audio, contentLength={ctx.Request.ContentLength})")
+            Store.logCall ctx.Request.Method url $"(multipart audio, {ctx.Request.ContentLength} bytes)"
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.sttResponseScript.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondJson ctx 200 """{"text":""}"""
+        }
+
+    /// Sets the scripted-response queue for the audio/transcriptions (STT) endpoint.
+    /// An empty/absent `responses` array clears it (calls fall back to an empty transcript).
+    let setSttScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearSttScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.sttResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
     let getCalls (ctx: HttpContext) =
         task {
             let calls = Store.calls |> Seq.toArray

@@ -342,6 +342,25 @@ type Tg() =
                 )
         )
 
+    /// Builds an Update with a voice message in a group/supergroup chat.
+    static member groupVoiceMessage(fromUser: User, chatId: int64, ?fileId: string, ?duration: int64, ?replyToMessageId: int64) =
+        let chat = Tg.groupChat(id = chatId)
+        let fid = defaultArg fileId ($"voice-{next ()}")
+        Update.Create(
+            updateId = next(),
+            message =
+                Message.Create(
+                    messageId = next(),
+                    date = DateTime.UtcNow,
+                    chat = chat,
+                    from = fromUser,
+                    voice = Voice.Create(fid, fid + "-uid", defaultArg duration 3L),
+                    ?replyToMessage =
+                        (replyToMessageId
+                         |> Option.map (fun rid -> Message.Create(messageId = rid, date = DateTime.UtcNow, chat = chat)))
+                )
+        )
+
     /// Builds an Update with a document in a group/supergroup chat.
     static member groupDocumentMessage(fromUser: User, chatId: int64, ?caption: string) =
         let chat = Tg.groupChat(id = chatId)

@@ -167,6 +167,21 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             return msg.id
         }
 
+    /// Sends an on-disk ogg/opus file as a genuine voice note (not a generic audio
+    /// attachment) — DocumentAttributeAudio's `voice` flag is what makes Telegram
+    /// clients render it as a playable voice bubble instead of a file attachment.
+    /// Returns the sent message id.
+    member _.SendVoice(chatId: int64, oggFilePath: string, durationSeconds: int) : Task<int> =
+        task {
+            let! peer = resolvePeer chatId
+            let! uploaded = client.UploadFileAsync(oggFilePath)
+            let audioAttr =
+                DocumentAttributeAudio(duration = durationSeconds, flags = DocumentAttributeAudio.Flags.voice)
+            let media = InputMediaUploadedDocument(uploaded, "audio/ogg", [| audioAttr :> DocumentAttribute |])
+            let! msg = client.SendMessageAsync(peer, "", media)
+            return msg.id
+        }
+
     /// First incoming message in `chatId` that replies to `repliedMsgId`, or None on timeout.
     member _.TryAwaitReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
         task {

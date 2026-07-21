@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.IO
 open System.Net.Http
+open System.Net.Http.Headers
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
@@ -30,6 +31,29 @@ module internal AzureWire =
 
     let embeddingsUri (endpoint: string) (deployment: string) =
         $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/embeddings?api-version={ApiVersion}"
+
+    let transcriptionsUri (endpoint: string) (deployment: string) =
+        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/transcriptions?api-version={ApiVersion}"
+
+    let speechUri (endpoint: string) (deployment: string) =
+        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/speech?api-version={ApiVersion}"
+
+    let buildSpeechBody (text: string) (voice: string) =
+        let root = JsonObject()
+        root["input"] <- JsonValue.Create text
+        root["voice"] <- JsonValue.Create voice
+        root["response_format"] <- JsonValue.Create "opus"
+        root.ToJsonString()
+
+    /// Best-effort transcript extraction: response_format=json returns {"text": "..."};
+    /// anything else (or an unparseable body) is treated as the raw text itself.
+    let parseTranscript (body: string) : string =
+        try
+            use doc = JsonDocument.Parse(body)
+            match doc.RootElement.TryGetProperty "text" with
+            | true, v when v.ValueKind = JsonValueKind.String -> v.GetString()
+            | _ -> body
+        with _ -> body
 
     let newRequest (apiKey: string) (uri: string) (bodyJson: string) =
         let req = new HttpRequestMessage(HttpMethod.Post, uri)
@@ -286,6 +310,38 @@ module internal AzureHttp =
             return result.Value, retries
         }
 
+    /// Same 429 policy as `sendWithRetry`, but reads the success body as raw bytes
+    /// (audio) instead of a UTF-8 string — TTS responses are binary and would be
+    /// corrupted by a string round-trip.
+    let sendBinaryWithRetry
+        (client: HttpClient)
+        (makeRequest: unit -> HttpRequestMessage)
+        (ct: CancellationToken)
+        : Task<Result<byte[], LlmError> * int> =
+        task {
+            let maxRetries = 2
+            let mutable retries = 0
+            let mutable result: Result<byte[], LlmError> option = None
+            while result.IsNone do
+                try
+                    use req = makeRequest ()
+                    use! resp = client.SendAsync(req, ct)
+                    if resp.IsSuccessStatusCode then
+                        let! bytes = resp.Content.ReadAsByteArrayAsync(ct)
+                        result <- Some(Ok bytes)
+                    else
+                        let! body = resp.Content.ReadAsStringAsync(ct)
+                        let err = AzureWire.classifyError (int resp.StatusCode) (AzureWire.retryAfterOf resp) body
+                        match err with
+                        | LlmError.RateLimited retryAfter when retries < maxRetries ->
+                            do! Task.Delay(AzureWire.backoffDelay retries retryAfter, ct)
+                            retries <- retries + 1
+                        | _ -> result <- Some(Error err)
+                with ex ->
+                    result <- Some(Error(LlmError.NetworkError ex.Message))
+            return result.Value, retries
+        }
+
 /// Mutable accumulator for one streamed tool call (fragments arrive across chunks).
 type internal ToolCallAcc() =
     member val Id = "" with get, set
@@ -517,6 +573,63 @@ type AzureFoundryEmbeddings(httpFactory: IHttpClientFactory, options: IOptions<B
                         let err = LlmError.ApiError(200, body)
                         call.Failed(err, retries)
                         return Error err
+                | Error err ->
+                    AzureWire.logLlmError logger err
+                    call.Failed(err, retries)
+                    return Error err
+            }
+
+/// ISpeech against Azure AI Foundry's audio endpoints — STT via
+/// audio/transcriptions (multipart), TTS via audio/speech (JSON in, binary out).
+/// Deployment names come from IOptions<BotConfiguration> (STT_DEPLOYMENT/TTS_DEPLOYMENT).
+type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundrySpeech>) =
+
+    interface ISpeech with
+        member _.Transcribe(audio: byte[], ct: CancellationToken) =
+            task {
+                let conf = options.Value
+                use call = new LlmCall("llm.stt", conf.SttDeployment, false, conf.LlmPricingJson, logger)
+                let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
+                let uri = AzureWire.transcriptionsUri conf.AzureFoundryEndpoint conf.SttDeployment
+
+                let makeRequest () =
+                    let req = new HttpRequestMessage(HttpMethod.Post, uri)
+                    req.Headers.Add("api-key", conf.AzureFoundryKey)
+                    let content = new MultipartFormDataContent()
+                    let fileContent = new ByteArrayContent(audio)
+                    fileContent.Headers.ContentType <- MediaTypeHeaderValue("audio/ogg")
+                    content.Add(fileContent, "file", "voice.ogg")
+                    content.Add(new StringContent("json"), "response_format")
+                    req.Content <- content
+                    req
+
+                let! result, retries = AzureHttp.sendWithRetry client makeRequest ct
+                match result with
+                | Ok body ->
+                    let text = AzureWire.parseTranscript body
+                    call.Succeeded(None, None, retries)
+                    return Ok text
+                | Error err ->
+                    AzureWire.logLlmError logger err
+                    call.Failed(err, retries)
+                    return Error err
+            }
+
+        member _.Synthesize(text: string, voice: string option, ct: CancellationToken) =
+            task {
+                let conf = options.Value
+                use call = new LlmCall("llm.tts", conf.TtsDeployment, false, conf.LlmPricingJson, logger)
+                let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
+                let uri = AzureWire.speechUri conf.AzureFoundryEndpoint conf.TtsDeployment
+                let voiceName = voice |> Option.defaultValue "alloy"
+                let bodyJson = AzureWire.buildSpeechBody text voiceName
+                let makeRequest () = AzureWire.newRequest conf.AzureFoundryKey uri bodyJson
+
+                let! result, retries = AzureHttp.sendBinaryWithRetry client makeRequest ct
+                match result with
+                | Ok bytes ->
+                    call.Succeeded(None, None, retries)
+                    return Ok bytes
                 | Error err ->
                     AzureWire.logLlmError logger err
                     call.Failed(err, retries)

@@ -401,6 +401,17 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the Azure OpenAI audio/transcriptions (STT) endpoint (AlitaBot voice
+    /// transcription). An empty array clears the script (calls fall back to an empty transcript).
+    member _.SetAzureSttScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/stt-script", payload)
+            return ()
+        }
+
     /// Returns only the Azure OpenAI chat-completions calls the fake recorded (filters out OCR).
     /// Tests count these to assert dedup/single-flight (e.g. "exactly 1 call for this content")
     /// and retry (e.g. ">= 2 calls" after a scripted 429).

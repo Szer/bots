@@ -22,3 +22,16 @@ let sendTextReply (tg: ITelegramApi) (chatId: int64) (text: string) (replyToMess
 
 let editMessageText (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) =
     tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text)) |> taskIgnore
+
+/// Sends a text reply carrying explicit entities (e.g. expandable_blockquote for
+/// voice transcripts) — entities are mutually exclusive with parse_mode on the wire,
+/// so callers that need formatting without a parse_mode use this instead of sendTextReply.
+let sendTextReplyWithEntities
+    (tg: ITelegramApi)
+    (chatId: int64)
+    (text: string)
+    (entities: MessageEntity[])
+    (replyToMessageId: int64)
+    : Task<Message> =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(Req.SendMessage.Make(chatId, text, entities = entities, replyParameters = replyParams))

@@ -29,6 +29,12 @@ module Store =
     /// reaction path fails fast (no retry) instead of storming.
     let reactionLlmResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Scripted responses for the Azure OpenAI audio/transcriptions endpoint (AlitaBot voice
+    /// transcription). Kept separate from the chat-completions queues. If non-empty, dequeue one
+    /// per call; after it empties, respond with an empty transcript ({"text":""}) so a forgotten
+    /// script doesn't silently reuse a stale scripted transcript across tests.
+    let sttResponseScript = ConcurrentQueue<ScriptedResponse>()
+
     /// Streaming knobs for the chat-completions SSE mode (see LlmStreamOptionsDto).
     /// Set via /test/mock/azure-llm-stream-options; all zeros = defaults.
     let mutable llmStreamChunkDelayMs = 0
@@ -61,6 +67,11 @@ module Store =
     let clearReactionLlmScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while reactionLlmResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearSttScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while sttResponseScript.TryDequeue(&item) do
             ()
 
     /// Resets the OCR mock to its pristine baseline: default 200 response, no delay,

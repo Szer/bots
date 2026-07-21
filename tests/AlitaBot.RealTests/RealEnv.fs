@@ -19,6 +19,8 @@ type RealEnv =
       AzureFoundryEndpoint: string
       AzureFoundryKey: string
       LlmDeployment: string
+      SttDeployment: string
+      TtsDeployment: string
       /// echo | llm — forwarded to the spawned bot (default echo).
       ResponderMode: string
       /// draft | edit | plain — forwarded to the spawned bot (default edit, matches prod).
@@ -103,6 +105,8 @@ module RealEnv =
           AzureFoundryEndpoint = getVarOr "AZURE_FOUNDRY_ENDPOINT" ""
           AzureFoundryKey = getVarOr "AZURE_FOUNDRY_KEY" ""
           LlmDeployment = getVarOr "ALITA_LLM_DEPLOYMENT" ""
+          SttDeployment = getVarOr "ALITA_STT_DEPLOYMENT" ""
+          TtsDeployment = getVarOr "ALITA_TTS_DEPLOYMENT" ""
           ResponderMode = getVarOr "RESPONDER_MODE" "echo"
           StreamMode = getVarOr "STREAM_MODE" "edit" }
 

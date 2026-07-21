@@ -47,6 +47,9 @@ type AlitaTestContainers() =
                 "CONTEXT_WINDOW_MESSAGES", "30",                                "FREE_FORM", "llm"
                 "AZURE_FOUNDRY_ENDPOINT",  "http://fake-azure-ocr:8081",        "FREE_FORM", "llm"
                 "LLM_DEPLOYMENT",          "alita-gpt-5-mini",                  "FREE_FORM", "llm"
+                "STT_DEPLOYMENT",          "alita-stt",                         "FREE_FORM", "llm"
+                "TTS_DEPLOYMENT",          "alita-tts",                         "FREE_FORM", "llm"
+                "VOICE_TRANSCRIBE_ENABLED", "true",                             "FEATURE_FLAG", "llm"
                 "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00}}""", "JSON_BLOB", "llm"
                 "TEST_MODE",               "true",                              "FEATURE_FLAG", "diagnostics"
             ]

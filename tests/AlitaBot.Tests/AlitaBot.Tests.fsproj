@@ -11,6 +11,7 @@
     <Compile Include="ContainerTestBase.fs" />
     <Compile Include="SkeletonTests.fs" />
     <Compile Include="LlmTests.fs" />
+    <Compile Include="VoiceTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

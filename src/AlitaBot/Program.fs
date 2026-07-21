@@ -57,10 +57,13 @@ let buildBotConf () =
       AzureFoundryKey = getEnvOr "AZURE_FOUNDRY_KEY" ""
       LlmDeployment = getSettingOr "LLM_DEPLOYMENT" ""
       EmbeddingDeployment = getSettingOr "EMBEDDING_DEPLOYMENT" ""
+      SttDeployment = getSettingOr "STT_DEPLOYMENT" ""
+      TtsDeployment = getSettingOr "TTS_DEPLOYMENT" ""
       LlmPricingJson = getSettingOr "LLM_PRICING" "{}"
       ResponderMode = getSettingOr "RESPONDER_MODE" "echo"
       StreamMode = getSettingOr "STREAM_MODE" "edit"
       ContextWindowMessages = getSettingOr "CONTEXT_WINDOW_MESSAGES" "30" |> int
+      VoiceTranscribeEnabled = getSettingOr "VOICE_TRANSCRIBE_ENABLED" "true" |> bool.Parse
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -114,6 +117,7 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<ReplyRendererFactory>()
     .AddSingleton<IChatCompletion, AzureFoundryChat>()
     .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
+    .AddSingleton<ISpeech, AzureFoundrySpeech>()
     .AddSingleton<DbService>(fun _ -> DbService(connString))
 
 let app = builder.Build()

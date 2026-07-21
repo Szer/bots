@@ -20,5 +20,6 @@ type IMusicGen =
     abstract Generate : prompt: string * ct: CancellationToken -> Task<Result<byte[], LlmError>>
 
 type ISpeech =
-    abstract Synthesize : text: string * ct: CancellationToken -> Task<Result<byte[], LlmError>>
+    /// `voice` defaults to "alloy" when None.
+    abstract Synthesize : text: string * voice: string option * ct: CancellationToken -> Task<Result<byte[], LlmError>>
     abstract Transcribe : audio: byte[] * ct: CancellationToken -> Task<Result<string, LlmError>>

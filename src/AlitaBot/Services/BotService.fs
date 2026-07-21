@@ -3,21 +3,39 @@ namespace AlitaBot.Services
 open System
 open System.Collections.Generic
 open System.Text.RegularExpressions
+open System.Threading
+open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Funogram.Telegram.Types
 open AlitaBot
+open AlitaBot.Llm
 open AlitaBot.Telemetry
 open BotInfra
+
+module Req = Funogram.Telegram.Req
 
 type BotService(
     options: IOptions<BotConfiguration>,
     db: DbService,
     responder: ResponderService,
+    tg: ITelegramApi,
+    speech: ISpeech,
+    chat: IChatCompletion,
     logger: ILogger<BotService>,
     time: TimeProvider
 ) =
     let nameTriggerRegex = Regex(@"(?i)\bалита\b|\balita\b", RegexOptions.Compiled)
+
+    /// Transcripts longer than this get a one-line TL;DR appended (outside the blockquote).
+    [<Literal>]
+    let TldrThreshold = 400
+
+    /// Bot API 7.7+ entity type — collapses long quoted text behind a "Show more" toggle.
+    /// Funogram's MessageEntity.Type is a plain string (no closed DU), so any Bot-API-valid
+    /// value passes straight through the wire; no Funogram version bump needed to use it.
+    [<Literal>]
+    let ExpandableBlockquote = "expandable_blockquote"
 
     let countOutcome (outcome: string) =
         Metrics.messagesTotal.Add(1L, KeyValuePair("outcome", box outcome))
@@ -55,39 +73,77 @@ type BotService(
     let isTriggered (conf: BotConfiguration) (text: string) (msg: Message) =
         mentionsBot conf text msg || isReplyToBot conf msg || nameTriggerRegex.IsMatch text
 
+    /// (fileId, duration) of a Voice/VideoNote/Audio message, or None for anything else.
+    let voiceSource (msg: Message) : string option =
+        match msg.Voice with
+        | Some v -> Some v.FileId
+        | None ->
+            match msg.VideoNote with
+            | Some vn -> Some vn.FileId
+            | None ->
+                match msg.Audio with
+                | Some a -> Some a.FileId
+                | None -> None
+
+    let logRow (chatId: int64) (messageId: int64) (userId: int64) (username: string) (displayName: string) (isBot: bool) (replyTo: int64 option) (text: string) : MessageLogRow =
+        { chat_id = chatId
+          message_id = messageId
+          user_id = userId
+          username = username
+          display_name = displayName
+          is_bot = isBot
+          reply_to_message_id = (match replyTo with Some r -> Nullable r | None -> Nullable())
+          text = text
+          sent_at = time.GetUtcNow().UtcDateTime }
+
+    let tldrRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content =
+                  [ ContentPart.Text
+                        "Summarize the following voice-message transcript in ONE short sentence, in the same language as the transcript. Output only the summary, no preamble, no quotes." ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = Some 60 }
+
+    /// Cheap non-stream TL;DR for long transcripts. Best-effort: any failure just
+    /// means the reply ships without a TL;DR line, never blocks the transcript reply.
+    let tryTldr (conf: BotConfiguration) (transcript: string) =
+        task {
+            if transcript.Length <= TldrThreshold then
+                return None
+            else
+                match! chat.Complete(tldrRequest conf transcript, CancellationToken.None) with
+                | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> return Some(resp.Text.Trim())
+                | Ok _ -> return None
+                | Error err ->
+                    logger.LogWarning("TL;DR generation failed for a voice transcript: {Error}", string err)
+                    return None
+        }
+
     let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
         task {
             use a = botActivity.StartActivity("handleMessage")
             %a.SetTag("chatId", msg.Chat.Id)
             %a.SetTag("fromId", from.Id)
 
-            do! db.LogMessage
-                    { chat_id = msg.Chat.Id
-                      message_id = msg.MessageId
-                      user_id = from.Id
-                      username = Option.toObj from.Username
-                      display_name = displayNameOf from
-                      is_bot = from.IsBot
-                      reply_to_message_id =
-                        match msg.ReplyToMessage with
-                        | Some r -> Nullable r.MessageId
-                        | None -> Nullable()
-                      text = text
-                      sent_at = time.GetUtcNow().UtcDateTime }
+            do! db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) text)
 
             if isTriggered conf text msg then
                 match! responder.Respond(msg) with
                 | Some(sent, replyText) ->
-                    do! db.LogMessage
-                            { chat_id = msg.Chat.Id
-                              message_id = sent.MessageId
-                              user_id = botUserId conf
-                              username = conf.BotUsername
-                              display_name = conf.BotUsername
-                              is_bot = true
-                              reply_to_message_id = Nullable msg.MessageId
-                              text = replyText
-                              sent_at = time.GetUtcNow().UtcDateTime }
+                    do! db.LogMessage(
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) replyText)
                     %a.SetTag("outcome", "replied")
                     countOutcome "replied"
                 | None ->
@@ -98,17 +154,96 @@ type BotService(
                 countOutcome "logged"
         }
 
+    /// Voice/VideoNote/Audio flow: download -> transcribe -> reply as an expandable
+    /// blockquote (+ TL;DR when long) -> log both the sender's transcript and the bot's
+    /// reply -> optionally hand the transcript to the normal trigger/responder path
+    /// (e.g. a voice message saying "алита ...") without ever auto-triggering by itself.
+    let handleVoiceMessage (conf: BotConfiguration) (msg: Message) (from: User) (fileId: string) =
+        task {
+            use a = botActivity.StartActivity("handleVoiceMessage")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            if not conf.VoiceTranscribeEnabled then
+                %a.SetTag("outcome", "voice_disabled")
+            else
+                let! file = tg.CallExn(Req.GetFile.Make(fileId))
+                match file.FilePath with
+                | None ->
+                    logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
+                    %a.SetTag("outcome", "voice_no_filepath")
+                | Some filePath when String.IsNullOrWhiteSpace filePath ->
+                    logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
+                    %a.SetTag("outcome", "voice_no_filepath")
+                | Some filePath ->
+                    let! bytes = tg.DownloadFile filePath
+                    match! speech.Transcribe(bytes, CancellationToken.None) with
+                    | Error err ->
+                        logger.LogWarning("Voice transcription failed: {Error}", string err)
+                        %a.SetTag("outcome", "voice_transcribe_failed")
+                    | Ok transcript when String.IsNullOrWhiteSpace transcript ->
+                        %a.SetTag("outcome", "voice_empty_transcript")
+                    | Ok transcript ->
+                        // Sender's voice content enters the conversational log verbatim
+                        // (prefixed) so it feeds later LLM context like any text message.
+                        do! db.LogMessage(
+                                logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                                    (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                                    $"[voice] {transcript}")
+
+                        let! tldr = tryTldr conf transcript
+                        let quoted = $"🎙️ {transcript}"
+                        let entities = [| MessageEntity.Create(``type`` = ExpandableBlockquote, offset = 0L, length = int64 quoted.Length) |]
+                        let fullText =
+                            match tldr with
+                            | Some t -> $"{quoted}\n\nTL;DR: {t}"
+                            | None -> quoted
+
+                        let! sent = BotHelpers.sendTextReplyWithEntities tg msg.Chat.Id fullText entities msg.MessageId
+                        do! db.LogMessage(
+                                logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                    (Some msg.MessageId) fullText)
+
+                        // Transcription itself never triggers the responder — but a
+                        // transcript that independently matches the normal trigger rules
+                        // (name/mention/reply-to-bot) may, exactly like a text message.
+                        let transcribedMsg = { msg with Text = Some transcript }
+                        if isTriggered conf transcript transcribedMsg then
+                            match! responder.Respond(transcribedMsg) with
+                            | Some(replySent, replyText) ->
+                                do! db.LogMessage(
+                                        logRow msg.Chat.Id replySent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                            (Some msg.MessageId) replyText)
+                                %a.SetTag("outcome", "voice_transcribed_and_triggered")
+                                countOutcome "voice_transcribed_and_triggered"
+                            | None ->
+                                %a.SetTag("outcome", "voice_transcribed")
+                                countOutcome "voice_transcribed"
+                        else
+                            %a.SetTag("outcome", "voice_transcribed")
+                            countOutcome "voice_transcribed"
+        }
+
     member _.OnUpdate(update: Update) =
         task {
             let conf = options.Value
             match update.Message with
             | Some msg ->
-                match msg.Text, msg.From with
-                | Some text, Some from ->
-                    if conf.TargetChatIds |> List.contains msg.Chat.Id then
-                        do! handleMessage conf msg from text
-                    else
-                        countOutcome "ignored"
-                | _ -> ()
+                match msg.From with
+                | Some from ->
+                    match msg.Text with
+                    | Some text ->
+                        if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                            do! handleMessage conf msg from text
+                        else
+                            countOutcome "ignored"
+                    | None ->
+                        match voiceSource msg with
+                        | Some fileId ->
+                            if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                do! handleVoiceMessage conf msg from fileId
+                            // else: silently ignored — same privacy gate as text messages.
+                        | None -> ()
+                | None -> ()
             | None -> ()
         }
