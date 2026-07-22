@@ -86,3 +86,9 @@ module Metrics =
     /// milliseconds. Only recorded when transcription was actually attempted (i.e. not
     /// for VOICE_TRANSCRIBE_ENABLED=false).
     let voiceTranscribeDurationMs = meter.CreateHistogram<float>("alitabot_voice_transcribe_duration_ms")
+
+    /// Count of embedding-pipeline failures (Slice 5a) — an LLM error from IEmbeddings
+    /// or an exception inserting the message_embedding row. Always Warning-logged
+    /// alongside this counter, never surfaced to the reply path — see BotService's
+    /// `tryEmbed`.
+    let embeddingFailuresTotal = meter.CreateCounter<int64>("alitabot_embedding_failures_total")

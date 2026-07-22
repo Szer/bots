@@ -22,6 +22,11 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
 - `VisionTests.fs` — photo message handling, image parts attached to LLM requests.
 - `ImageGenTests.fs` — `/img`/`!img` command parsing, text-to-image and img2img (reply-to-photo), disabled/empty-prompt/failure paths.
 - `LlmTests.fs` — streaming renderers (edit/draft/plain), 429 handling.
+- `CommandsTests.fs` — command registry dispatch, `/model`, `/summary`, `/usage`.
+- `MemoryTests.fs` — Slice 5a: the inline embedding pipeline (`message_log` ->
+  `message_embedding`, `EMBED_MESSAGES`/`EMBEDDING_MIN_CHARS`) and `/ask` semantic search,
+  against `FakeAzureOcrApi`'s deterministic hash-of-text `/embeddings` fake (see
+  `src/AlitaBot/README.md`'s "Memory" section for the scheme).
 
 Container logs land in `test-artifacts/AlitaBot.Tests/AlitaTestContainers/` (`bot.log`,
 `postgres.log`, `flyway.log`, `fake-tg-api.log`, `fake-azure-ocr.log`) on pass or fail.
@@ -47,7 +52,7 @@ it). Field names, no values:
 | `ALITA_WEBHOOK_SECRET` | shared secret between the harness and the bot process |
 | `ALITA_TEST_CHAT_ID` | test group chat id (`make tg-chats` to find it) |
 | `ALITA_TG_API_ID`, `ALITA_TG_API_HASH`, `ALITA_TG_API_PHONE` | MTProto test-user client credentials (`make tg-login` for the session) |
-| `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_KEY`, `ALITA_LLM_DEPLOYMENT`, `ALITA_STT_DEPLOYMENT`, `ALITA_TTS_DEPLOYMENT`, `ALITA_IMAGE_DEPLOYMENT` | real Azure AI Foundry deployments (only needed for `RESPONDER_MODE=llm` / voice / image real-tests; each real-test suite self-skips via `Assert.Skip` when its deployment env var is missing) |
+| `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_KEY`, `ALITA_LLM_DEPLOYMENT`, `ALITA_STT_DEPLOYMENT`, `ALITA_TTS_DEPLOYMENT`, `ALITA_IMAGE_DEPLOYMENT`, `ALITA_EMBEDDING_DEPLOYMENT` | real Azure AI Foundry deployments (only needed for `RESPONDER_MODE=llm` / voice / image / `/ask` real-tests; each real-test suite self-skips via `Assert.Skip` when its deployment env var is missing) |
 | `RESPONDER_MODE`, `STREAM_MODE` | optional overrides (default `echo`/`edit`), upserted into `bot_setting` on every run |
 
 ```bash
@@ -57,8 +62,11 @@ make alita-clean  # tear down containers + deleteWebhook (run when done for the 
 ```
 
 `SmokeTests.fs` is the core conversational suite; `VoiceRealTests.fs`, `VisionRealTests.fs`,
-`ImageGenRealTests.fs` cover their respective slices and self-skip when their deployment
-isn't configured. STT real tests accept any one of the test phrase's three words
+`ImageGenRealTests.fs`, `AskRealTests.fs` cover their respective slices and self-skip when
+their deployment isn't configured. `AskRealTests.fs` (Slice 5a) sends two GUID-marked
+factual messages, polls Postgres for their `message_embedding` rows, then asks `/ask`
+about the fact and asserts the reply references it. STT real tests accept any one of the
+test phrase's three words
 (case-insensitive) in the transcript/reply — real STT has, once, misrecognized a single word
 of the short Russian test phrase, so requiring all three verbatim made the assertion flakier
 than the feature it's testing.

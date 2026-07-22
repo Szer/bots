@@ -48,4 +48,18 @@ type BotConfiguration =
       ModelAllowlistJson: string
       /// SUMMARY_PROMPT bot_setting: system prompt for the /summary command. Default "".
       SummaryPrompt: string
+      /// FEATURE_FLAG EMBED_MESSAGES — embed every logged message (user + bot) into
+      /// message_embedding for /ask's semantic search. Default true.
+      EmbedMessagesEnabled: bool
+      /// EMBEDDING_MIN_CHARS bot_setting: messages shorter than this are never embedded
+      /// (too little semantic content to be worth indexing). Default 3.
+      EmbeddingMinChars: int
+      /// ASK_TOP_K bot_setting: how many nearest message_embedding rows /ask pulls as
+      /// candidate context before the similarity floor is applied. Default 8.
+      AskTopK: int
+      /// ASK_SIM_FLOOR bot_setting: minimum cosine similarity (1 - cosine distance) for a
+      /// candidate to be included in /ask's context. Default 0.5.
+      AskSimFloor: float
+      /// ASK_PROMPT bot_setting: system prompt for the /ask command. Default "".
+      AskPrompt: string
       TestMode: bool }

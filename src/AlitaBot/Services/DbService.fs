@@ -46,6 +46,15 @@ type UsageByUserRow =
       calls: int64
       cost_usd: decimal }
 
+/// One row of /ask's semantic-search join (message_embedding + message_log), scored by
+/// cosine similarity (1 - cosine distance, pgvector's `<=>` operator).
+[<CLIMutable>]
+type AskMatchRow =
+    { display_name: string
+      text: string
+      sent_at: DateTime
+      similarity: float }
+
 /// F# option -> Dapper-friendly Nullable<'a>, for optional numeric columns.
 [<AutoOpen>]
 module private DbServiceHelpers =
@@ -53,6 +62,14 @@ module private DbServiceHelpers =
         match o with
         | Some v -> Nullable v
         | None -> Nullable()
+
+    /// pgvector's text input format: "[v1,v2,...]". G9 round-trips a float32 exactly
+    /// without falling back to scientific notation for ordinary embedding magnitudes;
+    /// Npgsql sends it as a plain text parameter, cast to `vector` in the SQL itself
+    /// (`@embedding::vector`) — avoids taking a dependency on the Pgvector NuGet package
+    /// just for parameter binding.
+    let vectorLiteral (v: float32[]) : string =
+        "[" + (v |> Array.map (fun f -> f.ToString("G9", Globalization.CultureInfo.InvariantCulture)) |> String.concat ",") + "]"
 
 type DbService(connString: string) =
     let openConn() = task {
@@ -62,13 +79,16 @@ type DbService(connString: string) =
     }
 
     /// Idempotent insert: webhook redelivery of the same (chat_id, message_id) is a
-    /// no-op. Returns true when this call actually inserted the row (first delivery),
-    /// false when it was already there (a duplicate delivery) — callers use this to
-    /// skip re-running the LLM/voice/image work a retry would otherwise repeat, which
-    /// the INSERT's own idempotency does not prevent by itself (a webhook retry would
-    /// re-run the whole handler and send a second, distinct Telegram reply even though
-    /// the log row itself collapses to one).
-    member _.LogMessage(row: MessageLogRow) =
+    /// no-op. Returns `Some id` when this call actually inserted the row (first
+    /// delivery — `id` is the new message_log.id, used to key its message_embedding
+    /// row), `None` when it was already there (a duplicate delivery) — callers use this
+    /// to skip re-running the LLM/voice/image/embedding work a retry would otherwise
+    /// repeat, which the INSERT's own idempotency does not prevent by itself (a webhook
+    /// retry would re-run the whole handler and send a second, distinct Telegram reply
+    /// even though the log row itself collapses to one). `RETURNING id` naturally
+    /// yields nothing when ON CONFLICT DO NOTHING skips the row, so this doubles as the
+    /// insert-vs-duplicate signal without a separate existence check.
+    member _.LogMessage(row: MessageLogRow) : Task<int64 option> =
         task {
             use! conn = openConn()
             //language=postgresql
@@ -76,10 +96,69 @@ type DbService(connString: string) =
                 """
 INSERT INTO message_log (chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at)
 VALUES (@chat_id, @message_id, @user_id, @username, @display_name, @is_bot, @reply_to_message_id, @text, @sent_at)
-ON CONFLICT (chat_id, message_id) DO NOTHING;
+ON CONFLICT (chat_id, message_id) DO NOTHING
+RETURNING id;
 """
-            let! rowsAffected = conn.ExecuteAsync(sql, row)
-            return rowsAffected > 0
+            let! id = conn.QuerySingleOrDefaultAsync<Nullable<int64>>(sql, row)
+            return if id.HasValue then Some id.Value else None
+        }
+
+    /// Inserts one `message_embedding` row (Slice 5a's embedding pipeline). Idempotent
+    /// (ON CONFLICT DO NOTHING on the message_log_id PK) so a retried fire-and-forget
+    /// embed can never violate the PK. Caller (BotService's embedding pipeline) is
+    /// failure-tolerant around this — an exception here is caught by `fireAndForget`,
+    /// logged Warning, and never surfaces to the reply path.
+    member _.InsertMessageEmbedding(messageLogId: int64, embedding: float32[]) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO message_embedding (message_log_id, embedding)
+VALUES (@message_log_id, @embedding::vector)
+ON CONFLICT (message_log_id) DO NOTHING;
+"""
+            let! _ =
+                conn.ExecuteAsync(
+                    sql,
+                    {| message_log_id = messageLogId
+                       embedding = vectorLiteral embedding |})
+            return ()
+        }
+
+    /// /ask's semantic search: nearest `topK` message_embedding rows for `chatId` by
+    /// cosine distance (pgvector's `<=>`, matching the HNSW index's vector_cosine_ops),
+    /// then filtered to `simFloor` and returned oldest-first (citation order). The two-
+    /// stage shape (ORDER BY distance LIMIT topK, *then* filter by similarity) lets the
+    /// HNSW index serve the LIMIT efficiently while still respecting the floor exactly —
+    /// filtering first would force a full scan since pgvector can't push a similarity
+    /// WHERE clause into the index.
+    member _.SemanticSearch(chatId: int64, queryEmbedding: float32[], topK: int, simFloor: float) : Task<AskMatchRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT display_name, text, sent_at, similarity FROM (
+    SELECT ml.display_name, ml.text, ml.sent_at,
+           1 - (me.embedding <=> @qvec::vector) AS similarity
+    FROM message_embedding me
+    JOIN message_log ml ON ml.id = me.message_log_id
+    WHERE ml.chat_id = @chat_id
+    ORDER BY me.embedding <=> @qvec::vector
+    LIMIT @top_k
+) candidates
+WHERE similarity >= @sim_floor
+ORDER BY sent_at ASC;
+"""
+            let! rows =
+                conn.QueryAsync<AskMatchRow>(
+                    sql,
+                    {| qvec = vectorLiteral queryEmbedding
+                       chat_id = chatId
+                       top_k = topK
+                       sim_floor = simFloor |})
+            return rows |> Seq.toArray
         }
 
     /// Last `n` messages of the chat, returned in chronological order.

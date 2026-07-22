@@ -15,6 +15,7 @@
     <Compile Include="VisionTests.fs" />
     <Compile Include="ImageGenTests.fs" />
     <Compile Include="CommandsTests.fs" />
+    <Compile Include="MemoryTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

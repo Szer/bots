@@ -34,7 +34,9 @@ spec:
     spec:
       containers:
       - name: postgres
-        image: postgres:17.10
+        # pgvector build of postgres:17 — Slice 5a's message_embedding table needs
+        # the `vector` extension (V3 migration).
+        image: pgvector/pgvector:pg17
         ports:
         - containerPort: 5432
           name: postgres

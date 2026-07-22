@@ -73,6 +73,11 @@ let buildBotConf () =
       ImageQuality = getSettingOr "IMAGE_QUALITY" "medium"
       ModelAllowlistJson = getSettingOr "MODEL_ALLOWLIST" "[]"
       SummaryPrompt = getSettingOr "SUMMARY_PROMPT" ""
+      EmbedMessagesEnabled = getSettingOr "EMBED_MESSAGES" "true" |> bool.Parse
+      EmbeddingMinChars = getSettingOr "EMBEDDING_MIN_CHARS" "3" |> int
+      AskTopK = getSettingOr "ASK_TOP_K" "8" |> int
+      AskSimFloor = getSettingOr "ASK_SIM_FLOOR" "0.5" |> float
+      AskPrompt = getSettingOr "ASK_PROMPT" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())

@@ -26,6 +26,7 @@ type BotService(
     speech: ISpeech,
     chat: IChatCompletion,
     imageGen: IImageGen,
+    embeddings: IEmbeddings,
     settingsReloader: ISettingsReloader,
     logger: ILogger<BotService>,
     time: TimeProvider
@@ -130,6 +131,54 @@ type BotService(
           text = text
           sent_at = time.GetUtcNow().UtcDateTime }
 
+    // ── Embedding pipeline (Slice 5a: memory foundation) ────────────────────
+    //
+    // Every successful message_log insert (user AND bot rows alike) gets embedded
+    // in the background and written to message_embedding, feeding /ask's semantic
+    // search. Entirely best-effort: an embedding failure (LLM error or exception)
+    // is Warning-logged + counted (alitabot_embedding_failures_total) and never
+    // affects the reply path — see tryEmbed's fireAndForget wrapping.
+
+    /// Skips embedding pure command invocations — bare "/xxx"/"!xxx" text, or our own
+    /// "[xxx-cmd] ..." message_log tagging convention (handleSimpleCommand /
+    /// handleImageCommand / handleSummaryCommand / handleAskCommand) — neither carries
+    /// conversational content worth indexing for semantic search.
+    let isPureCommandText (text: string) =
+        let t = text.TrimStart()
+        t.StartsWith("/") || t.StartsWith("!") || (t.StartsWith("[") && t.Contains("-cmd]"))
+
+    /// Embeds `text` (batch of 1) and inserts the resulting message_embedding row for
+    /// `messageLogId`, fully in the background (BotInfra.Utils.fireAndForget — catches
+    /// and Warning-logs any exception on top of the explicit LlmError handling below).
+    /// No-ops entirely when EMBED_MESSAGES=false, `text` is shorter than
+    /// EMBEDDING_MIN_CHARS, or it looks like a pure command (isPureCommandText).
+    let tryEmbed (conf: BotConfiguration) (chatId: int64) (userId: int64) (messageLogId: int64) (text: string) =
+        if conf.EmbedMessagesEnabled && text.Length >= conf.EmbeddingMinChars && not (isPureCommandText text) then
+            fireAndForget logger "embedding.pipeline" (fun () ->
+                task {
+                    let ctx: UsageContext = { ChatId = Some chatId; UserId = Some userId }
+                    match! embeddings.Embed(conf.EmbeddingDeployment, [ text ], ctx, CancellationToken.None) with
+                    | Ok vectors when vectors.Length > 0 && vectors[0].Length > 0 ->
+                        do! db.InsertMessageEmbedding(messageLogId, vectors[0])
+                    | Ok _ -> ()
+                    | Error err ->
+                        Metrics.embeddingFailuresTotal.Add(1L)
+                        logger.LogWarning("Embedding failed for message_log {Id}: {Error}", messageLogId, string err)
+                } :> Task)
+
+    /// Drop-in replacement for `db.LogMessage` at every call site: same `bool` contract
+    /// (true = first delivery inserted, false = webhook-redelivery duplicate) every
+    /// existing caller already relies on, but additionally kicks off the embedding
+    /// pipeline (tryEmbed) on a real insert. A duplicate delivery is never re-embedded.
+    let logAndEmbed (conf: BotConfiguration) (row: MessageLogRow) : Task<bool> =
+        task {
+            match! db.LogMessage(row) with
+            | Some id ->
+                tryEmbed conf row.chat_id row.user_id id row.text
+                return true
+            | None -> return false
+        }
+
     let tldrRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
         { Deployment = conf.LlmDeployment
           Messages =
@@ -172,7 +221,7 @@ type BotService(
             %a.SetTag("fromId", from.Id)
 
             let! inserted =
-                db.LogMessage(
+                logAndEmbed conf (
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) logText)
 
@@ -187,7 +236,7 @@ type BotService(
             elif isTriggered conf triggerText msg then
                 match! responder.Respond(msg) with
                 | Some(sent, replyText) ->
-                    do! db.LogMessage(
+                    do! logAndEmbed conf (
                             logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                 (Some msg.MessageId) replyText)
                         |> taskIgnore
@@ -266,7 +315,7 @@ type BotService(
                         // Sender's voice content enters the conversational log verbatim
                         // (prefixed) so it feeds later LLM context like any text message.
                         let! inserted =
-                            db.LogMessage(
+                            logAndEmbed conf (
                                 logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                                     (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                                     $"[voice] {transcript}")
@@ -289,7 +338,7 @@ type BotService(
                             | None -> quoted
 
                         let! sent = BotHelpers.sendTextReplyWithEntities tg msg.Chat.Id fullText entities msg.MessageId
-                        do! db.LogMessage(
+                        do! logAndEmbed conf (
                                 logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                     (Some msg.MessageId) fullText)
                             |> taskIgnore
@@ -301,7 +350,7 @@ type BotService(
                         if isTriggered conf transcript transcribedMsg then
                             match! responder.Respond(transcribedMsg) with
                             | Some(replySent, replyText) ->
-                                do! db.LogMessage(
+                                do! logAndEmbed conf (
                                         logRow msg.Chat.Id replySent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                             (Some msg.MessageId) replyText)
                                     |> taskIgnore
@@ -356,7 +405,7 @@ type BotService(
             %a.SetTag("fromId", from.Id)
 
             let! inserted =
-                db.LogMessage(
+                logAndEmbed conf (
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                         $"[img-cmd] {prompt}")
@@ -371,7 +420,7 @@ type BotService(
                 let hint =
                     "Напиши, что нарисовать: `/img рыжий кот на подоконнике`. Ответь этой командой на фото — перерисую его по описанию."
                 let! sent = BotHelpers.sendTextReply tg msg.Chat.Id hint msg.MessageId
-                do! db.LogMessage(
+                do! logAndEmbed conf (
                         logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                             (Some msg.MessageId) hint)
                     |> taskIgnore
@@ -380,7 +429,7 @@ type BotService(
             elif not conf.ImageGenEnabled then
                 let disabledText = "Генерация картинок сейчас выключена."
                 let! sent = BotHelpers.sendTextReply tg msg.Chat.Id disabledText msg.MessageId
-                do! db.LogMessage(
+                do! logAndEmbed conf (
                         logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                             (Some msg.MessageId) disabledText)
                     |> taskIgnore
@@ -403,7 +452,7 @@ type BotService(
                             $"{truncated}\n${costStr}"
                         | None -> truncated
                     let! sentPhoto = BotHelpers.sendPhotoReply tg msg.Chat.Id bytes caption msg.MessageId
-                    do! db.LogMessage(
+                    do! logAndEmbed conf (
                             logRow msg.Chat.Id sentPhoto.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                 (Some msg.MessageId) $"[image] {truncated}")
                         |> taskIgnore
@@ -446,7 +495,7 @@ type BotService(
             %a.SetTag("fromId", from.Id)
 
             let! inserted =
-                db.LogMessage(
+                logAndEmbed conf (
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                         (if args = "" then $"[{name}-cmd]" else $"[{name}-cmd] {args}"))
@@ -457,7 +506,7 @@ type BotService(
             else
                 let! replyText, outcome = body()
                 let! sent = BotHelpers.sendTextReply tg msg.Chat.Id replyText msg.MessageId
-                do! db.LogMessage(
+                do! logAndEmbed conf (
                         logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                             (Some msg.MessageId) replyText)
                     |> taskIgnore
@@ -599,7 +648,7 @@ type BotService(
             %a.SetTag("fromId", from.Id)
 
             let! inserted =
-                db.LogMessage(
+                logAndEmbed conf (
                     logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
                         (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
                         (if args = "" then "[summary-cmd]" else $"[summary-cmd] {args}"))
@@ -607,7 +656,7 @@ type BotService(
             let reply (text: string) (outcome: string) =
                 task {
                     let! sent = BotHelpers.trySendEphemeralOrReply tg logger msg.Chat.Id from.Id text msg.MessageId
-                    do! db.LogMessage(
+                    do! logAndEmbed conf (
                             logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
                                 (Some msg.MessageId) text)
                         |> taskIgnore
@@ -636,6 +685,90 @@ type BotService(
                         do! reply "Не получилось подвести итоги 🙁" "summary_failed"
         }
 
+    // ── /ask (Slice 5a: semantic search over this chat's message_embedding) ────
+
+    /// Context block fed to the LLM: one line per matched message, oldest first
+    /// (matches DbService.SemanticSearch's ordering) — author, date, quoted text.
+    let buildAskContext (rows: AskMatchRow[]) : string =
+        rows
+        |> Array.map (fun r -> $"""[{r.display_name}, {r.sent_at.ToString("yyyy-MM-dd")}]: {r.text}""")
+        |> String.concat "\n"
+
+    let askRequest (conf: BotConfiguration) (question: string) (context: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.AskPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text $"Вопрос: {question}\n\nСообщения из истории чата:\n{context}" ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    /// `/ask <question>` — embeds the question, pulls the ASK_TOP_K nearest
+    /// message_embedding rows for this chat above ASK_SIM_FLOOR cosine similarity
+    /// (DbService.SemanticSearch), and answers via a non-stream LLM call grounded in
+    /// that context (ASK_PROMPT). No candidates above the floor short-circuits to a
+    /// fixed RU "nothing relevant" reply — deterministic, no LLM call needed to say
+    /// there's nothing to say. Empty question -> RU usage hint, no embedding/LLM call.
+    let handleAskCommand (conf: BotConfiguration) (msg: Message) (from: User) (question: string) =
+        task {
+            use a = botActivity.StartActivity("handleAskCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if question = "" then "[ask-cmd]" else $"[ask-cmd] {question}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = BotHelpers.sendTextReply tg msg.Chat.Id text msg.MessageId
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif String.IsNullOrWhiteSpace question then
+                do! reply "Спроси что-нибудь про этот чат: `/ask когда договорились встретиться`." "ask_empty_question"
+            else
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                match! embeddings.Embed(conf.EmbeddingDeployment, [ question ], usageCtx, CancellationToken.None) with
+                | Error err ->
+                    logger.LogWarning("/ask: failed to embed the question: {Error}", string err)
+                    do! reply "Не получилось разобрать вопрос 🙁" "ask_embed_failed"
+                | Ok vectors when vectors.Length = 0 || vectors[0].Length = 0 ->
+                    logger.LogWarning("/ask: embedding returned no vectors for the question")
+                    do! reply "Не получилось разобрать вопрос 🙁" "ask_embed_failed"
+                | Ok vectors ->
+                    let! matches = db.SemanticSearch(msg.Chat.Id, vectors[0], conf.AskTopK, conf.AskSimFloor)
+
+                    if matches.Length = 0 then
+                        do! reply "Ничего подходящего в истории этого чата не нашла." "ask_no_matches"
+                    else
+                        let context = buildAskContext matches
+
+                        match! chat.Complete(askRequest conf question context, usageCtx, CancellationToken.None) with
+                        | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> do! reply resp.Text "ask_answered"
+                        | Ok _ -> do! reply "Модель промолчала." "ask_empty_response"
+                        | Error err ->
+                            logger.LogWarning("/ask: LLM call failed: {Error}", string err)
+                            do! reply "Не получилось ответить 🙁" "ask_failed"
+        }
+
     let commandsWithoutHelp: CommandDef list =
         [ { Name = "img"
             Aliases = []
@@ -653,7 +786,11 @@ type BotService(
           { Name = "usage"
             Aliases = []
             Description = "расход и статистика использования LLM"
-            Handler = handleUsageCommand } ]
+            Handler = handleUsageCommand }
+          { Name = "ask"
+            Aliases = []
+            Description = "ответить на вопрос по истории этого чата (семантический поиск): /ask <вопрос>"
+            Handler = handleAskCommand } ]
 
     /// `/help` (and `/start`, for a newcomer's first message) — auto-generated from the
     /// registry (Commands.helpText), so it can never list a command that doesn't exist
