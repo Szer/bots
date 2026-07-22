@@ -48,6 +48,7 @@ type BotProcess private (proc: Process, log: TextWriter, logPath: string) =
                   "RESPONDER_MODE", env.ResponderMode
                   "AZURE_FOUNDRY_ENDPOINT", env.AzureFoundryEndpoint
                   "AZURE_FOUNDRY_KEY", env.AzureFoundryKey
+                  "GEMINI_API_KEY", env.GeminiApiKey
                   // Make sure the bot talks to the real Telegram API even if the
                   // parent shell has a fake URL exported.
                   "TELEGRAM_API_URL", "" ]

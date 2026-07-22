@@ -69,6 +69,48 @@ module Store =
     /// similarity to be a function of the input text, not a scripted value.
     let embeddingsResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    // ── Gemini generateContent (AlitaBot Gemini provider slice: Nano Banana images, Lyria
+    // music) ─────────────────────────────────────────────────────────────────────────────
+    //
+    // Both routed through the SAME fake handler (`Handlers.handleGeminiGenerateContent`,
+    // one URL pattern `/gemini/v1beta/models/{model}:generateContent` — Gemini has no
+    // separate "edits" endpoint the way Azure does, see GeminiProvider.fs's doc comment).
+    // The handler picks image-vs-music by whether the model name contains "image"
+    // (case-insensitive) — true of both the real discovered model names
+    // (gemini-3.1-flash-image / lyria-3-pro-preview) and the test fixture's
+    // (gemini-test-image / lyria-test-music).
+
+    /// A tiny valid WAV (8kHz mono 16-bit, ~50ms silence), base64-encoded — the default
+    /// "generated music" response, analogous to `tinyPngBase64` above.
+    let tinyWavBase64 =
+        "UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+
+    let defaultGeminiImageResponse =
+        $"""{{"candidates":[{{"content":{{"parts":[{{"inlineData":{{"mimeType":"image/png","data":"{tinyPngBase64}"}}}}],"role":"model"}},"finishReason":"STOP","index":0}}],"usageMetadata":{{"promptTokenCount":10,"candidatesTokenCount":1290,"totalTokenCount":1300}}}}"""
+
+    let defaultGeminiMusicResponse =
+        $"""{{"candidates":[{{"content":{{"parts":[{{"inlineData":{{"mimeType":"audio/wav","data":"{tinyWavBase64}"}}}}],"role":"model"}},"finishReason":"STOP","index":0}}],"usageMetadata":{{"promptTokenCount":20,"candidatesTokenCount":2000,"totalTokenCount":2020}}}}"""
+
+    /// Scripted responses for Gemini generateContent calls against an IMAGE model (model
+    /// name contains "image"). If non-empty, dequeue one per call; after it empties, falls
+    /// back to `defaultGeminiImageResponse`.
+    let geminiImageResponseScript = ConcurrentQueue<ScriptedResponse>()
+
+    /// Scripted responses for Gemini generateContent calls against a MUSIC model (model
+    /// name does not contain "image" — i.e. a Lyria model). Same fallback convention as
+    /// `geminiImageResponseScript`.
+    let geminiMusicResponseScript = ConcurrentQueue<ScriptedResponse>()
+
+    let clearGeminiImageScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while geminiImageResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearGeminiMusicScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while geminiMusicResponseScript.TryDequeue(&item) do
+            ()
+
     /// Streaming knobs for the chat-completions SSE mode (see LlmStreamOptionsDto).
     /// Set via /test/mock/azure-llm-stream-options; all zeros = defaults.
     let mutable llmStreamChunkDelayMs = 0

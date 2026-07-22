@@ -20,7 +20,9 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   message_log attribution, duplicate-webhook-delivery idempotency.
 - `VoiceTests.fs` — transcription flow, TL;DR threshold, disabled/no-filepath/empty-transcript paths.
 - `VisionTests.fs` — photo message handling, image parts attached to LLM requests.
-- `ImageGenTests.fs` — `/img`/`!img` command parsing, text-to-image and img2img (reply-to-photo), disabled/empty-prompt/failure paths.
+- `ImageGenTests.fs` — `/img`/`!img` command parsing, text-to-image and img2img (reply-to-photo), disabled/empty-prompt/failure paths (Azure backend, `IMAGE_PROVIDER=azure`).
+- `GeminiTests.fs` — `/img` routed to the Gemini backend (`IMAGE_PROVIDER=gemini`, `FakeAzureOcrApi`'s additive `/gemini/*` routes) and provider switching back to Azure.
+- `SongTests.fs` — `/song` (Lyria music generation): delivery + `message_log`/`llm_usage` rows, per-user cooldown, over-`SONG_MAX_CHARS`, empty prompt.
 - `LlmTests.fs` — streaming renderers (edit/draft/plain), 429 handling.
 - `CommandsTests.fs` — command registry dispatch, `/model`, `/summary`, `/usage`.
 - `MemoryTests.fs` — Slice 5a: the inline embedding pipeline (`message_log` ->
@@ -93,6 +95,7 @@ it). Field names, no values:
 | `ALITA_TEST_CHAT_ID` | test group chat id (`make tg-chats` to find it) |
 | `ALITA_TG_API_ID`, `ALITA_TG_API_HASH`, `ALITA_TG_API_PHONE` | MTProto test-user client credentials (`make tg-login` for the session) |
 | `AZURE_FOUNDRY_ENDPOINT`, `AZURE_FOUNDRY_KEY`, `ALITA_LLM_DEPLOYMENT`, `ALITA_STT_DEPLOYMENT`, `ALITA_TTS_DEPLOYMENT`, `ALITA_IMAGE_DEPLOYMENT`, `ALITA_EMBEDDING_DEPLOYMENT` | real Azure AI Foundry deployments (only needed for `RESPONDER_MODE=llm` / voice / image / `/ask` real-tests; each real-test suite self-skips via `Assert.Skip` when its deployment env var is missing) |
+| `ALITA_GEMINI_API_KEY` | real Gemini API key (Nano Banana images, Lyria music) — `ImageGenRealTests`/`SongRealTests` self-skip when unset, or when set but Gemini's own billing gate blocks generation for this key's project (`GeminiProbe.fs` probes this before asserting — see `docs/TECH-DEBT.md`) |
 | `RESPONDER_MODE`, `STREAM_MODE` | optional overrides (default `echo`/`edit`), upserted into `bot_setting` on every run |
 
 ```bash
@@ -117,6 +120,11 @@ race PersonaRealTests' emoji test already had to work around).
 `SmokeTests.fs` is the core conversational suite; `VoiceRealTests.fs`, `VisionRealTests.fs`,
 `ImageGenRealTests.fs`, `AskRealTests.fs`, `DossierRealTests.fs`, `PersonaRealTests.fs` cover
 their respective slices and self-skip when their deployment isn't configured.
+`ImageGenRealTests.fs` runs against Gemini when `ALITA_GEMINI_API_KEY` is set (falling back
+to Azure's `ALITA_IMAGE_DEPLOYMENT`), and `SongRealTests.fs` (Gemini/Lyria `/song`) also
+gates on `ALITA_GEMINI_API_KEY` — both self-skip if Gemini's own billing gate blocks
+generation (`GeminiProbe.isQuotaBlocked`, one real HTTP probe before the Telegram round trip
+assertion), rather than hard-failing on an external blocker.
 `PersonaRealTests.fs` (Slice 6, all three require `RESPONDER_MODE=llm`): (a) flips
 `OUTCOME_WEIGHTS` to `emoji=100` (direct `bot_setting` upsert + `/reload-settings`, restored
 in a `finally`), mentions the bot, and awaits a `TL.UpdateMessageReactions` on the triggering

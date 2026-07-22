@@ -65,6 +65,26 @@ let sendAudioReply (tg: ITelegramApi) (chatId: int64) (bytes: byte[]) (replyToMe
     let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
     tg.CallExn(Req.SendAudio.Make(chatId, InputFile.FileBytes("voice.mp3", bytes), replyParameters = replyParams))
 
+/// Sends a titled audio attachment reply (Bot API `sendAudio` with `title`/`performer`) —
+/// used by `/song` (Gemini/Lyria music generation) so the delivered track shows a name in
+/// Telegram's audio player instead of just a bare filename, unlike `/say`'s plain
+/// sendAudioReply fallback (a voice-note-style TTS clip has no meaningful "title").
+let sendAudioReplyWithTitle
+    (tg: ITelegramApi)
+    (chatId: int64)
+    (bytes: byte[])
+    (title: string)
+    (replyToMessageId: int64)
+    : Task<Message> =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(
+        Req.SendAudio.Make(
+            chatId,
+            InputFile.FileBytes("song.mp3", bytes),
+            title = title,
+            performer = "Алита",
+            replyParameters = replyParams))
+
 /// Sends a text reply carrying explicit entities (e.g. expandable_blockquote for
 /// voice transcripts) — entities are mutually exclusive with parse_mode on the wire,
 /// so callers that need formatting without a parse_mode use this instead of sendTextReply.

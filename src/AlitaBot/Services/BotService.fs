@@ -70,6 +70,7 @@ type BotService(
     speech: ISpeech,
     chat: IChatCompletion,
     imageGen: IImageGen,
+    musicGen: IMusicGen,
     embeddings: IEmbeddings,
     settingsReloader: ISettingsReloader,
     logger: ILogger<BotService>,
@@ -759,8 +760,16 @@ type BotService(
                     let truncated =
                         if prompt.Length > ImgCaptionPromptMaxLen then prompt.Substring(0, ImgCaptionPromptMaxLen)
                         else prompt
+                    // Gemini has no quality tiers (flat "per_image" pricing field, keyed by
+                    // GEMINI_IMAGE_MODEL) — Azure keeps its "per_image_<quality>" tiers
+                    // keyed by IMAGE_DEPLOYMENT. See ImagePricing.tryCost's doc comment.
+                    let pricingModel, pricingQuality =
+                        if conf.ImageProvider.Equals("azure", StringComparison.OrdinalIgnoreCase) then
+                            conf.ImageDeployment, Some conf.ImageQuality
+                        else
+                            conf.GeminiImageModel, None
                     let caption =
-                        match ImagePricing.tryCost logger conf.LlmPricingJson conf.ImageDeployment conf.ImageQuality with
+                        match ImagePricing.tryCost logger conf.LlmPricingJson pricingModel pricingQuality with
                         | Some cost ->
                             let costStr = cost.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)
                             $"{truncated}\n${costStr}"
@@ -1731,6 +1740,156 @@ type BotService(
                         countOutcome outcome
         }
 
+    // ── /song (Gemini/Lyria music generation) ───────────────────────────────────
+
+    /// Truncation length for the `/song` audio's title (Bot API `sendAudio` `title` field)
+    /// — mirrors `ImgCaptionPromptMaxLen`.
+    [<Literal>]
+    let SongTitleMaxLen = 60
+
+    /// Splits `/song`'s args into an optional leading `(style hint)` and the rest (lyrics /
+    /// description) — Matie-style inline flags, e.g. `(рок-баллада) текст песни...` ->
+    /// `Some "рок-баллада", "текст песни..."`. A `(` with no matching `)` is treated as
+    /// ordinary text (no style extracted) rather than an error — `/song (незакрытая скобка`
+    /// still generates something instead of refusing on a punctuation slip.
+    let parseSongArgs (args: string) : string option * string =
+        let trimmed = args.Trim()
+        if trimmed.StartsWith "(" then
+            match trimmed.IndexOf ')' with
+            | -1 -> None, trimmed
+            | i ->
+                let style = trimmed.Substring(1, i - 1).Trim()
+                let rest = trimmed.Substring(i + 1).Trim()
+                (if style = "" then None else Some style), rest
+        else
+            None, trimmed
+
+    /// Best-effort re-encode of Lyria's (unverified — see GeminiProvider.fs's doc comment)
+    /// audio bytes into mp3 via `ffmpeg`, mirroring `tryConvertToOggOpus`'s pattern:
+    /// mp3 (not ogg/opus) because `/song` delivers via `sendAudio` with a `title` — a
+    /// regular audio-player attachment, not a voice-note bubble. Returns `None` when
+    /// `ffmpeg` is missing or the conversion itself fails — the caller falls back to
+    /// sending the raw bytes as-is.
+    let tryConvertToMp3 (bytes: byte[]) : Task<byte[] option> =
+        task {
+            let inPath = IO.Path.GetTempFileName()
+            let outPath = IO.Path.ChangeExtension(IO.Path.GetTempFileName(), ".mp3")
+            try
+                try
+                    do! IO.File.WriteAllBytesAsync(inPath, bytes)
+                    let psi =
+                        ProcessStartInfo(
+                            FileName = "ffmpeg",
+                            Arguments = $"-y -i \"{inPath}\" -c:a libmp3lame -b:a 128k \"{outPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true)
+                    use proc = new Process(StartInfo = psi)
+                    if not (proc.Start()) then
+                        return None
+                    else
+                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
+                        let! _stderr = proc.StandardError.ReadToEndAsync()
+                        do! proc.WaitForExitAsync()
+                        if proc.ExitCode = 0 && IO.File.Exists outPath then
+                            let! converted = IO.File.ReadAllBytesAsync(outPath)
+                            return Some converted
+                        else
+                            return None
+                with ex ->
+                    logger.LogWarning(ex, "/song: ffmpeg conversion to mp3 failed — sending raw bytes as-is")
+                    return None
+            finally
+                (try IO.File.Delete inPath with _ -> ())
+                (try IO.File.Delete outPath with _ -> ())
+        }
+
+    /// `/song [(style)] <lyrics or description>` — Gemini's Lyria music generation
+    /// (GEMINI_MUSIC_MODEL). Logs `[song-cmd] {args}` first (webhook-redelivery dedup guard,
+    /// same convention as every other command), then: empty prompt -> RU usage hint; over
+    /// `SONG_MAX_CHARS` -> RU refusal; on cooldown (`SONG_COOLDOWN_SECONDS`, per-invoker —
+    /// see `DbService.LastSongAt`'s doc comment) -> RU cooldown reply; otherwise sends a
+    /// "сочиняю..." placeholder, generates, re-encodes to mp3 when possible (best-effort,
+    /// `tryConvertToMp3`), delivers via `sendAudio` with a title, and logs the bot's own
+    /// reply row as `[song] {prompt}`. The cooldown is only stamped on an actual successful
+    /// delivery, mirroring `/roast`'s `RecordRoast` convention.
+    let handleSongCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        task {
+            use a = botActivity.StartActivity("handleSongCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then "[song-cmd]" else $"[song-cmd] {args}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = BotHelpers.sendTextReply tg msg.Chat.Id text msg.MessageId
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                let styleHint, lyricsOrDesc = parseSongArgs args
+                if String.IsNullOrWhiteSpace lyricsOrDesc then
+                    do!
+                        reply
+                            "Напиши, что сочинить: `/song текст песни` или `/song (стиль) текст песни`, например `/song (рок-баллада) про баги в проде`."
+                            "song_empty_prompt"
+                elif lyricsOrDesc.Length > conf.SongMaxChars then
+                    do! reply $"Слишком длинный текст — максимум {conf.SongMaxChars} символов." "song_too_long"
+                else
+                    let now = time.GetUtcNow().UtcDateTime
+                    let! lastSong = db.LastSongAt(from.Id)
+                    match lastSong with
+                    | Some last when (now - last).TotalSeconds < float conf.SongCooldownSeconds ->
+                        do! reply "рано, дай отдышаться — попробуй чуть позже" "song_cooldown"
+                    | _ ->
+                        let prompt =
+                            match styleHint with
+                            | Some style -> $"Style: {style}\n\n{lyricsOrDesc}"
+                            | None -> lyricsOrDesc
+                        let! placeholder = BotHelpers.sendTextReply tg msg.Chat.Id "сочиняю..." msg.MessageId
+                        let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                        match! musicGen.Generate(prompt, usageCtx, CancellationToken.None) with
+                        | Error err ->
+                            logger.LogWarning("Music generation failed: {Error}", string err)
+                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось сочинить 🙁"
+                            %a.SetTag("outcome", "song_failed")
+                            countOutcome "song_failed"
+                        | Ok(bytes, _usage) when bytes.Length = 0 ->
+                            logger.LogWarning("Music generation returned no audio")
+                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось сочинить 🙁"
+                            %a.SetTag("outcome", "song_failed")
+                            countOutcome "song_failed"
+                        | Ok(bytes, _usage) ->
+                            let! mp3Bytes = tryConvertToMp3 bytes
+                            let deliverBytes = mp3Bytes |> Option.defaultValue bytes
+                            let title =
+                                if lyricsOrDesc.Length > SongTitleMaxLen then lyricsOrDesc.Substring(0, SongTitleMaxLen)
+                                else lyricsOrDesc
+                            let! sent = BotHelpers.sendAudioReplyWithTitle tg msg.Chat.Id deliverBytes title msg.MessageId
+                            do! logAndEmbed conf (
+                                    logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                        (Some msg.MessageId) $"[song] {prompt}")
+                                |> taskIgnore
+                            do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
+                            do! db.RecordSong(from.Id, now)
+                            %a.SetTag("outcome", "song_delivered")
+                            countOutcome "song_delivered"
+        }
+
     // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
 
     /// Parses the ADMIN_USER_IDS bot_setting (JSON_BLOB array of ints) — lenient like
@@ -1909,6 +2068,10 @@ type BotService(
             Aliases = []
             Description = "озвучить текст голосом: /say [голос] текст, или ответом на сообщение"
             Handler = handleSayCommand }
+          { Name = "song"
+            Aliases = []
+            Description = "сгенерировать музыку: /song [(стиль)] текст песни или описание"
+            Handler = handleSongCommand }
           { Name = "sql"
             Aliases = []
             Description = "аналитика по базе на естественном языке, только для админов: /sql <вопрос>"

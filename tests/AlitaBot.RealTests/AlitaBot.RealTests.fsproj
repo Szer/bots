@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <Compile Include="RealEnv.fs" />
+    <Compile Include="GeminiProbe.fs" />
     <Compile Include="NgrokTunnel.fs" />
     <Compile Include="DevDb.fs" />
     <Compile Include="BotProcess.fs" />
@@ -23,6 +24,7 @@
     <Compile Include="VoiceRealTests.fs" />
     <Compile Include="VisionRealTests.fs" />
     <Compile Include="ImageGenRealTests.fs" />
+    <Compile Include="SongRealTests.fs" />
     <Compile Include="CommandRealTests.fs" />
     <Compile Include="AskRealTests.fs" />
     <Compile Include="DossierRealTests.fs" />

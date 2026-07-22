@@ -111,6 +111,16 @@ let buildBotConf () =
       AdminUserIdsJson = getSettingOr "ADMIN_USER_IDS" "[]"
       SqlPrompt = getSettingOr "SQL_PROMPT" ""
       CostFooterEnabled = getSettingOr "COST_FOOTER_ENABLED" "false" |> bool.Parse
+      // Gemini provider slice: Nano Banana images (an alternative /img backend to Azure,
+      // routed by IMAGE_PROVIDER) + Lyria music (/song). GeminiApiKey is a secret (env,
+      // like AzureFoundryKey) — everything else is a hot-reloadable bot_setting.
+      GeminiApiKey = getEnvOr "GEMINI_API_KEY" ""
+      GeminiBaseUrl = getSettingOr "GEMINI_BASE_URL" "https://generativelanguage.googleapis.com"
+      GeminiImageModel = getSettingOr "GEMINI_IMAGE_MODEL" "gemini-3.1-flash-image"
+      GeminiMusicModel = getSettingOr "GEMINI_MUSIC_MODEL" "lyria-3-pro-preview"
+      ImageProvider = getSettingOr "IMAGE_PROVIDER" "gemini"
+      SongMaxChars = getSettingOr "SONG_MAX_CHARS" "1000" |> int
+      SongCooldownSeconds = getSettingOr "SONG_COOLDOWN_SECONDS" "120" |> int
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -156,6 +166,9 @@ if botConfOptions.Value.TestMode then
 
 // Named HttpClient for Azure Foundry LLM calls (raw HTTP + SSE, decision D3).
 %builder.Services.AddHttpClient(AzureFoundry.HttpClientName)
+// Named HttpClient for Gemini API calls (Nano Banana images, Lyria music) — same
+// raw-HTTP idiom as Azure Foundry above, see Llm/GeminiProvider.fs.
+%builder.Services.AddHttpClient(Gemini.HttpClientName)
 
 %builder
     .Services
@@ -174,7 +187,21 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<IChatCompletion, AzureFoundryChat>()
     .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
     .AddSingleton<ISpeech, AzureFoundrySpeech>()
-    .AddSingleton<IImageGen, AzureFoundryImageGen>()
+    // Gemini provider slice: both concrete IImageGen implementations are registered as
+    // themselves (not as IImageGen — that would leave DI to pick one arbitrarily), then
+    // ImageGenRouter (Llm/GeminiProvider.fs) is the single IImageGen registration, reading
+    // IMAGE_PROVIDER per call so `/reload-settings` can flip providers with zero restart.
+    // AzureFoundryImageGen stays wired for when Azure image quota lands (see
+    // AlitaBot/docs/TECH-DEBT.md) — IMAGE_PROVIDER=gemini is just today's default.
+    .AddSingleton<AzureFoundryImageGen>()
+    .AddSingleton<GeminiImageGen>()
+    .AddSingleton<IImageGen>(fun sp ->
+        ImageGenRouter(
+            sp.GetRequiredService<AzureFoundryImageGen>(),
+            sp.GetRequiredService<GeminiImageGen>(),
+            sp.GetRequiredService<IOptions<BotConfiguration>>())
+        :> IImageGen)
+    .AddSingleton<IMusicGen, GeminiMusicGen>()
     // Slice 5b: nightly per-person dossier fact extraction (Services/DossierService.fs,
     // Services/ScheduledJobs.fs). SchedulerHostedService needs `connString` directly (the
     // lease functions in ScheduledJobs.fs are plain functions over a connection string,

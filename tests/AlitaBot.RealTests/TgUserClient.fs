@@ -316,6 +316,53 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
                     failwith $"No voice-note reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
         }
 
+    /// Same shape as TryAwaitVoiceReplyTo, but for a REGULAR audio attachment (Bot API
+    /// `sendAudio`, no `voice` flag on the DocumentAttributeAudio) — used by SongRealTests
+    /// to detect `/song`'s Lyria-generated track. Returns (durationSeconds, byteSize).
+    member _.TryAwaitAudioReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) : Task<(int * int64) option> =
+        task {
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                result <-
+                    snapshot ()
+                    |> Array.tryPick (fun m ->
+                        if
+                            peerMatches chatId m.peer_id
+                            && (match m.ReplyTo with
+                                | :? MessageReplyHeader as h -> h.reply_to_msg_id = repliedMsgId
+                                | _ -> false)
+                        then
+                            match m.media with
+                            | :? MessageMediaDocument as md ->
+                                match md.document with
+                                | :? TL.Document as doc ->
+                                    doc.attributes
+                                    |> Array.tryPick (fun a ->
+                                        match a with
+                                        | :? DocumentAttributeAudio as aa -> Some(aa.duration, doc.size)
+                                        | _ -> None)
+                                | _ -> None
+                            | _ -> None
+                        else
+                            None)
+
+                if result.IsNone then
+                    do! Task.Delay pollInterval
+
+            return result
+        }
+
+    member this.AwaitAudioReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
+        task {
+            match! this.TryAwaitAudioReplyTo(chatId, repliedMsgId, timeout) with
+            | Some r -> return r
+            | None ->
+                return
+                    failwith $"No audio reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+        }
+
     /// First incoming message from someone else in `chatId` whose text contains `marker`.
     member _.AwaitContaining(chatId: int64, marker: string, timeout: TimeSpan) =
         task {

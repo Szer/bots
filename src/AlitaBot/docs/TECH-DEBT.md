@@ -37,6 +37,41 @@ documented images API, not verified against a real response — the fake suite c
 response shape so it can't catch a wire-format mismatch the way the STT/TTS/vision real tests
 caught issues in earlier slices.
 
+**Update (Gemini provider slice):** `/img` now defaults to Gemini (`IMAGE_PROVIDER=gemini`,
+`Llm/GeminiProvider.fs`'s `GeminiImageGen`) instead of Azure, since Azure's quota above is
+still 0 — this unblocks real end-to-end `/img` testing without waiting on the Azure quota
+ticket. `AzureFoundryImageGen` is untouched and still wired (`ImageGenRouter` dispatches to
+either by the `IMAGE_PROVIDER` bot_setting) — flip it back once Azure quota lands. See the
+new entry below: Gemini has its OWN billing-gate quota problem, so this isn't a full fix,
+just an alternative path that happens to work for THIS key's chat/text models.
+
+## Gemini image/music generation is billing-gated for the discovery-time API key
+
+Discovered while building the Gemini provider slice (`Llm/GeminiProvider.fs`): the
+`ALITA_GEMINI_API_KEY` used for development/testing works fine for TEXT `generateContent`
+calls (chat models), but every image- or music-capable model (`gemini-*-image`,
+`lyria-3-*`) 429s with `RESOURCE_EXHAUSTED`, `free_tier_requests, limit: 0` — a genuine
+Google Cloud billing gate specific to this key's project (no billing account attached),
+confirmed NOT a transient rate limit: a deliberately malformed request body still 400s
+before quota is even consulted, and text models on the SAME key 200 fine. No real
+successful image/music generation was ever observed against this key — the request wire
+shapes are empirically confirmed schema-valid (see the README's "Gemini provider" section),
+but the response-parsing shapes are best-effort from Google's public docs, same posture as
+the Azure `gpt-image-1` entry above.
+
+`tests/AlitaBot.RealTests/GeminiProbe.fs` probes this SAME failure mode directly (one real
+HTTP call) before `ImageGenRealTests`'/`SongRealTests`' real-Telegram assertions run, and
+self-skips with a clear diagnostic when it's hit, rather than hard-failing `make real-test`
+forever on an external blocker outside this PR's control.
+
+**Action:** once billing is enabled on the Google Cloud project behind `ALITA_GEMINI_API_KEY`
+(or a new key on a billing-enabled project is provisioned), re-run `RESPONDER_MODE=llm make
+real-test` — `ImageGenRealTests`/`SongRealTests` will then exercise the full real round trip
+instead of skipping, and any response-shape mismatch (the best-effort parsing above) will
+surface as a real, actionable test failure. Also worth updating the `LLM_PRICING` estimates
+in `dev-bot-settings.sql` (`gemini-3.1-flash-image`/`lyria-3-pro`) once a real invoice shows
+actual per-item cost.
+
 ## Orphan model deployments from the first Alita attempt
 
 The abandoned first attempt left two unused model deployments provisioned on another bot's

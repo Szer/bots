@@ -28,8 +28,14 @@ type RealEnv =
       SttDeployment: string
       TtsDeployment: string
       /// Empty when unconfigured (quota denied at S3 deploy time, see AlitaBot/docs/TECH-DEBT.md)
-      /// — ImageGenRealTests self-skips rather than failing.
+      /// — ImageGenRealTests self-skips rather than failing when this AND GeminiApiKey are
+      /// both empty (Gemini is the alternative real image-gen path — see GeminiApiKey).
       ImageDeployment: string
+      /// GEMINI_API_KEY for the Gemini provider slice (Nano Banana images, Lyria music) —
+      /// real image/music generation runs against Gemini when this is set, bypassing
+      /// Azure's still-0 image quota (ImageDeployment above). ImageGenRealTests/
+      /// SongRealTests self-skip when this is empty.
+      GeminiApiKey: string
       /// Optional override for EMBEDDING_DEPLOYMENT — dev-bot-settings.sql already seeds
       /// "alita-text-embedding-3-small" as the default, same as LLM_DEPLOYMENT's
       /// "alita-gpt-5-mini" assumption; only pushed to bot_setting when set. AskRealTests
@@ -166,6 +172,7 @@ module RealEnv =
           SttDeployment = getVarOr "ALITA_STT_DEPLOYMENT" ""
           TtsDeployment = getVarOr "ALITA_TTS_DEPLOYMENT" ""
           ImageDeployment = getVarOr "ALITA_IMAGE_DEPLOYMENT" ""
+          GeminiApiKey = getVarOr "ALITA_GEMINI_API_KEY" ""
           EmbeddingDeployment = getVarOr "ALITA_EMBEDDING_DEPLOYMENT" ""
           ResponderMode = getVarOr "RESPONDER_MODE" "echo"
           StreamMode = getVarOr "STREAM_MODE" "edit" }

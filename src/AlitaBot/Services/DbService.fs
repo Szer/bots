@@ -591,6 +591,37 @@ ON CONFLICT (target_user_id) DO UPDATE SET last_roasted_at = EXCLUDED.last_roast
             return ()
         }
 
+    /// Most recent `/song` timestamp for `userId`, or `None` if they've never generated one
+    /// — `SONG_COOLDOWN_SECONDS`'s cooldown check (per-INVOKER, unlike `/roast`'s
+    /// per-TARGET cooldown — `/song` has no target concept, just a pricey/slow call the
+    /// same user shouldn't be able to spam).
+    member _.LastSongAt(userId: int64) : Task<DateTime option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT last_song_at FROM song_cooldown WHERE user_id = @user_id;"
+            let! at = conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(sql, {| user_id = userId |})
+            return if at.HasValue then Some at.Value else None
+        }
+
+    /// Stamps `userId` as having generated a song at `songAt` — called only after a
+    /// successful `/song` reply actually went out (never on a cooldown/empty-prompt/
+    /// too-long/failed attempt), same convention as `RecordRoast`. `songAt` is caller-
+    /// supplied (the app's `TimeProvider`) for the same `TEST_MODE`/`FakeTimeProvider`
+    /// reasoning `RecordRoast`'s doc comment explains.
+    member _.RecordSong(userId: int64, songAt: DateTime) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO song_cooldown (user_id, last_song_at) VALUES (@user_id, @song_at)
+ON CONFLICT (user_id) DO UPDATE SET last_song_at = EXCLUDED.last_song_at;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| user_id = userId; song_at = songAt |})
+            return ()
+        }
+
     /// Inserts one `karma` row (`/awards`, one per awarded title). `userId` is `None` when
     /// the LLM's "user" field couldn't be resolved to a known `message_log.username` — the
     /// row is still kept (with the raw `username` text) so the announcement itself is never

@@ -465,6 +465,41 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts Gemini generateContent calls against an IMAGE model (AlitaBot Gemini
+    /// provider slice, `/img` with IMAGE_PROVIDER=gemini) — model name contains "image",
+    /// see FakeAzureOcrApi's Handlers.handleGeminiGenerateContent. An empty array clears
+    /// the script (calls fall back to the fake's default scripted tiny PNG).
+    member _.SetGeminiImageScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/gemini-image-script", payload)
+            return ()
+        }
+
+    /// Scripts Gemini generateContent calls against a MUSIC model (`/song`) — model name
+    /// does not contain "image" (a Lyria model). An empty array clears the script (calls
+    /// fall back to the fake's default scripted tiny WAV).
+    member _.SetGeminiMusicScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/gemini-music-script", payload)
+            return ()
+        }
+
+    /// Returns only the Gemini generateContent calls the fake recorded (`/gemini/*` — same
+    /// shared container as the Azure OCR/OpenAI fakes, see `GetAzureOcrCalls`).
+    member _.GetGeminiCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
+            return resp |> Array.filter (fun c -> c.Url.Contains("/gemini/"))
+        }
+
     /// Returns only the Azure OpenAI embeddings calls the fake recorded.
     member _.GetAzureEmbeddingsCalls() =
         task {

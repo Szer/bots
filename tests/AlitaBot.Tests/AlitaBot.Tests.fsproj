@@ -21,6 +21,8 @@
     <Compile Include="SocialTests.fs" />
     <Compile Include="ProactiveTests.fs" />
     <Compile Include="StretchTests.fs" />
+    <Compile Include="GeminiTests.fs" />
+    <Compile Include="SongTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

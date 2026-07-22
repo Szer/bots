@@ -166,6 +166,9 @@ jobs:
         CHAT_ID: ${{ secrets.ALITA_CI_CHAT_ID }}
         FOUNDRY_ENDPOINT: ${{ secrets.ALITA_AZURE_FOUNDRY_ENDPOINT }}
         FOUNDRY_KEY: ${{ secrets.ALITA_AZURE_FOUNDRY_KEY }}
+        # Gemini provider slice: GEMINI_API_KEY is the bot's own env var (secret name
+        # only, per repo policy — see ALITA_GEMINI_API_KEY below for the actual value).
+        GEMINI_KEY: ${{ secrets.ALITA_GEMINI_API_KEY }}
       run: |
         kubectl create secret generic alita-bot-env -n "$NAMESPACE" \
           --from-literal=DATABASE_URL="Host=alita-test-postgres;Port=5432;Database=alita_bot;Username=alita_bot_service;Password=alita_bot_service;Include Error Detail=true" \
@@ -176,6 +179,7 @@ jobs:
           --from-literal=TARGET_CHAT_IDS="$CHAT_ID" \
           --from-literal=AZURE_FOUNDRY_ENDPOINT="$FOUNDRY_ENDPOINT" \
           --from-literal=AZURE_FOUNDRY_KEY="$FOUNDRY_KEY" \
+          --from-literal=GEMINI_API_KEY="$GEMINI_KEY" \
           --dry-run=client -o yaml \
         | kubectl label -f - alita-ci=transient --local -o yaml \
         | kubectl apply -f -
@@ -244,6 +248,10 @@ jobs:
         ALITA_LLM_DEPLOYMENT: ${{ secrets.ALITA_LLM_DEPLOYMENT }}
         ALITA_STT_DEPLOYMENT: ${{ secrets.ALITA_STT_DEPLOYMENT }}
         ALITA_TTS_DEPLOYMENT: ${{ secrets.ALITA_TTS_DEPLOYMENT }}
+        # Gemini provider slice (Nano Banana images, Lyria /song) — RealEnv.fs's
+        # GeminiApiKey. ImageGenRealTests/SongRealTests self-skip if this is unset, or if
+        # it IS set but Gemini's own billing gate blocks generation (see GeminiProbe.fs).
+        ALITA_GEMINI_API_KEY: ${{ secrets.ALITA_GEMINI_API_KEY }}
       run: >-
         dotnet test tests/AlitaBot.RealTests -c Release
         --logger "trx;LogFileName=real-test-results.trx"
