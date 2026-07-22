@@ -19,6 +19,7 @@ app.MapPost("/test/mock/file", Func<HttpContext, Threading.Tasks.Task>(fun ctx -
 app.MapPost("/test/mock/methodError", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setMethodError ctx)) |> ignore
 app.MapPost("/test/mock/methodDelay", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setMethodDelay ctx)) |> ignore
 app.MapPost("/test/mock/chat", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setMockChat ctx)) |> ignore
+app.MapPost("/test/mock/rejectMdv2", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setRejectMdv2 ctx)) |> ignore
 
 app.MapGet("/health", Func<string>(fun () -> "OK")) |> ignore
 

@@ -81,4 +81,15 @@ type BotConfiguration =
       /// (DossierService) — must instruct the model to answer in RU, max 250 words.
       /// Default "".
       MergePrompt: string
+      /// FEATURE_FLAG REWRITER_ENABLED — a second, cheap non-stream LLM call rewrites
+      /// ResponderService's final reply text ("перепиши как живой человек в чате...")
+      /// before rendering. Default false. Forces the main LLM call to non-stream too (see
+      /// ResponderService.Respond) — streaming stays exactly as before when this is off.
+      RewriterEnabled: bool
+      /// REWRITER_PROMPT bot_setting: system prompt for the rewrite pass. Default "".
+      RewriterPrompt: string
+      /// OUTCOME_WEIGHTS bot_setting (JSON_BLOB): weighted outcome roll for a TRIGGERED
+      /// non-command message — {"reply":100,"silence":0,"emoji":0}. Default keeps the
+      /// pre-S6 behavior (always reply). See Services/OutcomeRouter.fs.
+      OutcomeWeightsJson: string
       TestMode: bool }

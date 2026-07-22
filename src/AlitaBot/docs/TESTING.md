@@ -45,6 +45,16 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   advanced across the whole assembly run (every seeded message across every test class shares
   one frozen `sent_at`), so without truncating, every user_id ever seeded by an earlier test
   class would show up as "active in the last 24h" too.
+- `PersonaTests.fs` — Slice 6: the outcome router (`OUTCOME_WEIGHTS` at 100/0/0, 0/100/0,
+  0/0/100 — reply/silence/emoji, each toggled via `fixture.SetBotSetting` + `ReloadSettings`),
+  MarkdownV2 final-message rendering (a scripted `**bold** and `code`` reply lands as the
+  final `editMessageText` with `parse_mode=MarkdownV2` and the correctly-escaped payload,
+  `message_log` keeping the plain unescaped text), the plain-text fallback on a simulated
+  Telegram 400 (`fixture.SetMdv2Rejected(true)` — a new `FakeTgApi` knob, `/test/mock/
+  rejectMdv2`, that rejects any `sendMessage`/`editMessageText` carrying `parse_mode=
+  MarkdownV2`), the rewriter pass (`REWRITER_ENABLED=true` -> two chat-completions calls,
+  `message_log`'s bot reply is the SECOND script's text), and reply-context enrichment (a
+  reply-to-message's author + text show up in the LLM request body).
 
 Container logs land in `test-artifacts/AlitaBot.Tests/AlitaTestContainers/` (`bot.log`,
 `postgres.log`, `flyway.log`, `fake-tg-api.log`, `fake-azure-ocr.log`) on pass or fail.
@@ -80,8 +90,17 @@ make alita-clean  # tear down containers + deleteWebhook (run when done for the 
 ```
 
 `SmokeTests.fs` is the core conversational suite; `VoiceRealTests.fs`, `VisionRealTests.fs`,
-`ImageGenRealTests.fs`, `AskRealTests.fs`, `DossierRealTests.fs` cover their respective slices
-and self-skip when their deployment isn't configured. `AskRealTests.fs` (Slice 5a) sends two
+`ImageGenRealTests.fs`, `AskRealTests.fs`, `DossierRealTests.fs`, `PersonaRealTests.fs` cover
+their respective slices and self-skip when their deployment isn't configured.
+`PersonaRealTests.fs` (Slice 6, all three require `RESPONDER_MODE=llm`): (a) flips
+`OUTCOME_WEIGHTS` to `emoji=100` (direct `bot_setting` upsert + `/reload-settings`, restored
+in a `finally`), mentions the bot, and awaits a `TL.UpdateMessageReactions` on the triggering
+message (`TgUserClient.TryAwaitReactionOn` — see its doc comment for why a plain MTProto
+client sees this update and not the bot-only `UpdateBotMessageReaction*` pair) plus 15s of
+silence on a text reply; (b) asks for a markdown-shaped reply and best-effort-asserts the
+settled message carries real MTProto entities (`TgUserClient.LastEntitiesOf`) once MDV2 has
+round-tripped through Telegram's own parser; (c) asserts a real reply contains none of a
+short assistant-isms list ("как ИИ", "отличный вопрос"). `AskRealTests.fs` (Slice 5a) sends two
 GUID-marked factual messages, polls Postgres for their `message_embedding` rows, then asks
 `/ask` about the fact and asserts the reply references it. `DossierRealTests.fs` (Slice 5b)
 sends three GUID-marked personal-fact messages from the test user, triggers the nightly

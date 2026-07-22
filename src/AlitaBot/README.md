@@ -38,6 +38,88 @@ failure after text started → finalize whatever text arrived.
 | `EditThrottleRenderer` | `edit` | Sends on the first chunk, then edits that message whenever ≥1.5s elapsed **and** ≥40 new chars accumulated, plus a final edit at completion. |
 | `DraftRenderer` | `draft` | Streams via `sendMessageDraft` (Bot API 10.2) throttled to ≥500ms per update, then sends **one real message** at the end. On the first `sendMessageDraft` rejection for a chat, permanently (process-lifetime) falls back to `EditThrottleRenderer` for that chat — see findings below. |
 
+**MarkdownV2 formatting applies once, at the FINAL message only** (Slice 6,
+`Services/MarkdownRenderer.fs` + `ReplyRenderer.fs`'s `Mdv2Delivery` module) — every streamed
+partial along the way (the first `sendMessage`, every throttled `editMessageText`) stays plain
+text, unchanged from before this slice. `MarkdownRenderer.toMarkdownV2` walks Markdig's parsed
+CommonMark AST (we do **not** vendor a third-party MDV2 emitter) and emits Telegram's
+MarkdownV2 wire syntax directly: bold (`**`/`__` → MDV2 `*...*`), italic (`*`/`_` → MDV2
+`_..._`), inline `` `code` ``, fenced/indented code blocks (→ `` ```lang\n...\n``` ``), links,
+(un)ordered lists (→ `•`/`N\.` prefixed lines), blockquotes (→ `>`-prefixed lines), and a
+best-effort `||spoiler||` pass over literal text (Markdig has no native spoiler syntax).
+Everything else degrades to escaped plain text — never raw/unescaped output. `Mdv2Delivery`:
+
+- **Normal case**: `sendMessage`/`editMessageText` with `parse_mode=MarkdownV2`.
+- **Telegram 400 (bad entities)**: falls back to a plain-text resend/edit — Warning-logged,
+  counted (`alitabot_mdv2_fallback_total`).
+- **MDV2 form exceeds 4096 chars**: escalates to `Req.SendRichMessage` (the `markdown` field
+  of `InputRichMessage`) instead of a formatted `sendMessage`; a chat that rejects THAT falls
+  back to plain multipart sends (`BotHelpers.sendTextReply` per ≤4096-char chunk), memoized
+  per chat from then on — same probe-and-fallback shape as `DraftRenderer`'s per-chat memo. An
+  over-length final **edit** (streaming path) skips the rich-message escalation entirely and
+  just edits plain — an edit can't turn into multiple messages the way a fresh send can.
+
+Command outputs (`/usage`, `/help`, etc.) are unaffected — they still go through
+`BotHelpers.sendTextReply` directly, no MDV2 formatting.
+
+### Rewriter pass (`REWRITER_ENABLED`, off by default)
+
+A second, cheap **non-stream** LLM call that rewrites `ResponderService`'s final reply text —
+`REWRITER_PROMPT` bot_setting ("перепиши как живой человек в чате: убери ассистентские
+обороты, сократи, сохрани смысл и факты") — before it's rendered. **Documented tradeoff**: the
+main LLM call is also forced non-stream while this is on, so there's no incremental streaming
+UX at all in that mode (`ResponderService.respondWithRewriter`) — the default
+(`REWRITER_ENABLED=false`) path is completely untouched: streaming + the three renderers above
+behave exactly as before. Both LLM calls are usage-recorded (`kind='chat'`) the same as every
+other `IChatCompletion.Complete` call. Skipped entirely for command outputs (`/summary`, `/ask`,
+etc.) — only `ResponderService.Respond`'s "llm" branch ever calls it. Failure policy mirrors
+`PlainRenderer`: `ContentFiltered` on the main call → fixed RU reply; any other failure/empty
+text on the main call → silence; a failed/empty **rewrite** falls back to sending the
+unrewritten text rather than dropping the reply.
+
+### Outcome router (`OUTCOME_WEIGHTS`, `Services/OutcomeRouter.fs`)
+
+A TRIGGERED non-command message doesn't always get a text reply — `OUTCOME_WEIGHTS` bot_setting
+(`{"reply":100,"silence":0,"emoji":0}` by default, keeping the pre-S6 always-reply behavior)
+rolls a weighted outcome in `BotService.handleTriggerableMessage`:
+
+- **reply** — the normal path, unchanged (`ResponderService.Respond`).
+- **silence** — says nothing at all; no LLM call, `outcome=silence` (`alitabot_messages_total`).
+- **emoji** — a tiny non-stream LLM call picks ONE emoji from Telegram's allowed reaction set
+  (👍❤️🔥😁🤔🤯😱🤬😢🎉🤩💩🤡🥱 — the prompt lists exactly these and instructs "output only
+  it"), then `Req.SetMessageReaction` reacts to the triggering message — no text reply,
+  `outcome=emoji`. A malformed/unlisted model answer falls back to the set's first emoji rather
+  than refusing to react; a failed LLM call or a rejected `SetMessageReaction` is Warning-logged
+  and simply skipped.
+
+`OutcomeRouter.pick` is a pure, deterministic function over `(weights, roll: float in [0,1))` —
+the actual `Random.Shared.NextDouble()` draw lives at the call site. Non-positive/all-zero
+weights degrade to "reply" (a trigger is never silently dropped by a misconfigured setting).
+
+### Persona (`SYSTEM_PROMPT`)
+
+The S1 placeholder ("дружелюбный участник чата, отвечай кратко") is replaced with Алита's real
+character prompt (RU, ~170 words, tuned for `gpt-5-mini`): cynical-warm, chat-native for a
+~30-person IT chat — sharp and laconic by default, dark humor welcome, zero assistant-isms
+("отличный вопрос", emoji spam, disclaimers) banned outright, speaks as a chat member (not a
+service), addresses people by the names it sees in the transcript, and leans on dossiers
+(Slice 5b recall injection) for what it remembers about them. `src/alita-bot/dev-bot-settings.sql`
+carries the dev/test seed value; the **production** value is tuned live via `bot_setting`
+(`AGENTS.md`'s "Settings seeds, not migrations") and doesn't need to match the seed exactly.
+
+### Context enrichment
+
+Two additive-only prepends onto the triggering user's turn in the LLM request
+(`ResponderService.buildRequest`) — neither is persisted in `message_log`, so both are
+recomputed fresh from the live `Message` on every request, not carried by context-window rows:
+
+- **Reply-quote**: when the triggering message replies to another one, that message's author +
+  text (falling back to Caption for a photo, same as everywhere else a photo's "text" is
+  needed) is quoted as `[в ответ на {author}]: {text}`.
+- **Forward attribution**: when the triggering message itself is a forward (`Message.
+  ForwardOrigin`), attributes it to a channel post, a user (or one who hid their identity), or
+  an anonymous chat/group post.
+
 ## Image generation (`/img`, `!img`, Phase-1 Slice 3)
 
 `/img <prompt>`, `!img <prompt>`, or `/img@{BOT_USERNAME} <prompt>` in a target chat generates

@@ -29,6 +29,16 @@ module LlmTestHelpers =
     let scripted (status: int) (body: string) : AzureScriptedResponse =
         { status = status; body = body; delayMs = 0; errorMode = "" }
 
+    /// Slice 6: renderers apply MarkdownV2 formatting to the FINAL delivered message —
+    /// mirrors `MarkdownRenderer.escapeText`'s reserved-char list for a plain (no active
+    /// markdown syntax) single-paragraph string, which is all these scripted replies ever
+    /// are. Kept independent of production code on purpose (same posture as every other
+    /// hand-built "expected wire value" in this test class).
+    let escapeMdv2Plain (s: string) =
+        let reserved =
+            set [ '\\'; '_'; '*'; '['; ']'; '('; ')'; '~'; '`'; '>'; '#'; '+'; '-'; '='; '|'; '{'; '}'; '.'; '!' ]
+        s |> Seq.map (fun c -> if reserved.Contains c then $"\\{c}" else string c) |> String.concat ""
+
 /// LLM responder mode tests against the fake Azure chat-completions (SSE) backend.
 /// Each test flips RESPONDER_MODE to llm for its duration and restores echo after,
 /// so the M1 skeleton tests keep their expected mode regardless of ordering.
@@ -72,11 +82,17 @@ FROM message_log WHERE chat_id = @cid AND is_bot = TRUE AND reply_to_message_id 
                     text.Length > 0 && scriptedContent.StartsWith(text, StringComparison.Ordinal))
             Assert.NotEmpty(firstChunkSend)
 
-            // …and the full text arrives via the editMessageText path.
+            // …and the full text arrives via the editMessageText path, MarkdownV2-formatted
+            // (Slice 6: the final edit always applies MDV2, even for a plain-sentence reply
+            // with no markdown syntax of its own — only its reserved characters change).
             let! edits = fixture.GetFakeCalls("editMessageText")
+            let expected = LlmTestHelpers.escapeMdv2Plain scriptedContent
             Assert.True(
-                edits |> Array.exists (fun c -> LlmTestHelpers.jsonString c "text" = scriptedContent),
-                "Expected a final editMessageText carrying the full scripted reply")
+                edits
+                |> Array.exists (fun c ->
+                    LlmTestHelpers.jsonString c "text" = expected
+                    && LlmTestHelpers.jsonString c "parse_mode" = "MarkdownV2"),
+                "Expected a final editMessageText carrying the MDV2-escaped full scripted reply")
 
             let! row = botReplyRow msgId
             Assert.NotNull(box row)
@@ -154,11 +170,16 @@ FROM message_log WHERE chat_id = @cid AND is_bot = TRUE AND reply_to_message_id 
             Assert.True(row.text.Length < scriptedContent.Length, "expected a PARTIAL text, got the full reply")
             Assert.StartsWith(row.text, scriptedContent)
 
-            // The partial text was delivered (send of the first chunk + finalizing edit).
+            // The partial text was delivered (send of the first chunk + finalizing edit,
+            // the latter MarkdownV2-formatted same as a graceful completion — Slice 6).
             let! edits = fixture.GetFakeCalls("editMessageText")
+            let expected = LlmTestHelpers.escapeMdv2Plain row.text
             Assert.True(
-                edits |> Array.exists (fun c -> LlmTestHelpers.jsonString c "text" = row.text),
-                "Expected a finalizing editMessageText with the partial text")
+                edits
+                |> Array.exists (fun c ->
+                    LlmTestHelpers.jsonString c "text" = expected
+                    && LlmTestHelpers.jsonString c "parse_mode" = "MarkdownV2"),
+                "Expected a finalizing editMessageText with the MDV2-escaped partial text")
         }
 
     interface IAsyncLifetime with

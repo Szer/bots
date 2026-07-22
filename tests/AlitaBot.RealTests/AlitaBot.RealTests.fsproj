@@ -26,6 +26,7 @@
     <Compile Include="CommandRealTests.fs" />
     <Compile Include="AskRealTests.fs" />
     <Compile Include="DossierRealTests.fs" />
+    <Compile Include="PersonaRealTests.fs" />
     <!-- CompileAfter guarantees the [<EntryPoint>] file lands after build-injected
          sources (xunit runner reporters, MTP SelfRegisteredExtensions). -->
     <CompileAfter Include="Program.fs" />

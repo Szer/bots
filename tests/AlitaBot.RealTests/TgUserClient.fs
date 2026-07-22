@@ -42,6 +42,12 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
     /// (peer id, message id) -> (last new/edit seen at UTC, latest text).
     let lastActivity = ConcurrentDictionary<struct (int64 * int), struct (DateTime * string)>()
 
+    /// (peer id, message id) -> latest entities (Slice 6 MDV2 real-test: best-effort
+    /// check that the settled final message actually carries bold/etc. entities, not
+    /// just plain text) — a message with no entities on a given update stores `[||]`,
+    /// same as Telegram's own `null`/empty-array convention.
+    let lastEntities = ConcurrentDictionary<struct (int64 * int), MessageEntity[]>()
+
     /// Bot API chat id -> resolved InputPeer (with access hash).
     let peers = ConcurrentDictionary<int64, InputPeer>()
 
@@ -66,6 +72,7 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
     let record (msg: TL.Message) (isEdit: bool) =
         let text = if isNull msg.message then "" else msg.message
         lastActivity[struct (msg.peer_id.ID, msg.id)] <- struct (DateTime.UtcNow, text)
+        lastEntities[struct (msg.peer_id.ID, msg.id)] <- (if isNull msg.entities then [||] else msg.entities)
 
         if not isEdit then
             lock gate (fun () -> newMessages.Add msg)
@@ -308,6 +315,69 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
                     failwith
                         $"Message {msgId} in chat {chatId} never went quiet for {quietPeriod.TotalSeconds}s (waited {editsSettleTimeout.TotalSeconds}s)"
         }
+
+    /// Probe-only (Slice 6 outcome-router real test): polls `Messages_GetHistory` until
+    /// `msgId` in `chatId` carries at least one reaction, or `timeout` elapses.
+    ///
+    /// EMPIRICAL FINDING (M6/Slice 6, this repo's basic-group test chat): a bot's
+    /// `setMessageReaction` (Bot API) genuinely lands server-side — confirmed by fetching
+    /// history moments later and finding `Message.reactions.results` populated — but the
+    /// corresponding `UpdateMessageReactions` this harness's raw-update sink expected
+    /// (the update shape a REGULAR MTProto client is documented to receive for a
+    /// reaction change; bots get a different, bot-only pair —
+    /// `UpdateBotMessageReaction`/`UpdateBotMessageReactions`, delivered solely to their
+    /// own getUpdates/webhook, never to this harness) was never observed to arrive over
+    /// this client's live update stream within 30s, even though every other live-update
+    /// path this harness relies on (`UpdateNewMessage`/`UpdateEditMessage`, used by
+    /// `AwaitReplyTo`/`AwaitEditsSettled` throughout every other real test) works
+    /// reliably in the same chat. Whether that's a basic-group-specific gap (same shape
+    /// as `sendMessageDraft`'s `TEXTDRAFT_PEER_INVALID` and the ephemeral-message
+    /// `BOT_NOT_ADMIN` findings elsewhere in this README) or something specific to a
+    /// bot-authored reaction is unconfirmed — polling the authoritative source
+    /// (`Messages_GetHistory`) sidesteps the question rather than depending on a push
+    /// update this harness can't reliably observe.
+    member _.TryAwaitReactionOn(chatId: int64, msgId: int, timeout: TimeSpan) : Task<string[] option> =
+        task {
+            let! peer = resolvePeer chatId
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                let! history = client.Messages_GetHistory(peer, limit = 30)
+
+                let found =
+                    history.Messages
+                    |> Array.tryPick (fun m ->
+                        match m with
+                        | :? TL.Message as msg when msg.id = msgId ->
+                            if isNull (box msg.reactions) || isNull msg.reactions.results || msg.reactions.results.Length = 0 then
+                                None
+                            else
+                                Some(
+                                    msg.reactions.results
+                                    |> Array.choose (fun rc ->
+                                        match rc.reaction with
+                                        | :? ReactionEmoji as re -> Some re.emoticon
+                                        | _ -> None)
+                                )
+                        | _ -> None)
+
+                match found with
+                | Some e -> result <- Some e
+                | None -> do! Task.Delay pollInterval
+
+            return result
+        }
+
+    /// Entities recorded on the latest new/edit seen for `msgId` in `chatId` — read this
+    /// right after `AwaitEditsSettled` confirms the message has gone quiet, so it
+    /// reflects the settled, final content (Slice 6 MDV2 real-test). `[||]` for "settled
+    /// but no entities" as well as "nothing recorded yet" — callers that need to
+    /// distinguish those should call `AwaitEditsSettled` first.
+    member _.LastEntitiesOf(chatId: int64, msgId: int) : MessageEntity[] =
+        match lastEntities.TryGetValue(struct (peerKey chatId, msgId)) with
+        | true, e -> e
+        | _ -> [||]
 
     /// Human-readable dialog list with Bot API chat id conventions (-100… for channels).
     member _.ListDialogsAsync() =

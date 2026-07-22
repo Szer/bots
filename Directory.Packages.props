@@ -31,6 +31,9 @@
     <!-- Async sequences (IAsyncEnumerable production for LLM streaming) -->
     <PackageVersion Include="FSharp.Control.TaskSeq" Version="1.1.1" />
 
+    <!-- Markdown -> Telegram MarkdownV2 rendering (AlitaBot final-message formatting) -->
+    <PackageVersion Include="Markdig" Version="1.3.2" />
+
     <!-- Observability -->
     <PackageVersion Include="OpenTelemetry.Exporter.Console" Version="1.15.3" />
     <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />

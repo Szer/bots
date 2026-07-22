@@ -9,6 +9,8 @@
     <Compile Include="Llm/AzureFoundryProvider.fs" />
     <Compile Include="Services/DbService.fs" />
     <Compile Include="Services/BotHelpers.fs" />
+    <Compile Include="Services/MarkdownRenderer.fs" />
+    <Compile Include="Services/OutcomeRouter.fs" />
     <Compile Include="Services/ReplyRenderer.fs" />
     <Compile Include="Services/ResponderService.fs" />
     <Compile Include="Services/Commands.fs" />
@@ -23,6 +25,8 @@
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
     <!-- taskSeq CE: IAsyncEnumerable production for CompleteStream -->
     <PackageReference Include="FSharp.Control.TaskSeq" />
+    <!-- Markdown -> Telegram MarkdownV2 rendering (Services/MarkdownRenderer.fs) -->
+    <PackageReference Include="Markdig" />
   </ItemGroup>
 
   <ItemGroup>

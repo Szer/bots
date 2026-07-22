@@ -92,3 +92,10 @@ module Metrics =
     /// alongside this counter, never surfaced to the reply path — see BotService's
     /// `tryEmbed`.
     let embeddingFailuresTotal = meter.CreateCounter<int64>("alitabot_embedding_failures_total")
+
+    /// Count of MarkdownV2-formatted final-message deliveries Telegram rejected (400 bad
+    /// entities) — the renderer falls back to a plain-text resend/edit every time this
+    /// fires, so a sustained nonzero rate means `MarkdownRenderer.toMarkdownV2` is
+    /// producing entities Telegram doesn't accept (see Services/ReplyRenderer.fs's
+    /// `Mdv2Delivery`).
+    let mdv2FallbackTotal = meter.CreateCounter<int64>("alitabot_mdv2_fallback_total")

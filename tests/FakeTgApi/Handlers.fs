@@ -92,6 +92,18 @@ module Handlers =
     let private handleSimulatedError ctx =
         respondJson ctx 400 """{"ok":false,"error_code":400,"description":"Simulated error by test"}"""
 
+    /// AlitaBot Slice 6: simulated "can't parse entities" 400 — used by
+    /// `Store.rejectMdv2` to exercise `Mdv2Delivery`'s plain-text fallback.
+    let private handleMdv2RejectedError ctx =
+        respondJson ctx 400 """{"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: simulated by test"}"""
+
+    /// Deliberately a loose substring check (not a strict `"parse_mode":"MarkdownV2"` JSON
+    /// match) — Funogram sends most requests as multipart form fields, and `readBody`'s
+    /// form->JSON reconstruction is best-effort; nothing else in the bot ever sends the
+    /// literal text "MarkdownV2" on the wire, so this is safe.
+    let private isMdv2Request (body: string) =
+        not (isNull body) && body.Contains("MarkdownV2", StringComparison.Ordinal)
+
     /// Bot API 10.2 ephemeral messages (AlitaBot /summary, Phase-1 Slice 4): when the
     /// request carries `receiver_user_id`, real Telegram's response Message would carry
     /// an `ephemeral_message_id` — faked additively here (both fields just echo the same
@@ -224,7 +236,12 @@ module Handlers =
             do! Task.Delay delayMs
         | _ -> ()
 
+        let mdv2Rejected =
+            (methodName = "sendMessage" || methodName = "editMessageText") && Store.rejectMdv2 && isMdv2Request body
+
         match methodName with
+        | _ when mdv2Rejected ->
+            do! handleMdv2RejectedError ctx
         | m when Store.methodErrors.TryGetValue(m) |> fst ->
             do! handleSimulatedError ctx
         | "sendMessage"      -> do! handleSendMessage ctx body
@@ -357,6 +374,17 @@ module Handlers =
                 else
                     Store.methodErrors.TryRemove(payload.methodName) |> ignore
                     do! respondJson ctx 200 (okResult "true")
+            with _ ->
+                do! respondJson ctx 400 (okResult "false")
+        }
+
+    let setRejectMdv2 (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload = JsonSerializer.Deserialize<RejectMdv2Mock>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                Store.rejectMdv2 <- payload.enabled
+                do! respondJson ctx 200 (okResult "true")
             with _ ->
                 do! respondJson ctx 400 (okResult "false")
         }

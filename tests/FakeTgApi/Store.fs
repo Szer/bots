@@ -10,6 +10,11 @@ module Store =
     let files = ConcurrentDictionary<string, byte[]>()
     let methodErrors = ConcurrentDictionary<string, bool>()
 
+    /// AlitaBot Slice 6: when true, sendMessage/editMessageText calls whose body carries
+    /// `"parse_mode":"MarkdownV2"` get a simulated 400 instead of the normal ok response —
+    /// see RejectMdv2Mock's doc comment.
+    let mutable rejectMdv2 = false
+
     /// username (normalized: lowercase, no leading '@') -> (chatId, title).
     /// Lets getChat("@username") resolve to a meaningful id/title in tests.
     let chatByUsername = ConcurrentDictionary<string, int64 * string>()
@@ -42,4 +47,5 @@ module Store =
             ()
         methodErrors.Clear()
         methodDelays.Clear()
+        rejectMdv2 <- false
 

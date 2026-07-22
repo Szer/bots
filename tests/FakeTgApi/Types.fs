@@ -37,3 +37,11 @@ type ChatMock =
       id: int64
       title: string }
 
+/// Mock payload for FakeTgApi /test/mock/rejectMdv2 (AlitaBot Slice 6) — when enabled,
+/// sendMessage/editMessageText calls carrying `"parse_mode":"MarkdownV2"` get a simulated
+/// 400 "can't parse entities" instead of the normal ok response, so the fake suite can
+/// exercise Mdv2Delivery's plain-text fallback without a real MDV2-rejecting payload
+/// (the fake never actually validates entities/parse_mode otherwise).
+[<CLIMutable>]
+type RejectMdv2Mock = { enabled: bool }
+

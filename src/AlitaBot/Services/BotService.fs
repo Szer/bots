@@ -219,9 +219,63 @@ type BotService(
                     return None
         }
 
+    // ── Outcome router (Slice 6) ─────────────────────────────────────────────
+    //
+    // A TRIGGERED non-command message doesn't always get a text reply: OUTCOME_WEIGHTS
+    // (bot_setting) rolls "reply" (normal path, unchanged) | "silence" (say nothing) |
+    // "emoji" (react instead of replying) — see Services/OutcomeRouter.fs for the
+    // weighted-pick itself. Defaults keep the pre-S6 behavior (always "reply").
+
+    /// Telegram restricts message-reaction emoji to a fixed allowed set; this is the
+    /// subset the emoji outcome picks from (plan §3's list) — chosen to cover a broad
+    /// range of reactions without listing Telegram's entire allowed-emoji table.
+    let allowedReactionEmoji =
+        [| "👍"; "❤️"; "🔥"; "😁"; "🤔"; "🤯"; "😱"; "🤬"; "😢"; "🎉"; "🤩"; "💩"; "🤡"; "🥱" |]
+
+    let emojiPickRequest (conf: BotConfiguration) (text: string) : ChatRequest =
+        let allowedText = String.concat "" allowedReactionEmoji
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content =
+                  [ ContentPart.Text
+                        $"Choose ONE fitting emoji reaction from this allowed set: {allowedText}. Output ONLY that one emoji, nothing else — no words, no punctuation." ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text text ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = Some 10 }
+
+    /// "emoji" outcome: a tiny non-stream LLM call picks one emoji from
+    /// `allowedReactionEmoji`, then `Req.SetMessageReaction` reacts to the triggering
+    /// message — no text reply. Best-effort: a malformed/unlisted model answer falls back
+    /// to the set's first emoji rather than refusing to react at all; a failed LLM call or
+    /// a rejected SetMessageReaction call is Warning-logged and simply skipped (the
+    /// message stays logged either way — this never blocks or retries the trigger).
+    let handleEmojiOutcome (conf: BotConfiguration) (msg: Message) (from: User) =
+        task {
+            let text = msg.Text |> Option.orElse msg.Caption |> Option.defaultValue ""
+            let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+            match! chat.Complete(emojiPickRequest conf text, ctx, CancellationToken.None) with
+            | Error err -> logger.LogWarning("Outcome=emoji: emoji-pick LLM call failed: {Error}", string err)
+            | Ok resp ->
+                let picked = resp.Text.Trim()
+                let emoji = if Array.contains picked allowedReactionEmoji then picked else allowedReactionEmoji[0]
+                let reaction = [| ReactionType.Emoji(ReactionTypeEmoji.Create(``type`` = "emoji", emoji = emoji)) |]
+                try
+                    do! tg.CallExn(Req.SetMessageReaction.Make(msg.Chat.Id, msg.MessageId, reaction = reaction)) |> taskIgnore
+                with ex ->
+                    logger.LogWarning(ex, "Outcome=emoji: SetMessageReaction failed for message {MessageId}", msg.MessageId)
+        }
+
     /// Shared by plain text messages and photo messages: logs `logText` to message_log,
     /// checks `triggerText` (raw text/caption, matching whatever entity array the mention
-    /// offsets are relative to) for a trigger, and dispatches to the responder.
+    /// offsets are relative to) for a trigger, and — when triggered — rolls the outcome
+    /// router before dispatching to the responder.
     let handleTriggerableMessage (conf: BotConfiguration) (msg: Message) (from: User) (logText: string) (triggerText: string) =
         task {
             use a = botActivity.StartActivity("handleMessage")
@@ -242,17 +296,27 @@ type BotService(
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
             elif isTriggered conf triggerText msg then
-                match! responder.Respond(msg) with
-                | Some(sent, replyText) ->
-                    do! logAndEmbed conf (
-                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                (Some msg.MessageId) replyText)
-                        |> taskIgnore
-                    %a.SetTag("outcome", "replied")
-                    countOutcome "replied"
-                | None ->
-                    %a.SetTag("outcome", "logged")
-                    countOutcome "logged"
+                let weights = OutcomeRouter.parseWeights conf.OutcomeWeightsJson
+                match OutcomeRouter.pick weights (Random.Shared.NextDouble()) with
+                | OutcomeRouter.Silence ->
+                    %a.SetTag("outcome", "silence")
+                    countOutcome "silence"
+                | OutcomeRouter.Emoji ->
+                    do! handleEmojiOutcome conf msg from
+                    %a.SetTag("outcome", "emoji")
+                    countOutcome "emoji"
+                | _ ->
+                    match! responder.Respond(msg) with
+                    | Some(sent, replyText) ->
+                        do! logAndEmbed conf (
+                                logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                    (Some msg.MessageId) replyText)
+                            |> taskIgnore
+                        %a.SetTag("outcome", "replied")
+                        countOutcome "replied"
+                    | None ->
+                        %a.SetTag("outcome", "logged")
+                        countOutcome "logged"
             else
                 %a.SetTag("outcome", "logged")
                 countOutcome "logged"
