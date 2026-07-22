@@ -17,9 +17,11 @@ open Xunit
 /// ImageGenRealTests' own self-skip idiom for Azure's 0 image quota. The fake-suite tests
 /// (tests/AlitaBot.Tests/SongTests.fs) cover the command/plumbing behavior in the meantime.
 module SongRealTimeouts =
-    /// Music generation is slow (Lyria inference + Telegram round trip) — same generous
-    /// budget ImageGenRealTests gives image generation.
-    let songReply = TimeSpan.FromSeconds 120.
+    /// Music generation is slow (Lyria inference + Telegram round trip). 120s proved too
+    /// tight for the first real (billed) Lyria run in CI — "No audio reply ... within
+    /// 120s" — even though the same test passes locally; 240s gives real music-generation
+    /// latency an honest budget instead of chasing the exact tail with a tighter number.
+    let songReply = TimeSpan.FromSeconds 240.
 
 type SongRealTests(fx: RealAssemblyFixture) =
     let env = fx.Env
@@ -79,7 +81,7 @@ ORDER BY message_id LIMIT 1;
 
     [<Fact>]
     member _.``real /song short lyrics gets an audio reply``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if String.IsNullOrWhiteSpace env.GeminiApiKey then
@@ -113,4 +115,4 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
-        }
+        })

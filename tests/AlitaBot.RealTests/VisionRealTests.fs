@@ -82,7 +82,7 @@ type VisionRealTests(fx: RealAssemblyFixture) =
 
     [<Fact>]
     member _.``real photo with unambiguous text gets read by the vision-enabled bot``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -107,4 +107,4 @@ type VisionRealTests(fx: RealAssemblyFixture) =
             Assert.True(
                 lower.Contains "42" || lower.Contains "alita" || lower.Contains "алита",
                 $"expected the reply to reference the image's text (\"ALITA 42\"), got: {finalText}")
-        }
+        })

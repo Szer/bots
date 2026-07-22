@@ -148,7 +148,7 @@ WHERE chat_id = @chat_id AND is_bot = FALSE
 
     [<Fact>]
     member _.``digest_daily enabled sends a morning digest referencing the seeded conversation``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
@@ -204,7 +204,7 @@ WHERE chat_id = @chat_id AND is_bot = FALSE
                 raise ex
 
             do! restoreDigestSettings ()
-        }
+        })
 
     // ── Willingness-gated interjection ───────────────────────────────────────
 
@@ -229,7 +229,7 @@ WHERE chat_id = @chat_id AND is_bot = FALSE
     /// hermetic suite's semantics, and nothing is left running once this test returns.
     [<Fact>]
     member _.``a burst of activity with p=1.0 triggers a deterministic interjection``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
@@ -256,4 +256,4 @@ WHERE chat_id = @chat_id AND is_bot = FALSE
                 raise ex
 
             do! restoreInterjectSettings ()
-        }
+        })

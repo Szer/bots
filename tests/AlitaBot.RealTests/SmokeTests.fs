@@ -107,7 +107,7 @@ ORDER BY message_id LIMIT 1;
 
     [<Fact>]
     member _.``plumbing - public healthz reachable through tunnel and webhook registered``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessCore()
 
             use http = new HttpClient(Timeout = TimeSpan.FromSeconds 15.)
@@ -117,22 +117,22 @@ ORDER BY message_id LIMIT 1;
 
             let! info = fx.Webhook.GetInfoAsync()
             Assert.Equal(env.WebhookUrl, info.GetProperty("url").GetString())
-        }
+        })
 
     [<Fact>]
     member _.``mention triggers a reply``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let marker = Guid.NewGuid().ToString "N"
             let! msgId = fx.UserClient.SendText(env.TestChatId, $"@{env.BotUsername} ping {marker}")
             let! reply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
             Assert.False(String.IsNullOrWhiteSpace reply.message)
-        }
+        })
 
     [<Fact>]
     member _.``mention exchange is fully logged with attribution``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let marker = Guid.NewGuid().ToString "N"
@@ -152,11 +152,11 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
-        }
+        })
 
     [<Fact>]
     member _.``non-mention is logged but not answered``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let marker = Guid.NewGuid().ToString "N"
@@ -171,7 +171,7 @@ ORDER BY message_id LIMIT 1;
             | Some row ->
                 Assert.False row.is_bot
                 Assert.Contains(marker, row.text)
-        }
+        })
 
     /// Green under both STREAM_MODE=edit and STREAM_MODE=draft (M5, `make real-test`
     /// run once per mode). The test chat is a basic group, where `sendMessageDraft`
@@ -180,7 +180,7 @@ ORDER BY message_id LIMIT 1;
     /// this test's perspective the two modes are behaviorally identical here.
     [<Fact>]
     member _.``streamed reply settles into a final text``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let marker = Guid.NewGuid().ToString "N"
@@ -195,4 +195,4 @@ ORDER BY message_id LIMIT 1;
             else
                 // Echo mode: exactly one reply, never edited, echoing the marker.
                 Assert.Contains(marker, finalText)
-        }
+        })

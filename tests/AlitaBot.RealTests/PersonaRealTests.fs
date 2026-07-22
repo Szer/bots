@@ -60,7 +60,7 @@ ON CONFLICT (key) DO UPDATE SET value = @value
 
     [<Fact>]
     member _.``OUTCOME_WEIGHTS emoji=100 makes the bot react instead of replying``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
@@ -90,13 +90,13 @@ ON CONFLICT (key) DO UPDATE SET value = @value
                 raise ex
 
             do! restoreDefaultWeights ()
-        }
+        })
 
     // ── (b) MarkdownV2: settled final message carries real entities ──────────
 
     [<Fact>]
     member _.``a markdown-shaped reply settles with non-empty entities (best-effort)``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
             // Defensive: don't depend on declaration/execution order relative to the
@@ -122,13 +122,13 @@ ON CONFLICT (key) DO UPDATE SET value = @value
                     "NOTE: settled reply carried no entities — either the model didn't use markdown this time, or MDV2 rendering/parsing isn't round-tripping; not failing the test (best-effort per plan).")
             else
                 Assert.Contains(entities, fun (e: MessageEntity) -> e :? MessageEntityBold)
-        }
+        })
 
     // ── (c) Persona smoke: no assistant-isms ─────────────────────────────────
 
     [<Fact>]
     member _.``a real reply contains no assistant-isms``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
             // Defensive: don't depend on declaration/execution order relative to the
@@ -146,4 +146,4 @@ ON CONFLICT (key) DO UPDATE SET value = @value
                 Assert.False(
                     finalText.Contains(banned, StringComparison.OrdinalIgnoreCase),
                     $"expected no assistant-ism '{banned}' in the persona reply: {finalText}")
-        }
+        })

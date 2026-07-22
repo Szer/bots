@@ -84,7 +84,7 @@ ORDER BY message_id LIMIT 1;
 
     [<Fact>]
     member _.``real /img prompt gets a photo reply captioned with the prompt``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let usingGemini = not (String.IsNullOrWhiteSpace env.GeminiApiKey)
@@ -123,4 +123,4 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
-        }
+        })

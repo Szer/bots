@@ -100,7 +100,7 @@ ORDER BY message_id LIMIT 1;
 
     [<Fact>]
     member _.``real /say привет arrives as a genuine voice note``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if String.IsNullOrWhiteSpace env.TtsDeployment then
@@ -127,13 +127,13 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.StartsWith("[voice]", botRow.text)
-        }
+        })
 
     // ── /sql ─────────────────────────────────────────────────────────────────
 
     [<Fact>]
     member _.``real /sql as an admin answers a natural-language question with a number``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
@@ -158,13 +158,13 @@ ORDER BY message_id LIMIT 1;
             finally
                 setBotSetting "ADMIN_USER_IDS" "[]" |> ignore
                 reloadSettings () |> ignore
-        }
+        })
 
     // ── Cost footer ──────────────────────────────────────────────────────────
 
     [<Fact>]
     member _.``real cost footer appears on an LLM reply when enabled``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
@@ -189,4 +189,4 @@ ORDER BY message_id LIMIT 1;
             finally
                 setBotSetting "COST_FOOTER_ENABLED" "false" |> ignore
                 reloadSettings () |> ignore
-        }
+        })

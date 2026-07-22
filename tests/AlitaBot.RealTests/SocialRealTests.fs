@@ -72,7 +72,7 @@ type SocialRealTests(fx: RealAssemblyFixture) =
 
     [<Fact>]
     member _.``roast (no target = self) references a real dossier fact or a seeded quote``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -112,11 +112,11 @@ type SocialRealTests(fx: RealAssemblyFixture) =
                 $"expected the roast to reference something from the seeded facts/quotes: {roastReply.message}")
 
             printfn "[SocialRealTests] /roast reply: %s" roastReply.message
-        }
+        })
 
     [<Fact>]
     member _.``quote picks something from real recent chat history``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -136,11 +136,11 @@ type SocialRealTests(fx: RealAssemblyFixture) =
                 $"expected either the fixed 'Цитата' label or the seeded quote fragment in the /quote reply: {quoteReply.message}")
 
             printfn "[SocialRealTests] /quote reply: %s" quoteReply.message
-        }
+        })
 
     [<Fact>]
     member _.``awards renders a non-empty announcement and writes a karma row``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -178,4 +178,4 @@ type SocialRealTests(fx: RealAssemblyFixture) =
                     do! Task.Delay 1000
 
             Assert.True(newestAwardedAt.IsSome, "expected at least one new karma row written by this /awards call")
-        }
+        })
