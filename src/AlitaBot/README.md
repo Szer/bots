@@ -263,10 +263,16 @@ VahterBanBot/CouponHubBot too, and nothing outside AlitaBot needs a scheduler ye
 `docs/TECH-DEBT.md`). `SchedulerHostedService` (`BackgroundService`) ticks every 10
 minutes, tries to acquire the `dossier_nightly_update` lease for 02:00 UTC, and on success
 runs `DossierService.RunNightlyUpdate()` then releases it. `POST /test/run-job?name=
-dossier_nightly_update` (TEST_MODE-only, 404 otherwise) runs the job immediately, bypassing
-the lease/schedule check entirely — used by both the fake suite (`DossierTests.fs`) and the
-real suite (`DossierRealTests.fs`, reachable because `DevDb.applyRealSettingsAsync` now
-forces `TEST_MODE=true` on every real-test run).
+dossier_nightly_update` (TEST_MODE-only, 404 otherwise) starts the job immediately,
+bypassing the lease/schedule check entirely — used by both the fake suite
+(`DossierTests.fs`) and the real suite (`DossierRealTests.fs`, reachable because
+`DevDb.applyRealSettingsAsync` now forces `TEST_MODE=true` on every real-test run).
+**Fire-and-forget** (`BotInfra.Utils.fireAndForget`): the endpoint returns as soon as the
+job is kicked off, not once it's finished — the job can run for tens of seconds (two
+sequential real LLM calls against Azure AI Foundry), and awaiting it inline held the HTTP
+response open long enough to exceed the CI real-test AKS gateway's request timeout
+(`504: upstream request timeout`). Callers poll the database (or the fake suite's captured
+LLM calls) for the job's effect instead of reading it off the HTTP response.
 
 ### Nightly job (`DossierService.RunNightlyUpdate`)
 

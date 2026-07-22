@@ -188,9 +188,17 @@ let app = builder.Build()
                 return Results.Json({| ok = true; advancedMs = ms |})
     }))
 
-// Test-only hook (Slice 5b): runs a named scheduled job immediately, bypassing the
+// Test-only hook (Slice 5b): starts a named scheduled job immediately, bypassing the
 // lease/schedule check entirely (SchedulerHostedService.RunJobNow) — mirrors the old
-// (pre-Funogram) `feature/alita-bot` branch's `/test/run-job`. 404 outside TEST_MODE.
+// (pre-Funogram) `feature/alita-bot` branch's `/test/run-job`. 404 outside TEST_MODE, and
+// also 404 for an unrecognized job name (SchedulerHostedService.IsKnownJob), rather than
+// accepting the request and silently no-op-ing. RunJobNow itself is fire-and-forget (see
+// its doc comment) — this handler returns 202 Accepted as soon as the job is kicked off,
+// not once it's finished, because awaiting it inline held the HTTP response open long
+// enough (two sequential real LLM calls against Azure AI Foundry) to exceed the CI
+// real-test AKS gateway's ~15s upstream timeout (`504: upstream request timeout`).
+// Callers poll the database for the job's effects instead of reading them off the
+// response (DossierTests.fs / DossierRealTests.fs).
 %app.MapPost("/test/run-job", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
@@ -199,8 +207,11 @@ let app = builder.Build()
         else
             let jobName = string ctx.Request.Query["name"]
             let scheduler = ctx.RequestServices.GetRequiredService<SchedulerHostedService>()
-            do! scheduler.RunJobNow(jobName)
-            return Results.Json({| ok = true; job = jobName |})
+            if not (scheduler.IsKnownJob jobName) then
+                return Results.NotFound()
+            else
+                do! scheduler.RunJobNow(jobName)
+                return Results.Json({| started = jobName |}, statusCode = 202)
     }))
 
 // Reload settings endpoint

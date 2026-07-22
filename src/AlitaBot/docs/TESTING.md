@@ -34,7 +34,11 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   prompt — asserted via `GetAzureLlmCalls`'s request body, present for the matching author,
   absent for anyone else), `DOSSIER_ENABLED=false`, `/dossier` (self/`@username`/unknown/empty),
   and `/forget-me` (purges dossier data, then the embedding pipeline and nightly job both
-  skip the now-opted-out user). **Truncates `message_log`/`message_embedding`/
+  skip the now-opted-out user). The endpoint is fire-and-forget (returns before the job
+  finishes — see README's "ScheduledJobs.fs" section), so every test polls for the job's
+  effect (a DB row, or a new fake chat-completions call) instead of asserting immediately
+  after `runJob()` returns; "prove nothing happened" cases wait out a fixed window instead.
+  **Truncates `message_log`/`message_embedding`/
   `interaction_memory`/`person_dossier`/`memory_opt_out`** (`fixture.TruncateMemoryTables()`,
   admin connection) before every fact — the nightly job scans ALL of `message_log` for
   "active users", and this fixture's `TimeProvider` is a `FakeTimeProvider` that's never
