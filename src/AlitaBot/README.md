@@ -229,6 +229,114 @@ real embedding model. A `SetAzureEmbeddingsScript`/`GetAzureEmbeddingsCalls` pai
 (mirroring the other `Azure*Script` members on `BotContainerBase`) is also available for
 tests that need to inject a scripted/failing response instead.
 
+## Dossiers: per-person memory + nightly fact extraction (Phase-1 Slice 5b)
+
+Builds a per-person, cross-chat dossier on top of Slice 5a's memory foundation: a nightly
+job extracts short facts from what each active person said, dedups them against what's
+already known, and folds them into a cumulative RU summary — which ResponderService then
+recalls (summary + matching facts) into the system prompt whenever that person triggers
+the bot.
+
+### Storage (V4 migration)
+
+- **`scheduled_job`** — distributed job-lease locking (`job_name` PK,
+  `last_completed_at`/`locked_until`/`locked_by`), seeded with one row:
+  `dossier_nightly_update`.
+- **`interaction_memory`** — one row per extracted fact: `user_id`, `content` (short RU
+  text), `embedding vector(1536)`, `valid_from`/`valid_to` (nothing sets `valid_to` yet —
+  see `docs/TECH-DEBT.md`), `created_at`. HNSW index (`vector_cosine_ops`, not ivfflat —
+  ivfflat needs pre-existing rows to pick sane list/probe counts and degrades to a full
+  scan on a small/empty table, one of the old design's flaws this fixes) plus a partial
+  index on `user_id WHERE valid_to IS NULL` ("active" facts) and a
+  `(user_id, created_at DESC)` index for `/dossier`'s newest-facts listing.
+- **`person_dossier`** — one row per person: `user_id` PK, `display_name`, `summary`
+  (LLM-merged, RU, max 250 words), `updated_at`.
+- **`memory_opt_out`** — `/forget-me`: `user_id` PK, `opted_out_at`.
+
+### `ScheduledJobs.fs` — local, not `BotInfra`
+
+Adapted from the old (pre-Funogram) `feature/alita-bot` branch's `src/BotInfra/
+ScheduledJobs.fs` (`git show origin/feature/alita-bot:src/BotInfra/ScheduledJobs.fs`) —
+same `UPDATE ... RETURNING` atomic lease-acquire pattern — but living inside
+`AlitaBot.Services` instead of `BotInfra`: a `BotInfra` change rebuilds and redeploys
+VahterBanBot/CouponHubBot too, and nothing outside AlitaBot needs a scheduler yet (see
+`docs/TECH-DEBT.md`). `SchedulerHostedService` (`BackgroundService`) ticks every 10
+minutes, tries to acquire the `dossier_nightly_update` lease for 02:00 UTC, and on success
+runs `DossierService.RunNightlyUpdate()` then releases it. `POST /test/run-job?name=
+dossier_nightly_update` (TEST_MODE-only, 404 otherwise) runs the job immediately, bypassing
+the lease/schedule check entirely — used by both the fake suite (`DossierTests.fs`) and the
+real suite (`DossierRealTests.fs`, reachable because `DevDb.applyRealSettingsAsync` now
+forces `TEST_MODE=true` on every real-test run).
+
+### Nightly job (`DossierService.RunNightlyUpdate`)
+
+For every `user_id` with at least one non-bot `message_log` row in the last 24h and **not**
+in `memory_opt_out`:
+
+1. **Extract** — a non-stream LLM call (`EXTRACT_PROMPT` bot_setting as system message,
+   the person's existing summary + their own last-24h messages as user content) that must
+   answer with a JSON array of short RU fact strings (`[]` if nothing new). Malformed
+   JSON/non-array/non-string elements are silently dropped, never a crash.
+2. **Embed + dedup + insert** — each candidate fact is embedded (`IEmbeddings`,
+   `EMBEDDING_DEPLOYMENT`), then checked against the cosine similarity of the person's
+   nearest ACTIVE fact (`DbService.NearestActiveFactSimilarity`, HNSW-served): **>= 0.90
+   cosine → skip** (near-duplicate, e.g. the same fact re-extracted on a later night),
+   otherwise inserted as a new active `interaction_memory` row.
+3. **Merge** — only when at least one fact was actually new: a second non-stream LLM call
+   (`MERGE_PROMPT` bot_setting, RU, max 250 words) folds the existing summary + newly
+   inserted facts into an updated summary, upserted into `person_dossier`.
+
+Both LLM calls go through the existing `IChatCompletion`/`IUsageRecorder` plumbing — usage
+rows (`kind='chat'`) and telemetry spans (`dossier.extract`, `dossier.merge`) are automatic,
+same as every other LLM call in the bot. Per-user failures (LLM/embedding errors, or an
+unexpected exception) are caught and logged; one bad user can't abort the whole run.
+
+**Fixes over the old design** (`git show
+origin/feature/alita-bot:src/AlitaBot/Services/DossierService.fs`): no similarity floor on
+recall (fixed — see below), no fact dedup (fixed — step 2 above), ivfflat-on-an-empty-table
+(fixed — HNSW).
+
+### Recall injection (`ResponderService`)
+
+When `DOSSIER_ENABLED` (bot_setting, default `true`) and a triggering message's author has
+a `person_dossier` row and isn't opted out: the triggering message's own text is embedded,
+the author's `DOSSIER_RECALL_K` (default `5`) nearest ACTIVE facts above `DOSSIER_SIM_FLOOR`
+(default `0.60`) cosine similarity are pulled (`DbService.NearestActiveFacts`, same
+two-stage index-then-floor shape as `/ask`'s `SemanticSearch`), and both the summary and any
+matching facts are appended to the system prompt:
+
+```
+Досье автора:
+<summary>
+
+Известные факты об авторе:
+- <fact>
+- <fact>
+```
+
+Additive only — no dossier, an opted-out author, an embed failure, or no facts above the
+floor all just mean nothing gets appended; the rest of the request build is unaffected.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `/dossier [@username]` | No arg: your own dossier. `@username` (leading `@` optional): another chat member's, resolved from their most recent `message_log.username`. Renders the summary plus the newest 5 active facts, or a fixed "пусто, я тебя ещё не изучила" when there's nothing yet (unknown username and "known user, no dossier yet" are deliberately indistinguishable — telling them apart would leak whether a given username has ever posted in the chat). |
+| `/forget-me` | Opts the requester out of memory (`memory_opt_out`) and hard-deletes their `interaction_memory`/`person_dossier`/`message_embedding` rows (`DbService.PurgeUserMemory`). `message_log` itself is untouched — it's the shared chat record, not personal memory. From this point on: excluded from the nightly job, the inline embedding pipeline (`BotService.tryEmbed`), and recall injection. |
+
+### Fake-suite testing (`tests/AlitaBot.Tests/DossierTests.fs`)
+
+Same deterministic hash-of-text embeddings as `MemoryTests.fs` — real cosine-similarity
+behavior (shared vocabulary → high similarity) without a real embedding model, enough to
+assert dedup (an identical fact scripted across two nightly runs yields one active row) and
+recall (a fact whose vocabulary overlaps the triggering message shows up in the LLM request
+body for that author, never for a different, dossier-less author). Truncates
+`message_log`/the dossier tables before every fact (`fixture.TruncateMemoryTables()`) — the
+nightly job scans *all* of `message_log` for "active users", and this fixture's frozen
+`FakeTimeProvider` means every message ever seeded in the whole assembly run (across every
+test class) shares one `sent_at`, so without truncating, unrelated users from earlier test
+classes would show up as "active" too.
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

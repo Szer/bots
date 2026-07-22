@@ -18,6 +18,7 @@ type ResponderService(
     tg: ITelegramApi,
     db: DbService,
     chat: IChatCompletion,
+    embeddings: IEmbeddings,
     renderers: ReplyRendererFactory,
     options: IOptions<BotConfiguration>,
     logger: ILogger<ResponderService>
@@ -88,11 +89,65 @@ type ResponderService(
                 return parts |> Array.choose id |> Array.toList
         }
 
+    /// Slice 5b recall injection: when DOSSIER_ENABLED and the triggering message's author
+    /// has a dossier (and isn't opted out), returns the text to append to the system
+    /// prompt — "Досье автора:\n{summary}" plus up to DOSSIER_RECALL_K ACTIVE
+    /// interaction_memory facts for that author, scored by cosine similarity against the
+    /// incoming message's own text (floor DOSSIER_SIM_FLOOR) — never an unfiltered "just
+    /// the nearest K" (see the V4 migration's header comment on why /ask and this both
+    /// apply a floor). Returns "" for everything else (feature off, no author, no
+    /// dossier, opted out, embed failure, or no facts above the floor) — additive-only,
+    /// never affects the rest of the request build.
+    let dossierContextFor (conf: BotConfiguration) (msg: Message) : Task<string> =
+        task {
+            if not conf.DossierEnabled then
+                return ""
+            else
+                match msg.From with
+                | None -> return ""
+                | Some author ->
+                    let! optedOut = db.IsOptedOut(author.Id)
+                    if optedOut then
+                        return ""
+                    else
+                        match! db.GetPersonDossier(author.Id) with
+                        | None -> return ""
+                        | Some dossier ->
+                            let messageText = msg.Text |> Option.orElse msg.Caption |> Option.defaultValue ""
+                            let! factsText =
+                                task {
+                                    if String.IsNullOrWhiteSpace messageText then
+                                        return ""
+                                    else
+                                        let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some author.Id }
+                                        match!
+                                            embeddings.Embed(conf.EmbeddingDeployment, [ messageText ], ctx, CancellationToken.None)
+                                        with
+                                        | Ok vectors when vectors.Length > 0 && vectors[0].Length > 0 ->
+                                            let! facts =
+                                                db.NearestActiveFacts(author.Id, vectors[0], conf.DossierRecallK, conf.DossierSimFloor)
+                                            if facts.Length = 0 then
+                                                return ""
+                                            else
+                                                return
+                                                    "\n\nИзвестные факты об авторе:\n"
+                                                    + (facts |> Array.map (fun f -> $"- {f.content}") |> String.concat "\n")
+                                        | Ok _ -> return ""
+                                        | Error err ->
+                                            logger.LogWarning(
+                                                "Dossier recall: failed to embed the triggering message: {Error}",
+                                                string err)
+                                            return ""
+                                }
+                            return $"\n\nДосье автора:\n{dossier.summary}{factsText}"
+        }
+
     let buildRequest (conf: BotConfiguration) (rows: MessageLogRow[]) (msg: Message) : Task<ChatRequest> =
         task {
+            let! dossierContext = dossierContextFor conf msg
             let system =
                 { Role = ChatRole.System
-                  Content = [ ContentPart.Text conf.SystemPrompt ]
+                  Content = [ ContentPart.Text(conf.SystemPrompt + dossierContext) ]
                   ToolCalls = []
                   ToolCallId = None }
             let context = rows |> Array.map textTurn |> Array.toList

@@ -82,6 +82,12 @@ type RealEnv =
     /// boot and no reload is needed.
     member this.ReloadSettingsUrl = this.PublicBase + "/reload-settings"
 
+    /// TEST_MODE-only endpoint (Slice 5b, ScheduledJobs.fs's SchedulerHostedService) that
+    /// runs a named scheduled job immediately — `?name=dossier_nightly_update`.
+    /// `DevDb.applyRealSettingsAsync` forces TEST_MODE=true on every real-test run so this
+    /// is always reachable, in both local and remote mode.
+    member this.RunJobUrl = this.PublicBase + "/test/run-job"
+
     /// Everything the webhook plumbing needs (bot token + chat id + secret, plus
     /// either an ngrok domain (local) or ALITA_WEBHOOK_PUBLIC_URL (remote)).
     member this.HasCore =

@@ -78,6 +78,11 @@ let buildBotConf () =
       AskTopK = getSettingOr "ASK_TOP_K" "8" |> int
       AskSimFloor = getSettingOr "ASK_SIM_FLOOR" "0.5" |> float
       AskPrompt = getSettingOr "ASK_PROMPT" ""
+      DossierEnabled = getSettingOr "DOSSIER_ENABLED" "true" |> bool.Parse
+      DossierRecallK = getSettingOr "DOSSIER_RECALL_K" "5" |> int
+      DossierSimFloor = getSettingOr "DOSSIER_SIM_FLOOR" "0.60" |> float
+      ExtractPrompt = getSettingOr "EXTRACT_PROMPT" ""
+      MergePrompt = getSettingOr "MERGE_PROMPT" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -142,6 +147,19 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
     .AddSingleton<ISpeech, AzureFoundrySpeech>()
     .AddSingleton<IImageGen, AzureFoundryImageGen>()
+    // Slice 5b: nightly per-person dossier fact extraction (Services/DossierService.fs,
+    // Services/ScheduledJobs.fs). SchedulerHostedService needs `connString` directly (the
+    // lease functions in ScheduledJobs.fs are plain functions over a connection string,
+    // like DbService itself) rather than through DbService, so it's constructed via a
+    // factory closure here instead of relying on constructor-parameter DI.
+    .AddSingleton<DossierService>()
+    .AddSingleton<SchedulerHostedService>(fun sp ->
+        new SchedulerHostedService(
+            connString,
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<DossierService>(),
+            sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
+    .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
 
 let app = builder.Build()
 
@@ -168,6 +186,21 @@ let app = builder.Build()
                     else 1000
                 fake.Advance(TimeSpan.FromMilliseconds(float ms))
                 return Results.Json({| ok = true; advancedMs = ms |})
+    }))
+
+// Test-only hook (Slice 5b): runs a named scheduled job immediately, bypassing the
+// lease/schedule check entirely (SchedulerHostedService.RunJobNow) — mirrors the old
+// (pre-Funogram) `feature/alita-bot` branch's `/test/run-job`. 404 outside TEST_MODE.
+%app.MapPost("/test/run-job", Func<HttpContext, Task<IResult>>(fun ctx ->
+    task {
+        let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+        if not opts.Value.TestMode then
+            return Results.NotFound()
+        else
+            let jobName = string ctx.Request.Query["name"]
+            let scheduler = ctx.RequestServices.GetRequiredService<SchedulerHostedService>()
+            do! scheduler.RunJobNow(jobName)
+            return Results.Json({| ok = true; job = jobName |})
     }))
 
 // Reload settings endpoint

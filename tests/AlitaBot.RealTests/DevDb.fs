@@ -105,7 +105,12 @@ let applyRealSettingsAsync (env: RealEnv) =
             [ "TARGET_CHAT_IDS", string env.TestChatId, "FREE_FORM", "telegram"
               "BOT_USERNAME", env.BotUsername, "FREE_FORM", "telegram"
               "RESPONDER_MODE", env.ResponderMode, "FREE_FORM", "llm"
-              "STREAM_MODE", env.StreamMode, "FREE_FORM", "llm" ]
+              "STREAM_MODE", env.StreamMode, "FREE_FORM", "llm"
+              // Slice 5b: DossierRealTests triggers the nightly job via POST /test/run-job,
+              // which 404s outside TEST_MODE (Program.fs) — force it on for every real-test
+              // run, same as RESPONDER_MODE/STREAM_MODE above (dev-bot-settings.sql's local-
+              // dev seed defaults it to 'false', matching production posture).
+              "TEST_MODE", "true", "FEATURE_FLAG", "diagnostics" ]
             @ (if String.IsNullOrWhiteSpace env.SttDeployment then [] else [ "STT_DEPLOYMENT", env.SttDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.TtsDeployment then [] else [ "TTS_DEPLOYMENT", env.TtsDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.ImageDeployment then [] else [ "IMAGE_DEPLOYMENT", env.ImageDeployment, "FREE_FORM", "llm" ])

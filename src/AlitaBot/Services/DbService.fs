@@ -55,6 +55,24 @@ type AskMatchRow =
       sent_at: DateTime
       similarity: float }
 
+/// One `person_dossier` row (Slice 5b).
+[<CLIMutable>]
+type PersonDossierRow =
+    { user_id: int64
+      display_name: string | null
+      summary: string
+      updated_at: Nullable<DateTime> }
+
+/// One `interaction_memory` row as rendered by `/dossier` (newest-first, no similarity —
+/// unlike ResponderService's recall, `/dossier` isn't scored against a query).
+[<CLIMutable>]
+type ActiveFactRow = { content: string; created_at: DateTime }
+
+/// One `interaction_memory` row recalled by cosine similarity (ResponderService) — same
+/// shape as AskMatchRow's `similarity` convention (1 - cosine distance).
+[<CLIMutable>]
+type RecalledFactRow = { content: string; similarity: float }
+
 /// F# option -> Dapper-friendly Nullable<'a>, for optional numeric columns.
 [<AutoOpen>]
 module private DbServiceHelpers =
@@ -181,6 +199,229 @@ ORDER BY sent_at ASC, id ASC;
     /// AlitaBot.Services don't need to know the connection string separately.
     member _.UpsertBotSetting(key: string, value: string, typ: string, featureGroup: string) : Task<unit> =
         DbSettings.upsertBotSetting connString key value typ featureGroup
+
+    // ── Dossiers (Slice 5b: per-person dossiers + nightly fact extraction) ─────
+
+    /// True when `userId` has opted out of memory (`/forget-me`) — checked by the inline
+    /// embedding pipeline (BotService.tryEmbed, skips embedding for an opted-out author),
+    /// the nightly job's active-user query (ActiveUsersLast24h, excludes opted-out users
+    /// outright), and ResponderService's recall injection (skips a dossier lookup entirely).
+    member _.IsOptedOut(userId: int64) : Task<bool> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT EXISTS(SELECT 1 FROM memory_opt_out WHERE user_id = @user_id);"
+            return! conn.QuerySingleAsync<bool>(sql, {| user_id = userId |})
+        }
+
+    /// Distinct `user_id`s with at least one non-bot `message_log` row since `since`,
+    /// excluding opted-out users — the nightly job's candidate set.
+    member _.ActiveUsersLast24h(since: DateTime) : Task<int64[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT DISTINCT ml.user_id
+FROM message_log ml
+WHERE ml.is_bot = FALSE
+  AND ml.sent_at >= @since
+  AND NOT EXISTS (SELECT 1 FROM memory_opt_out mo WHERE mo.user_id = ml.user_id);
+"""
+            let! rows = conn.QueryAsync<int64>(sql, {| since = since |})
+            return rows |> Seq.toArray
+        }
+
+    /// `userId`'s own (non-bot) messages since `since`, chronological order — the nightly
+    /// job's fact-extraction input. Deliberately scoped to the user's own words only
+    /// (never what other people said about them) to avoid extracting facts about someone
+    /// from a message they didn't write.
+    member _.UserMessagesLast24h(userId: int64, since: DateTime) : Task<MessageLogRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at
+FROM message_log
+WHERE user_id = @user_id AND is_bot = FALSE AND sent_at >= @since
+ORDER BY sent_at ASC, id ASC;
+"""
+            let! rows = conn.QueryAsync<MessageLogRow>(sql, {| user_id = userId; since = since |})
+            return rows |> Seq.toArray
+        }
+
+    /// Highest cosine similarity between `embedding` and `userId`'s ACTIVE
+    /// (`valid_to IS NULL`) interaction_memory facts, or `None` when they have none yet —
+    /// the nightly job's dedup check (DossierService skips inserting a candidate fact
+    /// when this is >= its dedup floor).
+    member _.NearestActiveFactSimilarity(userId: int64, embedding: float32[]) : Task<float option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT 1 - (embedding <=> @qvec::vector) AS similarity
+FROM interaction_memory
+WHERE user_id = @user_id AND valid_to IS NULL
+ORDER BY embedding <=> @qvec::vector
+LIMIT 1;
+"""
+            let! sim =
+                conn.QuerySingleOrDefaultAsync<Nullable<float>>(
+                    sql,
+                    {| user_id = userId; qvec = vectorLiteral embedding |})
+            return if sim.HasValue then Some sim.Value else None
+        }
+
+    /// Inserts one new active `interaction_memory` fact for `userId` (nightly job, after
+    /// NearestActiveFactSimilarity found no near-duplicate).
+    member _.InsertInteractionMemory(userId: int64, content: string, embedding: float32[]) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO interaction_memory (user_id, content, embedding)
+VALUES (@user_id, @content, @embedding::vector);
+"""
+            let! _ =
+                conn.ExecuteAsync(
+                    sql,
+                    {| user_id = userId
+                       content = content
+                       embedding = vectorLiteral embedding |})
+            return ()
+        }
+
+    /// ResponderService's recall: the `topK` nearest ACTIVE interaction_memory facts for
+    /// `userId` by cosine distance (HNSW-served), filtered to `simFloor` — same two-stage
+    /// shape as SemanticSearch (index serves the LIMIT, the floor is applied after).
+    member _.NearestActiveFacts(userId: int64, queryEmbedding: float32[], topK: int, simFloor: float) : Task<RecalledFactRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT content, similarity FROM (
+    SELECT content, 1 - (embedding <=> @qvec::vector) AS similarity
+    FROM interaction_memory
+    WHERE user_id = @user_id AND valid_to IS NULL
+    ORDER BY embedding <=> @qvec::vector
+    LIMIT @top_k
+) candidates
+WHERE similarity >= @sim_floor
+ORDER BY similarity DESC;
+"""
+            let! rows =
+                conn.QueryAsync<RecalledFactRow>(
+                    sql,
+                    {| qvec = vectorLiteral queryEmbedding
+                       user_id = userId
+                       top_k = topK
+                       sim_floor = simFloor |})
+            return rows |> Seq.toArray
+        }
+
+    /// `/dossier`'s newest-`limit` active facts for `userId`, newest first.
+    member _.NewestActiveFacts(userId: int64, limit: int) : Task<ActiveFactRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT content, created_at FROM interaction_memory
+WHERE user_id = @user_id AND valid_to IS NULL
+ORDER BY created_at DESC
+LIMIT @limit;
+"""
+            let! rows = conn.QueryAsync<ActiveFactRow>(sql, {| user_id = userId; limit = limit |})
+            return rows |> Seq.toArray
+        }
+
+    /// `userId`'s dossier row, or `None` when they don't have one yet ("пусто, я тебя ещё
+    /// не изучила" — `/dossier` and ResponderService's recall both treat this the same way).
+    member _.GetPersonDossier(userId: int64) : Task<PersonDossierRow option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT user_id, display_name, summary, updated_at
+FROM person_dossier WHERE user_id = @user_id;
+"""
+            let! row = conn.QuerySingleOrDefaultAsync<PersonDossierRow>(sql, {| user_id = userId |})
+            return if box row = null then None else Some row
+        }
+
+    /// Upserts `userId`'s cumulative dossier summary (nightly job, after a summary-merge
+    /// LLM call produced new text).
+    member _.UpsertPersonDossier(userId: int64, displayName: string, summary: string) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO person_dossier (user_id, display_name, summary, updated_at)
+VALUES (@user_id, @display_name, @summary, NOW())
+ON CONFLICT (user_id) DO UPDATE
+SET display_name = EXCLUDED.display_name, summary = EXCLUDED.summary, updated_at = EXCLUDED.updated_at;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| user_id = userId; display_name = displayName; summary = summary |})
+            return ()
+        }
+
+    /// Resolves a `@username` (no leading `@`) to the most recently seen `user_id` for it
+    /// in `message_log` — `/dossier @username`'s lookup. `None` when nobody with that
+    /// username has ever been logged.
+    member _.ResolveUserIdByUsername(username: string) : Task<int64 option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT user_id FROM message_log
+WHERE username = @username
+ORDER BY sent_at DESC LIMIT 1;
+"""
+            let! id = conn.QuerySingleOrDefaultAsync<Nullable<int64>>(sql, {| username = username |})
+            return if id.HasValue then Some id.Value else None
+        }
+
+    /// `/forget-me` step 1: records the opt-out (idempotent — a repeat call just refreshes
+    /// nothing, ON CONFLICT DO NOTHING keeps the original opt-out timestamp).
+    member _.OptOutUser(userId: int64) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO memory_opt_out (user_id) VALUES (@user_id)
+ON CONFLICT (user_id) DO NOTHING;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| user_id = userId |})
+            return ()
+        }
+
+    /// `/forget-me` step 2: hard-deletes everything memory-related for `userId` —
+    /// interaction_memory facts, the dossier summary, and their message_embedding rows
+    /// (joined via message_log, since message_embedding itself has no user_id column).
+    /// `message_log` rows are deliberately left alone — the shared chat record, not
+    /// personal memory (see the V4 migration's header comment).
+    member _.PurgeUserMemory(userId: int64) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+DELETE FROM interaction_memory WHERE user_id = @user_id;
+DELETE FROM person_dossier WHERE user_id = @user_id;
+DELETE FROM message_embedding
+WHERE message_log_id IN (SELECT id FROM message_log WHERE user_id = @user_id);
+"""
+            let! _ = conn.ExecuteAsync(sql, {| user_id = userId |})
+            return ()
+        }
 
     /// Inserts one `llm_usage` row (Phase-1 Slice 4) — see IUsageRecorder. Called from the
     /// provider telemetry path (LlmCall/ImageCall, LlmTelemetry.fs) on every successful

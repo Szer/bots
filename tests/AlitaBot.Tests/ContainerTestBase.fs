@@ -72,6 +72,12 @@ type AlitaTestContainers() =
                 "ASK_TOP_K",               "8",                                 "FREE_FORM", "llm"
                 "ASK_SIM_FLOOR",           "0.5",                               "FREE_FORM", "llm"
                 "ASK_PROMPT",              "Answer the question using only the chat quotes below. Cite who said what and when. If nothing relevant is found, say so plainly.", "FREE_FORM", "llm"
+                // Slice 5b: per-person dossiers + nightly fact extraction.
+                "DOSSIER_ENABLED",        "true",                              "FEATURE_FLAG", "llm"
+                "DOSSIER_RECALL_K",       "5",                                 "FREE_FORM", "llm"
+                "DOSSIER_SIM_FLOOR",      "0.60",                              "FREE_FORM", "llm"
+                "EXTRACT_PROMPT",         "Extract new short facts about this person from their recent messages. Reply with ONLY a JSON array of short fact strings, e.g. [\"likes cats\"]. If nothing new, reply [].", "FREE_FORM", "llm"
+                "MERGE_PROMPT",           "Merge the new facts into the existing dossier summary. Reply with the updated summary text only, max 250 words.", "FREE_FORM", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(
@@ -98,6 +104,24 @@ VALUES(@key, @value, 'FREE_FORM', 'RUNTIME')
 ON CONFLICT (key) DO UPDATE SET value = @value
 """
             let! _ = conn.ExecuteAsync(sql, {| key = key; value = value |})
+            return ()
+        }
+
+    /// Truncates every Slice-5b memory/dossier table plus message_log/message_embedding
+    /// (owner-only op, via AdminDbConnectionString — the service role has no DELETE grant
+    /// broad enough for this) — DossierTests' nightly-job tests need a clean "active
+    /// users" population, otherwise every user_id ever seeded by an earlier test class in
+    /// this shared, `DisableTestParallelization = true` assembly fixture (see Program.fs)
+    /// shows up as "active in the last 24h" too (TEST_MODE's FakeTimeProvider is never
+    /// advanced across the whole assembly run, so every seeded message's `sent_at` shares
+    /// one frozen timestamp for the entire test run).
+    member this.TruncateMemoryTables() =
+        task {
+            use conn = new NpgsqlConnection(this.AdminDbConnectionString)
+            do! conn.OpenAsync()
+            let! _ =
+                conn.ExecuteAsync(
+                    "TRUNCATE message_log, message_embedding, interaction_memory, person_dossier, memory_opt_out RESTART IDENTITY CASCADE;")
             return ()
         }
 

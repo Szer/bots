@@ -62,4 +62,23 @@ type BotConfiguration =
       AskSimFloor: float
       /// ASK_PROMPT bot_setting: system prompt for the /ask command. Default "".
       AskPrompt: string
+      /// FEATURE_FLAG DOSSIER_ENABLED — recall injection (dossier summary + matching
+      /// facts appended to the LLM system prompt) in ResponderService. Default true.
+      /// The nightly extraction job itself always runs regardless of this flag — it only
+      /// gates whether the *recall* side reads back what's been learned.
+      DossierEnabled: bool
+      /// DOSSIER_RECALL_K bot_setting: how many nearest active interaction_memory facts
+      /// to recall for a triggering message's author. Default 5.
+      DossierRecallK: int
+      /// DOSSIER_SIM_FLOOR bot_setting: minimum cosine similarity for a recalled fact.
+      /// Default 0.60.
+      DossierSimFloor: float
+      /// EXTRACT_PROMPT bot_setting: system prompt for the nightly fact-extraction LLM
+      /// call (DossierService) — must instruct the model to answer with a JSON array of
+      /// short fact strings. Default "".
+      ExtractPrompt: string
+      /// MERGE_PROMPT bot_setting: system prompt for the nightly summary-merge LLM call
+      /// (DossierService) — must instruct the model to answer in RU, max 250 words.
+      /// Default "".
+      MergePrompt: string
       TestMode: bool }

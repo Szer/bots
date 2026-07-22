@@ -61,15 +61,23 @@ secrets are likewise not provisioned yet.
 **Action:** at AKS phase, clone the coupon bot's manifest + deploy-workflow wiring, provision
 the deployment secrets, and pick up the log-pipeline item above in the same pass.
 
-## `ScheduledJobs.fs` cherry-pick deferred
+## `ScheduledJobs.fs` cherry-pick — done (Slice 5b), but living outside `BotInfra`
 
-Plan decision D12: the old `feature/alita-bot` branch (pre-Funogram-migration, doesn't build)
-has a `ScheduledJobs.fs` for proactive/scheduled bot behavior. Phase 0 is reactive-only
-(mention → reply); nothing in `alita-now-for-real` needs a scheduler yet.
+Plan decision D12 deferred cherry-picking the old `feature/alita-bot` branch's
+`src/BotInfra/ScheduledJobs.fs` (distributed job-lease locking) until a proactive/scheduled
+feature actually needed it. Slice 5b (per-person dossiers, nightly fact extraction) is that
+feature — `src/AlitaBot/Services/ScheduledJobs.fs` now has the same `UPDATE ... RETURNING`
+lease-acquire pattern plus a `SchedulerHostedService` (BackgroundService) driving the nightly
+02:00 UTC dossier job, and a TEST_MODE-only `POST /test/run-job?name=` endpoint to trigger it
+immediately in tests.
 
-**Action:** when proactive features start, cherry-pick `ScheduledJobs.fs` from
-`feature/alita-bot` and adapt it to the current Funogram-based stack — don't restart it from
-scratch.
+**Deliberately NOT promoted to `BotInfra`.** The old design lived in `BotInfra` (shared by
+every bot); this one lives inside `AlitaBot.Services` instead — a `BotInfra` change rebuilds
+and triggers a prod redeploy of VahterBanBot and CouponHubBot too, and nothing outside
+AlitaBot needs a scheduler yet. If/when a second bot needs the same lease-locking primitive,
+promoting `ScheduledJobs.fs`'s `tryAcquire`/`complete` functions to `BotInfra` is a deliberate,
+reviewed, **daytime** PR of its own (per the guardrail that governs any `BotInfra` change) —
+not something to fold into a feature PR for one bot.
 
 ## Supergroup draft-mode probing pending
 
@@ -120,6 +128,22 @@ reply completes. That's a scoped follow-up, not a mid-pass redesign.
 `voice_duplicate_update` in `alitabot_messages_total`, or a support report of a doubled
 reply), rework the webhook handler to ack fast and move `BotService.OnUpdate`'s body behind
 `fireAndForget`, and update the fake-suite fixtures to poll instead of asserting immediately.
+
+## `interaction_memory.valid_to` is never set (Slice 5b) — dedup skips, never supersedes
+
+The V4 migration gives `interaction_memory` a `valid_from`/`valid_to` pair (plus a partial
+`WHERE valid_to IS NULL` index) so a fact could later be *superseded* — e.g. "moved to Berlin"
+replacing an earlier "lives in Moscow" — without losing history. Nothing sets `valid_to` yet:
+`DossierService.ProcessUser`'s dedup check (`NearestActiveFactSimilarity` against a 0.90 cosine
+floor) only ever **skips** inserting a near-duplicate candidate fact; it never detects or marks
+a genuinely *contradicting* fact as superseding an old one. Two facts that are similar-but-not-
+near-duplicate (e.g. 0.75 cosine — related but not the same fact) both end up as separate
+active rows forever, even if the newer one quietly contradicts the older one.
+
+**Action:** if/when contradiction-detection is worth building, the schema is already ready for
+it (the column, the index, and the "ACTIVE = `valid_to IS NULL`" convention every query already
+uses) — no migration needed, just teach `ProcessUser` to `UPDATE ... SET valid_to = now()` on
+the old row when a new fact is judged to supersede rather than duplicate it.
 
 ## `trySendEphemeralOrReply` fallback memo is process-lifetime
 

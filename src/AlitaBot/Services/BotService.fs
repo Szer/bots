@@ -156,14 +156,22 @@ type BotService(
         if conf.EmbedMessagesEnabled && text.Length >= conf.EmbeddingMinChars && not (isPureCommandText text) then
             fireAndForget logger "embedding.pipeline" (fun () ->
                 task {
-                    let ctx: UsageContext = { ChatId = Some chatId; UserId = Some userId }
-                    match! embeddings.Embed(conf.EmbeddingDeployment, [ text ], ctx, CancellationToken.None) with
-                    | Ok vectors when vectors.Length > 0 && vectors[0].Length > 0 ->
-                        do! db.InsertMessageEmbedding(messageLogId, vectors[0])
-                    | Ok _ -> ()
-                    | Error err ->
-                        Metrics.embeddingFailuresTotal.Add(1L)
-                        logger.LogWarning("Embedding failed for message_log {Id}: {Error}", messageLogId, string err)
+                    // Slice 5b: an opted-out author's (message_log.user_id, not the bot's
+                    // own reply — bot replies are never opted out) messages are never
+                    // embedded, mirroring their exclusion from the nightly dossier job and
+                    // from recall injection. Checked here, not at the message_log write
+                    // (BotService.logAndEmbed) — message_log itself is the shared chat
+                    // record, kept for everyone regardless of opt-out (see /forget-me).
+                    let! optedOut = db.IsOptedOut(userId)
+                    if not optedOut then
+                        let ctx: UsageContext = { ChatId = Some chatId; UserId = Some userId }
+                        match! embeddings.Embed(conf.EmbeddingDeployment, [ text ], ctx, CancellationToken.None) with
+                        | Ok vectors when vectors.Length > 0 && vectors[0].Length > 0 ->
+                            do! db.InsertMessageEmbedding(messageLogId, vectors[0])
+                        | Ok _ -> ()
+                        | Error err ->
+                            Metrics.embeddingFailuresTotal.Add(1L)
+                            logger.LogWarning("Embedding failed for message_log {Id}: {Error}", messageLogId, string err)
                 } :> Task)
 
     /// Drop-in replacement for `db.LogMessage` at every call site: same `bool` contract
@@ -769,6 +777,65 @@ type BotService(
                             do! reply "Не получилось ответить 🙁" "ask_failed"
         }
 
+    // ── /dossier, /forget-me (Slice 5b: per-person dossiers) ───────────────────
+
+    /// Fixed RU reply for "no dossier yet" — used both for a resolved user with no
+    /// person_dossier row, and for an unresolvable `@username`. Deliberately the same
+    /// message for both: distinguishing "never mentioned" from "unknown username" would
+    /// leak whether a given username has ever posted in the chat.
+    [<Literal>]
+    let NoDossierText = "пусто, я тебя ещё не изучила"
+
+    /// Renders a dossier's summary plus its newest `/dossier`-visible facts (already
+    /// fetched — DbService.NewestActiveFacts), newest first.
+    let renderDossier (summary: string) (facts: ActiveFactRow[]) : string =
+        if facts.Length = 0 then
+            summary
+        else
+            let factsText = facts |> Array.map (fun f -> $"- {f.content}") |> String.concat "\n"
+            $"{summary}\n\nФакты:\n{factsText}"
+
+    [<Literal>]
+    let DossierFactsShown = 5
+
+    /// `/dossier` (self, no arg) or `/dossier @username` (another chat member, `@`
+    /// optional) — renders the person's cumulative summary plus their newest
+    /// DossierFactsShown active facts, or NoDossierText when there's nothing yet (unknown
+    /// username, or a known user with no dossier row).
+    let handleDossierCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "dossier" conf msg from args (fun () ->
+            task {
+                let trimmedArg = args.Trim().TrimStart('@')
+                let! targetIdOpt =
+                    if trimmedArg = "" then Task.FromResult(Some from.Id) else db.ResolveUserIdByUsername(trimmedArg)
+
+                match targetIdOpt with
+                | None -> return NoDossierText, "dossier_unknown_user"
+                | Some targetId ->
+                    match! db.GetPersonDossier(targetId) with
+                    | None -> return NoDossierText, "dossier_empty"
+                    | Some dossier ->
+                        let! facts = db.NewestActiveFacts(targetId, DossierFactsShown)
+                        return renderDossier dossier.summary facts, "dossier_shown"
+            })
+
+    /// `/forget-me` — opts the requester out of memory (memory_opt_out), hard-deletes
+    /// their interaction_memory/person_dossier/message_embedding rows (DbService.
+    /// PurgeUserMemory), and confirms. message_log itself is untouched — it's the shared
+    /// chat record, not personal memory (see the V4 migration). From this point on the
+    /// requester is excluded from the nightly dossier job, the inline embedding pipeline,
+    /// and recall injection (ResponderService) — see DossierService/BotService.tryEmbed.
+    let handleForgetMeCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "forget-me" conf msg from args (fun () ->
+            task {
+                do! db.OptOutUser(from.Id)
+                do! db.PurgeUserMemory(from.Id)
+                return
+                    "Забыла всё, что успела про тебя узнать, и больше не буду запоминать. "
+                    + "История сообщений в чате (message_log) не трогается — это общий архив чата, а не личные данные.",
+                    "forget_me_done"
+            })
+
     let commandsWithoutHelp: CommandDef list =
         [ { Name = "img"
             Aliases = []
@@ -790,7 +857,15 @@ type BotService(
           { Name = "ask"
             Aliases = []
             Description = "ответить на вопрос по истории этого чата (семантический поиск): /ask <вопрос>"
-            Handler = handleAskCommand } ]
+            Handler = handleAskCommand }
+          { Name = "dossier"
+            Aliases = []
+            Description = "досье: своё (без аргумента) или чужое — /dossier @username"
+            Handler = handleDossierCommand }
+          { Name = "forget-me"
+            Aliases = []
+            Description = "забыть всё личное — выйти из системы памяти и удалить накопленное досье"
+            Handler = handleForgetMeCommand } ]
 
     /// `/help` (and `/start`, for a newcomer's first message) — auto-generated from the
     /// registry (Commands.helpText), so it can never list a command that doesn't exist

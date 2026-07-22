@@ -145,14 +145,11 @@ ORDER BY message_id LIMIT 1;
                 return outPath
         }
 
-    [<Fact>]
-    member _.``real voice note gets transcribed and the bot replies with the transcript``() =
+    /// One full round trip: synthesize a fresh TTS voice note, send it, and assert the
+    /// reply/sender-row/bot-row all contain one of VoicePhrase.words. `attemptNo` is only
+    /// used to tag assertion-failure messages with which attempt produced them.
+    let attemptVoiceRoundTrip (attemptNo: int) : Task<unit> =
         task {
-            fx.SkipUnlessUserClient()
-
-            if String.IsNullOrWhiteSpace env.TtsDeployment || String.IsNullOrWhiteSpace env.SttDeployment then
-                Assert.Skip "ALITA_TTS_DEPLOYMENT/ALITA_STT_DEPLOYMENT missing in ~/.alita-test/env"
-
             let phrase = "проверка связи Алита"
             let! rawPath = synthesizeToFile phrase
             let! oggPath = convertToVoiceOgg rawPath
@@ -163,24 +160,46 @@ ORDER BY message_id LIMIT 1;
             Assert.False(String.IsNullOrWhiteSpace reply.message)
             Assert.True(
                 VoicePhrase.containsAnyWord reply.message,
-                $"Expected reply to contain one of {VoicePhrase.words}: {reply.message}")
+                $"[attempt {attemptNo}] Expected reply to contain one of {VoicePhrase.words}: {reply.message}")
 
             match! awaitVoiceSenderRow () with
-            | None -> Assert.Fail "sender's voice transcript ('[voice] ...') never landed in message_log"
+            | None -> Assert.Fail $"[attempt {attemptNo}] sender's voice transcript ('[voice] ...') never landed in message_log"
             | Some senderRow ->
                 Assert.False senderRow.is_bot
                 Assert.True(
                     VoicePhrase.containsAnyWord senderRow.text,
-                    $"Expected sender transcript to contain one of {VoicePhrase.words}: {senderRow.text}")
+                    $"[attempt {attemptNo}] Expected sender transcript to contain one of {VoicePhrase.words}: {senderRow.text}")
 
                 match! awaitBotReplyRow senderRow.message_id with
                 | None ->
                     Assert.Fail
-                        $"no bot reply row (reply_to_message_id={senderRow.message_id}) in message_log for the voice transcript"
+                        $"[attempt {attemptNo}] no bot reply row (reply_to_message_id={senderRow.message_id}) in message_log for the voice transcript"
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
                     Assert.True(
                         VoicePhrase.containsAnyWord botRow.text,
-                        $"Expected bot reply row to contain one of {VoicePhrase.words}: {botRow.text}")
+                        $"[attempt {attemptNo}] Expected bot reply row to contain one of {VoicePhrase.words}: {botRow.text}")
+        }
+
+    [<Fact>]
+    member _.``real voice note gets transcribed and the bot replies with the transcript``() =
+        task {
+            fx.SkipUnlessUserClient()
+
+            if String.IsNullOrWhiteSpace env.TtsDeployment || String.IsNullOrWhiteSpace env.SttDeployment then
+                Assert.Skip "ALITA_TTS_DEPLOYMENT/ALITA_STT_DEPLOYMENT missing in ~/.alita-test/env"
+
+            // Self-retry (anti-flake): real Azure STT has, once, misrecognized a word of
+            // this short phrase in CI despite the 3-word tolerance (VoicePhrase). On any
+            // assertion failure in the first attempt, synthesize and send a SECOND, freshly
+            // TTS'd voice note and re-assert — two attempts total, the retry is logged so a
+            // green run after a retry is still visible in the test output, not silently green.
+            try
+                do! attemptVoiceRoundTrip 1
+            with ex ->
+                printfn
+                    "[voice retry] attempt 1 failed (%s) — sending a second freshly-synthesized voice note and re-asserting (see VoicePhrase's doc comment)"
+                    ex.Message
+                do! attemptVoiceRoundTrip 2
         }
