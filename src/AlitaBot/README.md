@@ -246,6 +246,38 @@ whether the response `Message.EphemeralMessageId` gets populated and whether the
 genuinely invisible to other chat members (needs a second real user account to observe from,
 which this harness doesn't have yet — see `TgUserClient`'s single-account limitation).
 
+**UPDATE (2026-07-22, re-probed while chasing a real-test hang):** the table above is now
+STALE for this repo's test chat — `receiver_user_id` on `sendMessage` succeeds there (`200 OK`,
+confirmed both via the app and a bare `curl` against the real Bot API), not `400
+BOT_NOT_ADMIN` as originally found. Whether that's Telegram loosening `BOT_NOT_ADMIN`'s
+requirement, a chat-permission change, or something else about this specific chat drifting
+since the original probe is unknown — the point is this table can silently go stale, so
+treat it as "last verified on the date above," not a permanent fact.
+
+That drift surfaced a real bug, now fixed: a successful ephemeral `sendMessage` reports
+`message_id: 0` on the wire (`ephemeral_message_id` carries the real, Telegram-side id
+instead — see the JSON above). `message_id: 0` is not a real, addressable Bot API message id
+(those start at 1), which broke two things `trySendEphemeralOrReply`'s callers used to assume
+every reply has:
+  - `handleSummaryCommand`'s `reply` used to log EVERY successful send into `message_log`
+    keyed by `sent.MessageId` — logging `0` would violate `message_log`'s
+    `UNIQUE(chat_id, message_id)` on this chat's SECOND-and-later ephemeral send (silently
+    dropped by the webhook-redelivery `ON CONFLICT DO NOTHING` dedup path, masking every
+    ephemeral reply after the first one ever sent to a chat). Fixed: a reply is only logged
+    when `sent.MessageId > 0` — an ephemeral send is, by definition, not part of the shared
+    chat log every other chat member can see, so it's correct for it to never appear in
+    later `/summary` transcripts or `/ask` semantic search either.
+  - `tests/AlitaBot.RealTests/CommandRealTests.fs`'s `/summary` test used to `AwaitReplyTo`
+    (this harness's MTProto client polling for a message whose reply-to matches the command)
+    for the digest itself — with `message_id: 0` there is no real message to correlate as a
+    "reply" over MTProto, so that wait never resolved and the test hung until its timeout
+    (previously "fixed" by giving it a longer timeout, which couldn't work since the target
+    genuinely never arrives that way, at any duration). Fixed: the test now proves
+    summarization succeeded via `message_log` (when Telegram fell back to a normal reply) OR
+    a fresh `llm_usage` row of `kind='chat'` (when the ephemeral send succeeded) — both
+    reliable server-side signals that don't depend on MTProto being able to see a Bot-API-only
+    ephemeral message.
+
 ## Memory: per-message embeddings + `/ask` (Phase-1 Slice 5a)
 
 pgvector-backed semantic search over a chat's own history — the first slice of the

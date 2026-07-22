@@ -14,17 +14,6 @@ open Xunit
 type CommandRealTests(fx: RealAssemblyFixture) =
     let env = fx.Env
 
-    /// `/summary`'s real Azure AI Foundry call (ephemeral-send-with-fallback, plus a
-    /// non-stream LLM completion) is the one real-test call observed to occasionally
-    /// exceed `Timeouts.reply` (90s) specifically when it lands deep into a long,
-    /// fully-sequential real-test run — cumulative real-Azure latency across dozens of
-    /// prior real LLM/STT/TTS calls in the same run, not this test's own logic (empirically
-    /// reproduced 5/5 consecutive full-suite runs while verifying the Gemini provider PR:
-    /// 3 local + 2 CI, always this exact test, never in isolation). Scoped to just this one
-    /// `AwaitReplyTo` call rather than widening the shared `Timeouts.reply` everywhere,
-    /// which would mask a real regression in every OTHER real test's timeout instead.
-    let summaryReplyTimeout = TimeSpan.FromSeconds 150.
-
     let queryOne (sql: string) (param: obj) =
         task {
             use conn = new NpgsqlConnection(fx.DbConnectionString)
@@ -83,6 +72,33 @@ ORDER BY message_id DESC LIMIT 1;
             return found
         }
 
+    /// Polls for a fresh `llm_usage` row of `kind='chat'` for this chat, inserted after
+    /// `since` — proves a chat-completion LLM call actually completed server-side.
+    /// `/summary`'s reply verification needs this: when Telegram accepts the ephemeral
+    /// `receiver_user_id` send (BotHelpers.trySendEphemeralOrReply), the reply is
+    /// deliberately never logged into `message_log` (see handleSummaryCommand's `reply`'s
+    /// doc comment — an ephemeral send reports `message_id: 0`, not a real Bot API id) and
+    /// is not observable over MTProto as a "reply" either (no real id to correlate) — so
+    /// `llm_usage` is the one channel that reliably proves the summarization itself
+    /// succeeded regardless of whether Telegram scoped the reply to just the requester or
+    /// fell back to a normal, chat-visible one.
+    let awaitLlmUsageSince (chatId: int64) (since: DateTime) =
+        task {
+            let deadline = DateTime.UtcNow + Timeouts.dbSettle
+            let mutable found = false
+
+            while not found && DateTime.UtcNow < deadline do
+                use conn = new NpgsqlConnection(fx.DbConnectionString)
+                let! exists =
+                    conn.QuerySingleAsync<bool>(
+                        "SELECT EXISTS(SELECT 1 FROM llm_usage WHERE chat_id = @chat_id AND kind = 'chat' AND called_at >= @since);",
+                        {| chat_id = chatId; since = since |})
+                found <- exists
+                if not found then do! Task.Delay 500
+
+            return found
+        }
+
     [<Fact>]
     member _.``help lists every registered command``() =
         task {
@@ -129,40 +145,47 @@ ORDER BY message_id DESC LIMIT 1;
             do! Task.Delay 1500
 
             // Best-effort ephemeral-send probe (Bot API 10.2, BotHelpers.trySendEphemeralOrReply):
-            // logs every raw update kind seen while awaiting the /summary reply. A single
-            // MTProto test-user account can't distinguish "ephemeral, delivered to me because
-            // I'm the receiver" from "a normal reply everyone in the chat would also see" —
-            // that needs a second account not in this harness — so this only records what
-            // arrives, it doesn't assert on it. See README's "Ephemeral message probe" section
-            // for what a run of this test actually observed.
+            // logs every raw update kind seen while awaiting the /summary reply below —
+            // diagnostic only, never asserted on (see README's "Ephemeral message probe").
             let rawUpdateKinds = List<string>()
             fx.UserClient.AddRawUpdateSink(fun updates ->
                 for u in updates.UpdateList do
                     rawUpdateKinds.Add(u.GetType().Name))
 
-            let! summaryMsgId = fx.UserClient.SendText(env.TestChatId, "/summary 20")
-            let! summaryReply = fx.UserClient.AwaitReplyTo(env.TestChatId, summaryMsgId, summaryReplyTimeout)
+            // REGRESSION (2026-07-22): this used to `AwaitReplyTo` (this harness's MTProto
+            // client polling for a message whose reply-to matches the command) for the
+            // digest reply itself. When Telegram accepts the ephemeral `receiver_user_id`
+            // send, the response reports `message_id: 0` — not a real, addressable Bot API
+            // message id (those start at 1) — so there is nothing for MTProto to correlate
+            // as "a reply to this command", and that wait never resolved (previously
+            // "fixed" by giving it a longer timeout, which couldn't work: the target
+            // genuinely never arrives that way, at any duration — see git history for the
+            // full story). Verified instead below via `message_log` (when Telegram fell
+            // back to a normal, chat-visible reply) OR a fresh `llm_usage` row (when the
+            // ephemeral send succeeded) — both reliable server-side signals that don't
+            // depend on MTProto being able to see a Bot-API-only ephemeral message.
+            let preRequest = DateTime.UtcNow
+            let! _summaryMsgId = fx.UserClient.SendText(env.TestChatId, "/summary 20")
 
-            Assert.False(String.IsNullOrWhiteSpace summaryReply.message)
-            printfn
-                "[ephemeral probe] raw update kinds seen while awaiting the /summary reply: %s"
-                (String.Join(", ", rawUpdateKinds |> Seq.distinct))
-
-            // summaryMsgId is an MTProto id (from SendText) — NOT directly comparable to
-            // message_log.message_id (Bot API domain, see awaitCommandRow's doc comment).
-            // Resolve the Bot-API-domain id via the logged "[summary-cmd] ..." row first.
             match! awaitCommandRow "[summary-cmd]" with
             | None -> Assert.Fail "no '[summary-cmd] ...' row landed in message_log"
             | Some cmdRow ->
                 match! awaitBotReplyRow cmdRow.message_id with
-                | None ->
-                    Assert.Fail
-                        $"no message_log row replying (reply_to_message_id={cmdRow.message_id}) to the /summary command"
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     // The digest is an LLM paraphrase, not a verbatim quote — check it's
                     // real, non-trivial output rather than requiring the marker itself.
                     Assert.False(String.IsNullOrWhiteSpace botRow.text)
+                | None ->
+                    let! usageLogged = awaitLlmUsageSince env.TestChatId preRequest
+                    Assert.True(
+                        usageLogged,
+                        $"no message_log reply row (reply_to_message_id={cmdRow.message_id}) AND no fresh llm_usage "
+                        + $"'chat' row for chat {env.TestChatId} — /summary produced no observable evidence of success")
+
+            printfn
+                "[ephemeral probe] raw update kinds seen while awaiting the /summary reply: %s"
+                (String.Join(", ", rawUpdateKinds |> Seq.distinct))
 
             let! usageMsgId = fx.UserClient.SendText(env.TestChatId, "/usage")
             let! usageReply = fx.UserClient.AwaitReplyTo(env.TestChatId, usageMsgId, Timeouts.reply)

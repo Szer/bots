@@ -46,6 +46,46 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             resp.EnsureSuccessStatusCode() |> ignore
         }
 
+    /// Counts non-bot `message_log` rows for `chatId` that share THIS bot process's
+    /// current frozen "now" — used by the interjection test below to make `BURST_MSGS`
+    /// account for however much traffic this persistently shared chat already has this
+    /// run, instead of assuming it starts empty. Two things make a plain, unfiltered
+    /// `sent_at >= now - N minutes` (mirroring `DbService.BurstStats` literally) wrong
+    /// here:
+    ///  1. Every real-test run leaves the bot's `TimeProvider` frozen at pod-start time
+    ///     for its whole lifetime (TEST_MODE's `FakeTimeProvider` — see Program.fs — and
+    ///     nothing in this test project ever calls `/test/clock/advance` the way the
+    ///     hermetic suite does), so EVERY `message_log.sent_at` a given bot process
+    ///     writes carries that SAME frozen instant, and `BurstStats`' own window check
+    ///     (`sent_at >= frozen_now - N minutes`) is trivially true for that instant
+    ///     regardless of N — using a real wall-clock `since` here would silently
+    ///     undercount (eventually to 0) the longer the suite runs.
+    ///  2. `make real-test`'s local Postgres volume (unlike CI's fresh-per-run AKS
+    ///     Postgres) survives across separate `make real-test` invocations on the same
+    ///     dev machine, so `message_log` can hold rows from SEVERAL earlier, unrelated
+    ///     bot processes against this same chat id, each with its OWN distinct frozen
+    ///     instant — counting ALL of them (no filter at all) over-counts just as badly,
+    ///     making `BURST_MSGS` unreachable (observed: a naive unfiltered COUNT(*) of 79
+    ///     when only 37 of those rows were actually from the CURRENT bot process).
+    /// `MAX(sent_at)` for this chat IS the current process's frozen "now" (every row it
+    /// writes carries that exact value), so anchoring the window to it — instead of to
+    /// either extreme — gets exactly what `BurstStats` would see for a message arriving
+    /// right now, whether the clock is frozen (today's reality) or, if that's ever fixed,
+    /// live.
+    let countNonBotMessagesSoFar (chatId: int64) =
+        task {
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            do! conn.OpenAsync()
+            //language=postgresql
+            let sql =
+                """
+SELECT COUNT(*) FROM message_log
+WHERE chat_id = @chat_id AND is_bot = FALSE
+  AND sent_at >= (SELECT MAX(sent_at) FROM message_log WHERE chat_id = @chat_id) - INTERVAL '5 minutes';
+"""
+            return! conn.QuerySingleAsync<int64>(sql, {| chat_id = chatId |})
+        }
+
     let runJob (jobName: string) =
         task {
             use http = new HttpClient(Timeout = TimeSpan.FromSeconds 30.)
@@ -168,6 +208,25 @@ ON CONFLICT (key) DO UPDATE SET value = @value
 
     // ── Willingness-gated interjection ───────────────────────────────────────
 
+    /// REGRESSION (2026-07-22): `env.TestChatId` is ONE persistently warm chat shared by
+    /// the entire real-test suite run — unlike the hermetic suite's `ProactiveTests.fs`,
+    /// which gives each interjection scenario its own fresh, empty chat id so a static
+    /// `BURST_MSGS "3"` is satisfied exactly once, by design. Here, a static "3" was
+    /// already satisfied by whatever non-bot traffic every EARLIER real test sent to this
+    /// same chat this run (see `countNonBotMessagesSoFar`'s doc comment on why that's
+    /// effectively ALL of it, not just the last `BURST_WINDOW_MINUTES`) — so all three of
+    /// THIS loop's messages independently rolled burst-eligible (not just the third), and
+    /// — since INTERJECT_PROBABILITY=1.0 and INTERJECT_COOLDOWN_MINUTES=0 gate nothing
+    /// further — each one fired its OWN real Azure LLM interjection call. The test used to
+    /// await only the FIRST resulting reply, then immediately restore settings and return:
+    /// the other 1-2 real LLM calls kept running afterward, still serialized on
+    /// BotService's per-chat `withChatLock`, and could delay ANY later real test touching
+    /// this same chat behind them — observed as `CommandRealTests`'s `/summary` test
+    /// timing out with zero replies (its own webhook request was simply queued behind
+    /// this leftover background work, never slow on its own). Fix: measure how many
+    /// eligible messages already exist and add 3, so burst genuinely only trips on this
+    /// loop's own third message — exactly one real interjection fires, matching the
+    /// hermetic suite's semantics, and nothing is left running once this test returns.
     [<Fact>]
     member _.``a burst of activity with p=1.0 triggers a deterministic interjection``() =
         task {
@@ -175,8 +234,10 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             requireLlmMode ()
 
             try
+                let! alreadyEligible = countNonBotMessagesSoFar env.TestChatId
+
                 do! setBotSetting "INTERJECT_PROBABILITY" "1.0"
-                do! setBotSetting "BURST_MSGS" "3"
+                do! setBotSetting "BURST_MSGS" (string (alreadyEligible + 3L))
                 do! setBotSetting "BURST_SPEAKERS" "1"
                 do! setBotSetting "BURST_WINDOW_MINUTES" "5"
                 do! setBotSetting "INTERJECT_COOLDOWN_MINUTES" "0"

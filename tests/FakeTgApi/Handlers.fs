@@ -105,15 +105,15 @@ module Handlers =
         not (isNull body) && body.Contains("MarkdownV2", StringComparison.Ordinal)
 
     /// Bot API 10.2 ephemeral messages (AlitaBot /summary, Phase-1 Slice 4): when the
-    /// request carries `receiver_user_id`, real Telegram's response Message would carry
-    /// an `ephemeral_message_id` — faked additively here (both fields just echo the same
-    /// allocated id) purely so a fake-suite test can assert `receiver_user_id` reached
-    /// the wire; the fake never rejects it (see src/AlitaBot/README.md for what real
-    /// Telegram does per chat type).
+    /// request carries `receiver_user_id`, real Telegram's response Message carries
+    /// `message_id: 0` (not a real, addressable message id — confirmed 2026-07-22 against
+    /// the real Bot API, see src/AlitaBot/README.md's "Ephemeral message probe" UPDATE)
+    /// plus a genuinely distinct `ephemeral_message_id`. Faked the same way here — the
+    /// fake never rejects `receiver_user_id` (see the README for what real Telegram does
+    /// per chat type), it only mirrors the wire shape of an accepted ephemeral send.
     let private handleSendMessage ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-        let msgId = Store.allocMessageId()
         let hasReceiverUserId =
             try
                 use doc = JsonDocument.Parse(body: string)
@@ -121,7 +121,8 @@ module Handlers =
                 | true, v -> v.ValueKind = JsonValueKind.Number
                 | _ -> false
             with _ -> false
-        let ephemeralField = if hasReceiverUserId then $""","ephemeral_message_id":{msgId}""" else ""
+        let msgId = if hasReceiverUserId then 0 else Store.allocMessageId()
+        let ephemeralField = if hasReceiverUserId then $""","ephemeral_message_id":{Store.allocMessageId()}""" else ""
         let resultJson =
             $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"{ephemeralField}}}"""
         respondJson ctx 200 (okResult resultJson)
