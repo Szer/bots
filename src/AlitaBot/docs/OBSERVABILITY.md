@@ -50,7 +50,7 @@ Meter: `AlitaBot.Metrics` (`src/AlitaBot/Telemetry.fs`, `src/AlitaBot/Llm/LlmTel
 
 | Metric | Type | Tags | Description |
 |---|---|---|---|
-| `alitabot_messages_total` | Counter | `outcome` | Every processed message. `outcome` ∈ `logged`, `replied`, `ignored`, `duplicate_update`, `voice_duplicate_update`, `voice_disabled`, `voice_no_filepath`, `voice_transcribe_failed`, `voice_empty_transcript`, `voice_transcribed`, `voice_transcribed_and_triggered`, `image_empty_prompt`, `image_disabled`, `image_generated`, `image_edited`, `image_failed`, `help_shown`, `model_shown`, `model_switched`, `model_refused`, `usage_shown`, `summary_generated`, `summary_empty_history`, `summary_empty_response`, `summary_failed`. `duplicate_update`/`voice_duplicate_update` count webhook redeliveries of an update already fully handled (see message_log idempotency below) — should stay near zero; a sustained nonzero rate means Telegram is retrying, usually because replies are taking too long. |
+| `alitabot_messages_total` | Counter | `outcome` | Every processed message. `outcome` ∈ `logged`, `replied`, `silence`, `emoji`, `ignored`, `duplicate_update`, `voice_duplicate_update`, `voice_disabled`, `voice_no_filepath`, `voice_transcribe_failed`, `voice_empty_transcript`, `voice_transcribed`, `voice_transcribed_and_triggered`, `image_empty_prompt`, `image_disabled`, `image_generated`, `image_edited`, `image_failed`, `help_shown`, `model_shown`, `model_switched`, `model_refused`, `usage_shown`, `summary_generated`, `summary_empty_history`, `summary_empty_response`, `summary_failed`. `duplicate_update`/`voice_duplicate_update` count webhook redeliveries of an update already fully handled (see message_log idempotency below) — should stay near zero; a sustained nonzero rate means Telegram is retrying, usually because replies are taking too long. `silence`/`emoji` (Slice 6) are the outcome router's non-reply rolls (`OUTCOME_WEIGHTS` bot_setting) — 0 under the default weights (`{"reply":100,"silence":0,"emoji":0}`). |
 | `alitabot_command_total` | Counter | `command` | Explicit command invocations (`img`, `model`, `summary`, `usage`, `help`) — incremented once per dispatch, centrally, in `BotService.OnUpdate` via the command registry (`Services/Commands.fs`), not by individual handlers. Mirrors CouponHubBot's `commandTotal`; mention/name/reply-to-bot triggers are NOT commands and stay out of this counter. |
 | `alitabot_voice_transcribe_total` | Counter | `outcome` | Voice/video-note/audio messages, tagged `disabled`, `no_filepath`, `failed`, `empty_transcript`, `transcribed`. |
 | `alitabot_voice_transcribe_duration_ms` | Histogram | — | Telegram file download + STT call wall-clock time; only recorded when transcription was actually attempted. |
@@ -58,6 +58,7 @@ Meter: `AlitaBot.Metrics` (`src/AlitaBot/Telemetry.fs`, `src/AlitaBot/Llm/LlmTel
 | `alitabot_llm_cost_usd_total` | Counter | — | Estimated USD cost, from the `LLM_PRICING` bot_setting (per-token for chat/embeddings, per-image-per-quality for image gen). Silently 0 for models/deployments with no matching pricing entry (one-time Warning logged instead). |
 | `alitabot_llm_latency_ms` | Histogram | — | Latency of every LLM/STT/TTS/image-gen call (span-scoped: for streamed chat, first byte to `[DONE]`). Not broken out by call type via a tag — use the span name (`llm.chat`/`llm.stt`/etc.) in Tempo to filter by operation. |
 | `alitabot_embedding_failures_total` | Counter | — | Embedding-pipeline failures (Slice 5a) — an `LlmError` from `IEmbeddings.Embed` or an exception inserting the `message_embedding` row. Always Warning-logged alongside this counter; never affects the reply path (`BotService`'s `tryEmbed`, fire-and-forget). Should stay near zero — a sustained nonzero rate means embeddings are silently failing to build `/ask`'s memory. |
+| `alitabot_mdv2_fallback_total` | Counter | — | MarkdownV2-formatted final-message deliveries Telegram rejected (400 bad entities) — Slice 6, `Mdv2Delivery` (`Services/ReplyRenderer.fs`). Always Warning-logged alongside this counter; the renderer always falls back to a plain-text resend/edit, so this never turns into a lost reply. Should stay near zero — a sustained nonzero rate means `MarkdownRenderer.toMarkdownV2` is producing entities Telegram doesn't accept. |
 
 ## Persistent usage accounting (`llm_usage`, Phase-1 Slice 4)
 
@@ -77,6 +78,8 @@ accounting" section for the exact write path and nullability rules.
 - LLM spend (24h): `sum(increase(alitabot_llm_cost_usd_total[24h]))`
 - Voice transcription p95 latency: `histogram_quantile(0.95, sum(rate(alitabot_voice_transcribe_duration_ms_bucket[1h])) by (le))`
 - Embedding failure rate (should be ~0): `sum(rate(alitabot_embedding_failures_total[1h]))`
+- MDV2 fallback rate (should be ~0): `sum(rate(alitabot_mdv2_fallback_total[1h]))`
+- Outcome-router mix (24h): `sum by (outcome)(increase(alitabot_messages_total{outcome=~"replied|logged|silence|emoji"}[24h]))`
 
 ## Webhook idempotency and per-chat serialization
 

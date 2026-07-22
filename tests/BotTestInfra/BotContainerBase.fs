@@ -294,6 +294,19 @@ type BotContainerBase(config: BotContainerConfig) =
             resp.EnsureSuccessStatusCode() |> ignore
         }
 
+    /// AlitaBot Slice 6: when `enabled`, FakeTgApi rejects (simulated 400) any
+    /// sendMessage/editMessageText call carrying MarkdownV2 formatting — used to exercise
+    /// `Mdv2Delivery`'s plain-text fallback. `fixture`'s `ClearFakeCalls`/test teardown
+    /// doesn't reset this by itself except via FakeTgApi's own `/test/calls` DELETE
+    /// (`Store.clearCalls`), which does — callers should still explicitly reset to false
+    /// when done, mirroring `SetMethodError`'s convention.
+    member _.SetMdv2Rejected(enabled: bool) =
+        task {
+            let payload: RejectMdv2Mock = { enabled = enabled }
+            let! resp = fakeTgHttp.PostAsJsonAsync("/test/mock/rejectMdv2", payload)
+            resp.EnsureSuccessStatusCode() |> ignore
+        }
+
     member _.CheckMethodErrorActive(methodName: string) =
         task {
             use content = new StringContent("{}", Encoding.UTF8, "application/json")

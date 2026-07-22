@@ -142,6 +142,39 @@ type ResponderService(
                             return $"\n\nДосье автора:\n{dossier.summary}{factsText}"
         }
 
+    let displayNameOf (u: User) =
+        match u.LastName with
+        | Some last -> $"{u.FirstName} {last}"
+        | None -> u.FirstName
+
+    /// Slice 6 context enrichment: when the triggering message is itself a reply, quotes
+    /// the replied-to message's author + text into the prompt — even when the replied-to
+    /// message is a photo (its Caption, same as everywhere else a photo's "text" is
+    /// needed) — so the model can see what's actually being replied to, not just the
+    /// bare trigger text. Additive-only: no reply target, or a reply target with neither
+    /// Text nor Caption (e.g. a bare photo/sticker), yields "".
+    let replyQuoteFor (msg: Message) : string =
+        match msg.ReplyToMessage with
+        | None -> ""
+        | Some r ->
+            match r.Text |> Option.orElse r.Caption with
+            | None -> ""
+            | Some text when String.IsNullOrWhiteSpace text -> ""
+            | Some text ->
+                let author = r.From |> Option.map displayNameOf |> Option.defaultValue "?"
+                $"[в ответ на {author}]: {text}\n"
+
+    /// Slice 6 context enrichment: attributes a forwarded triggering message to its
+    /// origin (Bot API `forward_origin`) — a channel post, a user (or one who hid their
+    /// identity), or an anonymous chat/group post. Additive-only: no forward -> "".
+    let forwardAttributionFor (msg: Message) : string =
+        match msg.ForwardOrigin with
+        | None -> ""
+        | Some(MessageOrigin.Channel c) -> $"[переслано из канала «{c.Chat.Title}»]\n"
+        | Some(MessageOrigin.User u) -> $"[переслано от {displayNameOf u.SenderUser}]\n"
+        | Some(MessageOrigin.HiddenUser h) -> $"[переслано от {h.SenderUserName}]\n"
+        | Some(MessageOrigin.Chat _) -> "[переслано из чата]\n"
+
     let buildRequest (conf: BotConfiguration) (rows: MessageLogRow[]) (msg: Message) : Task<ChatRequest> =
         task {
             let! dossierContext = dossierContextFor conf msg
@@ -159,12 +192,28 @@ type ResponderService(
 
             let! imageParts = collectImageParts conf msg
 
+            // Reply-quote + forward-attribution prepend onto whichever ChatMessage
+            // represents the live triggering turn — message_log text alone (what
+            // `textTurn` renders context rows from) never carries either, since neither
+            // is persisted there; both come straight off the live `msg`.
+            let enrichment = forwardAttributionFor msg + replyQuoteFor msg
+            let prependEnrichment (cm: ChatMessage) =
+                if enrichment = "" then
+                    cm
+                else
+                    match cm.Content with
+                    | ContentPart.Text t :: rest -> { cm with Content = ContentPart.Text(enrichment + t) :: rest }
+                    | other -> { cm with Content = ContentPart.Text enrichment :: other }
+
             let contextWithImages =
                 match currentIdx, imageParts with
                 | Some i, (_ :: _) ->
                     context
-                    |> List.mapi (fun j cm -> if j = i then { cm with Content = cm.Content @ imageParts } else cm)
-                | _ -> context
+                    |> List.mapi (fun j cm ->
+                        if j = i then { (prependEnrichment cm) with Content = (prependEnrichment cm).Content @ imageParts }
+                        else cm)
+                | Some i, [] -> context |> List.mapi (fun j cm -> if j = i then prependEnrichment cm else cm)
+                | None, _ -> context
 
             // Only reached when the context window missed the just-logged row (tiny
             // CONTEXT_WINDOW_MESSAGES) — falls back to Caption too, since a photo
@@ -175,12 +224,9 @@ type ResponderService(
                 | None ->
                     match msg.Text |> Option.orElse msg.Caption, msg.From with
                     | Some text, Some from ->
-                        let name =
-                            match from.LastName with
-                            | Some last -> $"{from.FirstName} {last}"
-                            | None -> from.FirstName
+                        let name = displayNameOf from
                         [ { Role = ChatRole.User
-                            Content = ContentPart.Text $"[{name}]: {text}" :: imageParts
+                            Content = ContentPart.Text $"{enrichment}[{name}]: {text}" :: imageParts
                             ToolCalls = []
                             ToolCallId = None } ]
                     | _ -> []
@@ -191,6 +237,60 @@ type ResponderService(
                   Tools = []
                   Temperature = None
                   MaxTokens = None }
+        }
+
+    /// Slice 6 rewriter pass request: a cheap non-stream LLM call that rewrites the main
+    /// response's text ("перепиши как живой человек в чате..." — REWRITER_PROMPT
+    /// bot_setting) — usage-recorded the same as every other `IChatCompletion.Complete`
+    /// call (`kind='chat'`), no special-casing needed.
+    let rewriteRequest (conf: BotConfiguration) (original: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.RewriterPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text original ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    /// Rewriter pass ON: forces the main call to non-stream (`IChatCompletion.Complete`)
+    /// so a second cheap non-stream call can rewrite its text before anything is rendered
+    /// — plan §2's documented tradeoff (no streaming while REWRITER_ENABLED). Mirrors
+    /// PlainRenderer's failure policy (ContentFiltered -> fixed RU reply; any other
+    /// failure/empty text -> silence) since there's no IReplyRenderer in play here — the
+    /// final (possibly rewritten) text goes out via the same `Mdv2Delivery.sendFinal` the
+    /// renderers use for their own final message.
+    let respondWithRewriter (conf: BotConfiguration) (request: ChatRequest) (ctx: UsageContext) (msg: Message) : Task<(Message * string) option> =
+        task {
+            match! chat.Complete(request, ctx, CancellationToken.None) with
+            | Error(LlmError.ContentFiltered _) ->
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id ReplyRenderer.ContentFilteredReply msg.MessageId
+                return Some(sent, ReplyRenderer.ContentFilteredReply)
+            | Error err ->
+                logger.LogWarning("Rewriter path: main LLM call failed — staying silent: {Error}", string err)
+                return None
+            | Ok resp when String.IsNullOrWhiteSpace resp.Text ->
+                logger.LogWarning("Rewriter path: main LLM call returned empty text — nothing to send")
+                return None
+            | Ok resp ->
+                let! finalText =
+                    task {
+                        match! chat.Complete(rewriteRequest conf resp.Text, ctx, CancellationToken.None) with
+                        | Ok rewritten when not (String.IsNullOrWhiteSpace rewritten.Text) -> return rewritten.Text
+                        | Ok _ ->
+                            logger.LogWarning("Rewriter pass returned empty text — sending the unrewritten reply")
+                            return resp.Text
+                        | Error err ->
+                            logger.LogWarning("Rewriter pass failed — sending the unrewritten reply: {Error}", string err)
+                            return resp.Text
+                    }
+                let! sent = Mdv2Delivery.sendFinal tg logger msg.Chat.Id msg.MessageId finalText
+                return Some(sent, finalText)
         }
 
     /// Replies to `msg` per the configured RESPONDER_MODE.
@@ -208,12 +308,19 @@ type ResponderService(
                 let! rows = db.RecentContext(msg.Chat.Id, conf.ContextWindowMessages)
                 let! request = buildRequest conf rows msg
                 let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = msg.From |> Option.map (fun u -> u.Id) }
-                let chunks = chat.CompleteStream(request, ctx, CancellationToken.None)
-                let renderer = renderers.ForMode(conf.StreamMode)
-                let! result = renderer.Render(msg.Chat.Id, msg.MessageId, chunks, CancellationToken.None)
-                match result.FinalMessage with
-                | Some sent -> return Some(sent, result.FullText)
-                | None -> return None
+                if conf.RewriterEnabled then
+                    // Non-stream main call + non-stream rewrite pass — see
+                    // respondWithRewriter's doc comment for the documented streaming
+                    // tradeoff. The default (REWRITER_ENABLED=false) path below is
+                    // completely untouched by this branch.
+                    return! respondWithRewriter conf request ctx msg
+                else
+                    let chunks = chat.CompleteStream(request, ctx, CancellationToken.None)
+                    let renderer = renderers.ForMode(conf.StreamMode)
+                    let! result = renderer.Render(msg.Chat.Id, msg.MessageId, chunks, CancellationToken.None)
+                    match result.FinalMessage with
+                    | Some sent -> return Some(sent, result.FullText)
+                    | None -> return None
             | mode ->
                 logger.LogWarning("Unknown RESPONDER_MODE '{Mode}' — staying silent", mode)
                 return None

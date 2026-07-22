@@ -50,6 +50,11 @@ type ChatMock =
       id: int64
       title: string }
 
+/// Mock payload for FakeTgApi /test/mock/rejectMdv2 (AlitaBot Slice 6) — see
+/// FakeTgApi.Types.RejectMdv2Mock's doc comment.
+[<CLIMutable>]
+type RejectMdv2Mock = { enabled: bool }
+
 /// Mock payload for FakeAzureOcrApi /test/mock/delay (per-call response delay).
 [<CLIMutable>]
 type AzureDelayMock =

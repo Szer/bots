@@ -83,6 +83,9 @@ let buildBotConf () =
       DossierSimFloor = getSettingOr "DOSSIER_SIM_FLOOR" "0.60" |> float
       ExtractPrompt = getSettingOr "EXTRACT_PROMPT" ""
       MergePrompt = getSettingOr "MERGE_PROMPT" ""
+      RewriterEnabled = getSettingOr "REWRITER_ENABLED" "false" |> bool.Parse
+      RewriterPrompt = getSettingOr "REWRITER_PROMPT" ""
+      OutcomeWeightsJson = getSettingOr "OUTCOME_WEIGHTS" """{"reply":100,"silence":0,"emoji":0}"""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())

@@ -158,6 +158,41 @@ extra failed `sendMessage` call per chat per restart, immediately caught and deg
 normal reply, not a user-visible failure. No action needed unless restart frequency ever gets
 high enough for the repeated probe calls to matter (unlikely).
 
+## `Req.SendRichMessage` >4096-char escalation is unverified against real Telegram (Slice 6)
+
+`Mdv2Delivery.sendFinal` (`Services/ReplyRenderer.fs`) escalates to `Req.SendRichMessage`
+(the `markdown` field of `InputRichMessage`) when a final reply's MDV2 form exceeds
+Telegram's 4096-char message limit, falling back to plain multipart sends if THAT is
+rejected. The fake suite exercises the fallback path's shape (a rejected `sendMessage`/
+`editMessageText` — `FakeTgApi`'s `/test/mock/rejectMdv2`) but nothing forces a real LLM
+reply past 4096 chars, so the `SendRichMessage` call itself — its exact wire behavior,
+whether Telegram accepts the same MDV2-flavored markdown string `parse_mode=MarkdownV2`
+does, and what a real rejection looks like — has never been exercised against real
+Telegram. In practice `gpt-5-mini` chat replies essentially never reach 4096 chars, so this
+is low-probability-but-unverified, same posture as the images API wire format in the
+"No real image-gen deployment yet" entry above.
+
+**Action:** if/when this path is suspected of misbehaving in prod (or before relying on it
+for a feature that deliberately produces long replies, e.g. `/summary`-length output routed
+through the responder), write a real-test that forces a >4096-char scripted-length reply
+(not currently possible against real Azure — would need a deliberately verbose prompt) and
+confirm `SendRichMessage`'s actual behavior.
+
+## Rewriter pass disables streaming entirely while `REWRITER_ENABLED=true` (Slice 6)
+
+`ResponderService.respondWithRewriter` forces the main LLM call to non-stream
+(`IChatCompletion.Complete`) so a second cheap call can rewrite its text before anything is
+rendered — a deliberate, documented tradeoff (README's "Rewriter pass" section), not an
+oversight: there is no `IReplyRenderer` in play on this path at all, so `STREAM_MODE` is
+silently ignored whenever the rewriter is on. Since `REWRITER_ENABLED` defaults to `false`,
+this doesn't affect default behavior, but a user chatting with the rewriter on will see the
+reply appear all at once (after two sequential LLM round trips) instead of streaming in.
+
+**Action:** if the UX cost turns out to matter in prod, a future slice could stream the
+*main* call as usual and only make the *rewrite* pass non-stream, feeding the rewritten text
+into a synthetic single-chunk `IAsyncEnumerable<ChatChunk>` for one of the existing
+renderers — deferred here because it adds real complexity for a feature that ships off.
+
 ## `DraftRenderer` fallback memo is process-lifetime
 
 `Services/ReplyRenderer.fs`'s `DraftRenderer` remembers, per `chatId`, that `sendMessageDraft`

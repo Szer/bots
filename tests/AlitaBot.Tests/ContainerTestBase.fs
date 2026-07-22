@@ -78,6 +78,10 @@ type AlitaTestContainers() =
                 "DOSSIER_SIM_FLOOR",      "0.60",                              "FREE_FORM", "llm"
                 "EXTRACT_PROMPT",         "Extract new short facts about this person from their recent messages. Reply with ONLY a JSON array of short fact strings, e.g. [\"likes cats\"]. If nothing new, reply [].", "FREE_FORM", "llm"
                 "MERGE_PROMPT",           "Merge the new facts into the existing dossier summary. Reply with the updated summary text only, max 250 words.", "FREE_FORM", "llm"
+                // Slice 6: persona + rewriter + outcome router + MarkdownV2 rendering.
+                "REWRITER_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
+                "REWRITER_PROMPT",        "Rewrite the following reply as if a real human chat member wrote it: strip assistant-isms, shorten where possible, keep the meaning and all facts. Reply with only the rewritten text.", "FREE_FORM", "llm"
+                "OUTCOME_WEIGHTS",        """{"reply":100,"silence":0,"emoji":0}""", "JSON_BLOB", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

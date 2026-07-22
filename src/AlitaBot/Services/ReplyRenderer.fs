@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
+open AlitaBot
 open AlitaBot.Llm
 open BotInfra
 
@@ -37,6 +38,123 @@ type IReplyRenderer =
 module ReplyRenderer =
     [<Literal>]
     let ContentFilteredReply = "ну и дичь ты написал, даже мой фильтр офигел 🤷"
+
+/// MarkdownV2-formats a renderer's FINAL delivered message (Slice 6, plan §4) — applied
+/// once, at the very end of a reply, never to the plain-text partials streamed along the
+/// way. Kept separate from `BotHelpers` because command outputs (`/usage` etc.) explicitly
+/// keep their current plain-text formatting path — only the three `IReplyRenderer`s below
+/// call into this.
+module Mdv2Delivery =
+    [<Literal>]
+    let TelegramMaxLen = 4096
+
+    /// Chats where `Req.SendRichMessage` has failed at least once — memoized permanently
+    /// (process-lifetime), mirroring `DraftRenderer`'s per-chat fallback memo: a chat that
+    /// rejects it once always gets plain multipart sends for an over-length final reply
+    /// from then on, instead of re-probing every time.
+    let private richMessageUnsupportedChats = ConcurrentDictionary<int64, unit>()
+
+    /// Splits `text` into chunks of at most `TelegramMaxLen` chars, preferring to break on
+    /// a newline in the back half of the window so a long reply doesn't get chopped
+    /// mid-sentence when a nearby line break is available.
+    let splitPlain (text: string) : string list =
+        if text.Length <= TelegramMaxLen then
+            [ text ]
+        else
+            let rec go (remaining: string) acc =
+                if remaining.Length <= TelegramMaxLen then
+                    List.rev (remaining :: acc)
+                else
+                    let window = remaining.Substring(0, TelegramMaxLen)
+                    let nl = window.LastIndexOf '\n'
+                    let breakAt = if nl > TelegramMaxLen / 2 then nl + 1 else TelegramMaxLen
+                    go (remaining.Substring(breakAt)) (remaining.Substring(0, breakAt) :: acc)
+            go text []
+
+    let private sendPlainMultipart
+        (tg: ITelegramApi)
+        (chatId: int64)
+        (replyToMessageId: int64)
+        (fullText: string)
+        : Task<Message> =
+        task {
+            let mutable last = Unchecked.defaultof<Message>
+            for chunk in splitPlain fullText do
+                let! sent = BotHelpers.sendTextReply tg chatId chunk replyToMessageId
+                last <- sent
+            return last
+        }
+
+    /// Sends the FINAL reply for a response that hasn't sent anything yet (`PlainRenderer`,
+    /// and the streaming renderers' edge cases that skip straight to one send). MDV2-
+    /// formats `fullText`; on a Telegram 400 (bad entities) falls back to a plain-text
+    /// resend (Warning-logged, `alitabot_mdv2_fallback_total`). When the MDV2 form exceeds
+    /// Telegram's 4096-char message limit, escalates to `Req.SendRichMessage` (markdown
+    /// variant) instead of a formatted `sendMessage`; a chat that rejects THAT falls back
+    /// to plain multipart sends, memoized per chat from then on (probe-and-fallback,
+    /// mirroring `DraftRenderer`).
+    let sendFinal
+        (tg: ITelegramApi)
+        (logger: ILogger)
+        (chatId: int64)
+        (replyToMessageId: int64)
+        (fullText: string)
+        : Task<Message> =
+        task {
+            let mdv2 = MarkdownRenderer.toMarkdownV2 fullText
+            let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+            if mdv2.Length <= TelegramMaxLen then
+                try
+                    return!
+                        tg.CallExn(
+                            Req.SendMessage.Make(chatId, mdv2, parseMode = ParseMode.MarkdownV2, replyParameters = replyParams))
+                with ex ->
+                    Metrics.mdv2FallbackTotal.Add(1L)
+                    logger.LogWarning(ex, "MDV2 sendMessage rejected by Telegram — falling back to plain text")
+                    return! BotHelpers.sendTextReply tg chatId fullText replyToMessageId
+            elif richMessageUnsupportedChats.ContainsKey chatId then
+                return! sendPlainMultipart tg chatId replyToMessageId fullText
+            else
+                try
+                    let rich = InputRichMessage.Create(markdown = mdv2)
+                    return! tg.CallExn(Req.SendRichMessage.Make(chatId, rich, replyParameters = replyParams))
+                with ex ->
+                    richMessageUnsupportedChats[chatId] <- ()
+                    logger.LogWarning(
+                        ex,
+                        "SendRichMessage rejected by Telegram — falling back to plain multipart sends for chat {ChatId}",
+                        chatId)
+                    return! sendPlainMultipart tg chatId replyToMessageId fullText
+        }
+
+    /// Finalizes a streaming renderer's already-sent message with MDV2 formatting — the
+    /// interim edits along the way stayed plain text; this is the one edit that switches
+    /// the message over to its formatted form. On a Telegram 400 falls back to a plain-
+    /// text edit (Warning-logged, `alitabot_mdv2_fallback_total`). A final text whose MDV2
+    /// form exceeds 4096 chars skips MDV2 entirely and edits plain — an edit can't
+    /// escalate into multiple messages the way a fresh send can (`sendFinal` above); this
+    /// case is rare in practice since the plain text would already have needed >4096 chars
+    /// to stream that far without Telegram rejecting the interim edit first.
+    let editFinal (tg: ITelegramApi) (logger: ILogger) (chatId: int64) (messageId: int64) (fullText: string) : Task<unit> =
+        task {
+            let mdv2 = MarkdownRenderer.toMarkdownV2 fullText
+            if mdv2.Length > TelegramMaxLen then
+                do! BotHelpers.editMessageText tg chatId messageId fullText
+            else
+                try
+                    do!
+                        tg.CallExn(
+                            Req.EditMessageText.Make(
+                                chatId = ChatId.Int chatId,
+                                messageId = messageId,
+                                text = mdv2,
+                                parseMode = ParseMode.MarkdownV2))
+                        |> taskIgnore
+                with ex ->
+                    Metrics.mdv2FallbackTotal.Add(1L)
+                    logger.LogWarning(ex, "MDV2 editMessageText rejected by Telegram — falling back to a plain edit")
+                    do! BotHelpers.editMessageText tg chatId messageId fullText
+        }
 
 /// Accumulates the whole stream, sends a single reply at the end.
 type PlainRenderer(tg: ITelegramApi, logger: ILogger<PlainRenderer>) =
@@ -75,7 +193,7 @@ type PlainRenderer(tg: ITelegramApi, logger: ILogger<PlainRenderer>) =
                     | RenderOutcome.Failed err ->
                         logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                     | _ -> ()
-                    let! sent = BotHelpers.sendTextReply tg chatId fullText replyToMessageId
+                    let! sent = Mdv2Delivery.sendFinal tg logger chatId replyToMessageId fullText
                     return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome }
             }
 
@@ -139,8 +257,11 @@ type EditThrottleRenderer(tg: ITelegramApi, time: TimeProvider, logger: ILogger<
                     | RenderOutcome.Failed err ->
                         logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                     | _ -> ()
-                    if fullText.Length <> lastSentLen then
-                        do! BotHelpers.editMessageText tg chatId m.MessageId fullText
+                    // Always fires, even when fullText already equals what was last
+                    // streamed plain — the streamed partials were deliberately plain text
+                    // (Mdv2Delivery applies only at the FINAL message), so this edit is
+                    // what actually switches the message over to its MDV2-formatted form.
+                    do! Mdv2Delivery.editFinal tg logger chatId m.MessageId fullText
                     return { FinalMessage = Some m; FullText = fullText; Outcome = outcome }
             }
 
@@ -256,13 +377,12 @@ type DraftRenderer(tg: ITelegramApi, time: TimeProvider, fallback: EditThrottleR
                     match sentMsg with
                     | Some m ->
                         // Already fell back to a real message mid-stream — finish exactly
-                        // like EditThrottleRenderer.
+                        // like EditThrottleRenderer (always a final MDV2 edit, see there).
                         match outcome with
                         | RenderOutcome.Failed err ->
                             logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                         | _ -> ()
-                        if fullText.Length <> lastSentLen then
-                            do! BotHelpers.editMessageText tg chatId m.MessageId fullText
+                        do! Mdv2Delivery.editFinal tg logger chatId m.MessageId fullText
                         return { FinalMessage = Some m; FullText = fullText; Outcome = outcome }
                     | None ->
                         // Draft-only the whole time (or an empty stream) — drafts never
@@ -282,7 +402,7 @@ type DraftRenderer(tg: ITelegramApi, time: TimeProvider, fallback: EditThrottleR
                             | RenderOutcome.Failed err ->
                                 logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                             | _ -> ()
-                            let! sent = BotHelpers.sendTextReply tg chatId fullText replyToMessageId
+                            let! sent = Mdv2Delivery.sendFinal tg logger chatId replyToMessageId fullText
                             return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome }
                 }
 
