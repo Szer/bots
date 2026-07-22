@@ -114,6 +114,11 @@ let applyRealSettingsAsync (env: RealEnv) =
             @ (if String.IsNullOrWhiteSpace env.SttDeployment then [] else [ "STT_DEPLOYMENT", env.SttDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.TtsDeployment then [] else [ "TTS_DEPLOYMENT", env.TtsDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.ImageDeployment then [] else [ "IMAGE_DEPLOYMENT", env.ImageDeployment, "FREE_FORM", "llm" ])
+            // Gemini provider slice: when a real GEMINI_API_KEY is configured, route /img
+            // to Gemini for the real-test run (Azure image quota is still 0 — see
+            // ImageDeployment's doc comment) so ImageGenRealTests exercises a real backend
+            // instead of self-skipping.
+            @ (if String.IsNullOrWhiteSpace env.GeminiApiKey then [] else [ "IMAGE_PROVIDER", "gemini", "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.EmbeddingDeployment then [] else [ "EMBEDDING_DEPLOYMENT", env.EmbeddingDeployment, "FREE_FORM", "llm" ])
 
         for key, value, typ, grp in settings do

@@ -94,7 +94,7 @@ type DossierRealTests(fx: RealAssemblyFixture) =
 
     [<Fact>]
     member _.``nightly job extracts facts from real Telegram messages and the bot recalls one when asked``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -155,4 +155,4 @@ type DossierRealTests(fx: RealAssemblyFixture) =
                 Assert.True(
                     containsAnyOf dossierReply.message needles,
                     $"expected /dossier to show a known fact ({needlesText}): {dossierReply.message}")
-        }
+        })

@@ -120,32 +120,45 @@ recomputed fresh from the live `Message` on every request, not carried by contex
   ForwardOrigin`), attributes it to a channel post, a user (or one who hid their identity), or
   an anonymous chat/group post.
 
-## Image generation (`/img`, `!img`, Phase-1 Slice 3)
+## Image generation (`/img`, `!img`, Phase-1 Slice 3 + Gemini provider slice)
 
 `/img <prompt>`, `!img <prompt>`, or `/img@{BOT_USERNAME} <prompt>` in a target chat generates
-an image via Azure's images/generations endpoint and replies with it as a photo; the same
-command sent **as a reply to a photo message** switches to images/edits (img2img — the replied
-photo is downloaded and passed as the source image). Command messages are handled entirely by
-`BotService.tryParseCommand`/`handleImageCommand` and never reach `ResponderService` — they
-don't trigger the LLM responder even if the prompt also happens to contain the bot's name.
+an image and replies with it as a photo; the same command sent **as a reply to a photo
+message** switches to img2img (the replied photo is downloaded and passed as the source
+image). Command messages are handled entirely by `BotService.tryParseCommand`/
+`handleImageCommand` and never reach `ResponderService` — they don't trigger the LLM
+responder even if the prompt also happens to contain the bot's name.
+
+**Provider routing (`IMAGE_PROVIDER`, default `"gemini"`):** `/img` dispatches to either
+Azure (`AzureFoundryImageGen`, images/generations + images/edits) or Gemini
+(`GeminiImageGen`, Nano Banana — see "Gemini provider" below) via `AlitaBot.Llm.
+ImageGenRouter`, which reads the hot-reloadable `IMAGE_PROVIDER` bot_setting fresh on every
+call — `/reload-settings` flips providers with no restart. Default is `"gemini"`: Azure
+image quota is still 0 in this subscription (below), so Gemini is the only backend that can
+actually generate anything today; flipping `IMAGE_PROVIDER` back to `"azure"` once quota
+lands needs zero code changes.
 
 Behavior: logs the command as `[img-cmd] {prompt}`, sends a "рисую..." placeholder, generates,
 deletes the placeholder and sends the photo captioned with the prompt (truncated 100 chars) plus
-cost (`$0.04`) when `LLM_PRICING` has a matching `per_image_<quality>` entry for `IMAGE_DEPLOYMENT`
-— logs the bot's reply as `[image] {truncated prompt}`. Empty prompt → RU usage hint, no Azure
-call. `IMAGE_GEN_ENABLED=false` (bot_setting, default `true`) → RU "выключено" reply, no Azure
-call. Any Azure failure (including an unconfigured/404 deployment) edits the placeholder into a
-RU apology instead of crashing or leaving the chat hanging.
+cost when `LLM_PRICING` has a matching entry for the active provider's model/deployment —
+`per_image_<quality>` for Azure (keyed by `IMAGE_DEPLOYMENT`), flat `per_image` for Gemini
+(keyed by `GEMINI_IMAGE_MODEL`, no quality tiers) — logs the bot's reply as
+`[image] {truncated prompt}`. Empty prompt → RU usage hint, no provider call. `IMAGE_GEN_ENABLED=
+false` (bot_setting, default `true`) → RU "выключено" reply, no provider call. Any provider
+failure (including an unconfigured/404 deployment, or a missing `GEMINI_API_KEY`) edits the
+placeholder into a RU apology instead of crashing or leaving the chat hanging.
 
-`IMAGE_SIZE` (default `1024x1024`) and `IMAGE_QUALITY` (default `medium`) are hot-reloadable
-bot_settings passed straight through to the images API. **`IMAGE_DEPLOYMENT` is empty by
-default** — every `gpt-image-*` model variant (and `dall-e-3`) had 0 quota in this
-subscription/region at S3 deploy time, so no real deployment exists yet; see
-[`docs/TECH-DEBT.md`](docs/TECH-DEBT.md) for the full story and what to do once quota is
-granted. `tests/AlitaBot.RealTests/ImageGenRealTests.fs` self-skips until `ALITA_IMAGE_DEPLOYMENT`
-is set; the fake-suite tests (`tests/AlitaBot.Tests/ImageGenTests.fs`) exercise the full
-command/plumbing behavior against `FakeAzureOcrApi`'s images/generations + images/edits routes
-in the meantime.
+`IMAGE_SIZE` (default `1024x1024`) and `IMAGE_QUALITY` (default `medium`) are Azure-only
+hot-reloadable bot_settings, passed straight through to Azure's images API (Gemini's Nano
+Banana models take neither). **`IMAGE_DEPLOYMENT` is empty by default** — every `gpt-image-*`
+model variant (and `dall-e-3`) had 0 quota in this subscription/region at S3 deploy time, so
+no real Azure deployment exists yet; see [`docs/TECH-DEBT.md`](docs/TECH-DEBT.md) for the
+full story. `tests/AlitaBot.RealTests/ImageGenRealTests.fs` runs against Gemini when
+`ALITA_GEMINI_API_KEY` is set (self-skipping only if Gemini's own billing gate blocks it —
+see "Gemini provider" below), else self-skips like before until `ALITA_IMAGE_DEPLOYMENT` is
+set; the fake-suite tests (`tests/AlitaBot.Tests/ImageGenTests.fs` for Azure,
+`GeminiTests.fs` for Gemini + provider switching) exercise the full command/plumbing
+behavior against `FakeAzureOcrApi`'s routes in the meantime.
 
 ## Commands (Phase-1 Slice 4)
 
@@ -161,12 +174,13 @@ reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
 
 | Command | Aliases | Description |
 |---|---|---|
-| `/img <prompt>` | — | Generate an image (see "Image generation" above); reply-to-photo → img2img. |
+| `/img <prompt>` | — | Generate an image (see "Image generation" above); reply-to-photo → img2img. Routed to Azure or Gemini by `IMAGE_PROVIDER`. |
 | `/model [name]` | — | No arg: show the current `LLM_DEPLOYMENT` + the `MODEL_ALLOWLIST`. With an allowlisted arg: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
 | `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below (as of the admin re-probe, "accepts" is confirmed but genuine delivery to the requester is not). |
 | `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
 | `/ask <question>` | — | Semantic search over this chat's message history (see "Memory" below): answers grounded in the nearest matching quotes, cited by author and date. Empty question → RU usage hint. |
 | `/say [voice] <text>` | — | Synthesize `text` as a voice note (see "`/say`, `/sql`, cost footer" below); reply-to-message with no text of its own → voices ITS text. |
+| `/song [(style)] <lyrics or description>` | — | Generate music via Gemini's Lyria (see "Gemini provider" below), delivered as an audio attachment with a title. Optional leading `(style hint)`, e.g. `/song (рок-баллада) текст`. Cooldown `SONG_COOLDOWN_SECONDS` per user. |
 | `/sql <question>` | — | Admin-gated (`ADMIN_USER_IDS`) natural-language SQL over Alita's own database, rendered as a table (see "`/say`, `/sql`, cost footer" below). |
 | `/help` | `/start` | Auto-generated list of the above, from the registry. |
 
@@ -730,6 +744,97 @@ response `AzureFoundrySpeech.Synthesize`'s `sendBinaryWithRetry` expects; the de
 `sendVoice` fast path without needing `ffmpeg` in the fake-test container. `FakeTgApi`
 gained explicit `sendVoice`/`sendAudio` handlers (Funogram's response parser needs a real
 `Types.Message`-shaped result, not the dispatcher's generic bare-`true` fallback).
+
+## Gemini provider: Nano Banana images + Lyria music (`/song`)
+
+Second `IImageGen` backend (Google's Generative Language API, `Llm/GeminiProvider.fs`) plus
+the first `IMusicGen` implementation, wired to the new `/song` command.
+
+### Model discovery
+
+`GET /v1beta/models` against the real API (with `x-goog-api-key`) returned this key's full
+roster. Image-capable ("Nano Banana") tiers, oldest → newest:
+
+| Model | Display name |
+|---|---|
+| `gemini-2.5-flash-image` | Nano Banana |
+| `gemini-3-pro-image[-preview]` | Nano Banana Pro |
+| `gemini-3.1-flash-image[-preview]` | Nano Banana 2 |
+| `gemini-3.1-flash-lite-image` | Nano Banana 2 Lite |
+
+`GEMINI_IMAGE_MODEL` defaults to `gemini-3.1-flash-image` — the newest non-preview tier.
+Music: `lyria-3-pro-preview` (full track) and `lyria-3-clip-preview` (short clip), both
+`generateContent`-capable on this key — no separate streaming "Lyria RealTime" model was
+listed. `GEMINI_MUSIC_MODEL` defaults to `lyria-3-pro-preview`.
+
+### Wire format
+
+One endpoint for everything — `POST {GEMINI_BASE_URL}/v1beta/models/{model}:generateContent`,
+auth via the `x-goog-api-key` header (not a bearer token) — unlike Azure, there's no separate
+"edits" route: img2img adds an `inline_data` (base64 PNG) part alongside the text prompt on
+the SAME endpoint. Image generation additionally sets `generationConfig.responseModalities =
+["IMAGE","TEXT"]`. A successful response's `candidates[0].content.parts[]` carries the
+generated bytes as an `inlineData` part (`{mimeType, data}`, base64) — `GeminiWire.
+tryParseGenerateContentResponse` collects every such part.
+
+**What was empirically verified vs. best-effort:** every request shape above (text-to-image,
+img2img, music) was confirmed **schema-valid** against the real API — a deliberately
+malformed body 400s ("Unknown name ... Cannot find field"), while these all reach the quota
+gate and 429 ("`RESOURCE_EXHAUSTED`, `free_tier_requests, limit: 0`"). That 429 is a genuine
+Google Cloud **billing gate specific to this key's project** — confirmed NOT a transient rate
+limit (a malformed request still 400s before quota is even consulted; text-only chat models
+on the same key 200 fine). **No real successful image/music response was ever observed**, so
+the response-parsing shapes above (camelCase `inlineData`/`mimeType`, `usageMetadata`) are
+best-effort from Google's public API docs — exactly the same posture Azure's `gpt-image-1`
+wire format has in `AzureFoundryProvider.fs` (unverified request→response round trip, quota
+denied). Lyria's audio container format (likely WAV/PCM) is unverified for the same reason —
+`/song` re-encodes via `ffmpeg` the same way `/say` does, degrading gracefully (raw bytes
+sent as-is) if `ffmpeg` is missing or the real container needs no conversion.
+
+Gemini 429s don't carry a standard `Retry-After` HTTP header (confirmed via `curl -D`), but
+DO carry a `details[].retryDelay` field in the JSON body (e.g. `"retryDelay": "30s"`) —
+`GeminiWire.retryDelayFromBody` parses that the way `AzureWire.retryAfterOf` reads the header.
+
+### Config
+
+`GEMINI_API_KEY` is a secret env var (like `AZURE_FOUNDRY_KEY` — never a bot_setting).
+Everything else is a hot-reloadable bot_setting: `GEMINI_BASE_URL` (default the real Google
+endpoint — overridden in the fake-suite fixture to point at `FakeAzureOcrApi`'s additive
+`/gemini/*` routes), `GEMINI_IMAGE_MODEL`, `GEMINI_MUSIC_MODEL`, `IMAGE_PROVIDER` (`"azure"`
+| `"gemini"`, default `"gemini"`), `SONG_MAX_CHARS` (default `1000`),
+`SONG_COOLDOWN_SECONDS` (default `120` — music generation is slow and pricier than
+chat/images). `LLM_PRICING` gained per-item entries: `{"gemini-3.1-flash-image":
+{"per_image":0.02},"lyria-3-pro":{"per_track":0.06}}` — both **estimates**, since no real
+call was ever successfully billed (see above); update once a real invoice confirms actual
+cost.
+
+### `/song [(style)] <lyrics or description>`
+
+Optional leading `(style hint)` in parens — same inline-flag convention `/say`'s voice
+selector uses — folded into the prompt as `Style: {style}\n\n{lyrics}` when present
+(`BotService.parseSongArgs`). Logs `[song-cmd] {args}` first (webhook-redelivery dedup),
+then: empty prompt → RU usage hint; over `SONG_MAX_CHARS` → RU refusal; on cooldown
+(`SONG_COOLDOWN_SECONDS`, **per-invoking-user** — `song_cooldown` table, mirrors `/roast`'s
+`roast_cooldown` but keyed by the caller since `/song` has no target concept) → RU cooldown
+reply; otherwise sends a "сочиняю..." placeholder, generates, re-encodes to mp3 via `ffmpeg`
+when possible (`BotService.tryConvertToMp3` — falls back to the raw bytes otherwise),
+delivers via `Req.SendAudio` with a title (truncated lyrics/description, 60 chars) and
+performer "Алита", and logs the bot's reply as `[song] {prompt}`. `llm_usage` records it
+under `kind='music'` (added by `V7__gemini_music.sql`'s `CHECK` constraint update).
+
+### Fake-suite testing (`tests/AlitaBot.Tests/GeminiTests.fs`, `SongTests.fs`)
+
+`FakeAzureOcrApi` gained additive `/gemini/v1beta/models/{model}:generateContent` routes
+(`Handlers.handleGeminiGenerateContent`) — one handler for both image and music calls
+(no separate edits route, matching the real API), routing to a scripted image-vs-music
+queue by whether the model name contains `"image"` (true of both the real discovered names
+and the test fixture's `gemini-test-image`/`lyria-test-music`). Default (unscripted)
+responses are a tiny valid PNG (reusing the existing `tinyPngBase64`) and a tiny valid WAV.
+Control endpoints: `/test/mock/gemini-image-script`, `/test/mock/gemini-music-script` — new
+`BotContainerBase` methods `SetGeminiImageScript`/`SetGeminiMusicScript`/`GetGeminiCalls`.
+The fake-suite fixture's baseline `IMAGE_PROVIDER` stays `"azure"` (`ContainerTestBase.fs`)
+so the existing `ImageGenTests.fs` assertions are undisturbed — `GeminiTests.fs` flips it to
+`"gemini"` per-test.
 
 ## Empirical draft-semantics findings (M5)
 

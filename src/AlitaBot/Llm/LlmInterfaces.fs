@@ -15,8 +15,9 @@ type IEmbeddings =
 /// AlitaBot.Services.DbService, injected into the provider layer (AzureFoundryProvider.fs)
 /// so LlmCall/ImageCall (LlmTelemetry.fs) can persist a row alongside the existing OTel
 /// metrics on every successful call. `kind` is one of the `llm_usage.kind` CHECK values
-/// ("chat" | "stt" | "tts" | "image" | "embedding"). Fire-and-forget at the call site — a
-/// slow/failed usage-row insert must never hold up or fail the actual bot reply.
+/// ("chat" | "stt" | "tts" | "image" | "embedding" | "music" — the last added by the Gemini
+/// slice's V7 migration). Fire-and-forget at the call site — a slow/failed usage-row insert
+/// must never hold up or fail the actual bot reply.
 type IUsageRecorder =
     abstract Record :
         kind: string *
@@ -39,10 +40,14 @@ type IUsageRecorder =
 type IImageGen =
     abstract Generate : prompt: string * sourceImage: byte[] option * ctx: UsageContext * ct: CancellationToken -> Task<Result<byte[] * TokenUsage, LlmError>>
 
-// ── Multimodal stubs — implementations arrive in later phases ───────────
-
+/// Music generation (Gemini/Lyria slice): `prompt` is the caller-assembled style + lyrics
+/// text (see BotService's `/song` — an optional leading "(style hint)" is folded in before
+/// this is called). Returns the generated audio bytes (whatever container Lyria's
+/// generateContent response carries — see GeminiProvider.fs's doc comments; BotService
+/// re-encodes/falls back the same way `/say`'s ISpeech.Synthesize output does) plus token
+/// usage, mirroring IImageGen's shape so the same telemetry/pricing idioms apply.
 type IMusicGen =
-    abstract Generate : prompt: string * ct: CancellationToken -> Task<Result<byte[], LlmError>>
+    abstract Generate : prompt: string * ctx: UsageContext * ct: CancellationToken -> Task<Result<byte[] * TokenUsage, LlmError>>
 
 type ISpeech =
     /// `voice` defaults to "alloy" when None.

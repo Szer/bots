@@ -5,6 +5,13 @@ open System.Collections.Concurrent
 open System.Threading.Tasks
 open TL
 
+/// Raised by TgUserClient's Await* helpers when their poll deadline elapses without
+/// a match ("No ... within Ns"). This is the ONLY exception TestRetry.withTimeoutRetry
+/// treats as retryable — genuine assertion failures (Assert.*, Assert.Fail) are a
+/// different, non-flaky failure mode and must never be caught by that filter.
+type AwaitTimeoutException(message: string) =
+    inherit Exception(message)
+
 /// MTProto user client (WTelegramClient) playing the human in the test group.
 /// Incoming updates are recorded and polled every 500ms by the Await* helpers.
 /// Bot API supergroup ids (-100xxxxxxxxxx) are translated to MTProto channel
@@ -228,7 +235,7 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             | Some m -> return m
             | None ->
                 return
-                    failwith $"No reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+                    raise (AwaitTimeoutException $"No reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s")
         }
 
     /// First incoming message in `chatId` that replies to `repliedMsgId` AND carries a photo
@@ -263,7 +270,7 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             | Some m -> return m
             | None ->
                 return
-                    failwith $"No photo reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+                    raise (AwaitTimeoutException $"No photo reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s")
         }
 
     /// First incoming message in `chatId` that replies to `repliedMsgId` AND carries a
@@ -313,7 +320,54 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             | Some r -> return r
             | None ->
                 return
-                    failwith $"No voice-note reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+                    raise (AwaitTimeoutException $"No voice-note reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s")
+        }
+
+    /// Same shape as TryAwaitVoiceReplyTo, but for a REGULAR audio attachment (Bot API
+    /// `sendAudio`, no `voice` flag on the DocumentAttributeAudio) — used by SongRealTests
+    /// to detect `/song`'s Lyria-generated track. Returns (durationSeconds, byteSize).
+    member _.TryAwaitAudioReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) : Task<(int * int64) option> =
+        task {
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                result <-
+                    snapshot ()
+                    |> Array.tryPick (fun m ->
+                        if
+                            peerMatches chatId m.peer_id
+                            && (match m.ReplyTo with
+                                | :? MessageReplyHeader as h -> h.reply_to_msg_id = repliedMsgId
+                                | _ -> false)
+                        then
+                            match m.media with
+                            | :? MessageMediaDocument as md ->
+                                match md.document with
+                                | :? TL.Document as doc ->
+                                    doc.attributes
+                                    |> Array.tryPick (fun a ->
+                                        match a with
+                                        | :? DocumentAttributeAudio as aa -> Some(aa.duration, doc.size)
+                                        | _ -> None)
+                                | _ -> None
+                            | _ -> None
+                        else
+                            None)
+
+                if result.IsNone then
+                    do! Task.Delay pollInterval
+
+            return result
+        }
+
+    member this.AwaitAudioReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
+        task {
+            match! this.TryAwaitAudioReplyTo(chatId, repliedMsgId, timeout) with
+            | Some r -> return r
+            | None ->
+                return
+                    raise (AwaitTimeoutException $"No audio reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s")
         }
 
     /// First incoming message from someone else in `chatId` whose text contains `marker`.
@@ -341,7 +395,9 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
 
             match result with
             | Some m -> return m
-            | None -> return failwith $"No message containing '{marker}' in chat {chatId} within {timeout.TotalSeconds}s"
+            | None ->
+                return
+                    raise (AwaitTimeoutException $"No message containing '{marker}' in chat {chatId} within {timeout.TotalSeconds}s")
         }
 
     /// Waits until message `msgId` has seen no new content/edits for `quietPeriod`,
@@ -362,8 +418,9 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             | Some text -> return text
             | None ->
                 return
-                    failwith
-                        $"Message {msgId} in chat {chatId} never went quiet for {quietPeriod.TotalSeconds}s (waited {editsSettleTimeout.TotalSeconds}s)"
+                    raise (
+                        AwaitTimeoutException
+                            $"Message {msgId} in chat {chatId} never went quiet for {quietPeriod.TotalSeconds}s (waited {editsSettleTimeout.TotalSeconds}s)")
         }
 
     /// Probe-only (Slice 6 outcome-router real test): polls `Messages_GetHistory` until

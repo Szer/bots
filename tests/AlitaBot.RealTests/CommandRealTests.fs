@@ -78,7 +78,7 @@ ORDER BY message_id DESC LIMIT 1;
 
     [<Fact>]
     member _.``help lists every registered command``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let! msgId = fx.UserClient.SendText(env.TestChatId, "/help")
@@ -86,11 +86,11 @@ ORDER BY message_id DESC LIMIT 1;
 
             for name in [ "/img"; "/model"; "/summary"; "/usage"; "/help" ] do
                 Assert.Contains(name, reply.message)
-        }
+        })
 
     [<Fact>]
     member _.``model with no arg shows the current LLM deployment``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if String.IsNullOrWhiteSpace env.LlmDeployment then
@@ -100,7 +100,7 @@ ORDER BY message_id DESC LIMIT 1;
             let! reply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
 
             Assert.Contains(env.LlmDeployment, reply.message)
-        }
+        })
 
     /// Combined test (plan's real-suite item): sends a GUID-marked message, then
     /// /summary, then /usage — checking each depends on the previous having actually
@@ -108,7 +108,7 @@ ORDER BY message_id DESC LIMIT 1;
     /// three separate slow real-Telegram round trips for what's really one scenario.
     [<Fact>]
     member _.``summary references recent chat content and usage shows a cost line afterwards``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -193,4 +193,4 @@ ORDER BY message_id DESC LIMIT 1;
             let! usageReply = fx.UserClient.AwaitReplyTo(env.TestChatId, usageMsgId, Timeouts.reply)
 
             Assert.Contains("$", usageReply.message)
-        }
+        })

@@ -59,21 +59,24 @@ module LlmPricing =
             None
 
 /// Cost lookup for image generation, driven by the same LLM_PRICING bot_setting as
-/// LlmPricing but a different shape: flat per-image price by quality tier (gpt-image-1
-/// bills by tokens, but Azure doesn't expose a stable per-token USD rate for it the way
-/// chat models do, so pricing here is per-image-per-quality instead):
-///   {"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}
-/// Keyed by the image DEPLOYMENT name (unlike LlmPricing, which matches the response's
+/// LlmPricing but a different shape: flat per-image price, optionally by quality tier
+/// (gpt-image-1 bills by tokens, but Azure doesn't expose a stable per-token USD rate for
+/// it the way chat models do, so pricing here is per-image-[per-quality] instead):
+///   Azure:  {"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}
+///   Gemini: {"gemini-3.1-flash-image":{"per_image":0.02}} (no quality tiers — `quality = None`)
+/// Keyed by the image DEPLOYMENT/MODEL name (unlike LlmPricing, which matches the response's
 /// `model` field) — Azure's images API doesn't consistently echo a `model` field across
-/// gpt-image-1/dall-e-3, so the deployment name is the one thing always known here.
+/// gpt-image-1/dall-e-3, and Gemini's config is DEPLOYMENT-shaped too for symmetry, so the
+/// caller-known name is the one thing always available here.
 module ImagePricing =
     /// (deployment, quality) pairs already warned about — logs at most one Warning each.
     let private warned = ConcurrentDictionary<string, byte>()
 
     /// Substring match against `deployment`, same convention as LlmPricing.tryCost.
-    /// Missing entry (unknown deployment, or no per_image_<quality> field for it) -> None
-    /// + a one-time Warning, never an exception.
-    let tryCost (logger: ILogger) (pricingJson: string) (deployment: string) (quality: string) : float option =
+    /// `quality = Some q` looks up the `per_image_{q}` field (Azure); `None` looks up the
+    /// flat `per_image` field (Gemini — no quality tiers). Missing entry (unknown
+    /// deployment, or no matching field) -> None + a one-time Warning, never an exception.
+    let tryCost (logger: ILogger) (pricingJson: string) (deployment: string) (quality: string option) : float option =
         try
             use doc = JsonDocument.Parse(pricingJson)
             if doc.RootElement.ValueKind <> JsonValueKind.Object then
@@ -84,11 +87,12 @@ module ImagePricing =
                     |> Seq.tryFind (fun prop -> deployment.Contains(prop.Name, StringComparison.OrdinalIgnoreCase))
                 match matched with
                 | Some prop ->
-                    let field = $"per_image_{quality}"
+                    let field = match quality with Some q -> $"per_image_{q}" | None -> "per_image"
                     match prop.Value.TryGetProperty field with
                     | true, v when v.ValueKind = JsonValueKind.Number -> Some(v.GetDouble())
                     | _ ->
-                        if warned.TryAdd($"{deployment}:{quality}", 0uy) then
+                        let warnKey = match quality with Some q -> $"{deployment}:{q}" | None -> deployment
+                        if warned.TryAdd(warnKey, 0uy) then
                             logger.LogWarning(
                                 "No LLM_PRICING '{Field}' entry for image deployment '{Deployment}' — cost not recorded",
                                 field, deployment)
@@ -102,10 +106,23 @@ module ImagePricing =
 
 /// One image-generation call's span + metrics — same lifecycle shape as LlmCall
 /// (create at call start, mark the outcome exactly once, dispose at call end) but
-/// costed via ImagePricing (per-image-per-quality) instead of LlmPricing (per-token).
-/// `usageRecorder`/`ctx` additively persist an `llm_usage` row (kind="image") on success —
-/// see IUsageRecorder; existing OTel metrics below are unchanged.
-type ImageCall(deployment: string, quality: string, size: string, pricingJson: string, usageRecorder: IUsageRecorder, ctx: UsageContext, logger: ILogger) =
+/// costed via ImagePricing (per-image, optionally per-quality) instead of LlmPricing
+/// (per-token). `usageRecorder`/`ctx` additively persist an `llm_usage` row (kind="image")
+/// on success — see IUsageRecorder; existing OTel metrics below are unchanged.
+/// `system` is the `gen_ai.system` tag value ("azure.ai.openai" | "gemini" — Gemini slice);
+/// `quality`/`size` are `None` for providers with no such concept (Gemini's Nano Banana
+/// models take neither) — Azure always passes `Some`.
+type ImageCall
+    (
+        system: string,
+        deployment: string,
+        quality: string option,
+        size: string option,
+        pricingJson: string,
+        usageRecorder: IUsageRecorder,
+        ctx: UsageContext,
+        logger: ILogger
+    ) =
     let activity = Telemetry.botActivity.StartActivity("llm.image")
     let startedAt = Stopwatch.GetTimestamp()
 
@@ -113,10 +130,10 @@ type ImageCall(deployment: string, quality: string, size: string, pricingJson: s
         if not (isNull activity) then %activity.SetTag(key, value)
 
     do
-        setTag "gen_ai.system" "azure.ai.openai"
+        setTag "gen_ai.system" system
         setTag "gen_ai.request.model" deployment
-        setTag "image.quality" quality
-        setTag "image.size" size
+        quality |> Option.iter (setTag "image.quality")
+        size |> Option.iter (setTag "image.size")
 
     member _.Succeeded(usage: TokenUsage) =
         if usage.TotalTokens > 0 then
@@ -134,6 +151,85 @@ type ImageCall(deployment: string, quality: string, size: string, pricingJson: s
             if usage.TotalTokens > 0 then Some usage.PromptTokens, Some usage.CompletionTokens else None, None
         fireAndForget logger "llm_usage.record" (fun () ->
             usageRecorder.Record("image", deployment, inputTokens, outputTokens, cost, ctx) :> Task)
+
+    member _.Failed(error: LlmError) =
+        let errorType =
+            match error with
+            | LlmError.RateLimited _ -> "rate_limited"
+            | LlmError.ContentFiltered _ -> "content_filtered"
+            | LlmError.ApiError _ -> "api_error"
+            | LlmError.NetworkError _ -> "network_error"
+        setTag "error.type" errorType
+        if not (isNull activity) then %activity.SetStatus(ActivityStatusCode.Error, errorType)
+
+    interface IDisposable with
+        member _.Dispose() =
+            LlmMetrics.latencyMs.Record(Stopwatch.GetElapsedTime(startedAt).TotalMilliseconds)
+            if not (isNull activity) then activity.Dispose()
+
+/// Cost lookup for music generation (Gemini/Lyria slice) — same per-item convention as
+/// ImagePricing but with a single flat `per_track` field (no quality tiers): driven by the
+/// same LLM_PRICING bot_setting, e.g. {"lyria-3-pro":{"per_track":0.06}}. Keyed by the
+/// GEMINI_MUSIC_MODEL name (substring match, same as ImagePricing/LlmPricing).
+module MusicPricing =
+    let private warned = ConcurrentDictionary<string, byte>()
+
+    let tryCost (logger: ILogger) (pricingJson: string) (model: string) : float option =
+        try
+            use doc = JsonDocument.Parse(pricingJson)
+            if doc.RootElement.ValueKind <> JsonValueKind.Object then
+                None
+            else
+                let matched =
+                    doc.RootElement.EnumerateObject()
+                    |> Seq.tryFind (fun prop -> model.Contains(prop.Name, StringComparison.OrdinalIgnoreCase))
+                match matched with
+                | Some prop ->
+                    match prop.Value.TryGetProperty "per_track" with
+                    | true, v when v.ValueKind = JsonValueKind.Number -> Some(v.GetDouble())
+                    | _ ->
+                        if warned.TryAdd(model, 0uy) then
+                            logger.LogWarning(
+                                "No LLM_PRICING 'per_track' entry for music model '{Model}' — cost not recorded", model)
+                        None
+                | None ->
+                    if warned.TryAdd(model, 0uy) then
+                        logger.LogWarning("No LLM_PRICING entry matches music model '{Model}' — cost not recorded", model)
+                    None
+        with _ ->
+            None
+
+/// One music-generation call's span + metrics — same lifecycle shape as ImageCall, costed
+/// via MusicPricing (flat per-track) instead of per-quality. `usageRecorder`/`ctx`
+/// additively persist an `llm_usage` row (kind="music", added by the Gemini slice's V7
+/// migration) on success.
+type MusicCall(model: string, pricingJson: string, usageRecorder: IUsageRecorder, ctx: UsageContext, logger: ILogger) =
+    let activity = Telemetry.botActivity.StartActivity("llm.music")
+    let startedAt = Stopwatch.GetTimestamp()
+
+    let setTag (key: string) (value: obj) =
+        if not (isNull activity) then %activity.SetTag(key, value)
+
+    do
+        setTag "gen_ai.system" "gemini"
+        setTag "gen_ai.request.model" model
+
+    member _.Succeeded(usage: TokenUsage) =
+        if usage.TotalTokens > 0 then
+            setTag "gen_ai.usage.input_tokens" usage.PromptTokens
+            setTag "gen_ai.usage.output_tokens" usage.CompletionTokens
+            LlmMetrics.tokensTotal.Add(int64 usage.PromptTokens, KeyValuePair("direction", box "input"))
+            LlmMetrics.tokensTotal.Add(int64 usage.CompletionTokens, KeyValuePair("direction", box "output"))
+        let cost = MusicPricing.tryCost logger pricingJson model
+        match cost with
+        | Some c ->
+            setTag "llm.cost_usd" c
+            LlmMetrics.costUsdTotal.Add(c)
+        | None -> ()
+        let inputTokens, outputTokens =
+            if usage.TotalTokens > 0 then Some usage.PromptTokens, Some usage.CompletionTokens else None, None
+        fireAndForget logger "llm_usage.record" (fun () ->
+            usageRecorder.Record("music", model, inputTokens, outputTokens, cost, ctx) :> Task)
 
     member _.Failed(error: LlmError) =
         let errorType =

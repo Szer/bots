@@ -171,4 +171,34 @@ type BotConfiguration =
       /// the message_log insert (so the model never sees its own cost in later context).
       /// Default false.
       CostFooterEnabled: bool
+      /// GEMINI_API_KEY env var (secret, like AzureFoundryKey — never a bot_setting).
+      /// Empty when unconfigured — GeminiImageGen/GeminiMusicGen then fail gracefully
+      /// (RU apology, no doomed network call) instead of crashing.
+      GeminiApiKey: string
+      /// GEMINI_BASE_URL bot_setting: the Generative Language API base URL. Default the
+      /// real Google endpoint; overridden in the fake-suite test fixture to point at
+      /// FakeAzureOcrApi's additive `/gemini/*` routes (see AlitaBot.Tests'
+      /// ContainerTestBase.fs) — same "swap the base URL, keep the wire format" idiom
+      /// AZURE_FOUNDRY_ENDPOINT already uses for the Azure provider.
+      GeminiBaseUrl: string
+      /// GEMINI_IMAGE_MODEL bot_setting: the Nano Banana model generateContent is called
+      /// against for `/img` when IMAGE_PROVIDER=gemini. Default "gemini-3.1-flash-image"
+      /// ("Nano Banana 2") — see GeminiProvider.fs's doc comment for the full discovered
+      /// model roster and why this tier was picked.
+      GeminiImageModel: string
+      /// GEMINI_MUSIC_MODEL bot_setting: the Lyria model `/song` calls. Default
+      /// "lyria-3-pro-preview" — see GeminiProvider.fs's doc comment.
+      GeminiMusicModel: string
+      /// IMAGE_PROVIDER bot_setting: "azure" | "gemini" — which IImageGen `/img` routes
+      /// to (see Llm/GeminiProvider.fs's ImageGenRouter). Default "gemini" — Azure image
+      /// quota is still 0 in this subscription (AlitaBot/docs/TECH-DEBT.md); Gemini is the
+      /// only real image-gen path until that quota lands, at which point flipping this
+      /// setting live switches `/img` back to Azure with zero code changes.
+      ImageProvider: string
+      /// SONG_MAX_CHARS bot_setting: `/song` refuses (RU) a style+lyrics prompt longer
+      /// than this instead of generating it. Default 1000.
+      SongMaxChars: int
+      /// SONG_COOLDOWN_SECONDS bot_setting: minimum seconds between two `/song` calls from
+      /// the same user (music generation is slow and pricier than images/chat). Default 120.
+      SongCooldownSeconds: int
       TestMode: bool }

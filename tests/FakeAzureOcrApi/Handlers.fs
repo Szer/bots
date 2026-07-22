@@ -495,6 +495,89 @@ module Handlers =
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
         }
 
+    /// Fake Gemini `generateContent` handler (AlitaBot Gemini provider slice: Nano Banana
+    /// images + Lyria music, GeminiProvider.fs) — ONE route for both, matching the real
+    /// API's single generateContent endpoint (no separate "edits" route the way Azure has).
+    /// `modelAndMethod` is the raw `{model}:generateContent` path segment (ASP.NET route
+    /// matching treats `:` as an ordinary character within a segment, so `{modelAndMethod}`
+    /// captures it whole) — split on the LAST `:` to recover the model name. Routes to the
+    /// image-vs-music scripted queue/default response by whether the model name contains
+    /// "image" (case-insensitive), true of both the real discovered names
+    /// (gemini-3.1-flash-image / lyria-3-pro-preview) and the test fixture's
+    /// (gemini-test-image / lyria-test-music) — see Store.fs's doc comment.
+    let handleGeminiGenerateContent (ctx: HttpContext) (modelAndMethod: string) =
+        task {
+            let model =
+                match modelAndMethod.LastIndexOf ':' with
+                | -1 -> modelAndMethod
+                | i -> modelAndMethod.Substring(0, i)
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE GEMINI IN {ctx.Request.Method} {url} model={model} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let isImage = model.Contains("image", StringComparison.OrdinalIgnoreCase)
+            let queue = if isImage then Store.geminiImageResponseScript else Store.geminiMusicResponseScript
+            let defaultBody = if isImage then Store.defaultGeminiImageResponse else Store.defaultGeminiMusicResponse
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if queue.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondJson ctx 200 defaultBody
+        }
+
+    /// Sets the scripted-response queue for Gemini generateContent calls against an IMAGE
+    /// model. An empty/absent `responses` array clears it (calls fall back to
+    /// `Store.defaultGeminiImageResponse`).
+    let setGeminiImageScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearGeminiImageScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.geminiImageResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Sets the scripted-response queue for Gemini generateContent calls against a MUSIC
+    /// model. An empty/absent `responses` array clears it (calls fall back to
+    /// `Store.defaultGeminiMusicResponse`).
+    let setGeminiMusicScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearGeminiMusicScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.geminiMusicResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
     /// Sets the scripted-response queue for the embeddings endpoint. An empty/absent
     /// `responses` array clears it (calls fall back to Embedding.embed's deterministic
     /// hash-of-text vectors).

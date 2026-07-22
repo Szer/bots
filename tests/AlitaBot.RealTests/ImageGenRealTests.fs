@@ -6,16 +6,21 @@ open Dapper
 open Npgsql
 open Xunit
 
-/// End-to-end image-generation test (Phase-1 Slice 3): sends `/img <prompt> <guid>` as a
-/// genuine Telegram message and waits for the bot's PHOTO reply — exercising the full
-/// command-parse -> Azure images/generations -> download -> sendPhoto round trip against
-/// real Telegram + real Azure.
+/// End-to-end image-generation test (Phase-1 Slice 3, extended by the Gemini provider
+/// slice): sends `/img <prompt> <guid>` as a genuine Telegram message and waits for the
+/// bot's PHOTO reply — exercising the full command-parse -> images backend -> download ->
+/// sendPhoto round trip against real Telegram + a real image-gen backend.
 ///
-/// Self-skips (rather than failing) when ALITA_IMAGE_DEPLOYMENT is unset: at S3 deploy time
+/// Backend selection: Gemini (Nano Banana) when ALITA_GEMINI_API_KEY is configured —
+/// DevDb.applyRealSettingsAsync then also pushes IMAGE_PROVIDER=gemini — else falls back to
+/// Azure (ALITA_IMAGE_DEPLOYMENT), self-skipping when NEITHER is set: at S3 deploy time
 /// every gpt-image-* variant (and dall-e-3, the documented fallback) had 0 quota in this
-/// subscription/region — see AlitaBot/docs/TECH-DEBT.md — so there is no real deployment to
-/// exercise yet. The fake-suite tests (tests/AlitaBot.Tests/ImageGenTests.fs) cover the
-/// command/plumbing behavior in the meantime.
+/// subscription/region — see AlitaBot/docs/TECH-DEBT.md. When Gemini IS configured but its
+/// own Google Cloud project has no billing enabled for image generation (a real, discovered
+/// constraint — see GeminiProbe.fs's doc comment), this ALSO self-skips rather than
+/// hard-failing on an external blocker outside this PR's control. The fake-suite tests
+/// (tests/AlitaBot.Tests/ImageGenTests.fs, GeminiTests.fs) cover the command/plumbing
+/// behavior for both backends in the meantime.
 module ImageGenRealTimeouts =
     /// Image generation is slow (several seconds of actual model inference on top of the
     /// Telegram round trip) — matches the plan's "timeout >= 120s" requirement.
@@ -79,12 +84,20 @@ ORDER BY message_id LIMIT 1;
 
     [<Fact>]
     member _.``real /img prompt gets a photo reply captioned with the prompt``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            if String.IsNullOrWhiteSpace env.ImageDeployment then
+            let usingGemini = not (String.IsNullOrWhiteSpace env.GeminiApiKey)
+
+            if not usingGemini && String.IsNullOrWhiteSpace env.ImageDeployment then
                 Assert.Skip
-                    "ALITA_IMAGE_DEPLOYMENT missing in ~/.alita-test/env — no real image-gen deployment exists yet (quota denied, see AlitaBot/docs/TECH-DEBT.md)"
+                    "Neither ALITA_GEMINI_API_KEY nor ALITA_IMAGE_DEPLOYMENT is set in ~/.alita-test/env — no real image-gen backend exists yet (Azure quota denied, see AlitaBot/docs/TECH-DEBT.md)"
+
+            if usingGemini then
+                let! blocked = GeminiProbe.isQuotaBlocked env.GeminiApiKey "gemini-3.1-flash-image"
+                if blocked then
+                    Assert.Skip
+                        "Gemini image generation is billing-gated (free_tier limit: 0) for this ALITA_GEMINI_API_KEY's Google Cloud project — see GeminiProbe.fs's doc comment"
 
             let marker = Guid.NewGuid().ToString "N"
             let prompt = $"нарисуй красный квадрат {marker}"
@@ -110,4 +123,4 @@ ORDER BY message_id LIMIT 1;
                 | Some botRow ->
                     Assert.True botRow.is_bot
                     Assert.Equal(env.BotUserId, botRow.user_id)
-        }
+        })

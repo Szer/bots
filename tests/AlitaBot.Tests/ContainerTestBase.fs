@@ -30,6 +30,7 @@ module AlitaTestConfig =
               "BOT_AUTH_TOKEN", secret
               "TELEGRAM_API_URL", "http://fake-tg-api:8080"
               "AZURE_FOUNDRY_KEY", "test-key"
+              "GEMINI_API_KEY", "test-gemini-key"
               "TEST_MODE", "true"
           ]
           // Slice 5a: message_embedding needs pgvector (CREATE EXTENSION vector, V3
@@ -63,7 +64,21 @@ type AlitaTestContainers() =
                 "IMAGE_GEN_ENABLED",       "true",                              "FEATURE_FLAG", "llm"
                 "IMAGE_SIZE",              "1024x1024",                         "FREE_FORM", "llm"
                 "IMAGE_QUALITY",           "medium",                            "FREE_FORM", "llm"
-                "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}""", "JSON_BLOB", "llm"
+                // Gemini provider slice: fake-suite default stays IMAGE_PROVIDER=azure so
+                // the existing ImageGenTests.fs (asserting Azure images/generations +
+                // images/edits calls) keeps passing unmodified — GeminiImageGenTests.fs /
+                // SongTests.fs flip IMAGE_PROVIDER=gemini per-test (mirrors prod's actual
+                // default seed of "gemini" in dev-bot-settings.sql; the two seeds are
+                // allowed to diverge, same as every other per-test-flipped setting here).
+                // GEMINI_BASE_URL points at FakeAzureOcrApi's additive /gemini/* routes —
+                // same container as fake-azure-ocr, no new fixture container needed.
+                "GEMINI_BASE_URL",         "http://fake-azure-ocr:8081/gemini", "FREE_FORM", "llm"
+                "GEMINI_IMAGE_MODEL",      "gemini-test-image",                "FREE_FORM", "llm"
+                "GEMINI_MUSIC_MODEL",      "lyria-test-music",                 "FREE_FORM", "llm"
+                "IMAGE_PROVIDER",          "azure",                            "FREE_FORM", "llm"
+                "SONG_MAX_CHARS",          "1000",                             "FREE_FORM", "llm"
+                "SONG_COOLDOWN_SECONDS",   "120",                              "FREE_FORM", "llm"
+                "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08},"gemini-test-image":{"per_image":0.02},"lyria-test-music":{"per_track":0.06}}""", "JSON_BLOB", "llm"
                 // Two entries so /model switch tests have a real allowlisted alternative
                 // to switch to (distinct from the initial LLM_DEPLOYMENT below).
                 "MODEL_ALLOWLIST",         """["alita-gpt-5-mini","alita-gpt-5-mini-2"]""", "JSON_BLOB", "llm"

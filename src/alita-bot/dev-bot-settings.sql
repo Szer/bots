@@ -27,7 +27,11 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('EMBEDDING_DEPLOYMENT',    'alita-text-embedding-3-small',                           'FREE_FORM',    'llm',         'Embeddings deployment name'),
     ('STT_DEPLOYMENT',          'alita-stt',                                              'FREE_FORM',    'llm',         'Speech-to-text deployment name (audio/transcriptions)'),
     ('TTS_DEPLOYMENT',          'alita-tts',                                              'FREE_FORM',    'llm',         'Text-to-speech deployment name (audio/speech)'),
-    ('LLM_PRICING',             '{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08}}', 'JSON_BLOB', 'llm', 'USD prices per 1M tokens by model (chat/embeddings) and per-image by quality tier (image gen), for cost telemetry'),
+    -- gemini-3.1-flash-image/lyria-3-pro per-item prices are ESTIMATES (never empirically
+    -- billed — this key's Google Cloud project has 0 free-tier quota for image/music
+    -- generateContent, see GeminiProvider.fs's doc comment) — update once a real invoice
+    -- confirms actual per-item cost.
+    ('LLM_PRICING',             '{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08},"gemini-3.1-flash-image":{"per_image":0.02},"lyria-3-pro":{"per_track":0.06}}', 'JSON_BLOB', 'llm', 'USD prices per 1M tokens by model (chat/embeddings), per-image by quality tier or flat (image gen), and per-track (music gen), for cost telemetry'),
     ('VOICE_TRANSCRIBE_ENABLED', 'true',                                                  'FEATURE_FLAG', 'llm',        'Auto-transcribe Voice/VideoNote/Audio messages in target chats'),
     ('VISION_ENABLED',          'true',                                                   'FEATURE_FLAG', 'llm',        'Attach photos (triggering message and/or its reply target) as image_url parts on LLM requests'),
     ('VISION_DETAIL',           'low',                                                    'FREE_FORM',    'llm',        'OpenAI image_url detail hint: low | high — controls vision token cost'),
@@ -83,5 +87,16 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('SAY_MAX_CHARS',           '500',                                                    'FREE_FORM',    'llm',        '/say refuses (RU) text longer than this instead of synthesizing it'),
     ('ADMIN_USER_IDS',          '[]',                                                     'JSON_BLOB',    'admin',      'Telegram user ids allowed to run /sql — empty until hand-seeded (see AGENTS.md''s "Settings seeds, not migrations")'),
     ('SQL_PROMPT',              'Ты переводишь вопрос на естественном языке в ОДИН read-only SQL SELECT-запрос к базе данных бота Алита (PostgreSQL). Таблицы: message_log(id, chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at) — весь текстовый лог чата; message_embedding(message_log_id, embedding vector(1536), embedded_at) — эмбеддинги сообщений; interaction_memory(id, user_id, content, embedding, valid_from, valid_to, created_at) — извлечённые факты о людях (valid_to IS NULL = активный факт); person_dossier(user_id, display_name, summary, updated_at) — досье по человеку; llm_usage(id, called_at, kind, model, input_tokens, output_tokens, cost_usd, chat_id, user_id) — учёт вызовов LLM; karma(id, user_id, username, title, evidence, awarded_at) — награды /awards; bot_setting(key, value, type, feature_group, description, created_at, updated_at) — настройки бота; scheduled_job(job_name, last_completed_at, locked_until, locked_by) — фоновые задачи. Отвечай ТОЛЬКО строгим JSON {"sql": "..."} с одним SELECT- или WITH-запросом (без точки с запятой внутри, без INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/GRANT). Никакого текста вне JSON.', 'FREE_FORM', 'llm', 'System prompt for /sql — must yield strict JSON {"sql": "..."} with a single read-only SELECT/WITH statement against Alita''s own schema'),
-    ('COST_FOOTER_ENABLED',     'false',                                                  'FEATURE_FLAG', 'llm',        'Appends a "⛽ $0.0021" cost line to LLM responder replies (not command replies) — visible in Telegram, stripped before the message_log insert')
+    ('COST_FOOTER_ENABLED',     'false',                                                  'FEATURE_FLAG', 'llm',        'Appends a "⛽ $0.0021" cost line to LLM responder replies (not command replies) — visible in Telegram, stripped before the message_log insert'),
+    -- Gemini provider slice: Nano Banana images (/img, IMAGE_PROVIDER-routed) + Lyria
+    -- music (/song). GEMINI_API_KEY is a secret (env var, like AZURE_FOUNDRY_KEY) — never
+    -- a bot_setting. Model names are the discovered roster (see GeminiProvider.fs's doc
+    -- comment) as of 2026-07-22; Azure image quota is still 0 (AlitaBot/docs/TECH-DEBT.md)
+    -- so IMAGE_PROVIDER defaults to gemini until that lands.
+    ('GEMINI_BASE_URL',         'https://generativelanguage.googleapis.com',             'FREE_FORM',    'llm',        'Google Generative Language API base URL'),
+    ('GEMINI_IMAGE_MODEL',      'gemini-3.1-flash-image',                                'FREE_FORM',    'llm',        '/img (IMAGE_PROVIDER=gemini) generateContent model — "Nano Banana 2"'),
+    ('GEMINI_MUSIC_MODEL',      'lyria-3-pro-preview',                                   'FREE_FORM',    'llm',        '/song generateContent model'),
+    ('IMAGE_PROVIDER',          'gemini',                                                'FREE_FORM',    'llm',        '/img backend: azure | gemini'),
+    ('SONG_MAX_CHARS',          '1000',                                                  'FREE_FORM',    'llm',        '/song refuses (RU) a style+lyrics prompt longer than this'),
+    ('SONG_COOLDOWN_SECONDS',   '120',                                                   'FREE_FORM',    'llm',        'Minimum seconds between two /song calls from the same user')
 ON CONFLICT (key) DO NOTHING;

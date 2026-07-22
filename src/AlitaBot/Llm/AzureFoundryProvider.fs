@@ -721,7 +721,16 @@ type AzureFoundryImageGen(httpFactory: IHttpClientFactory, options: IOptions<Bot
         member _.Generate(prompt: string, sourceImage: byte[] option, ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new ImageCall(conf.ImageDeployment, conf.ImageQuality, conf.ImageSize, conf.LlmPricingJson, usageRecorder, ctx, logger)
+                use call =
+                    new ImageCall(
+                        "azure.ai.openai",
+                        conf.ImageDeployment,
+                        Some conf.ImageQuality,
+                        Some conf.ImageSize,
+                        conf.LlmPricingJson,
+                        usageRecorder,
+                        ctx,
+                        logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
 
                 let makeRequest () =

@@ -43,7 +43,7 @@ WHERE ml.chat_id = @chat_id AND ml.text LIKE '%' || @marker || '%';
 
     [<Fact>]
     member _.``ask answers a fact from a GUID-marked chat message and ignores an unrelated decoy``() =
-        task {
+        TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             if env.ResponderMode <> "llm" then
@@ -75,4 +75,4 @@ WHERE ml.chat_id = @chat_id AND ml.text LIKE '%' || @marker || '%';
                 reply.message.Contains("Канберра", StringComparison.OrdinalIgnoreCase)
                 || reply.message.Contains factGuid,
                 $"expected the /ask reply to reference the seeded fact (Канберра) or its marker ({factGuid}): {reply.message}")
-        }
+        })

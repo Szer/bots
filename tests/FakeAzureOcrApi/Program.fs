@@ -33,6 +33,13 @@ app.MapPost("/openai/deployments/{deployment}/images/edits", Func<HttpContext, T
 app.MapPost("/openai/deployments/{deployment}/embeddings", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleEmbeddings ctx))
 |> ignore
 
+// Gemini generateContent (used by AlitaBot's Gemini provider slice — Nano Banana images,
+// Lyria music). ADDITIVE: same fake server/container as everything above, one new route
+// prefix. `{modelAndMethod}` captures the whole `{model}:generateContent` path segment —
+// see Handlers.handleGeminiGenerateContent's doc comment for why `:` needs no escaping.
+app.MapPost("/gemini/v1beta/models/{modelAndMethod}", Func<HttpContext, string, Threading.Tasks.Task>(fun ctx modelAndMethod -> handleGeminiGenerateContent ctx modelAndMethod))
+|> ignore
+
 // Test endpoints (configure response / inspect calls)
 app.MapPost("/test/mock/reset",     Func<HttpContext, Threading.Tasks.Task>(fun ctx -> resetMock ctx))    |> ignore
 app.MapPost("/test/mock/response",  Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setResponse ctx))  |> ignore
@@ -46,6 +53,8 @@ app.MapPost("/test/mock/stt-script", Func<HttpContext, Threading.Tasks.Task>(fun
 app.MapPost("/test/mock/tts-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setTtsScript ctx)) |> ignore
 app.MapPost("/test/mock/image-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setImageScript ctx)) |> ignore
 app.MapPost("/test/mock/embeddings-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setEmbeddingsScript ctx)) |> ignore
+app.MapPost("/test/mock/gemini-image-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setGeminiImageScript ctx)) |> ignore
+app.MapPost("/test/mock/gemini-music-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setGeminiMusicScript ctx)) |> ignore
 app.MapGet("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> getCalls ctx)) |> ignore
 app.MapDelete("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> clearCalls ctx)) |> ignore
 
