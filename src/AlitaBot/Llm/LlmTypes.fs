@@ -39,7 +39,18 @@ type ChatRequest =
       Messages: ChatMessage list
       Tools: ToolDef list
       Temperature: float option
-      MaxTokens: int option }
+      MaxTokens: int option
+      /// gpt-5-family "reasoning_effort" ("minimal" | "low" | "medium" | "high") — omitted
+      /// entirely when None (server default, currently observed to reason heavily even on
+      /// tiny formulaic asks). PROD INCIDENT (S10 first live use, 2026-07-22 staging): with
+      /// this left unset, MediaActions.composeCaption's call — a big persona SystemPrompt
+      /// plus a one-line "react in 1-2 sentences" ask — burned its ENTIRE
+      /// `max_completion_tokens` budget on reasoning tokens with finish_reason="length" and
+      /// ZERO visible text, even after raising the budget to 500 (confirmed against a real
+      /// Azure call, not simulated). Only Azure Foundry's chat-completions wire
+      /// (AzureWire.buildChatBody) currently reads this — Gemini/Responses-API providers
+      /// don't implement IChatCompletion.
+      ReasoningEffort: string option }
 
 type TokenUsage =
     { PromptTokens: int

@@ -221,8 +221,11 @@ type BotConfiguration =
       NlToolsRateLimitPerHour: int
       /// TOOL_USE_PROMPT bot_setting: appended to the system prompt whenever tools are
       /// offered to the model — must instruct it to use tools immediately when explicitly
-      /// asked, with no pre-announcement, react to results in its own style, and never
-      /// repeat the request/prompt verbatim. Default "".
+      /// asked, with no pre-announcement, react to results in its own style, never
+      /// repeat the request/prompt verbatim, and (S10 staging finding, Bug 2) default to an
+      /// EMPTY final reply once a media tool already delivered its result with a caption —
+      /// AgentToolLoop's duplicate-final-reply guard is the deterministic backstop for this
+      /// same rule, not a substitute for it. Default "".
       ToolUsePrompt: string
       /// MEDIA_CAPTION_PROMPT bot_setting: system-prompt addition for
       /// MediaActions.composeCaption — one short in-character phrase reacting to having

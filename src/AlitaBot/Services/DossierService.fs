@@ -76,7 +76,8 @@ type DossierService
           // originally set Some 0.2 for "low-temperature, more deterministic extraction",
           // which the fake suite's LLM never validates — only a real call caught it.
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     let mergeRequest (conf: BotConfiguration) (existingSummary: string) (newFacts: string list) : ChatRequest =
         let factsText = newFacts |> List.map (fun f -> $"- {f}") |> String.concat "\n"
@@ -92,7 +93,8 @@ type DossierService
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// One user's nightly pass: extract candidate facts (LLM), embed + dedup + insert each
     /// one, then — only if at least one fact was actually new — merge the summary (LLM)

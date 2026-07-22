@@ -53,6 +53,14 @@ module NlToolLoopTestHelpers =
         root["usage"] <- usage
         root.ToJsonString()
 
+    /// A "successful" (HTTP 200) chat-completion body with EMPTY content and
+    /// `finish_reason="length"` — the shape MediaActions.composeCaption's call gets back
+    /// from gpt-5-mini when its reasoning tokens alone exhaust `max_completion_tokens`
+    /// before any visible text is produced (S10 staging Bug 1: NOT an `Error` path, a
+    /// "successful" empty response).
+    let emptyLengthCompletionBody () : string =
+        """{"id":"chatcmpl-empty","object":"chat.completion","model":"gpt-5-mini-2025-08-07","choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":900,"completion_tokens":60,"total_tokens":960}}"""
+
     /// Builds a scripted Azure Responses API body (`AzureResponsesWire.tryParseResponsesOutput`'s
     /// expected shape) with a single `output_text` message and no citations.
     let azureResponsesBody (text: string) : string =
@@ -195,6 +203,140 @@ ORDER BY message_id
 
             let! replies = botReplyRows msgId
             Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = $"[image] {scriptedCaption}")
+        }
+
+    /// S10 staging Bug 1: composeCaption's LLM call can come back HTTP 200 with EMPTY
+    /// content (`finish_reason="length"`) — not an `Error`, so the old code silently fell
+    /// back to "Готово." with no log line anywhere. Root cause (confirmed against a REAL
+    /// Azure call, not just this fake suite): gpt-5-mini's reasoning tokens alone can
+    /// exhaust `max_completion_tokens` — raising the budget to 500 was NOT enough on its
+    /// own (real evidence: 500/500 tokens spent, still zero visible text), so the actual
+    /// fix caps reasoning itself via `reasoning_effort="minimal"`. Asserts the fallback
+    /// still delivers a usable caption, the request carries BOTH the widened MaxTokens
+    /// headroom AND reasoning_effort=minimal, and the empty response is now Warning-logged
+    /// instead of invisible.
+    [<Fact>]
+    let ``composeCaption's LLM call returning empty text (200 OK, finish_reason=length) falls back to the fixed caption, requests widened MaxTokens + minimal reasoning_effort, and logs a Warning`` () =
+        task {
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_empty", "generate_image", """{"prompt":"пустая подпись"}""" ])
+                       LlmTestHelpers.scripted 200 (NlToolLoopTestHelpers.emptyLengthCompletionBody ())
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "и это всё") |]
+
+            let user = Tg.user(id = 9511L, username = "nl_judy", firstName = "Judy")
+            let update = Tg.groupMessage("алита, нарисуй что-нибудь", user, fixture.TargetChatId)
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! photoSends = fixture.GetFakeCalls("sendPhoto")
+            let toChat = photoSends |> Array.filter (isToChat fixture.TargetChatId)
+            Assert.Contains(toChat, fun c -> (jsonString c "caption") = "Готово.")
+
+            let! llmCalls = fixture.GetAzureLlmCalls()
+            use captionReqDoc = JsonDocument.Parse(llmCalls[1].Body)
+            Assert.Equal(500, captionReqDoc.RootElement.GetProperty("max_completion_tokens").GetInt32())
+            Assert.Equal("minimal", captionReqDoc.RootElement.GetProperty("reasoning_effort").GetString())
+
+            let! logs = fixture.GetBotLogs()
+            Assert.Contains("composeCaption", logs)
+        }
+
+    /// S10 staging Bug 2 (deterministic guard): the loop's final round can echo/paraphrase
+    /// the caption a media tool already sent, as a SECOND, separate text reply. A
+    /// near-exact duplicate (case + trailing punctuation differ, guard normalizes both
+    /// away) must be suppressed — the already-sent message gets deleted and no second
+    /// message_log row is written.
+    [<Fact>]
+    let ``final round text that (near-exactly) duplicates the just-sent caption is suppressed: message deleted, no second message_log row`` () =
+        task {
+            let scriptedCaption = "вот, специально для тебя"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_dup", "generate_image", """{"prompt":"дубликат"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption)
+                       // Near-exact duplicate: different case + trailing "!" — the guard's
+                       // normalization must still catch it.
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "Вот, специально для тебя!") |]
+
+            let user = Tg.user(id = 9520L, username = "nl_kate", firstName = "Kate")
+            let update = Tg.groupMessage("алита, нарисуй дубликат", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! photoSends = fixture.GetFakeCalls("sendPhoto")
+            let toChat = photoSends |> Array.filter (isToChat fixture.TargetChatId)
+            Assert.Contains(toChat, fun c -> (jsonString c "caption") = scriptedCaption)
+
+            let! replies = botReplyRows msgId
+            Assert.Single(replies) |> ignore
+            Assert.Equal($"[image] {scriptedCaption}", replies[0].text)
+
+            let! deletes = fixture.GetFakeCalls("deleteMessage")
+            Assert.NotEmpty deletes
+        }
+
+    /// S10 staging Bug 2 (deterministic guard, negative case): a final round that is
+    /// genuinely NEW content — not a rewording of the caption — must still ship as a
+    /// second reply. Guards against the duplicate check being too aggressive.
+    [<Fact>]
+    let ``final round text that is genuinely distinct from the just-sent caption still ships as a second reply`` () =
+        task {
+            let scriptedCaption = "вот, специально для тебя"
+            let distinctFollowUp = "кстати, давно хотела такое нарисовать"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_distinct", "generate_image", """{"prompt":"нечто новое"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody distinctFollowUp) |]
+
+            let user = Tg.user(id = 9521L, username = "nl_leo", firstName = "Leo")
+            let update = Tg.groupMessage("алита, нарисуй нечто новое", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! replies = botReplyRows msgId
+            Assert.Equal(2, replies.Length)
+            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = $"[image] {scriptedCaption}")
+            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = distinctFollowUp)
+
+            let! deletes = fixture.GetFakeCalls("deleteMessage")
+            Assert.Empty deletes
+        }
+
+    /// S10 staging Bug 3: a single SendChatAction call goes stale (~5s Telegram lifetime)
+    /// long before a 10-15s+ image generation finishes. Asserts the periodic refresher
+    /// fired `upload_photo` (not just `typing`) at least once during a generate_image
+    /// tool's execution — timing/cadence is deliberately not asserted (fake responses
+    /// return effectively instantly, so this only proves the FIRST refresher tick used the
+    /// right action, not the 4s cadence itself).
+    [<Fact>]
+    let ``generate_image tool execution fires an upload_photo chat action (not just typing)`` () =
+        task {
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_action", "generate_image", """{"prompt":"индикатор"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody "готово, любуйся")
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "вот") |]
+
+            let user = Tg.user(id = 9522L, username = "nl_mike", firstName = "Mike")
+            let update = Tg.groupMessage("алита, нарисуй индикатор", user, fixture.TargetChatId)
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! actionCalls = fixture.GetFakeCalls("sendChatAction")
+            let toChat = actionCalls |> Array.filter (isToChat fixture.TargetChatId)
+            Assert.Contains(toChat, fun c -> (jsonString c "action") = "upload_photo")
         }
 
     [<Fact>]

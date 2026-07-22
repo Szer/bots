@@ -137,7 +137,7 @@ type AlitaTestContainers() =
                 "NL_TOOLS_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
                 "NL_TOOLS_MAX_ITERATIONS", "4",                                "FREE_FORM", "llm"
                 "NL_TOOLS_RATE_LIMIT_PER_HOUR", "20",                          "FREE_FORM", "llm"
-                "TOOL_USE_PROMPT",        "Use tools immediately when explicitly asked, with no pre-announcement. React to tool results in your own style. Never repeat the request/prompt verbatim.", "FREE_FORM", "llm"
+                "TOOL_USE_PROMPT",        "Use tools immediately when explicitly asked, with no pre-announcement. React to tool results in your own style. Never repeat the request/prompt verbatim. When a media tool has ALREADY delivered its result with a caption, silence is the default final reply unless there is something genuinely new to add — never repeat or paraphrase a caption a tool already sent.", "FREE_FORM", "llm"
                 "MEDIA_CAPTION_PROMPT",   "You just generated media for the user. Reply with ONE short in-character reaction, 1-2 sentences. NEVER describe or repeat the prompt/request, no meta-commentary.", "FREE_FORM", "llm"
                 "WEB_SEARCH_ENABLED",     "true",                              "FEATURE_FLAG", "llm"
                 "AZURE_RESPONSES_ENDPOINT", "http://fake-azure-ocr:8081",      "FREE_FORM", "llm"

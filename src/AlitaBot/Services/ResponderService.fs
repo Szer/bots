@@ -253,7 +253,8 @@ type ResponderService(
                   Messages = system :: contextWithImages @ current
                   Tools = tools
                   Temperature = None
-                  MaxTokens = None }
+                  MaxTokens = None
+                  ReasoningEffort = None }
         }
 
     /// Slice 6 rewriter pass request: a cheap non-stream LLM call that rewrites the main
@@ -273,7 +274,8 @@ type ResponderService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// Slice 9 (stretch) cost footer: when COST_FOOTER_ENABLED and `usage` is available,
     /// appends a "⛽ $0.0021" line to the ALREADY-SENT message `sent` via one extra MDV2

@@ -186,7 +186,9 @@ module internal AzureWire =
         o
 
     /// gpt-5 family rejects `max_tokens` (use `max_completion_tokens`) and its reasoning
-    /// models ignore `temperature` — both are omitted entirely when unset.
+    /// models ignore `temperature` — both are omitted entirely when unset. `reasoning_effort`
+    /// (also omitted when unset) caps how hard a reasoning model thinks before answering —
+    /// see `ChatRequest.ReasoningEffort`'s doc comment for the prod incident that added it.
     let buildChatBody (req: ChatRequest) (stream: bool) =
         let root = JsonObject()
         let messages = JsonArray()
@@ -210,6 +212,9 @@ module internal AzureWire =
         | None -> ()
         match req.MaxTokens with
         | Some m -> root["max_completion_tokens"] <- JsonValue.Create m
+        | None -> ()
+        match req.ReasoningEffort with
+        | Some effort -> root["reasoning_effort"] <- JsonValue.Create effort
         | None -> ()
         if stream then
             root["stream"] <- JsonValue.Create true

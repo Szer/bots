@@ -30,7 +30,13 @@ type ToolExecResult =
     { ResultText: string
       /// "ok" | "denied_cooldown" | "denied_disabled" | "denied_rate_limit" |
       /// "denied_admin" | "gen_failed" | "bad_arguments" | "unknown_tool" | "tool_exception"
-      Outcome: string }
+      Outcome: string
+      /// Set to the ACTUAL caption text (MediaActions.composeCaption's output) when this
+      /// call delivered media with a caption already attached (S10 PR1 staging finding:
+      /// the loop's own final round could echo/paraphrase this same caption as a second,
+      /// separate text reply) — AgentToolLoop threads this through to a deterministic
+      /// duplicate-final-reply guard. `None` for every non-media tool/outcome.
+      CaptionSent: string option }
 
 type IToolExecutor =
     abstract Execute : name: string * argumentsJson: string * ctx: ToolExecContext * ct: CancellationToken -> Task<ToolExecResult>
@@ -98,23 +104,30 @@ type ToolExecutorService
             | None ->
                 return
                     { ResultText = "Не поняла, что рисовать — переспроси у пользователя описание картинки."
-                      Outcome = "bad_arguments" }
+                      Outcome = "bad_arguments"
+                      CaptionSent = None }
             | Some prompt ->
                 let! ok = underRateLimit conf ctx.UserId
                 if not ok then
                     return
                         { ResultText = "Слишком много картинок за последний час — предложи подождать и попробовать позже."
-                          Outcome = "denied_rate_limit" }
+                          Outcome = "denied_rate_limit"
+                          CaptionSent = None }
                 else
                     match!
                         MediaActions.generateImage
-                            imageGen chat tg conf ctx.ChatId ctx.ReplyToMessageId ctx.SourceImage prompt ctx.UsageCtx
+                            logger imageGen chat tg conf ctx.ChatId ctx.ReplyToMessageId ctx.SourceImage prompt ctx.UsageCtx
                     with
                     | MediaOutcome.Sent(sent, caption) ->
                         do! logMediaReply conf ctx sent.MessageId $"[image] {caption}"
-                        return { ResultText = $"Изображение отправлено. Подпись: «{caption}»"; Outcome = "ok" }
-                    | MediaOutcome.Refused reason -> return { ResultText = reason; Outcome = "denied_disabled" }
-                    | MediaOutcome.GenFailed reason -> return { ResultText = reason; Outcome = "gen_failed" }
+                        return
+                            { ResultText = $"Изображение отправлено. Подпись: «{caption}»"
+                              Outcome = "ok"
+                              CaptionSent = Some caption }
+                    | MediaOutcome.Refused reason ->
+                        return { ResultText = reason; Outcome = "denied_disabled"; CaptionSent = None }
+                    | MediaOutcome.GenFailed reason ->
+                        return { ResultText = reason; Outcome = "gen_failed"; CaptionSent = None }
         }
 
     let execWebSearch (argumentsJson: string) (ctx: ToolExecContext) (ct: CancellationToken) : Task<ToolExecResult> =
@@ -123,20 +136,22 @@ type ToolExecutorService
             | None ->
                 return
                     { ResultText = "Не поняла запрос для поиска — переспроси, что искать."
-                      Outcome = "bad_arguments" }
+                      Outcome = "bad_arguments"
+                      CaptionSent = None }
             | Some query ->
                 let conf = options.Value
                 let! ok = underRateLimit conf ctx.UserId
                 if not ok then
                     return
                         { ResultText = "Слишком много поисков за последний час — предложи подождать и попробовать позже."
-                          Outcome = "denied_rate_limit" }
+                          Outcome = "denied_rate_limit"
+                          CaptionSent = None }
                 else
                     match! webSearch.Search(query, ctx.UsageCtx, ct) with
-                    | Ok text -> return { ResultText = text; Outcome = "ok" }
+                    | Ok text -> return { ResultText = text; Outcome = "ok"; CaptionSent = None }
                     | Error err ->
                         logger.LogWarning("web_search tool call failed: {Error}", string err)
-                        return { ResultText = "Поиск временно недоступен."; Outcome = "gen_failed" }
+                        return { ResultText = "Поиск временно недоступен."; Outcome = "gen_failed"; CaptionSent = None }
         }
 
     interface IToolExecutor with
@@ -144,4 +159,8 @@ type ToolExecutorService
             match name with
             | "generate_image" -> execGenerateImage argumentsJson ctx ct
             | "web_search" -> execWebSearch argumentsJson ctx ct
-            | other -> Task.FromResult { ResultText = $"Неизвестный инструмент: {other}"; Outcome = "unknown_tool" }
+            | other ->
+                Task.FromResult
+                    { ResultText = $"Неизвестный инструмент: {other}"
+                      Outcome = "unknown_tool"
+                      CaptionSent = None }

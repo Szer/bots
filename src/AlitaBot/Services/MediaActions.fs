@@ -3,6 +3,7 @@ namespace AlitaBot.Services
 open System
 open System.Threading
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
 open AlitaBot
 open AlitaBot.Llm
@@ -37,7 +38,30 @@ module MediaActions =
     /// meta-commentary (that's TOOL_USE_PROMPT/MEDIA_CAPTION_PROMPT's job to enforce on the
     /// model side). Best-effort: an LLM failure or empty response falls back to a fixed
     /// short RU line ("Готово.") — a caption must never block media delivery.
+    ///
+    /// PROD INCIDENT (S10 first live use, 2026-07-22 staging): this call's `MaxTokens` was
+    /// 60 — fine for a short 1-2 sentence caption in isolation, but gpt-5-mini is a
+    /// reasoning model and `max_completion_tokens` covers BOTH its internal reasoning
+    /// tokens AND the visible answer. `conf.SystemPrompt` is the FULL persona prompt (many
+    /// paragraphs of behavioral rules, grown considerably by the persona-consistency pass),
+    /// so the model reasons FAR more before answering than the plain system prompts every
+    /// other cheap call in this codebase uses (tldrRequest/emojiPickRequest) — with no
+    /// `reasoning_effort` cap, the reasoning tokens alone can exhaust the budget, leaving
+    /// ZERO visible tokens: a 200 OK response with `finish_reason="length"` and empty
+    /// `content`. That is NOT an error (`Error` branch) — it's a "successful" empty
+    /// response, which the old code silently mapped to the "Готово." fallback with no log
+    /// line anywhere, making the failure mode invisible (confirmed against prod Loki: no
+    /// Warning/Error around the caption call for that window, only the empty fallback
+    /// caption reaching the user). Bumping `MaxTokens` to 500 alone was NOT enough —
+    /// re-verified against a REAL Azure call (not the fake suite): still 500/500 completion
+    /// tokens spent on reasoning, zero visible text, `finish_reason="length"`. The actual
+    /// fix is `ReasoningEffort = Some "minimal"`: this is a formulaic "react in 1-2
+    /// sentences" ask that doesn't need deep reasoning, and "minimal" is the documented
+    /// gpt-5 lever for bounding how much a reasoning model thinks before answering — kept
+    /// together with the widened MaxTokens as a belt-and-braces safety margin, plus (b)
+    /// logging the empty-response case (regardless of cause) so this doesn't go dark again.
     let composeCaption
+        (logger: ILogger)
         (chat: IChatCompletion)
         (conf: BotConfiguration)
         (ctx: UsageContext)
@@ -58,11 +82,22 @@ module MediaActions =
                         ToolCallId = None } ]
                   Tools = []
                   Temperature = None
-                  MaxTokens = Some 60 }
+                  MaxTokens = Some 500
+                  ReasoningEffort = Some "minimal" }
 
             match! chat.Complete(request, ctx, CancellationToken.None) with
             | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> return resp.Text.Trim()
-            | _ -> return "Готово."
+            | Ok resp ->
+                logger.LogWarning(
+                    "MediaActions.composeCaption: LLM call succeeded but returned empty/whitespace text for a {Kind} caption (finish_reason={FinishReason}, completion_tokens={CompletionTokens}) — falling back to the fixed caption. Likely gpt-5-mini reasoning tokens exhausting MaxTokens before any visible text.",
+                    kind,
+                    resp.FinishReason,
+                    (resp.Usage |> Option.map (fun u -> u.CompletionTokens) |> Option.defaultValue -1))
+                return "Готово."
+            | Error _ ->
+                // The provider layer already Warning/Error-logs the failure itself
+                // (AzureWire.logLlmError / AzureFoundryChat.Complete) — no need to duplicate.
+                return "Готово."
         }
 
     /// Core of `/img` (command AND `generate_image` tool): guardrails (IMAGE_GEN_ENABLED,
@@ -71,6 +106,7 @@ module MediaActions =
     /// "рисую..." placeholder message; the NL tool path doesn't send one) — this function
     /// never touches a placeholder.
     let generateImage
+        (logger: ILogger)
         (imageGen: IImageGen)
         (chat: IChatCompletion)
         (tg: ITelegramApi)
@@ -89,7 +125,7 @@ module MediaActions =
             else
                 match! imageGen.Generate(prompt, sourceImage, ctx, CancellationToken.None) with
                 | Ok(bytes, _usage) ->
-                    let! caption = composeCaption chat conf ctx "изображение" prompt
+                    let! caption = composeCaption logger chat conf ctx "изображение" prompt
                     let! sent = BotHelpers.sendPhotoReply tg chatId bytes caption replyToMessageId
                     return MediaOutcome.Sent(sent, caption)
                 | Error err ->

@@ -91,6 +91,39 @@ type NlToolLoopRealTests(fx: RealAssemblyFixture) =
                 Assert.False(
                     caption.Contains marker,
                     $"expected an in-persona caption reaction, not an echo of the prompt/marker ({marker}): {caption}")
+
+                // S10 first live use, 2026-07-22 staging finding (Bug 1): composeCaption's
+                // LLM call could silently exhaust its completion-token budget on gpt-5-mini
+                // reasoning tokens and fall back to the fixed "Готово." caption — assert we
+                // got a REAL in-persona reaction, not the fallback.
+                Assert.NotEqual<string>("Готово.", caption)
+
+                // S10 first live use staging finding (Bug 2): the loop's final round could
+                // echo/paraphrase the caption as a SECOND, separate text reply right after
+                // the photo. message_log is the authoritative, non-racy way to assert
+                // "exactly one reply" — poll for the settle window, then re-check after an
+                // extra grace period to catch a late-arriving duplicate the first poll
+                // might otherwise miss.
+                let countBotReplies () =
+                    task {
+                        use conn = new NpgsqlConnection(fx.DbConnectionString)
+                        return!
+                            conn.ExecuteScalarAsync<int64>(
+                                "SELECT COUNT(*) FROM message_log WHERE chat_id = @chat_id AND is_bot = true AND reply_to_message_id = @rid",
+                                {| chat_id = env.TestChatId; rid = int64 msgId |})
+                    }
+                let deadline = DateTime.UtcNow + Timeouts.dbSettle
+                let mutable count = 0L
+                while count = 0L && DateTime.UtcNow < deadline do
+                    let! c = countBotReplies ()
+                    count <- c
+                    if count = 0L then do! Task.Delay 500
+                // Grace period for a late-arriving duplicate final reply — the photo (and
+                // its message_log row) lands well before a would-be duplicate final round
+                // even starts, so this window is generous on purpose.
+                do! Task.Delay 5000
+                let! finalCount = countBotReplies ()
+                Assert.Equal(1L, finalCount)
         })
 
     /// EMPIRICAL FINDING (first real run of this test, 2026-07-22): the real model, even
