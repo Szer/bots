@@ -128,6 +128,20 @@ type AlitaTestContainers() =
                 "ADMIN_USER_IDS",         "[]",                                "JSON_BLOB", "admin"
                 "SQL_PROMPT",             """You translate a natural-language question into ONE read-only SQL SELECT statement against the bot's own PostgreSQL database. Tables: message_log(id, chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at) — the full chat text log; message_embedding(message_log_id, embedding vector(1536), embedded_at); interaction_memory(id, user_id, content, embedding, valid_from, valid_to, created_at) — valid_to IS NULL means an active fact; person_dossier(user_id, display_name, summary, updated_at); llm_usage(id, called_at, kind, model, input_tokens, output_tokens, cost_usd, chat_id, user_id); karma(id, user_id, username, title, evidence, awarded_at); bot_setting(key, value, type, feature_group, description, created_at, updated_at); scheduled_job(job_name, last_completed_at, locked_until, locked_by). Reply with ONLY strict JSON {"sql": "..."} containing a single SELECT or WITH statement (no semicolons inside, no INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/GRANT). No text outside the JSON.""", "FREE_FORM", "llm"
                 "COST_FOOTER_ENABLED",    "false",                             "FEATURE_FLAG", "llm"
+                // S10 PR1: natural-language tool-calling loop — OFF by default in the fixture
+                // (mirrors prod's conservative seeded-false posture) so every existing
+                // RESPONDER_MODE=llm test suite keeps its pre-S10 request/response shape
+                // undisturbed; NlToolLoopTests.fs flips this on per-test (IAsyncLifetime,
+                // same convention as GeminiTests' IMAGE_PROVIDER / ImageGenTests'
+                // IMAGE_GEN_ENABLED toggles).
+                "NL_TOOLS_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
+                "NL_TOOLS_MAX_ITERATIONS", "4",                                "FREE_FORM", "llm"
+                "NL_TOOLS_RATE_LIMIT_PER_HOUR", "20",                          "FREE_FORM", "llm"
+                "TOOL_USE_PROMPT",        "Use tools immediately when explicitly asked, with no pre-announcement. React to tool results in your own style. Never repeat the request/prompt verbatim.", "FREE_FORM", "llm"
+                "MEDIA_CAPTION_PROMPT",   "You just generated media for the user. Reply with ONE short in-character reaction, 1-2 sentences. NEVER describe or repeat the prompt/request, no meta-commentary.", "FREE_FORM", "llm"
+                "WEB_SEARCH_ENABLED",     "true",                              "FEATURE_FLAG", "llm"
+                "AZURE_RESPONSES_ENDPOINT", "http://fake-azure-ocr:8081",      "FREE_FORM", "llm"
+                "WEB_SEARCH_MODEL",       "alita-gpt-5-mini",                  "FREE_FORM", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

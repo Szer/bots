@@ -881,6 +881,80 @@ The fake-suite fixture's baseline `IMAGE_PROVIDER` stays `"azure"` (`ContainerTe
 so the existing `ImageGenTests.fs` assertions are undisturbed — `GeminiTests.fs` flips it to
 `"gemini"` per-test.
 
+## Natural-language tool-calling: `generate_image` + `web_search` (S10 PR1)
+
+The LLM responder can now call tools mid-conversation instead of only reacting to explicit
+`/img` etc. commands — "Алита, нарисуй рыжего кота" or "Алита, найди в интернете..." works
+without a slash command. Gated by `NL_TOOLS_ENABLED` (default `false` in prod — flip live via
+`/reload-settings` after staging validation; dev seed defaults it `true`).
+
+### Architecture
+
+`Services/AgentToolLoop.fs` reuses the existing `IReplyRenderer.Render` UNMODIFIED, once per
+round: attach the offered `ChatRequest.Tools`, `chat.CompleteStream`, hand the chunk stream to
+the same renderer the non-tool path already uses. A pure tool-call round has empty streamed
+text, so the renderer's existing "nothing to send" branch does the right thing (no Telegram
+message that round) — this required one small renderer change: the "empty text" Warning is
+now guarded to not fire when `FinishReason.ToolCalls` is the (expected) shape. The loop then
+executes the requested tools (`Services/ToolExecutor.fs`), appends an `Assistant` message
+(with `ToolCalls`) plus one `Tool`-role message per result, and starts the next round — until
+either the model stops requesting tools or `NL_TOOLS_MAX_ITERATIONS` (default `4`) is hit, at
+which point `Tools` is stripped from the next request to force a clean final text answer.
+
+`Services/MediaActions.fs` is the shared generate+caption+send core for image generation —
+used by BOTH the `/img` command AND the `generate_image` NL tool, so a caption fix benefits
+both call sites identically. The caption is no longer the (truncated) raw prompt: it's a
+cheap non-stream LLM call (`MediaActions.composeCaption`, `MEDIA_CAPTION_PROMPT` bot_setting)
+that reacts to having just made the image, explicitly forbidden from describing/repeating the
+prompt — `message_log`'s bot row for `/img`/`generate_image` now logs `[image] {caption}`
+(previously `[image] {truncated prompt}`).
+
+`Services/ToolRegistry.fs` is pure data — the tool catalog (`generate_image`, `web_search` in
+PR1) filtered by `WEB_SEARCH_ENABLED` (per-tool kill switch) and admin status (`AdminOnly`
+tools, none shipped yet — PR2's `sql_query` will be the first). `Services/Admin.fs` and
+`Services/MessageLog.fs` are prerequisite extractions out of `BotService.fs` so the tool
+executor can reuse admin-gating and `message_log` bookkeeping without a dependency on
+`BotService` itself.
+
+### `web_search` — Azure Responses API
+
+`Llm/AzureResponsesProvider.fs` is a self-contained sub-call to Azure's Responses API
+(`POST {AZURE_RESPONSES_ENDPOINT}/openai/v1/responses`) using its server-managed `web_search`
+tool — a DIFFERENT API surface from `AzureFoundryProvider.fs`'s chat completions (different
+request/response shape, and even a different base host on the same Azure AI Foundry resource:
+`https://szer-foundry.openai.azure.com`, not `AZURE_FOUNDRY_ENDPOINT`'s
+`https://szer-foundry.cognitiveservices.azure.com`).
+
+**DISCOVERY** (curl probe against the real API, run before writing the provider — see
+`AzureResponsesWire`'s doc comment for the full writeup): the unified endpoint worked on the
+first attempt, no `?api-version=` needed; auth is the same `api-key` header the chat-
+completions endpoint uses; the `alita-gpt-5-mini` deployment name worked directly as the
+`model` field. Response shape: a top-level `output[]` array mixing opaque `reasoning`/
+`web_search_call` items with exactly one `type="message"` item whose `content[]` holds
+`output_text` parts (`text` + `annotations[]` of `type="url_citation"` with `title`/`url`).
+Usage uses the Responses API's own field names (`input_tokens`/`output_tokens`, not chat
+completions' `prompt_tokens`/`completion_tokens`). The probed query ran a 3-round internal
+search (two `web_search_call`s plus reasoning) before answering — all invisible to the parser,
+which only reads the final `message` item.
+
+`WEB_SEARCH_MODEL` (default `""`, meaning unconfigured — fails gracefully like an empty
+`IMAGE_DEPLOYMENT`) is the model value sent; dev seed uses the probe-verified
+`alita-gpt-5-mini`. No new rate-limit table: `DbService.ToolCallCountSince` queries `llm_usage`
+directly (`V8__web_search_usage_kind.sql` added `'web_search'` to its `kind` CHECK).
+
+### Fake-suite testing (`tests/AlitaBot.Tests/NlToolLoopTests.fs`)
+
+`FakeAzureOcrApi` gained a `POST /openai/v1/responses` route
+(`Handlers.handleResponsesApi`/`Store.azureResponsesScript`, control endpoint
+`/test/mock/responses-script`, `BotContainerBase.SetAzureResponsesScript`/
+`GetAzureResponsesCalls`) and its existing chat-completions SSE fake
+(`respondChatCompletionSse`) now also rebuilds a scripted `message.tool_calls` array into the
+`delta.tool_calls` SSE shape `AzureFoundryChat.CompleteStream`'s parser expects (one complete
+fragment per call, not split char-by-char). The fixture's baseline `NL_TOOLS_ENABLED` stays
+`false` (mirrors prod's conservative default) so every other `RESPONDER_MODE=llm` test suite
+keeps its pre-S10 request/response shape undisturbed — `NlToolLoopTests.fs` flips it on
+per-test.
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

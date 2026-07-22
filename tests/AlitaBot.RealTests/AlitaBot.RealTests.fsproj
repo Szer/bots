@@ -34,6 +34,12 @@
     <Compile Include="SocialRealTests.fs" />
     <Compile Include="ProactiveRealTests.fs" />
     <Compile Include="StretchRealTests.fs" />
+    <!-- Runs LAST (real-test suites execute roughly in declaration order): its 2 extra
+         real chat messages (image draw + web search ask) must not land in DossierRealTests'
+         "last 24h" nightly-extraction window ahead of that test's own seeded facts — see
+         NlToolLoopRealTests.fs's module doc comment for the empirical finding that prompted
+         this placement. -->
+    <Compile Include="NlToolLoopRealTests.fs" />
     <!-- CompileAfter guarantees the [<EntryPoint>] file lands after build-injected
          sources (xunit runner reporters, MTP SelfRegisteredExtensions). -->
     <CompileAfter Include="Program.fs" />

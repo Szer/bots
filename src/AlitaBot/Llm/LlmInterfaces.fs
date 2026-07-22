@@ -53,3 +53,12 @@ type ISpeech =
     /// `voice` defaults to "alloy" when None.
     abstract Synthesize : text: string * voice: string option * ctx: UsageContext * ct: CancellationToken -> Task<Result<byte[], LlmError>>
     abstract Transcribe : audio: byte[] * ctx: UsageContext * ct: CancellationToken -> Task<Result<string, LlmError>>
+
+/// Self-contained server-managed web search (S10 NL tool-calling slice) — sub-call to the
+/// Azure Responses API (POST {AzureResponsesEndpoint}/openai/v1/responses,
+/// {"model":...,"tools":[{"type":"web_search"}],"input":query}) returning grounded text +
+/// url_citation annotations pre-formatted into one tool-result-ready string. Separate from
+/// IChatCompletion: different API surface and response shape — see
+/// Llm/AzureResponsesProvider.fs's DISCOVERY doc comment for the probed wire details.
+type IWebSearch =
+    abstract Search : query: string * ctx: UsageContext * ct: CancellationToken -> Task<Result<string, LlmError>>

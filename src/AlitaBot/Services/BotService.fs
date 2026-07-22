@@ -164,76 +164,13 @@ type BotService(
                 | Some a -> Some a.FileId
                 | None -> None
 
-    /// Truncation length for the /img photo caption's echoed prompt (plan §B2).
-    [<Literal>]
-    let ImgCaptionPromptMaxLen = 100
-
-    let logRow (chatId: int64) (messageId: int64) (userId: int64) (username: string) (displayName: string) (isBot: bool) (replyTo: int64 option) (text: string) : MessageLogRow =
-        { chat_id = chatId
-          message_id = messageId
-          user_id = userId
-          username = username
-          display_name = displayName
-          is_bot = isBot
-          reply_to_message_id = (match replyTo with Some r -> Nullable r | None -> Nullable())
-          text = text
-          sent_at = time.GetUtcNow().UtcDateTime }
-
-    // ── Embedding pipeline (Slice 5a: memory foundation) ────────────────────
-    //
-    // Every successful message_log insert (user AND bot rows alike) gets embedded
-    // in the background and written to message_embedding, feeding /ask's semantic
-    // search. Entirely best-effort: an embedding failure (LLM error or exception)
-    // is Warning-logged + counted (alitabot_embedding_failures_total) and never
-    // affects the reply path — see tryEmbed's fireAndForget wrapping.
-
-    /// Skips embedding pure command invocations — bare "/xxx"/"!xxx" text, or our own
-    /// "[xxx-cmd] ..." message_log tagging convention (handleSimpleCommand /
-    /// handleImageCommand / handleSummaryCommand / handleAskCommand) — neither carries
-    /// conversational content worth indexing for semantic search.
-    let isPureCommandText (text: string) =
-        let t = text.TrimStart()
-        t.StartsWith("/") || t.StartsWith("!") || (t.StartsWith("[") && t.Contains("-cmd]"))
-
-    /// Embeds `text` (batch of 1) and inserts the resulting message_embedding row for
-    /// `messageLogId`, fully in the background (BotInfra.Utils.fireAndForget — catches
-    /// and Warning-logs any exception on top of the explicit LlmError handling below).
-    /// No-ops entirely when EMBED_MESSAGES=false, `text` is shorter than
-    /// EMBEDDING_MIN_CHARS, or it looks like a pure command (isPureCommandText).
-    let tryEmbed (conf: BotConfiguration) (chatId: int64) (userId: int64) (messageLogId: int64) (text: string) =
-        if conf.EmbedMessagesEnabled && text.Length >= conf.EmbeddingMinChars && not (isPureCommandText text) then
-            fireAndForget logger "embedding.pipeline" (fun () ->
-                task {
-                    // Slice 5b: an opted-out author's (message_log.user_id, not the bot's
-                    // own reply — bot replies are never opted out) messages are never
-                    // embedded, mirroring their exclusion from the nightly dossier job and
-                    // from recall injection. Checked here, not at the message_log write
-                    // (BotService.logAndEmbed) — message_log itself is the shared chat
-                    // record, kept for everyone regardless of opt-out (see /forget-me).
-                    let! optedOut = db.IsOptedOut(userId)
-                    if not optedOut then
-                        let ctx: UsageContext = { ChatId = Some chatId; UserId = Some userId }
-                        match! embeddings.Embed(conf.EmbeddingDeployment, [ text ], ctx, CancellationToken.None) with
-                        | Ok vectors when vectors.Length > 0 && vectors[0].Length > 0 ->
-                            do! db.InsertMessageEmbedding(messageLogId, vectors[0])
-                        | Ok _ -> ()
-                        | Error err ->
-                            Metrics.embeddingFailuresTotal.Add(1L)
-                            logger.LogWarning("Embedding failed for message_log {Id}: {Error}", messageLogId, string err)
-                } :> Task)
-
-    /// Drop-in replacement for `db.LogMessage` at every call site: same `bool` contract
-    /// (true = first delivery inserted, false = webhook-redelivery duplicate) every
-    /// existing caller already relies on, but additionally kicks off the embedding
-    /// pipeline (tryEmbed) on a real insert. A duplicate delivery is never re-embedded.
-    let logAndEmbed (conf: BotConfiguration) (row: MessageLogRow) : Task<bool> =
-        task {
-            match! db.LogMessage(row) with
-            | Some id ->
-                tryEmbed conf row.chat_id row.user_id id row.text
-                return true
-            | None -> return false
-        }
+    // ── message_log bookkeeping (Slice 5a: memory foundation) — extracted to
+    // Services/MessageLog.fs (S10 PR1 prerequisite) so the NL tool-calling loop's
+    // ToolExecutorService can log its own media-tool replies the same way. Rebound locally
+    // so every existing ~30-site call (logRow chatId messageId ...; logAndEmbed conf row)
+    // stays byte-for-byte unchanged.
+    let logRow = MessageLog.logRow time
+    let logAndEmbed = MessageLog.logAndEmbed logger embeddings db
 
     let tldrRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
         { Deployment = conf.LlmDeployment
@@ -687,39 +624,22 @@ type BotService(
         }
 
     /// Downloads the largest photo of `msg`'s reply target, if any — the img2img source
-    /// image for a `/img` reply-to-a-photo prompt. Best-effort: any failure (API error,
-    /// missing FilePath) logs a Warning and returns None, degrading to text-to-image
-    /// instead of failing the whole command (mirrors ResponderService's vision fetch).
-    let tryFetchReplySourceImage (msg: Message) : Task<byte[] option> =
-        task {
-            match msg.ReplyToMessage |> Option.bind BotHelpers.largestPhoto with
-            | None -> return None
-            | Some photo ->
-                try
-                    let! file = tg.CallExn(Req.GetFile.Make(photo.FileId))
-                    match file.FilePath with
-                    | None -> return None
-                    | Some fp when String.IsNullOrWhiteSpace fp -> return None
-                    | Some fp ->
-                        let! bytes = tg.DownloadFile fp
-                        return Some bytes
-                with ex ->
-                    logger.LogWarning(
-                        ex,
-                        "Image gen: failed to fetch reply-to photo {FileId} — falling back to text-to-image",
-                        photo.FileId)
-                    return None
-        }
+    /// image for a `/img` reply-to-a-photo prompt. Moved to BotHelpers (S10 PR1
+    /// prerequisite) so ResponderService can share it for the NL `generate_image` tool's
+    /// ToolExecContext.SourceImage; rebound locally so the one call site below is unchanged.
+    let tryFetchReplySourceImage = BotHelpers.tryFetchReplySourceImage tg logger
 
     /// `/img` / `!img` command flow (plan §B2). Always logs the command as
     /// `[img-cmd] {prompt}` first, then branches: empty prompt -> RU usage hint;
     /// IMAGE_GEN_ENABLED=false -> RU "disabled" reply; otherwise sends a "рисую..."
-    /// placeholder, resolves an optional img2img source image from the reply target,
-    /// generates, deletes the placeholder and sends the photo (or edits the placeholder
-    /// into an apology on failure). Never dispatches to ResponderService — a command
-    /// message is fully handled here, regardless of whether it also happens to contain
-    /// the bot's name/mention. `alitabot_command_total` is incremented centrally by the
-    /// dispatcher (see `commands`/OnUpdate), not here.
+    /// placeholder, resolves an optional img2img source image from the reply target, and
+    /// delegates the generate+caption+send core to MediaActions.generateImage (S10 PR1 —
+    /// shared with the NL `generate_image` tool path) — branching on the returned
+    /// MediaOutcome for placeholder cleanup, message_log bookkeeping, and metrics. Never
+    /// dispatches to ResponderService — a command message is fully handled here, regardless
+    /// of whether it also happens to contain the bot's name/mention.
+    /// `alitabot_command_total` is incremented centrally by the dispatcher
+    /// (see `commands`/OnUpdate), not here.
     let handleImageCommand (conf: BotConfiguration) (msg: Message) (from: User) (prompt: string) =
         task {
             use a = botActivity.StartActivity("handleImageCommand")
@@ -762,49 +682,38 @@ type BotService(
                 let! placeholder = BotHelpers.sendTextReply tg msg.Chat.Id "рисую..." msg.MessageId
                 let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
 
-                match! imageGen.Generate(prompt, sourceImage, usageCtx, CancellationToken.None) with
-                | Ok(bytes, _usage) ->
-                    let truncated =
-                        if prompt.Length > ImgCaptionPromptMaxLen then prompt.Substring(0, ImgCaptionPromptMaxLen)
-                        else prompt
-                    // Gemini has no quality tiers (flat "per_image" pricing field, keyed by
-                    // GEMINI_IMAGE_MODEL) — Azure keeps its "per_image_<quality>" tiers
-                    // keyed by IMAGE_DEPLOYMENT. See ImagePricing.tryCost's doc comment.
-                    let pricingModel, pricingQuality =
-                        if conf.ImageProvider.Equals("azure", StringComparison.OrdinalIgnoreCase) then
-                            conf.ImageDeployment, Some conf.ImageQuality
-                        else
-                            conf.GeminiImageModel, None
-                    let caption =
-                        match ImagePricing.tryCost logger conf.LlmPricingJson pricingModel pricingQuality with
-                        | Some cost ->
-                            let costStr = cost.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)
-                            $"{truncated}\n${costStr}"
-                        | None -> truncated
-                    let! sentPhoto = BotHelpers.sendPhotoReply tg msg.Chat.Id bytes caption msg.MessageId
+                match!
+                    MediaActions.generateImage
+                        imageGen chat tg conf msg.Chat.Id msg.MessageId sourceImage prompt usageCtx
+                with
+                | MediaOutcome.Sent(sentPhoto, caption) ->
+                    // OQ3 (accepted): message_log logs the real caption now, not the raw
+                    // (truncated) prompt — matches /say's "[voice] {text}" convention.
                     do! logAndEmbed conf (
                             logRow msg.Chat.Id sentPhoto.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                (Some msg.MessageId) $"[image] {truncated}")
+                                (Some msg.MessageId) $"[image] {caption}")
                         |> taskIgnore
                     do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
                     let outcome = if sourceImage.IsSome then "image_edited" else "image_generated"
                     %a.SetTag("outcome", outcome)
                     countOutcome outcome
-                | Error err ->
-                    logger.LogWarning("Image generation failed: {Error}", string err)
-                    // Transient (rate-limited / Gemini 503 "high demand") gets a distinct RU
-                    // reply that tells the user retrying might actually help, instead of the
-                    // generic shrug — see LlmTypes.LlmError.isTransient's doc comment (prod
-                    // evidence: a Gemini 503 UNAVAILABLE /img failure with no such hint).
-                    let failText =
-                        if LlmError.isTransient err then
-                            "Модель перегружена, попробуй ещё раз через минутку 🙏"
+                | MediaOutcome.GenFailed reason ->
+                    logger.LogWarning("Image generation failed: {Reason}", reason)
+                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId reason
+                    let outcome =
+                        if reason.Contains("перегружена", StringComparison.Ordinal) then
+                            "image_failed_transient"
                         else
-                            "Не получилось нарисовать 🙁"
-                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId failText
-                    let outcome = if LlmError.isTransient err then "image_failed_transient" else "image_failed"
+                            "image_failed"
                     %a.SetTag("outcome", outcome)
                     countOutcome outcome
+                | MediaOutcome.Refused reason ->
+                    // Defensive only: the empty-prompt/IMAGE_GEN_ENABLED guards above already
+                    // rule these cases out before the placeholder is ever sent, so this
+                    // should never actually fire from the command path.
+                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId reason
+                    %a.SetTag("outcome", "image_refused")
+                    countOutcome "image_refused"
         }
 
     // ── Command registry (Phase-1 Slice 4) ──────────────────────────────────
@@ -1187,7 +1096,7 @@ type BotService(
     /// PurgeUserMemory), and confirms. message_log itself is untouched — it's the shared
     /// chat record, not personal memory (see the V4 migration). From this point on the
     /// requester is excluded from the nightly dossier job, the inline embedding pipeline,
-    /// and recall injection (ResponderService) — see DossierService/BotService.tryEmbed.
+    /// and recall injection (ResponderService) — see DossierService/MessageLog.tryEmbed.
     let handleForgetMeCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         handleSimpleCommand "forget-me" conf msg from args (fun () ->
             task {
@@ -1789,8 +1698,7 @@ type BotService(
 
     // ── /song (Gemini/Lyria music generation) ───────────────────────────────────
 
-    /// Truncation length for the `/song` audio's title (Bot API `sendAudio` `title` field)
-    /// — mirrors `ImgCaptionPromptMaxLen`.
+    /// Truncation length for the `/song` audio's title (Bot API `sendAudio` `title` field).
     [<Literal>]
     let SongTitleMaxLen = 60
 
@@ -1946,19 +1854,10 @@ type BotService(
         }
 
     // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
-
-    /// Parses the ADMIN_USER_IDS bot_setting (JSON_BLOB array of ints) — lenient like
-    /// parseLlmModels/parseAwardsJson: malformed JSON or a non-array value -> []
-    /// (nobody is admin until the setting is fixed, never "everybody").
-    let parseAdminUserIds (json: string) : int64 list =
-        try
-            use doc = JsonDocument.Parse(json: string)
-            if doc.RootElement.ValueKind <> JsonValueKind.Array then
-                []
-            else
-                [ for el in doc.RootElement.EnumerateArray() do
-                    if el.ValueKind = JsonValueKind.Number then el.GetInt64() ]
-        with _ -> []
+    //
+    // ADMIN_USER_IDS parsing + isAdmin moved to Services/Admin.fs (S10 PR1 prerequisite) so
+    // ToolRegistry/ResponderService can gate AdminOnly NL tools (PR2's sql_query) the same
+    // way — handleSqlCommand below now calls Admin.isAdmin directly.
 
     /// S3-style troll refusal, Алита-styled — a non-admin gets exactly this, no LLM call.
     [<Literal>]
@@ -2054,7 +1953,7 @@ type BotService(
             if not inserted then
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
-            elif not (parseAdminUserIds conf.AdminUserIdsJson |> List.contains from.Id) then
+            elif not (Admin.isAdmin conf from.Id) then
                 do! reply SqlNonAdminRefusal "sql_refused_non_admin"
             elif String.IsNullOrWhiteSpace question then
                 do! reply "Спроси что-нибудь про базу: `/sql сколько сообщений за сегодня?`" "sql_empty_question"

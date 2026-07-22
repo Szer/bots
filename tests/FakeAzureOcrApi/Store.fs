@@ -69,6 +69,24 @@ module Store =
     /// similarity to be a function of the input text, not a scripted value.
     let embeddingsResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Scripted responses for the Azure Responses API's `POST /openai/v1/responses`
+    /// endpoint (AlitaBot's `web_search` NL tool, S10 PR1 — Llm/AzureResponsesProvider.fs).
+    /// Kept separate from the other queues. If non-empty, dequeue one per call; after it
+    /// empties, falls back to a fixed default "answer with no citations" body.
+    let azureResponsesScript = ConcurrentQueue<ScriptedResponse>()
+
+    let clearAzureResponsesScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while azureResponsesScript.TryDequeue(&item) do
+            ()
+
+    /// Default `/openai/v1/responses` body — a single `type="message"` output item with
+    /// one `output_text` part and no citations, matching the real shape probed for S10 PR1
+    /// (see AzureResponsesWire's DISCOVERY doc comment) closely enough for tests that don't
+    /// care about the exact wording, just that SOME grounded answer comes back.
+    let defaultAzureResponsesBody =
+        """{"output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Готовый ответ из веб-поиска.","annotations":[]}]}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"""
+
     // ── Gemini generateContent (AlitaBot Gemini provider slice: Nano Banana images, Lyria
     // music) ─────────────────────────────────────────────────────────────────────────────
     //

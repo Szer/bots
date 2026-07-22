@@ -33,6 +33,10 @@ app.MapPost("/openai/deployments/{deployment}/images/edits", Func<HttpContext, T
 app.MapPost("/openai/deployments/{deployment}/embeddings", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleEmbeddings ctx))
 |> ignore
 
+// Azure Responses API (used by AlitaBot's `web_search` NL tool, S10 PR1)
+app.MapPost("/openai/v1/responses", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> handleResponsesApi ctx))
+|> ignore
+
 // Gemini generateContent (used by AlitaBot's Gemini provider slice — Nano Banana images,
 // Lyria music). ADDITIVE: same fake server/container as everything above, one new route
 // prefix. `{modelAndMethod}` captures the whole `{model}:generateContent` path segment —
@@ -53,6 +57,7 @@ app.MapPost("/test/mock/stt-script", Func<HttpContext, Threading.Tasks.Task>(fun
 app.MapPost("/test/mock/tts-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setTtsScript ctx)) |> ignore
 app.MapPost("/test/mock/image-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setImageScript ctx)) |> ignore
 app.MapPost("/test/mock/embeddings-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setEmbeddingsScript ctx)) |> ignore
+app.MapPost("/test/mock/responses-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setAzureResponsesScript ctx)) |> ignore
 app.MapPost("/test/mock/gemini-image-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setGeminiImageScript ctx)) |> ignore
 app.MapPost("/test/mock/gemini-music-script", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> setGeminiMusicScript ctx)) |> ignore
 app.MapGet("/test/calls", Func<HttpContext, Threading.Tasks.Task>(fun ctx -> getCalls ctx)) |> ignore

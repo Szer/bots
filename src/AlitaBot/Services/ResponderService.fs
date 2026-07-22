@@ -20,6 +20,7 @@ type ResponderService(
     chat: IChatCompletion,
     embeddings: IEmbeddings,
     renderers: ReplyRendererFactory,
+    agentToolLoop: AgentToolLoop,
     options: IOptions<BotConfiguration>,
     logger: ILogger<ResponderService>
 ) =
@@ -175,12 +176,28 @@ type ResponderService(
         | Some(MessageOrigin.HiddenUser h) -> $"[переслано от {h.SenderUserName}]\n"
         | Some(MessageOrigin.Chat _) -> "[переслано из чата]\n"
 
+    /// S10 PR1: the tool defs to offer for this triggering message — `[]` unless
+    /// NL_TOOLS_ENABLED, else the catalog filtered by WEB_SEARCH_ENABLED and whether the
+    /// triggering author is an admin (AdminOnly tools, PR2's sql_query).
+    let toolsFor (conf: BotConfiguration) (msg: Message) : ToolDef list =
+        if not conf.NlToolsEnabled then
+            []
+        else
+            let isAdmin = msg.From |> Option.map (fun u -> Admin.isAdmin conf u.Id) |> Option.defaultValue false
+            ToolRegistry.availableToolDefs conf.WebSearchEnabled isAdmin
+
     let buildRequest (conf: BotConfiguration) (rows: MessageLogRow[]) (msg: Message) : Task<ChatRequest> =
         task {
             let! dossierContext = dossierContextFor conf msg
+            let tools = toolsFor conf msg
+            let systemText =
+                if tools.IsEmpty then
+                    conf.SystemPrompt + dossierContext
+                else
+                    conf.SystemPrompt + dossierContext + "\n\n" + conf.ToolUsePrompt
             let system =
                 { Role = ChatRole.System
-                  Content = [ ContentPart.Text(conf.SystemPrompt + dossierContext) ]
+                  Content = [ ContentPart.Text systemText ]
                   ToolCalls = []
                   ToolCallId = None }
             let context = rows |> Array.map textTurn |> Array.toList
@@ -234,7 +251,7 @@ type ResponderService(
             return
                 { Deployment = conf.LlmDeployment
                   Messages = system :: contextWithImages @ current
-                  Tools = []
+                  Tools = tools
                   Temperature = None
                   MaxTokens = None }
         }
@@ -337,9 +354,32 @@ type ResponderService(
                     // Non-stream main call + non-stream rewrite pass — see
                     // respondWithRewriter's doc comment for the documented streaming
                     // tradeoff. The default (REWRITER_ENABLED=false) path below is
-                    // completely untouched by this branch.
+                    // completely untouched by this branch. (S10 PR1 OQ7: rewriter wins over
+                    // NL tools when both are enabled — a documented incompatibility, not a
+                    // bug — tools are silently unavailable while REWRITER_ENABLED=true.)
                     return! respondWithRewriter conf request ctx msg
+                elif conf.NlToolsEnabled && not request.Tools.IsEmpty then
+                    // S10 PR1: natural-language tool-calling loop. sourceImage is
+                    // pre-fetched from the TRIGGERING message's reply target here — the
+                    // model never supplies it (prompt-injection surface avoided), mirroring
+                    // the `/img` command path's own tryFetchReplySourceImage call.
+                    let! sourceImage = BotHelpers.tryFetchReplySourceImage tg logger msg
+                    let isAdmin = msg.From |> Option.map (fun u -> Admin.isAdmin conf u.Id) |> Option.defaultValue false
+                    let execCtx: ToolExecContext =
+                        { ChatId = msg.Chat.Id
+                          ReplyToMessageId = msg.MessageId
+                          UserId = msg.From |> Option.map (fun u -> u.Id) |> Option.defaultValue 0L
+                          IsAdmin = isAdmin
+                          UsageCtx = ctx
+                          SourceImage = sourceImage }
+                    let! result = agentToolLoop.Run(request, execCtx, conf.StreamMode, CancellationToken.None)
+                    match result.FinalMessage with
+                    | Some sent ->
+                        do! maybeAppendCostFooter conf result.Usage msg.Chat.Id sent result.FullText
+                        return Some(sent, result.FullText)
+                    | None -> return None
                 else
+                    // Byte-for-byte the pre-S10 path.
                     let chunks = chat.CompleteStream(request, ctx, CancellationToken.None)
                     let renderer = renderers.ForMode(conf.StreamMode)
                     let! result = renderer.Render(msg.Chat.Id, msg.MessageId, chunks, CancellationToken.None)

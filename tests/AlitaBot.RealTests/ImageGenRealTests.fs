@@ -130,9 +130,13 @@ ORDER BY message_id LIMIT 1;
             | Choice1Of2 photoReply ->
                 Assert.False(String.IsNullOrWhiteSpace photoReply.message)
                 let caption = photoReply.message
-                Assert.True(
-                    caption.Contains "красный" || caption.Contains marker,
-                    $"expected the photo caption to reference the prompt, got: {caption}")
+                // S10 PR1: the caption is now MediaActions.composeCaption's in-persona
+                // reaction (MEDIA_CAPTION_PROMPT explicitly forbids describing/repeating the
+                // prompt) — assert it's non-empty prose that does NOT echo the marker guid,
+                // not that it references the prompt content.
+                Assert.False(
+                    caption.Contains marker,
+                    $"expected an in-persona caption reaction, not an echo of the prompt/marker ({marker}): {caption}")
 
                 match! awaitUserCmdRow marker with
                 | None -> Assert.Fail $"'[img-cmd]' row (marker {marker}) never landed in message_log"

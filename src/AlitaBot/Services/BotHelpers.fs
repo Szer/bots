@@ -2,6 +2,7 @@ module AlitaBot.Services.BotHelpers
 
 open System
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
 open AlitaBot
 open BotInfra
@@ -117,3 +118,30 @@ let largestPhoto (msg: Message) : PhotoSize option =
     match msg.Photo with
     | Some photos when photos.Length > 0 -> Some(photos |> Array.maxBy (fun p -> p.Width * p.Height))
     | _ -> None
+
+/// Downloads the largest photo of `msg`'s reply target, if any — the img2img source image
+/// for a reply-to-a-photo image-generation prompt (`/img`, and S10 PR1's `generate_image`
+/// NL tool via ResponderService.ToolExecContext.SourceImage — moved here, from BotService,
+/// so both callers can share it). Best-effort: any failure (API error, missing FilePath)
+/// logs a Warning and returns None, degrading to text-to-image instead of failing the whole
+/// command/turn.
+let tryFetchReplySourceImage (tg: ITelegramApi) (logger: ILogger) (msg: Message) : Task<byte[] option> =
+    task {
+        match msg.ReplyToMessage |> Option.bind largestPhoto with
+        | None -> return None
+        | Some photo ->
+            try
+                let! file = tg.CallExn(Req.GetFile.Make(photo.FileId))
+                match file.FilePath with
+                | None -> return None
+                | Some fp when String.IsNullOrWhiteSpace fp -> return None
+                | Some fp ->
+                    let! bytes = tg.DownloadFile fp
+                    return Some bytes
+            with ex ->
+                logger.LogWarning(
+                    ex,
+                    "Image gen: failed to fetch reply-to photo {FileId} — falling back to text-to-image",
+                    photo.FileId)
+                return None
+    }

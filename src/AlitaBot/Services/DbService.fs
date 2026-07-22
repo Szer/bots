@@ -759,6 +759,22 @@ LIMIT @top;
             return rows |> Seq.toArray
         }
 
+    /// Count of `llm_usage` rows for `userId` whose `kind` is one of `kinds`, since `since`
+    /// (inclusive) — S10 PR1's NL_TOOLS_RATE_LIMIT_PER_HOUR check (ToolExecutorService),
+    /// mirroring UsageTotals' query shape but scoped to one user and a kind allowlist
+    /// instead of a global time window.
+    member _.ToolCallCountSince(userId: int64, kinds: string list, since: DateTime) : Task<int64> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT COUNT(*) FROM llm_usage
+WHERE user_id = @user_id AND kind = ANY(@kinds) AND called_at >= @since;
+"""
+            return! conn.QuerySingleAsync<int64>(sql, {| user_id = userId; kinds = kinds |> List.toArray; since = since |})
+        }
+
     // ── Proactive behavior (Slice 8: morning digest, interjections, meme reactions) ────
     //
     // The morning digest reuses HumanMessagesSince (above, /awards'/quote's query) for

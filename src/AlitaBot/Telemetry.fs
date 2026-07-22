@@ -107,3 +107,9 @@ module Metrics =
     /// MEME_REACT_PROBABILITY=0.0) — this stays at 0 in prod until hand-enabled via
     /// `bot_setting`.
     let proactiveTotal = meter.CreateCounter<int64>("alitabot_proactive_total")
+
+    /// Count of NL tool-calling loop tool executions (S10 PR1), tagged `tool` (e.g.
+    /// "generate_image", "web_search") and `outcome` (see ToolExecResult.Outcome — "ok" |
+    /// "denied_cooldown" | "denied_disabled" | "denied_rate_limit" | "denied_admin" |
+    /// "gen_failed" | "bad_arguments" | "unknown_tool" | "tool_exception").
+    let toolCallTotal = meter.CreateCounter<int64>("alitabot_tool_call_total")
