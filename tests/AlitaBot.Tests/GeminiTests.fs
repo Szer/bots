@@ -24,7 +24,7 @@ ORDER BY message_id
             {| cid = fixture.TargetChatId; mid = replyToMessageId |})
 
     [<Fact>]
-    let ``img with IMAGE_PROVIDER=gemini hits the Gemini fake, not Azure, and sends a photo`` () =
+    let ``img with IMAGE_PROVIDER=gemini hits the Gemini fake, not Azure, and sends a photo captioned with the composed persona reaction`` () =
         task {
             try
                 do! fixture.SetBotSetting("IMAGE_PROVIDER", "gemini")
@@ -32,6 +32,8 @@ ORDER BY message_id
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
                 do! fixture.SetGeminiImageScript [||]
+                let scriptedCaption = "готово, любуйся"
+                do! fixture.SetAzureLlmScript [| LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody scriptedCaption) |]
 
                 let user = Tg.user(id = 9301L, username = "gemini_alice", firstName = "Alice")
                 let prompt = "нарисуй красный квадрат"
@@ -52,11 +54,15 @@ ORDER BY message_id
                     azureCalls,
                     fun (c: FakeCall) -> c.Url.Contains "images/generations" || c.Url.Contains "images/edits")
 
+                // The caption/message_log row is now the composeCaption SCRIPTED text, not
+                // an echo of the raw prompt (S10 PR1, OQ3) — the Gemini image path shares
+                // MediaActions.generateImage with the Azure path, so this fix applies here too.
                 let! replies = botReplyRows msgId
-                Assert.Contains(replies, fun (r: MessageLogRow) -> r.text.StartsWith "[image] " && r.text.Contains prompt)
+                Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = $"[image] {scriptedCaption}")
             finally
                 fixture.SetBotSetting("IMAGE_PROVIDER", "azure") |> ignore
                 fixture.SetGeminiImageScript [||] |> ignore
+                fixture.SetAzureLlmScript [||] |> ignore
                 fixture.ReloadSettings() |> ignore
         }
 
@@ -174,6 +180,7 @@ ORDER BY message_id
                 do! fixture.SetBotSetting("IMAGE_PROVIDER", "azure")
                 do! fixture.SetGeminiImageScript [||]
                 do! fixture.SetAzureImageScript [||]
+                do! fixture.SetAzureLlmScript [||]
                 do! fixture.ReloadSettings()
             } :> Task)
 
@@ -182,5 +189,6 @@ ORDER BY message_id
                 do! fixture.SetBotSetting("IMAGE_PROVIDER", "azure")
                 do! fixture.SetGeminiImageScript [||]
                 do! fixture.SetAzureImageScript [||]
+                do! fixture.SetAzureLlmScript [||]
                 do! fixture.ReloadSettings()
             } :> Task)

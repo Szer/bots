@@ -110,7 +110,13 @@ let applyRealSettingsAsync (env: RealEnv) =
               // which 404s outside TEST_MODE (Program.fs) — force it on for every real-test
               // run, same as RESPONDER_MODE/STREAM_MODE above (dev-bot-settings.sql's local-
               // dev seed defaults it to 'false', matching production posture).
-              "TEST_MODE", "true", "FEATURE_FLAG", "diagnostics" ]
+              "TEST_MODE", "true", "FEATURE_FLAG", "diagnostics"
+              // S10 PR1: force the NL tool-calling loop on for every real-test run, same
+              // reasoning as TEST_MODE above — the dev seed already defaults this true, but
+              // forcing it here keeps NlToolLoopRealTests deterministic regardless of seed
+              // drift (dev-bot-settings.sql's ON CONFLICT DO NOTHING never re-applies to an
+              // existing dev DB volume).
+              "NL_TOOLS_ENABLED", "true", "FEATURE_FLAG", "llm" ]
             @ (if String.IsNullOrWhiteSpace env.SttDeployment then [] else [ "STT_DEPLOYMENT", env.SttDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.TtsDeployment then [] else [ "TTS_DEPLOYMENT", env.TtsDeployment, "FREE_FORM", "llm" ])
             @ (if String.IsNullOrWhiteSpace env.ImageDeployment then [] else [ "IMAGE_DEPLOYMENT", env.ImageDeployment, "FREE_FORM", "llm" ])

@@ -68,14 +68,51 @@ module Handlers =
             do! respondJson ctx status json
         }
 
+    /// Rebuilds a scripted `message.tool_calls` array (OpenAI non-stream shape:
+    /// `[{"id":...,"type":"function","function":{"name":...,"arguments":...}}]`, no
+    /// `index`) into the SSE delta shape AzureFoundryProvider's `CompleteStream` parser
+    /// reads (`delta.tool_calls[].index` disambiguates concurrently-accumulating calls —
+    /// see `ToolCallAcc`/`AzureFoundryChat.CompleteStream`'s `tools: SortedDictionary<int,
+    /// ToolCallAcc>`) — one COMPLETE fragment per call (S10 PR1 test infra: "one combined
+    /// fragment per call", not split char-by-char the way a real streamed response might
+    /// fragment `arguments`). `None` when the scripted message carries no tool_calls.
+    let private toolCallsDeltaJson (message: JsonElement) : string option =
+        match message.TryGetProperty "tool_calls" with
+        | true, tcs when tcs.ValueKind = JsonValueKind.Array && tcs.GetArrayLength() > 0 ->
+            let arr = JsonArray()
+            tcs.EnumerateArray()
+            |> Seq.iteri (fun i tc ->
+                let o = JsonObject()
+                o["index"] <- JsonValue.Create i
+                match tc.TryGetProperty "id" with
+                | true, v when v.ValueKind = JsonValueKind.String -> o["id"] <- JsonValue.Create(v.GetString())
+                | _ -> ()
+                o["type"] <- JsonValue.Create "function"
+                let f = JsonObject()
+                match tc.TryGetProperty "function" with
+                | true, fEl ->
+                    match fEl.TryGetProperty "name" with
+                    | true, v when v.ValueKind = JsonValueKind.String -> f["name"] <- JsonValue.Create(v.GetString())
+                    | _ -> ()
+                    match fEl.TryGetProperty "arguments" with
+                    | true, v when v.ValueKind = JsonValueKind.String -> f["arguments"] <- JsonValue.Create(v.GetString())
+                    | _ -> ()
+                | _ -> ()
+                o["function"] <- f
+                arr.Add o)
+            Some(arr.ToJsonString())
+        | _ -> None
+
     /// Streams a full chat-completion JSON as SSE: content split into ~3 delta chunks,
-    /// then a finish_reason chunk, a usage chunk (empty choices), and `data: [DONE]`.
-    /// Honors Store.llmStreamChunkDelayMs (delay before each data line) and
-    /// Store.llmStreamAbortAfterChunks (connection reset once N data lines were written —
-    /// the reset happens on the NEXT write, so already-written chunks can reach the client).
+    /// then (S10 PR1) one `delta.tool_calls` chunk when the scripted completion's
+    /// `message.tool_calls` is non-empty, then a finish_reason chunk, a usage chunk (empty
+    /// choices), and `data: [DONE]`. Honors Store.llmStreamChunkDelayMs (delay before each
+    /// data line) and Store.llmStreamAbortAfterChunks (connection reset once N data lines
+    /// were written — the reset happens on the NEXT write, so already-written chunks can
+    /// reach the client).
     let private respondChatCompletionSse (ctx: HttpContext) (completionJson: string) =
         task {
-            let content, model, finishReason, usageJson =
+            let content, model, finishReason, usageJson, toolCallsJson =
                 try
                     use doc = JsonDocument.Parse(completionJson)
                     let root = doc.RootElement
@@ -88,13 +125,17 @@ module Handlers =
                         match root.TryGetProperty "choices" with
                         | true, cs when cs.ValueKind = JsonValueKind.Array && cs.GetArrayLength() > 0 -> Some cs[0]
                         | _ -> None
-                    let content =
+                    let message0 =
                         choice0
                         |> Option.bind (fun c ->
                             match c.TryGetProperty "message" with
-                            | true, m -> (match m.TryGetProperty "content" with
-                                          | true, v when v.ValueKind = JsonValueKind.String -> Option.ofObj (v.GetString())
-                                          | _ -> None)
+                            | true, m -> Some m
+                            | _ -> None)
+                    let content =
+                        message0
+                        |> Option.bind (fun m ->
+                            match m.TryGetProperty "content" with
+                            | true, v when v.ValueKind = JsonValueKind.String -> Option.ofObj (v.GetString())
                             | _ -> None)
                         |> Option.defaultValue ""
                     let finish =
@@ -108,9 +149,10 @@ module Handlers =
                         match root.TryGetProperty "usage" with
                         | true, u when u.ValueKind = JsonValueKind.Object -> u.GetRawText()
                         | _ -> """{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}"""
-                    content, model, finish, usage
+                    let toolCalls = message0 |> Option.bind toolCallsDeltaJson
+                    content, model, finish, usage, toolCalls
                 with _ ->
-                    completionJson, "gpt-fake", "stop", """{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}"""
+                    completionJson, "gpt-fake", "stop", """{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}""", None
 
             ctx.Response.StatusCode <- 200
             ctx.Response.ContentType <- "text/event-stream"
@@ -142,6 +184,10 @@ module Handlers =
 
             for part in parts do
                 do! writeData $"""{{"id":"chatcmpl-fake-stream","object":"chat.completion.chunk","model":{esc model},"choices":[{{"index":0,"delta":{{"content":{esc part}}},"finish_reason":null}}]}}"""
+            match toolCallsJson with
+            | Some tcJson ->
+                do! writeData $"""{{"id":"chatcmpl-fake-stream","object":"chat.completion.chunk","model":{esc model},"choices":[{{"index":0,"delta":{{"tool_calls":{tcJson}}},"finish_reason":null}}]}}"""
+            | None -> ()
             do! writeData $"""{{"id":"chatcmpl-fake-stream","object":"chat.completion.chunk","model":{esc model},"choices":[{{"index":0,"delta":{{}},"finish_reason":{esc finishReason}}}]}}"""
             do! writeData $"""{{"id":"chatcmpl-fake-stream","object":"chat.completion.chunk","model":{esc model},"choices":[],"usage":{usageJson}}}"""
             do! writeData "[DONE]"
@@ -573,6 +619,56 @@ module Handlers =
                     if not (isNull (box payload.responses)) then
                         for r in payload.responses do
                             Store.geminiMusicResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Fake Azure Responses API handler (`POST /openai/v1/responses`, AlitaBot's
+    /// `web_search` NL tool, S10 PR1 — Llm/AzureResponsesProvider.fs). Doesn't attempt to
+    /// simulate a real web search — just logs the call (so tests can assert on the request
+    /// body shape: `tools:[{"type":"web_search"}]` + `input`) and returns the next scripted
+    /// response, same dequeue convention as every other endpoint here. An empty queue falls
+    /// back to `Store.defaultAzureResponsesBody`.
+    let handleResponsesApi (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.azureResponsesScript.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondJson ctx 200 Store.defaultAzureResponsesBody
+        }
+
+    /// Sets the scripted-response queue for the Azure Responses API endpoint. An
+    /// empty/absent `responses` array clears it (calls fall back to
+    /// `Store.defaultAzureResponsesBody`).
+    let setAzureResponsesScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearAzureResponsesScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.azureResponsesScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

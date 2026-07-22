@@ -207,4 +207,37 @@ type BotConfiguration =
       /// SONG_COOLDOWN_SECONDS bot_setting: minimum seconds between two `/song` calls from
       /// the same user (music generation is slow and pricier than images/chat). Default 120.
       SongCooldownSeconds: int
+      /// FEATURE_FLAG NL_TOOLS_ENABLED (S10 PR1) — natural-language tool-calling loop
+      /// (generate_image, web_search) for the LLM responder path. DB-only, no env fallback —
+      /// dev seed "true", PROD seeded "false" (see AGENTS.md's "Settings seeds, not
+      /// migrations"; flip live via /reload-settings after staging validation).
+      NlToolsEnabled: bool
+      /// NL_TOOLS_MAX_ITERATIONS bot_setting: hard cap on tool-call rounds per turn — once
+      /// exceeded, AgentToolLoop strips Tools from the next request, forcing a clean final
+      /// text answer instead of looping forever. Default 4.
+      NlToolsMaxIterations: int
+      /// NL_TOOLS_RATE_LIMIT_PER_HOUR bot_setting: per-user hourly cap (via llm_usage) on
+      /// cost-heavy tool calls (generate_image, generate_song [PR2], web_search). Default 20.
+      NlToolsRateLimitPerHour: int
+      /// TOOL_USE_PROMPT bot_setting: appended to the system prompt whenever tools are
+      /// offered to the model — must instruct it to use tools immediately when explicitly
+      /// asked, with no pre-announcement, react to results in its own style, and never
+      /// repeat the request/prompt verbatim. Default "".
+      ToolUsePrompt: string
+      /// MEDIA_CAPTION_PROMPT bot_setting: system-prompt addition for
+      /// MediaActions.composeCaption — one short in-character phrase reacting to having
+      /// just generated media, never describing the result or repeating the request.
+      /// Default "".
+      MediaCaptionPrompt: string
+      /// FEATURE_FLAG WEB_SEARCH_ENABLED — per-tool kill switch for the web_search NL tool,
+      /// independent of NL_TOOLS_ENABLED (which gates the whole loop). Default true.
+      WebSearchEnabled: bool
+      /// AZURE_RESPONSES_ENDPOINT bot_setting: base URL for the Azure Responses API
+      /// (web_search tool) — a DIFFERENT host than AzureFoundryEndpoint on the same Azure AI
+      /// Foundry resource, see Llm/AzureResponsesProvider.fs's DISCOVERY doc comment.
+      AzureResponsesEndpoint: string
+      /// WEB_SEARCH_MODEL bot_setting: the `model` value the Responses API call sends.
+      /// Empty means unconfigured — web_search then fails gracefully (RU apology) instead of
+      /// a doomed network call, same posture as an empty ImageDeployment.
+      WebSearchModel: string
       TestMode: bool }

@@ -53,10 +53,12 @@ ORDER BY message_id
             {| cid = fixture.TargetChatId; mid = replyToMessageId |})
 
     [<Fact>]
-    let ``img prompt sends a photo with the prompt in the caption, logs both rows, and cleans up the placeholder`` () =
+    let ``img prompt sends a photo captioned with the composed persona reaction (not the raw prompt), logs both rows, and cleans up the placeholder`` () =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.ClearAzureOcrCalls()
+            let scriptedCaption = "держи, свежее"
+            do! fixture.SetAzureLlmScript [| ImageGenTestHelpers.scripted 200 (LlmTestHelpers.completionBody scriptedCaption) |]
 
             let user = Tg.user(id = 7001L, username = "img_alice", firstName = "Alice")
             let prompt = "нарисуй рыжего кота на подоконнике"
@@ -69,7 +71,10 @@ ORDER BY message_id
             let! photoSends = fixture.GetFakeCalls("sendPhoto")
             let toChat = photoSends |> Array.filter (ImageGenTestHelpers.isToChat fixture.TargetChatId)
             Assert.NotEmpty toChat
-            Assert.Contains(toChat, fun c -> (ImageGenTestHelpers.jsonString c "caption").Contains prompt)
+            // The caption is MediaActions.composeCaption's SCRIPTED output, never a
+            // (truncated) echo of the raw prompt (S10 PR1, OQ3).
+            Assert.Contains(toChat, fun c -> (ImageGenTestHelpers.jsonString c "caption") = scriptedCaption)
+            Assert.DoesNotContain(toChat, fun c -> (ImageGenTestHelpers.jsonString c "caption").Contains prompt)
 
             // The "рисую..." placeholder must be sent then cleaned up (deleted).
             let! sends = fixture.GetFakeCalls("sendMessage")
@@ -84,8 +89,9 @@ ORDER BY message_id
             Assert.False row.is_bot
             Assert.Equal($"[img-cmd] {prompt}", row.text)
 
+            // message_log's bot row now logs the real (scripted) caption, not the prompt.
             let! replies = botReplyRows msgId
-            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text.StartsWith "[image] " && r.text.Contains prompt)
+            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = $"[image] {scriptedCaption}")
         }
 
     [<Fact>]
@@ -179,6 +185,7 @@ ORDER BY message_id
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
                 do! fixture.SetAzureImageScript [||]
+                do! fixture.SetAzureLlmScript [||]
                 do! fixture.SetBotSetting("IMAGE_GEN_ENABLED", "true")
                 do! fixture.ReloadSettings()
             } :> Task)
@@ -187,6 +194,7 @@ ORDER BY message_id
         member _.DisposeAsync() =
             ValueTask(task {
                 do! fixture.SetAzureImageScript [||]
+                do! fixture.SetAzureLlmScript [||]
                 do! fixture.SetBotSetting("IMAGE_GEN_ENABLED", "true")
                 do! fixture.ReloadSettings()
             } :> Task)

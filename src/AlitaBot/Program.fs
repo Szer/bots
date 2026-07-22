@@ -121,6 +121,16 @@ let buildBotConf () =
       ImageProvider = getSettingOr "IMAGE_PROVIDER" "gemini"
       SongMaxChars = getSettingOr "SONG_MAX_CHARS" "1000" |> int
       SongCooldownSeconds = getSettingOr "SONG_COOLDOWN_SECONDS" "120" |> int
+      // S10 PR1: natural-language tool-calling loop (generate_image, web_search).
+      NlToolsEnabled = getSettingOr "NL_TOOLS_ENABLED" "false" |> bool.Parse
+      NlToolsMaxIterations = getSettingOr "NL_TOOLS_MAX_ITERATIONS" "4" |> int
+      NlToolsRateLimitPerHour = getSettingOr "NL_TOOLS_RATE_LIMIT_PER_HOUR" "20" |> int
+      ToolUsePrompt = getSettingOr "TOOL_USE_PROMPT" ""
+      MediaCaptionPrompt = getSettingOr "MEDIA_CAPTION_PROMPT" ""
+      WebSearchEnabled = getSettingOr "WEB_SEARCH_ENABLED" "true" |> bool.Parse
+      AzureResponsesEndpoint =
+        getSettingOr "AZURE_RESPONSES_ENDPOINT" (getEnvOr "AZURE_RESPONSES_ENDPOINT" "https://szer-foundry.openai.azure.com")
+      WebSearchModel = getSettingOr "WEB_SEARCH_MODEL" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -202,6 +212,10 @@ if botConfOptions.Value.TestMode then
             sp.GetRequiredService<IOptions<BotConfiguration>>())
         :> IImageGen)
     .AddSingleton<IMusicGen, GeminiMusicGen>()
+    // S10 PR1: natural-language tool-calling loop.
+    .AddSingleton<IWebSearch, AzureResponsesWebSearch>()
+    .AddSingleton<IToolExecutor, ToolExecutorService>()
+    .AddSingleton<AgentToolLoop>()
     // Slice 5b: nightly per-person dossier fact extraction (Services/DossierService.fs,
     // Services/ScheduledJobs.fs). SchedulerHostedService needs `connString` directly (the
     // lease functions in ScheduledJobs.fs are plain functions over a connection string,

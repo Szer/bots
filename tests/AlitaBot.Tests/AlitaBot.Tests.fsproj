@@ -23,6 +23,7 @@
     <Compile Include="StretchTests.fs" />
     <Compile Include="GeminiTests.fs" />
     <Compile Include="SongTests.fs" />
+    <Compile Include="NlToolLoopTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

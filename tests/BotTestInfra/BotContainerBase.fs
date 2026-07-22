@@ -465,6 +465,28 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the Azure Responses API endpoint (`POST /openai/v1/responses`, AlitaBot's
+    /// `web_search` NL tool, S10 PR1). An empty array clears the script (calls fall back to
+    /// the fake's default "answer with no citations" body).
+    member _.SetAzureResponsesScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/responses-script", payload)
+            return ()
+        }
+
+    /// Returns only the Azure Responses API calls the fake recorded (S10 PR1's `web_search`
+    /// tool) — filters `GetAzureOcrCalls()` by url, same convention as `GetAzureEmbeddingsCalls`.
+    member _.GetAzureResponsesCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
+            return resp |> Array.filter (fun c -> c.Url.Contains("/openai/v1/responses"))
+        }
+
     /// Scripts Gemini generateContent calls against an IMAGE model (AlitaBot Gemini
     /// provider slice, `/img` with IMAGE_PROVIDER=gemini) — model name contains "image",
     /// see FakeAzureOcrApi's Handlers.handleGeminiGenerateContent. An empty array clears

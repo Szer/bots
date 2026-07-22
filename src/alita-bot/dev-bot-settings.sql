@@ -98,5 +98,17 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('GEMINI_MUSIC_MODEL',      'lyria-3-pro-preview',                                   'FREE_FORM',    'llm',        '/song generateContent model'),
     ('IMAGE_PROVIDER',          'gemini',                                                'FREE_FORM',    'llm',        '/img backend: azure | gemini'),
     ('SONG_MAX_CHARS',          '1000',                                                  'FREE_FORM',    'llm',        '/song refuses (RU) a style+lyrics prompt longer than this'),
-    ('SONG_COOLDOWN_SECONDS',   '120',                                                   'FREE_FORM',    'llm',        'Minimum seconds between two /song calls from the same user')
+    ('SONG_COOLDOWN_SECONDS',   '120',                                                   'FREE_FORM',    'llm',        'Minimum seconds between two /song calls from the same user'),
+    -- S10 PR1: natural-language tool-calling loop (generate_image, web_search). DEV seed
+    -- is 'true' so local testing exercises the loop by default — the deployed PROD value is
+    -- seeded 'false' via hand-run SQL (AGENTS.md's "Settings seeds, not migrations") and
+    -- flipped live via /reload-settings only after staging validation.
+    ('NL_TOOLS_ENABLED',        'true',                                                  'FEATURE_FLAG', 'llm',        'Natural-language tool-calling loop (generate_image, web_search) for the LLM responder'),
+    ('NL_TOOLS_MAX_ITERATIONS', '4',                                                     'FREE_FORM',    'llm',        'Hard cap on tool-call rounds per turn before the loop forces a final text answer'),
+    ('NL_TOOLS_RATE_LIMIT_PER_HOUR', '20',                                               'FREE_FORM',    'llm',        'Per-user hourly cap on cost-heavy tool calls (generate_image, web_search)'),
+    ('TOOL_USE_PROMPT',         'Используй инструменты сразу, если тебя явно просят — без анонсирования того, что собираешься делать. Реагируй на результат в своём обычном стиле. Никогда не повторяй запрос/промпт пользователя дословно.', 'FREE_FORM', 'llm', 'Appended to the system prompt whenever tools are offered to the model'),
+    ('MEDIA_CAPTION_PROMPT',    'Ты только что сделала то, о чём просили (картинку и т.п.). Ответь ОДНОЙ короткой репликой в своём характере, 1-2 предложения. НИКОГДА не описывай и не повторяй запрос, без мета-комментариев о том, что ты только что сделала технически.', 'FREE_FORM', 'llm', 'System-prompt addition for MediaActions.composeCaption'),
+    ('WEB_SEARCH_ENABLED',      'true',                                                  'FEATURE_FLAG', 'llm',        'Per-tool kill switch for the web_search NL tool (independent of NL_TOOLS_ENABLED)'),
+    ('AZURE_RESPONSES_ENDPOINT', 'https://szer-foundry.openai.azure.com',                'FREE_FORM',    'llm',        'Base URL for the Azure Responses API (web_search tool) — a DIFFERENT host than AZURE_FOUNDRY_ENDPOINT on the same Azure AI Foundry resource'),
+    ('WEB_SEARCH_MODEL',        'alita-gpt-5-mini',                                      'FREE_FORM',    'llm',        'Model value the Responses API web_search call sends — empty means unconfigured (graceful fail)')
 ON CONFLICT (key) DO NOTHING;
