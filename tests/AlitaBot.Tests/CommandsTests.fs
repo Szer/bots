@@ -351,6 +351,16 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             Assert.True(
                 summaryReplySend |> Array.exists (fun c -> jsonHasNumberProperty c "receiver_user_id"),
                 "expected the /summary reply's sendMessage call to carry receiver_user_id")
+
+            // Regression check (see BotHelpers.loggableMessageId / docs/TECH-DEBT.md): an
+            // accepted ephemeral send reports Message.MessageId = 0 on real Telegram (and
+            // now in FakeTgApi too — see Handlers.handleSendMessage), with the real per-send
+            // id in EphemeralMessageId instead. message_log has UNIQUE(chat_id, message_id)
+            // with ON CONFLICT DO NOTHING, so logging the raw MessageId=0 verbatim would make
+            // every ephemeral reply after the first one in a chat silently vanish. Asserting
+            // a nonzero message_id here pins that handleSummaryCommand logs
+            // BotHelpers.loggableMessageId, not sent.MessageId directly.
+            Assert.NotEqual(0L, replies[0].message_id)
         }
 
     [<Fact>]
