@@ -99,3 +99,11 @@ module Metrics =
     /// producing entities Telegram doesn't accept (see Services/ReplyRenderer.fs's
     /// `Mdv2Delivery`).
     let mdv2FallbackTotal = meter.CreateCounter<int64>("alitabot_mdv2_fallback_total")
+
+    /// Count of proactive-behavior actions (Slice 8: morning digest, willingness-gated
+    /// interjections, meme reactions), tagged `kind` ∈ `digest` | `interject` |
+    /// `interject_pass` | `meme_react` | `meme_comment` | `meme_pass`. Every proactive
+    /// feature defaults OFF/0.0 in seeds (DIGEST_ENABLED=false, INTERJECT_PROBABILITY=0.0,
+    /// MEME_REACT_PROBABILITY=0.0) — this stays at 0 in prod until hand-enabled via
+    /// `bot_setting`.
+    let proactiveTotal = meter.CreateCounter<int64>("alitabot_proactive_total")

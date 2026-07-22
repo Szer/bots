@@ -78,6 +78,11 @@ type RecalledFactRow = { content: string; similarity: float }
 [<CLIMutable>]
 type ResolvedUserRow = { user_id: int64; display_name: string }
 
+/// Burst-activity stats for one chat over a lookback window (Slice 8 interjection gate)
+/// — count of non-bot `message_log` rows and distinct authors among them.
+[<CLIMutable>]
+type BurstStatsRow = { message_count: int64; distinct_users: int64 }
+
 /// F# option -> Dapper-friendly Nullable<'a>, for optional numeric columns.
 [<AutoOpen>]
 module private DbServiceHelpers =
@@ -658,6 +663,39 @@ LIMIT @top;
 """
             let! rows = conn.QueryAsync<UsageByUserRow>(sql, {| since = since; top = top |})
             return rows |> Seq.toArray
+        }
+
+    // ── Proactive behavior (Slice 8: morning digest, interjections, meme reactions) ────
+    //
+    // The morning digest reuses HumanMessagesSince (above, /awards'/quote's query) for
+    // both its "active enough" threshold and its transcript — no new table. Interjections
+    // read straight off message_log too (below); meme reactions need no DB support at all
+    // (S6's SetMessageReaction path, no new state).
+
+    /// Non-bot message count + distinct author count in `chatId` since `since` — Slice 8's
+    /// willingness-gated-interjection burst check (`BURST_MSGS`/`BURST_SPEAKERS`).
+    member _.BurstStats(chatId: int64, since: DateTime) : Task<BurstStatsRow> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT COUNT(*) AS message_count, COUNT(DISTINCT user_id) AS distinct_users
+FROM message_log
+WHERE chat_id = @chat_id AND is_bot = FALSE AND sent_at >= @since;
+"""
+            return! conn.QuerySingleAsync<BurstStatsRow>(sql, {| chat_id = chatId; since = since |})
+        }
+
+    /// True when `chatId` has at least one bot (`is_bot = TRUE`) `message_log` row since
+    /// `since` — Slice 8's interjection cooldown check. A fresh interjection is logged the
+    /// same as any other bot reply, so it naturally self-cools the chat for the next one.
+    member _.HasBotMessageSince(chatId: int64, since: DateTime) : Task<bool> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT EXISTS(SELECT 1 FROM message_log WHERE chat_id = @chat_id AND is_bot = TRUE AND sent_at >= @since);"
+            return! conn.QuerySingleAsync<bool>(sql, {| chat_id = chatId; since = since |})
         }
 
     interface IUsageRecorder with

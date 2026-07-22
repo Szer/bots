@@ -1,0 +1,12 @@
+-- Slice 8: proactive behavior (morning digest, willingness-gated interjections, meme
+-- reactions). No new tables: the digest reuses message_log via HumanMessagesSince (the
+-- same query /awards and /quote already read); interjection burst/cooldown checks are
+-- plain message_log queries (DbService.BurstStats/HasBotMessageSince); meme reactions
+-- reuse the existing S6 SetMessageReaction path. This migration only registers the new
+-- scheduled job, same lease-locking table the nightly dossier job already uses (V4).
+--
+-- Every proactive feature defaults OFF/0.0 (see dev-bot-settings.sql) — the digest job
+-- runs on schedule regardless (lease acquired, last_completed_at stamped) but sends
+-- nothing while DIGEST_ENABLED=false, same as how dossier_nightly_update always runs but
+-- DOSSIER_ENABLED only gates the *recall* side.
+INSERT INTO scheduled_job (job_name) VALUES ('digest_daily');

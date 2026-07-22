@@ -476,6 +476,98 @@ the same "clean active-users slate" reason `DossierTests.fs` needs it. A new
 row-count assertions deterministic across the shared, `DisableTestParallelization=true`
 assembly fixture.
 
+## Proactive behavior: morning digest, interjections, meme reactions (Phase-1 Slice 8)
+
+The bot's default posture is still fully reactive — it only ever speaks when triggered or
+commanded. Slice 8 adds three OPT-IN proactive features, each gated by its own
+`bot_setting` and **defaulting OFF/0.0** so the bot stays exactly as polite as before until
+someone deliberately turns one on live in prod (`AGENTS.md`'s "Settings seeds, not
+migrations" — none of this is seeded on by a migration). Every action any of the three
+takes is counted by `alitabot_proactive_total{kind=...}` (`docs/OBSERVABILITY.md`).
+
+### Morning digest (`digest_daily`, `DIGEST_ENABLED`)
+
+A `SchedulerHostedService`-driven job (`Services/DigestService.fs`), same lease-acquire
+pattern as `dossier_nightly_update` (`Services/ScheduledJobs.fs`) — scheduled daily at
+`DIGEST_UTC_HOUR` UTC (default `7`), `POST /test/run-job?name=digest_daily` for TEST_MODE-
+only manual triggering. Unlike the dossier job, `DIGEST_ENABLED` (default `false`) gates
+the whole thing inside `DigestService.RunDailyDigest` itself — the lease is still acquired
+and `last_completed_at` stamped on schedule either way, it just sends nothing while
+disabled.
+
+For each `TARGET_CHAT_IDS` chat with at least `DIGEST_MIN_MESSAGES` (default `30`) human,
+non-command `message_log` rows in the last 24h (`DbService.HumanMessagesSince` — the same
+query `/awards`/`/quote` already use): builds a speaker-attributed transcript, runs it
+through a non-stream `DIGEST_PROMPT` LLM call ("утренний дайджест вчерашнего срача — по
+темам, с лёгким сарказмом, кто что задвигал, 6-10 строк, без воды"), MDV2-renders the
+result, and sends it as a **fresh, non-reply message** to that chat
+(`Mdv2Delivery.sendFinalToChat`, a Slice 8 addition to `Services/ReplyRenderer.fs` — same
+MDV2-with-Telegram-400-fallback/over-length-escalation policy as `sendFinal`, just without
+`reply_parameters` anywhere on the wire, since a scheduled job has no triggering message to
+reply to). The sent digest is logged to `message_log` like any other bot message. A chat
+below the threshold is silently skipped (span-tagged `below_min_messages`, no LLM call).
+
+### Willingness-gated interjections (`INTERJECT_PROBABILITY`)
+
+On every NON-triggered, non-command text message in a target chat (`BotService.
+tryInterject`, fired fire-and-forget from `handleTriggerableMessage`'s "logged" branch —
+**after** the message is already logged, never delaying the normal path), three gates must
+ALL hold, cheapest first:
+
+1. **Roll** — `INTERJECT_PROBABILITY` (default `0.0`) against `Random.Shared.NextDouble()`.
+   No DB round trip at all when this fails.
+2. **Burst** — at least `BURST_MSGS` (default `8`) messages from at least `BURST_SPEAKERS`
+   (default `3`) distinct authors in the last `BURST_WINDOW_MINUTES` (default `5`),
+   `DbService.BurstStats` — a plain `message_log` query, no new table.
+3. **Cooldown** — no bot message (`is_bot=TRUE` — a reply OR a previous interjection, both
+   logged identically) in this chat in the last `INTERJECT_COOLDOWN_MINUTES` (default `30`),
+   `DbService.HasBotMessageSince`. A fired interjection naturally self-cools the chat for
+   the next one, since it's logged the same as any reply.
+
+Only once all three hold does a recent-context (`CONTEXT_WINDOW_MESSAGES` rows,
+speaker-attributed transcript — same shape `/summary` builds) `INTERJECT_PROMPT` LLM call
+fire ("можешь вставить ОДНУ меткую реплику в этот разговор, или ответь ровно PASS если
+нечего добавить"). A `"PASS"` response (trimmed, case-insensitive) stays silent
+(`interject_pass`); anything else goes out as a **plain (non-reply) message**
+(`BotHelpers.sendMessage`, no MDV2 — a deliberately lighter-weight delivery than the
+digest's) and is logged like any other bot reply (`interject`).
+
+The whole hook runs through `withChatLock` (the same per-chat `SemaphoreSlim` normal
+message handling uses) — since it fires fire-and-forget from inside a callback the lock is
+already held by, and that callback finishes (releasing the lock) before the spawned task's
+own `WaitAsync()` ever completes, there's no deadlock; the interjection simply queues
+behind whatever touches the chat's lock next, same serialization guarantee triggered
+messages get.
+
+### Meme reactions (`MEME_REACT_PROBABILITY`)
+
+On every NON-triggered photo message in a target chat (`BotService.tryMemeReact`, same
+fire-and-forget/`withChatLock` shape as interjections): `MEME_REACT_PROBABILITY` (default
+`0.0`) roll, then a vision LLM call (the photo as an `image_url` content part + caption,
+`MEME_REACT_PROMPT`) that must answer strict JSON `{"action":"react|comment|pass",
+"emoji":"...","text":"..."}`:
+
+- **`react`** — sets a message reaction (`Req.SetMessageReaction`) using ONE emoji from the
+  same Telegram-allowed set the S6 outcome router's emoji outcome uses
+  (`allowedReactionEmoji`). An emoji outside that set is treated as a no-op (Warning-logged),
+  never sent to Telegram unchecked.
+- **`comment`** — sends a one-liner reply (`BotHelpers.sendTextReply`, logged normally).
+  Blank text is a no-op.
+- **`pass`** — does nothing.
+- **Malformed JSON** (or a failed LLM call, or an unrecognized `action`) — treated the same
+  as `pass`, Warning-logged.
+
+### Enabling in prod
+
+Every setting above is a normal `bot_setting` row — flip it live, then `POST
+/reload-settings` (or wait for the next natural reload). Start conservative:
+
+```sql
+UPDATE bot_setting SET value = 'true' WHERE key = 'DIGEST_ENABLED';
+UPDATE bot_setting SET value = '0.02' WHERE key = 'INTERJECT_PROBABILITY';  -- ~1-in-50 eligible burst
+UPDATE bot_setting SET value = '0.05' WHERE key = 'MEME_REACT_PROBABILITY'; -- ~1-in-20 photo
+```
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

@@ -90,6 +90,21 @@ let buildBotConf () =
       RoastCooldownSeconds = getSettingOr "ROAST_COOLDOWN_SECONDS" "300" |> int
       AwardsPrompt = getSettingOr "AWARDS_PROMPT" ""
       QuotePrompt = getSettingOr "QUOTE_PROMPT" ""
+      // Slice 8: proactive behavior (morning digest, willingness-gated interjections,
+      // meme reactions) — every default here keeps the bot polite/silent until hand-
+      // enabled live via bot_setting (see dev-bot-settings.sql's header comment).
+      DigestEnabled = getSettingOr "DIGEST_ENABLED" "false" |> bool.Parse
+      DigestUtcHour = getSettingOr "DIGEST_UTC_HOUR" "7" |> int
+      DigestMinMessages = getSettingOr "DIGEST_MIN_MESSAGES" "30" |> int
+      DigestPrompt = getSettingOr "DIGEST_PROMPT" ""
+      InterjectProbability = getSettingOr "INTERJECT_PROBABILITY" "0.0" |> float
+      BurstMsgs = getSettingOr "BURST_MSGS" "8" |> int
+      BurstSpeakers = getSettingOr "BURST_SPEAKERS" "3" |> int
+      BurstWindowMinutes = getSettingOr "BURST_WINDOW_MINUTES" "5" |> int
+      InterjectCooldownMinutes = getSettingOr "INTERJECT_COOLDOWN_MINUTES" "30" |> int
+      InterjectPrompt = getSettingOr "INTERJECT_PROMPT" ""
+      MemeReactProbability = getSettingOr "MEME_REACT_PROBABILITY" "0.0" |> float
+      MemeReactPrompt = getSettingOr "MEME_REACT_PROMPT" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -160,11 +175,16 @@ if botConfOptions.Value.TestMode then
     // like DbService itself) rather than through DbService, so it's constructed via a
     // factory closure here instead of relying on constructor-parameter DI.
     .AddSingleton<DossierService>()
+    // Slice 8: daily morning digest (Services/DigestService.fs) — same lease-driven
+    // scheduling as DossierService, both owned by SchedulerHostedService below.
+    .AddSingleton<DigestService>()
     .AddSingleton<SchedulerHostedService>(fun sp ->
         new SchedulerHostedService(
             connString,
             sp.GetRequiredService<TimeProvider>(),
             sp.GetRequiredService<DossierService>(),
+            sp.GetRequiredService<DigestService>(),
+            sp.GetRequiredService<IOptions<BotConfiguration>>(),
             sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
     .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
 
