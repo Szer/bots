@@ -187,7 +187,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = Some 60 }
+          MaxTokens = Some 60
+          ReasoningEffort = None }
 
     /// Cheap non-stream TL;DR for long transcripts. Best-effort: any failure just
     /// means the reply ships without a TL;DR line, never blocks the transcript reply.
@@ -233,7 +234,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = Some 10 }
+          MaxTokens = Some 10
+          ReasoningEffort = None }
 
     /// "emoji" outcome: a tiny non-stream LLM call picks one emoji from
     /// `allowedReactionEmoji`, then `Req.SetMessageReaction` reacts to the triggering
@@ -284,7 +286,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// Willingness-gated interjection (plan §2): INTERJECT_PROBABILITY roll, then a burst
     /// check (>= BURST_MSGS messages from >= BURST_SPEAKERS distinct users in the last
@@ -387,7 +390,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// Meme reaction (plan §3): MEME_REACT_PROBABILITY roll, then a vision LLM call
     /// (MEME_REACT_PROMPT) that must answer strict JSON {action,emoji,text}. "react" sets
@@ -684,7 +688,7 @@ type BotService(
 
                 match!
                     MediaActions.generateImage
-                        imageGen chat tg conf msg.Chat.Id msg.MessageId sourceImage prompt usageCtx
+                        logger imageGen chat tg conf msg.Chat.Id msg.MessageId sourceImage prompt usageCtx
                 with
                 | MediaOutcome.Sent(sentPhoto, caption) ->
                     // OQ3 (accepted): message_log logs the real caption now, not the raw
@@ -907,7 +911,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     // buildTranscript (rows |> [{display_name}]: text, joined) moved up next to the
     // Slice 8 proactive-behavior section — it's shared by /summary here and
@@ -987,7 +992,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// `/ask <question>` — embeds the question, pulls the ASK_TOP_K nearest
     /// message_embedding rows for this chat above ASK_SIM_FLOOR cosine similarity
@@ -1243,7 +1249,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     /// `/roast [@username | reply-to-target]` — see `resolveRoastTarget`/`gatherRoastAmmo`
     /// for target resolution and ammunition gathering. Delivered via `Mdv2Delivery.sendFinal`
@@ -1361,7 +1368,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     let renderAwards (awards: AwardEntry list) : string =
         let lines = awards |> List.map (fun a -> $"🏆 {a.Title} — {a.User}: „{a.EvidenceQuote}\"")
@@ -1463,7 +1471,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     let renderQuote (q: QuoteEntry) : string =
         $"💬 Цитата дня: „{q.Quote}\" — {q.Author}. {q.Comment}"
@@ -1889,7 +1898,8 @@ type BotService(
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     [<Literal>]
     let SqlRowLimit = 50

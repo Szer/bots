@@ -50,7 +50,8 @@ type DigestService
                 ToolCallId = None } ]
           Tools = []
           Temperature = None
-          MaxTokens = None }
+          MaxTokens = None
+          ReasoningEffort = None }
 
     let logRow (chatId: int64) (messageId: int64) (conf: BotConfiguration) (text: string) : MessageLogRow =
         { chat_id = chatId
