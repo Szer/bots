@@ -1,11 +1,20 @@
 # AlitaBot real-Telegram test loop (plan §5). Credentials: ~/.alita-test/env.
-# `make real-test` is THE agent loop: dev DB + Release build + tests/AlitaBot.RealTests.
+# `make real-test` is the dev quick-iteration loop: dev DB + Release build +
+# tests/AlitaBot.RealTests. A full run invokes paid external APIs (Azure AI Foundry
+# and/or Gemini — chat completions, TTS/STT, image and music generation), so prefer
+# scoping with FILTER, e.g.:
+#   make real-test FILTER="FullyQualifiedName~ImageGenRealTests"
+# which is passed straight through as `dotnet test`'s --filter. The full end-to-end
+# suite against a real AKS deployment (.github/workflows/alita-real-test.yml) is a
+# separate, manual `gh workflow run alita-real-test.yml --ref <branch>` — not part of
+# this loop and not run per-PR.
 
 # `docker` may be a shell alias for podman (not visible to make) — pick the real binary.
-DOCKER   ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
-COMPOSE   = $(DOCKER) compose -f src/alita-bot/docker-compose.dev.yml
-ALITA_ENV = $(HOME)/.alita-test/env
-ARTIFACTS = test-artifacts/AlitaBot.RealTests
+DOCKER     ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
+COMPOSE     = $(DOCKER) compose -f src/alita-bot/docker-compose.dev.yml
+ALITA_ENV   = $(HOME)/.alita-test/env
+ARTIFACTS   = test-artifacts/AlitaBot.RealTests
+REAL_FILTER = $(FILTER)
 
 .PHONY: alita-db alita-build alita-test real-test selfcheck smoke alita-logs tg-login tg-chats probe-draft alita-clean
 
@@ -19,7 +28,7 @@ alita-test:
 	dotnet test tests/AlitaBot.Tests -c Release
 
 real-test: alita-db alita-build
-	dotnet test tests/AlitaBot.RealTests -c Release
+	dotnet test tests/AlitaBot.RealTests -c Release $(if $(REAL_FILTER),--filter "$(REAL_FILTER)",)
 
 selfcheck: alita-db alita-build
 	dotnet run --project tests/AlitaBot.RealTests -c Release -- selfcheck

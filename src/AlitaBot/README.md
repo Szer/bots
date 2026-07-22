@@ -1086,7 +1086,7 @@ Makefile targets (repo root):
 | `make alita-build` | `dotnet build src/AlitaBot -c Release`. |
 | `make selfcheck` | Plumbing-only check (no MTProto): db → build → ngrok tunnel → bot process → webhook → public `/healthz` → teardown. |
 | `make probe-draft` | The M5 empirical probe — standalone, no tunnel/webhook/bot process needed; calls the Bot API directly and logs everything the MTProto user client observes. |
-| `make real-test` | **The agent loop.** `alita-db` + `alita-build` + `dotnet test tests/AlitaBot.RealTests -c Release` — full real-Telegram smoke suite (`SmokeTests.fs`). |
+| `make real-test` | **The dev quick-iteration loop.** `alita-db` + `alita-build` + `dotnet test tests/AlitaBot.RealTests -c Release` — invokes paid Azure/Gemini APIs, so prefer `make real-test FILTER=<pattern>` (passed through as `--filter`) to scope to what you're iterating on rather than running the whole suite. |
 | `make alita-logs` | Tails `bot.log`/`ngrok.log` from the last `real-test`/`selfcheck` run. |
 | `make alita-clean` | `docker compose down -v` + `deleteWebhook?drop_pending_updates=true`. Run when done for the session. |
 
@@ -1170,7 +1170,11 @@ container itself is wired correctly, not to duplicate the conversational test su
 ## CI real-test flow (M7): `ALITA_REAL_MODE=remote`
 
 `make real-test`/`make smoke` (above) are the local loops — bare-process or containerized,
-always against a tunnel and a dev-machine Postgres. `.github/workflows/alita-real-test.yml` runs
+always against a tunnel and a dev-machine Postgres. `.github/workflows/alita-real-test.yml` is
+**manual `workflow_dispatch` only** (`gh workflow run alita-real-test.yml --ref <branch>`) — it
+does not run per-PR. The PR gate is the hermetic suite (`tests/AlitaBot.Tests`, via
+`alita-build.yml`); this workflow is the full E2E, invoked on demand since it exercises real
+Telegram delivery plus paid LLM/image/music generation calls. When dispatched, it runs
 the *same* `tests/AlitaBot.RealTests` suite in CI, but against a real deployment: it builds and
 pushes `ghcr.io/szer/alita-bot:test-<sha>`, `kubectl apply`s Postgres + the bot into the
 `alita-test` AKS namespace (persistent namespace/cert/gateway-listener/RBAC from `my-infra` PR
@@ -1201,9 +1205,9 @@ fight over `setWebhook` (one bot account = one active webhook) or the MTProto se
 
 **Singleton queueing contract.** The workflow's `concurrency` block is
 `group: alita-aks-real-test, cancel-in-progress: false` — the `alita-test` namespace and its
-transient workload are a single shared resource, so a second PR's run queues behind the first
-rather than racing it for the same Postgres/bot/HTTPRoute. Expect PRs to serialize through this
-gate; it is not parallelized per-PR.
+transient workload are a single shared resource, so a second manually-dispatched run queues
+behind the first rather than racing it for the same Postgres/bot/HTTPRoute. Runs serialize
+through this gate; it is not parallelized.
 
 **No-ArgoCD-labels rule.** Everything the workflow applies under `.github/k8s/alita-test/` is
 labeled `alita-ci: transient` and **never** `app.kubernetes.io/instance` — that's the label
