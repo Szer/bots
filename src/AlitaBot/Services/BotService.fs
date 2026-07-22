@@ -972,8 +972,8 @@ type BotService(
                 task {
                     let! sent = BotHelpers.trySendEphemeralOrReply tg logger msg.Chat.Id from.Id text msg.MessageId
                     do! logAndEmbed conf (
-                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                (Some msg.MessageId) text)
+                            logRow msg.Chat.Id (BotHelpers.loggableMessageId sent) (botUserId conf) conf.BotUsername
+                                conf.BotUsername true (Some msg.MessageId) text)
                         |> taskIgnore
                     %a.SetTag("outcome", outcome)
                     countOutcome outcome
