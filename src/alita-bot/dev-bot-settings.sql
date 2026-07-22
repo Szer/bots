@@ -31,5 +31,10 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('IMAGE_QUALITY',           'medium',                                                 'FREE_FORM',    'llm',        'images/generations quality param: low | medium | high'),
     ('MODEL_ALLOWLIST',         '["alita-gpt-5-mini"]',                                   'JSON_BLOB',    'llm',        '/model may switch LLM_DEPLOYMENT to any deployment name in this array'),
     ('SUMMARY_PROMPT',          'Подведи итоги обсуждения в этом чате: с лёгким сарказмом, по темам, кто что утверждал. Коротко, без длинных вступлений.', 'FREE_FORM', 'llm', 'System prompt for the /summary command'),
-    ('TEST_MODE',               'false',                                                  'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/clock/advance)')
+    ('TEST_MODE',               'false',                                                  'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/clock/advance)'),
+    ('EMBED_MESSAGES',          'true',                                                   'FEATURE_FLAG', 'llm',        'Embed every logged message (user + bot) into message_embedding for /ask semantic search'),
+    ('EMBEDDING_MIN_CHARS',     '3',                                                      'FREE_FORM',    'llm',        'Messages shorter than this are never embedded'),
+    ('ASK_TOP_K',               '8',                                                      'FREE_FORM',    'llm',        '/ask: how many nearest message_embedding rows to pull as candidate context before the similarity floor'),
+    ('ASK_SIM_FLOOR',           '0.5',                                                    'FREE_FORM',    'llm',        '/ask: minimum cosine similarity (1 - cosine distance) for a candidate to be included in the context'),
+    ('ASK_PROMPT',              'Ответь на вопрос, используя только приведённые ниже цитаты из чата. Указывай, кто и когда это сказал. Если ничего подходящего не нашлось — прямо скажи об этом, не выдумывай.', 'FREE_FORM', 'llm', 'System prompt for the /ask command')
 ON CONFLICT (key) DO NOTHING;

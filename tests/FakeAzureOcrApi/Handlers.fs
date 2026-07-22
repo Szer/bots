@@ -4,6 +4,7 @@ open System
 open System.Net
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 
@@ -362,6 +363,75 @@ module Handlers =
             | None -> do! respondJson ctx 200 Store.defaultImageResponse
         }
 
+    /// Builds `{"object":"list","data":[{"object":"embedding","index":i,"embedding":[...]}],"model":"fake-embedding","usage":{...}}`
+    /// — one deterministic hash-of-text vector (Embedding.embed) per input. Kept as a
+    /// plain (non-task) function: the nested `for` loops over 1536-dim vectors inside a
+    /// `task { }` CE tripped the F# compiler's resumable-state-machine analysis (FS3511).
+    let private buildEmbeddingsResponseBody (inputs: string list) : string =
+        let root = JsonObject()
+        root["object"] <- JsonValue.Create "list"
+        let data = JsonArray()
+        inputs
+        |> List.iteri (fun i text ->
+            let item = JsonObject()
+            item["object"] <- JsonValue.Create "embedding"
+            item["index"] <- JsonValue.Create i
+            let arr = JsonArray()
+            for v in Embedding.embed text do
+                arr.Add(JsonValue.Create(float v))
+            item["embedding"] <- arr
+            data.Add item)
+        root["data"] <- data
+        root["model"] <- JsonValue.Create "fake-embedding"
+        let usage = JsonObject()
+        usage["prompt_tokens"] <- JsonValue.Create(inputs.Length * 5)
+        usage["total_tokens"] <- JsonValue.Create(inputs.Length * 5)
+        root["usage"] <- usage
+        root.ToJsonString()
+
+    /// Fake Azure OpenAI embeddings handler (AlitaBot's memory foundation, Slice 5a).
+    /// Parses `input` (a string or an array of strings) and returns one deterministic
+    /// hash-of-text vector per input (Embedding.embed — see its doc comment for the
+    /// scheme), unless a scripted response is queued (SetAzureEmbeddingsScript), which
+    /// takes priority — e.g. to inject a 429 and assert the embedding pipeline's
+    /// failure-tolerance (Warning-logged, counted, never affects the reply path).
+    let handleEmbeddings (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.embeddingsResponseScript.TryDequeue(&item) then Some item else None
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ -> do! respondJson ctx s.status s.body
+            | None ->
+                let inputs =
+                    try
+                        use doc = JsonDocument.Parse(body)
+                        match doc.RootElement.TryGetProperty "input" with
+                        | true, v when v.ValueKind = JsonValueKind.Array ->
+                            [ for el in v.EnumerateArray() do
+                                if el.ValueKind = JsonValueKind.String then
+                                    el.GetString() |> Option.ofObj |> Option.defaultValue "" ]
+                        | true, v when v.ValueKind = JsonValueKind.String ->
+                            [ v.GetString() |> Option.ofObj |> Option.defaultValue "" ]
+                        | _ -> []
+                    with _ -> []
+
+                do! respondJson ctx 200 (buildEmbeddingsResponseBody inputs)
+        }
+
     /// Sets the scripted-response queue for the images/generations + images/edits endpoints
     /// (shared — one control endpoint for both, per plan). An empty/absent `responses` array
     /// clears it (calls fall back to the default scripted tiny PNG).
@@ -378,6 +448,27 @@ module Handlers =
                     if not (isNull (box payload.responses)) then
                         for r in payload.responses do
                             Store.imageResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Sets the scripted-response queue for the embeddings endpoint. An empty/absent
+    /// `responses` array clears it (calls fall back to Embedding.embed's deterministic
+    /// hash-of-text vectors).
+    let setEmbeddingsScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearEmbeddingsScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.embeddingsResponseScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

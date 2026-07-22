@@ -28,7 +28,10 @@ module AlitaTestConfig =
               "TELEGRAM_API_URL", "http://fake-tg-api:8080"
               "AZURE_FOUNDRY_KEY", "test-key"
               "TEST_MODE", "true"
-          ] }
+          ]
+          // Slice 5a: message_embedding needs pgvector (CREATE EXTENSION vector, V3
+          // migration). Scoped to Alita alone — vahter/coupon keep postgres:17.10.
+          PostgresImage = "pgvector/pgvector:pg17" }
 
 type AlitaTestContainers() =
     inherit BotContainerBase(AlitaTestConfig.config)
@@ -47,6 +50,7 @@ type AlitaTestContainers() =
                 "CONTEXT_WINDOW_MESSAGES", "30",                                "FREE_FORM", "llm"
                 "AZURE_FOUNDRY_ENDPOINT",  "http://fake-azure-ocr:8081",        "FREE_FORM", "llm"
                 "LLM_DEPLOYMENT",          "alita-gpt-5-mini",                  "FREE_FORM", "llm"
+                "EMBEDDING_DEPLOYMENT",    "alita-text-embedding-3-small",      "FREE_FORM", "llm"
                 "STT_DEPLOYMENT",          "alita-stt",                         "FREE_FORM", "llm"
                 "TTS_DEPLOYMENT",          "alita-tts",                         "FREE_FORM", "llm"
                 "VOICE_TRANSCRIBE_ENABLED", "true",                             "FEATURE_FLAG", "llm"
@@ -62,6 +66,12 @@ type AlitaTestContainers() =
                 "MODEL_ALLOWLIST",         """["alita-gpt-5-mini","alita-gpt-5-mini-2"]""", "JSON_BLOB", "llm"
                 "SUMMARY_PROMPT",          "Summarize the chat discussion below, by topic, noting who said what. Be brief.", "FREE_FORM", "llm"
                 "TEST_MODE",               "true",                              "FEATURE_FLAG", "diagnostics"
+                // Slice 5a: memory foundation + /ask semantic search.
+                "EMBED_MESSAGES",          "true",                              "FEATURE_FLAG", "llm"
+                "EMBEDDING_MIN_CHARS",     "3",                                 "FREE_FORM", "llm"
+                "ASK_TOP_K",               "8",                                 "FREE_FORM", "llm"
+                "ASK_SIM_FLOOR",           "0.5",                               "FREE_FORM", "llm"
+                "ASK_PROMPT",              "Answer the question using only the chat quotes below. Cite who said what and when. If nothing relevant is found, say so plainly.", "FREE_FORM", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

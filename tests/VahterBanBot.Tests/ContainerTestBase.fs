@@ -84,7 +84,8 @@ module private VahterTestConfig =
           OcrEnabled = mlEnabled
           SecretToken = secret
           WebhookRoute = "/bot"
-          AppEnvVars = envVars }
+          AppEnvVars = envVars
+          PostgresImage = "postgres:17.10" }
 
 /// Path to the pre-trained ML model fixture committed to the repo.
 /// On CI, this file MUST exist or the test run aborts immediately.

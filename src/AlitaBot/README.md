@@ -83,6 +83,7 @@ reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
 | `/model [name]` | — | No arg: show the current `LLM_DEPLOYMENT` + the `MODEL_ALLOWLIST`. With an allowlisted arg: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
 | `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below. |
 | `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
+| `/ask <question>` | — | Semantic search over this chat's message history (see "Memory" below): answers grounded in the nearest matching quotes, cited by author and date. Empty question → RU usage hint. |
 | `/help` | `/start` | Auto-generated list of the above, from the registry. |
 
 ### Usage accounting (`llm_usage`, V2 migration)
@@ -146,6 +147,87 @@ this table with what an admin-bot `sendMessage(receiver_user_id=...)` actually d
 whether the response `Message.EphemeralMessageId` gets populated and whether the message is
 genuinely invisible to other chat members (needs a second real user account to observe from,
 which this harness doesn't have yet — see `TgUserClient`'s single-account limitation).
+
+## Memory: per-message embeddings + `/ask` (Phase-1 Slice 5a)
+
+pgvector-backed semantic search over a chat's own history — the first slice of the
+"memory" initiative, on top of `message_log` rather than replacing it.
+
+### Storage (`message_embedding`, V3 migration)
+
+`src/alita-bot/migrations/V3__message_embedding.sql` adds `CREATE EXTENSION IF NOT EXISTS
+vector;` plus a `message_embedding` table: `message_log_id BIGINT PRIMARY KEY REFERENCES
+message_log(id) ON DELETE CASCADE`, `embedding vector(1536) NOT NULL`, `embedded_at
+TIMESTAMPTZ`, and an HNSW index (`vector_cosine_ops`) matching the `<=>` (cosine distance)
+operator `/ask`'s search uses. The `vector` extension is **not** marked `trusted` in its
+control file (`pgvector/pgvector:pg17`'s `vector.control` has no `trusted = true` line),
+so `CREATE EXTENSION vector` needs a superuser even though Flyway's `admin` role already
+owns the database — confirmed empirically (`permission denied to create extension
+"vector" ... Must be superuser`). `src/alita-bot/init.sql`'s `admin` role is granted
+`SUPERUSER` for exactly this (dev/test only, same "no need for prod DB" posture as the
+rest of that file — a real deployment's Postgres role setup is out of this repo's scope).
+
+Postgres image is pgvector's build of postgres:17 (`pgvector/pgvector:pg17`) everywhere
+AlitaBot's tests/dev/CI provision their own Postgres — `src/alita-bot/docker-compose.dev.yml`,
+`.github/k8s/alita-test/postgres.yaml`, and the fake-suite's `BotContainerConfig.PostgresImage`
+(`tests/AlitaBot.Tests/ContainerTestBase.fs`). `BotContainerConfig.PostgresImage` is an
+additive field on the shared `BotTestInfra.BotContainerBase` (default `"postgres:17.10"`)
+so vahter/coupon's test containers are untouched.
+
+### Inline embedding pipeline
+
+Every successful `message_log` insert — sender messages **and** the bot's own replies
+alike — is embedded in the background and written to `message_embedding`
+(`BotService`'s `tryEmbed`/`logAndEmbed`, a drop-in wrapper around every `db.LogMessage`
+call site). Entirely best-effort: `fireAndForget` (`BotInfra.Utils`) plus explicit
+`LlmError` handling means an embedding failure is Warning-logged and counted
+(`alitabot_embedding_failures_total`) but **never** affects the reply path — the Telegram
+reply has already been sent by the time embedding runs. Skipped entirely (no Azure call
+at all) when:
+- `EMBED_MESSAGES=false` (bot_setting, `FEATURE_FLAG`, default `true`),
+- the text is shorter than `EMBEDDING_MIN_CHARS` (bot_setting, default `3`), or
+- the text looks like a pure command invocation — bare `/xxx`/`!xxx`, or the `"[xxx-cmd]
+  ..."` tagging convention `handleSimpleCommand`/`handleImageCommand`/`handleSummaryCommand`/
+  `handleAskCommand` already use to log command messages (`isPureCommandText`) — neither
+  carries conversational content worth indexing.
+
+Embeddings are produced via the existing `IEmbeddings`/`AzureFoundryEmbeddings`
+(`EMBEDDING_DEPLOYMENT` bot_setting) in batches of 1, threaded through `IUsageRecorder`
+the same way every other LLM call type is (`llm_usage.kind = 'embedding'`).
+
+### `/ask <question>`
+
+1. Embeds the question (same `IEmbeddings` call as the pipeline above).
+2. `DbService.SemanticSearch` pulls the `ASK_TOP_K` (default `8`) nearest
+   `message_embedding` rows for *this chat* by cosine distance (pgvector `<=>`, served by
+   the HNSW index), then filters to `ASK_SIM_FLOOR` (default `0.5`) cosine similarity —
+   two-stage on purpose: filtering by similarity first would force a full scan, since
+   pgvector can't push a similarity `WHERE` into the index, so the index serves the
+   `LIMIT` and the floor is applied to that candidate set afterward.
+3. No candidates above the floor → a fixed RU "ничего подходящего не нашла" reply,
+   deterministic, no LLM call at all (`ask_no_matches` outcome).
+4. Otherwise builds a context block (author, date, quoted text — oldest first) and
+   answers via a non-stream `IChatCompletion.Complete` call with the `ASK_PROMPT`
+   bot_setting as the system message, replied normally (not ephemeral — S4's ephemeral
+   pattern was judged not worth it here: unlike `/summary`, `/ask` is naturally a
+   question-and-answer exchange other chat members plausibly want to see too).
+
+Empty question → RU usage hint, no embedding/LLM call at all.
+
+### Fake-suite testing (`tests/AlitaBot.Tests/MemoryTests.fs`)
+
+`FakeAzureOcrApi` gained an `/openai/deployments/{deployment}/embeddings` route
+(`Handlers.handleEmbeddings`) returning **deterministic hash-of-text vectors**
+(`FakeAzureOcrApi.Embedding.embed`) rather than fixed/scripted ones: tokenize (Unicode
+letter/digit runs — handles Cyrillic), hash each token to one of 1536 dimensions
+(FNV-1a mod 1536), weight by occurrence count, L2-normalize. Two texts sharing
+vocabulary land close together (nonzero cosine similarity on the shared dimensions);
+texts with disjoint vocabulary land near-orthogonal (~0 similarity, modulo rare hash
+collisions). That's what lets the fake suite assert *real* semantic separation — "the
+relevant seeded message is in `/ask`'s LLM context, the irrelevant one isn't" — without a
+real embedding model. A `SetAzureEmbeddingsScript`/`GetAzureEmbeddingsCalls` pair
+(mirroring the other `Azure*Script` members on `BotContainerBase`) is also available for
+tests that need to inject a scripted/failing response instead.
 
 ## Empirical draft-semantics findings (M5)
 

@@ -49,6 +49,13 @@ module Store =
     /// `defaultImageResponse` (a scripted tiny PNG) rather than an error.
     let imageResponseScript = ConcurrentQueue<ScriptedResponse>()
 
+    /// Scripted responses for the Azure OpenAI embeddings endpoint (AlitaBot's memory
+    /// foundation, Slice 5a). Kept separate from the other queues. If non-empty, dequeue
+    /// one per call; after it empties, calls fall back to Embedding.embed's deterministic
+    /// hash-of-text vectors — the common case, since most embedding tests want
+    /// similarity to be a function of the input text, not a scripted value.
+    let embeddingsResponseScript = ConcurrentQueue<ScriptedResponse>()
+
     /// Streaming knobs for the chat-completions SSE mode (see LlmStreamOptionsDto).
     /// Set via /test/mock/azure-llm-stream-options; all zeros = defaults.
     let mutable llmStreamChunkDelayMs = 0
@@ -91,6 +98,11 @@ module Store =
     let clearImageScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while imageResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearEmbeddingsScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while embeddingsResponseScript.TryDequeue(&item) do
             ()
 
     /// Resets the OCR mock to its pristine baseline: default 200 response, no delay,

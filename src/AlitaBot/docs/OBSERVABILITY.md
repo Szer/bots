@@ -51,6 +51,7 @@ Meter: `AlitaBot.Metrics` (`src/AlitaBot/Telemetry.fs`, `src/AlitaBot/Llm/LlmTel
 | `alitabot_llm_tokens_total` | Counter | `direction` (`input`\|`output`) | Token throughput across all LLM call types (chat, embeddings, STT, TTS, image). |
 | `alitabot_llm_cost_usd_total` | Counter | — | Estimated USD cost, from the `LLM_PRICING` bot_setting (per-token for chat/embeddings, per-image-per-quality for image gen). Silently 0 for models/deployments with no matching pricing entry (one-time Warning logged instead). |
 | `alitabot_llm_latency_ms` | Histogram | — | Latency of every LLM/STT/TTS/image-gen call (span-scoped: for streamed chat, first byte to `[DONE]`). Not broken out by call type via a tag — use the span name (`llm.chat`/`llm.stt`/etc.) in Tempo to filter by operation. |
+| `alitabot_embedding_failures_total` | Counter | — | Embedding-pipeline failures (Slice 5a) — an `LlmError` from `IEmbeddings.Embed` or an exception inserting the `message_embedding` row. Always Warning-logged alongside this counter; never affects the reply path (`BotService`'s `tryEmbed`, fire-and-forget). Should stay near zero — a sustained nonzero rate means embeddings are silently failing to build `/ask`'s memory. |
 
 ## Persistent usage accounting (`llm_usage`, Phase-1 Slice 4)
 
@@ -69,6 +70,7 @@ accounting" section for the exact write path and nullability rules.
 - `/img` usage: `sum(increase(alitabot_command_total{command="img"}[24h]))`
 - LLM spend (24h): `sum(increase(alitabot_llm_cost_usd_total[24h]))`
 - Voice transcription p95 latency: `histogram_quantile(0.95, sum(rate(alitabot_voice_transcribe_duration_ms_bucket[1h])) by (le))`
+- Embedding failure rate (should be ~0): `sum(rate(alitabot_embedding_failures_total[1h]))`
 
 ## Webhook idempotency and per-chat serialization
 

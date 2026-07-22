@@ -28,7 +28,11 @@ type BotContainerConfig =
       SecretToken: string
       WebhookRoute: string
       /// Extra environment variables for the app container.
-      AppEnvVars: (string * string) list }
+      AppEnvVars: (string * string) list
+      /// Postgres image tag for the test container. Additive (Slice 5a: AlitaBot needs
+      /// pgvector for its message_embedding table) — every other bot keeps "postgres:17.10"
+      /// so this is scoped to Alita alone.
+      PostgresImage: string }
 
 /// Shared container lifecycle for bot integration tests.
 /// Orchestrates: network, postgres, init.sql, flyway, fake TG API, fake Azure OCR, bot app.
@@ -40,7 +44,7 @@ type BotContainerBase(config: BotContainerConfig) =
     let dbAlias = config.MigrationsSubdir + "-db"
     let fakeAlias = "fake-tg-api"
     let fakeAzureAlias = "fake-azure-ocr"
-    let pgImage = "postgres:17.10"
+    let pgImage = config.PostgresImage
 
     let internalConnectionString =
         $"Server={dbAlias};Database={config.DbName};Port=5432;User Id={config.DbUser};Password={config.DbPassword};Include Error Detail=true;Minimum Pool Size=1;Maximum Pool Size=20;Max Auto Prepare=100;Auto Prepare Min Usages=1;Trust Server Certificate=true;"
@@ -424,6 +428,27 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the Azure OpenAI embeddings endpoint (AlitaBot's memory foundation, Slice 5a) —
+    /// same shared-queue pattern as SetAzureImageScript. An empty array clears the script
+    /// (calls fall back to the fake's deterministic hash-of-text vectors, Embedding.embed).
+    member _.SetAzureEmbeddingsScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/embeddings-script", payload)
+            return ()
+        }
+
+    /// Returns only the Azure OpenAI embeddings calls the fake recorded.
+    member _.GetAzureEmbeddingsCalls() =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
+            return resp |> Array.filter (fun c -> c.Url.Contains("/embeddings"))
+        }
+
     /// Returns only the Azure OpenAI chat-completions calls the fake recorded (filters out OCR).
     /// Tests count these to assert dedup/single-flight (e.g. "exactly 1 call for this content")
     /// and retry (e.g. ">= 2 calls" after a scripted 429).
@@ -432,7 +457,13 @@ type BotContainerBase(config: BotContainerConfig) =
             if not config.OcrEnabled then
                 invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
             let! resp = fakeAzureHttp.GetFromJsonAsync<FakeCall array>("/test/calls")
-            return resp |> Array.filter (fun c -> c.Url.Contains("/openai/"))
+            // Chat-completions only — was "/openai/" (any Azure OpenAI route), which also
+            // matched images/audio/embeddings. That was harmless before Slice 5a (nothing
+            // else ran concurrently within a single test's window); the embedding pipeline
+            // now fires a background /embeddings call on essentially every logged message,
+            // which would otherwise silently join this list and break exact-count
+            // assertions (e.g. LlmTests' `Assert.Single(llmCalls)`).
+            return resp |> Array.filter (fun c -> c.Url.Contains("/chat/completions"))
         }
 
     /// Advances the bot's FakeTimeProvider by `ms` milliseconds, deterministically
