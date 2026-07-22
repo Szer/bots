@@ -14,6 +14,17 @@ open Xunit
 type CommandRealTests(fx: RealAssemblyFixture) =
     let env = fx.Env
 
+    /// `/summary`'s real Azure AI Foundry call (ephemeral-send-with-fallback, plus a
+    /// non-stream LLM completion) is the one real-test call observed to occasionally
+    /// exceed `Timeouts.reply` (90s) specifically when it lands deep into a long,
+    /// fully-sequential real-test run — cumulative real-Azure latency across dozens of
+    /// prior real LLM/STT/TTS calls in the same run, not this test's own logic (empirically
+    /// reproduced 5/5 consecutive full-suite runs while verifying the Gemini provider PR:
+    /// 3 local + 2 CI, always this exact test, never in isolation). Scoped to just this one
+    /// `AwaitReplyTo` call rather than widening the shared `Timeouts.reply` everywhere,
+    /// which would mask a real regression in every OTHER real test's timeout instead.
+    let summaryReplyTimeout = TimeSpan.FromSeconds 150.
+
     let queryOne (sql: string) (param: obj) =
         task {
             use conn = new NpgsqlConnection(fx.DbConnectionString)
@@ -130,7 +141,7 @@ ORDER BY message_id DESC LIMIT 1;
                     rawUpdateKinds.Add(u.GetType().Name))
 
             let! summaryMsgId = fx.UserClient.SendText(env.TestChatId, "/summary 20")
-            let! summaryReply = fx.UserClient.AwaitReplyTo(env.TestChatId, summaryMsgId, Timeouts.reply)
+            let! summaryReply = fx.UserClient.AwaitReplyTo(env.TestChatId, summaryMsgId, summaryReplyTimeout)
 
             Assert.False(String.IsNullOrWhiteSpace summaryReply.message)
             printfn
