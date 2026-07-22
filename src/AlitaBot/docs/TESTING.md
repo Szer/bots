@@ -1,11 +1,35 @@
 # Testing
 
-AlitaBot has two independent suites: a **fake suite** (Testcontainers + `FakeTgApi`/
-`FakeAzureOcrApi`, no network egress) that runs everywhere including CI, and a **real
-suite** (real Telegram + real Azure AI Foundry) that only runs locally against your own
-test bot and Azure resources.
+AlitaBot has three tiers, same model as VahterBanBot/CouponHubBot:
 
-## Fake suite — `tests/AlitaBot.Tests`
+1. **Hermetic suite** — `tests/AlitaBot.Tests` (Testcontainers + `FakeTgApi`/
+   `FakeAzureOcrApi`, no network egress, no external API cost). This is **the PR gate**
+   (`alita-build.yml`) and the default way to verify a change locally — run it before
+   pushing, exactly like you would for Vahter or Coupon.
+2. **Real suite** — `tests/AlitaBot.RealTests` (`make real-test`), a developer
+   quick-iteration harness against a real Telegram test bot (ngrok tunnel + MTProto test
+   user) and, for `RESPONDER_MODE=llm`, real Azure AI Foundry / Gemini. Run it
+   deliberately, not as a default pre-push check — a full run invokes paid generation
+   APIs (image gen, music gen, TTS/STT, chat completions). Prefer scoping to the test(s)
+   you're iterating on:
+   ```bash
+   dotnet test tests/AlitaBot.RealTests --filter "FullyQualifiedName~ImageGenRealTests"
+   ```
+   or via `make real-test FILTER="FullyQualifiedName~ImageGenRealTests"` (see the Makefile section below).
+3. **Full AKS E2E** — `.github/workflows/alita-real-test.yml`, the same
+   `tests/AlitaBot.RealTests` suite run against a transient deployment in the shared
+   `alita-test` AKS namespace. This does **not** run per-PR — it's `workflow_dispatch`
+   only, invoked on demand:
+   ```bash
+   gh workflow run alita-real-test.yml --ref <branch>
+   ```
+   Run it before merging a change you want validated end-to-end over the public
+   `https://alita-test.szer.dev` endpoint, or whenever you want CI-shaped confidence
+   beyond the hermetic gate — not automatically on every push, since (like tier 2) it
+   invokes real Telegram delivery and paid LLM/image/music generation calls. See
+   `src/AlitaBot/README.md`'s "CI real-test flow" section for how it's wired.
+
+## Hermetic suite — `tests/AlitaBot.Tests`
 
 ```bash
 dotnet test tests/AlitaBot.Tests -c Release
@@ -79,10 +103,14 @@ and assert against `FakeTgApi`'s captured calls (`fixture.GetFakeCalls`) and Pos
 
 ## Real suite — `tests/AlitaBot.RealTests` (`make real-test`)
 
-Exercises the bot end-to-end against real Telegram (a dedicated test bot + an MTProto
-test-user client playing the human side) and, for `RESPONDER_MODE=llm`, real Azure AI
-Foundry. See `src/AlitaBot/README.md`'s "One-time setup" section for how to provision the
-test bot, ngrok tunnel, and MTProto session.
+A developer quick-iteration harness: exercises the bot end-to-end against real Telegram (a
+dedicated test bot + an MTProto test-user client playing the human side) and, for
+`RESPONDER_MODE=llm`, real Azure AI Foundry / Gemini. Run it deliberately, not as a default
+pre-push check — a full run invokes paid generation APIs (image gen, music gen, TTS/STT,
+chat completions). Prefer scoping to what you're iterating on via `dotnet test`'s `--filter`
+(or `make real-test FILTER=<pattern>`, see the Makefile section below) instead of running
+the whole suite. See `src/AlitaBot/README.md`'s "One-time setup" section for how to
+provision the test bot, ngrok tunnel, and MTProto session.
 
 Credentials live in `~/.alita-test/env` (`KEY=VALUE`, gitignored — never commit values from
 it). Field names, no values:
@@ -99,9 +127,10 @@ it). Field names, no values:
 | `RESPONDER_MODE`, `STREAM_MODE` | optional overrides (default `echo`/`edit`), upserted into `bot_setting` on every run |
 
 ```bash
-make real-test    # dev DB + Release build + full real-Telegram smoke suite
-make alita-logs   # tail bot.log / ngrok.log from the last run
-make alita-clean  # tear down containers + deleteWebhook (run when done for the session)
+make real-test                        # dev DB + Release build + FULL real-Telegram suite — invokes paid APIs, use sparingly
+make real-test FILTER="FullyQualifiedName~ImageGenRealTests"  # scoped: only the matching test(s) — prefer this for iteration
+make alita-logs                       # tail bot.log / ngrok.log from the last run
+make alita-clean                      # tear down containers + deleteWebhook (run when done for the session)
 ```
 
 `ProactiveRealTests.fs` (Slice 8, both require `RESPONDER_MODE=llm`): enables
@@ -151,6 +180,22 @@ SECOND freshly-TTS'd voice note and re-asserts, logging the retry) for the same 
 from `src/Dockerfile.bot`), to catch anything the bare-`dotnet run` real-test path could hide
 (missing runtime deps, `ASPNETCORE_URLS` binding, container networking). See
 `src/AlitaBot/README.md`'s "Containerized smoke test" section.
+
+## Full AKS E2E — `.github/workflows/alita-real-test.yml`
+
+Runs the same `tests/AlitaBot.RealTests` suite against a transient deployment in the shared
+`alita-test` AKS namespace, over the public `https://alita-test.szer.dev` endpoint. Manual
+`workflow_dispatch` only — it does not trigger on `pull_request`, since (like the real suite
+above) it invokes real Telegram delivery and paid LLM/image/music generation calls:
+
+```bash
+gh workflow run alita-real-test.yml --ref <branch>
+```
+
+Singleton via `concurrency: group: alita-aks-real-test` — only one run uses the shared
+namespace at a time, so concurrent dispatches queue rather than collide. See
+`src/AlitaBot/README.md`'s "CI real-test flow" section for the full wiring (secrets,
+`ALITA_REAL_MODE=remote`, node-capacity notes, teardown contract).
 
 ## Container CLI
 

@@ -1,31 +1,20 @@
 name: "Alita: Real Telegram test (AKS)"
 
-# M7: every relevant PR builds AlitaBot, deploys it transiently into the
+# Full E2E (real Telegram + paid LLM/media calls): run on demand via
+#   gh workflow run alita-real-test.yml --ref <branch>
+# NOT per-PR. The PR gate is the hermetic suite (tests/AlitaBot.Tests, see
+# alita-build.yml) — it runs against fakes with no network egress and no
+# external API cost. This workflow deploys AlitaBot transiently into the
 # alita-test AKS namespace (kubectl apply, no GitOps for the workload — see
 # .github/k8s/alita-test/), runs the real-Telegram suite
 # (tests/AlitaBot.RealTests) against it over the public
 # https://alita-test.szer.dev endpoint, then tears everything it applied
 # back down. Singleton: only one run uses the shared alita-test namespace at
-# a time, so concurrent PRs queue rather than collide.
+# a time, so concurrent manual dispatches queue rather than collide.
+# GitHub Actions runs workflow_dispatch on whichever ref you pass to --ref
+# (or the default branch if omitted) — no extra input plumbing needed here.
 
 on:
-  pull_request:
-    branches: [ "main" ]
-    paths:
-      - 'src/BotInfra/**'
-      - 'src/AlitaBot/**'
-      - 'src/alita-bot/**'
-      - 'src/Dockerfile.bot'
-      - 'tests/AlitaBot.Tests/**'
-      - 'tests/AlitaBot.RealTests/**'
-      - 'tests/BotTestInfra/**'
-      - 'tests/FakeTgApi/**'
-      - 'tests/FakeAzureOcrApi/**'
-      - 'Directory.Build.props'
-      - 'Directory.Packages.props'
-      - 'global.json'
-      - '.github/workflows/alita-real-test.yml'
-      - '.github/k8s/alita-test/**'
   workflow_dispatch:
 
 concurrency:
