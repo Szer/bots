@@ -1,9 +1,7 @@
 module AlitaBot.Services.BotHelpers
 
 open System
-open System.Collections.Concurrent
 open System.Threading.Tasks
-open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
 open AlitaBot
 open BotInfra
@@ -98,80 +96,19 @@ let sendTextReplyWithEntities
     let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
     tg.CallExn(Req.SendMessage.Make(chatId, text, entities = entities, replyParameters = replyParams))
 
-// ── Ephemeral replies (Bot API 10.2, Phase-1 Slice 4 /summary probe) ───────
+// ── Ephemeral replies — RETIRED (Bot API 10.2, Phase-1 Slice 4 /summary probe) ─────
 //
-// Funogram.Telegram 10.2.0's Req.SendMessage carries an optional `receiverUserId`
-// (wire: `receiver_user_id`) — passing it makes Telegram deliver the message only to
-// that user (an "ephemeral" message per Bot API 10.2), everyone else in the chat never
-// sees it. Confirmed by decompiling Funogram.Telegram.dll (ilspycmd -t Funogram.Telegram.Req):
-// SendMessage's constructor/Make both carry `FSharpOption<long> receiverUserId`, and the
-// response Message carries a matching `FSharpOption<long> EphemeralMessageId`. Whether
-// Telegram actually accepts it varies by chat type/bot-admin-status — see the empirical
-// findings in src/AlitaBot/README.md ("Ephemeral message probe").
-//
-// Re-probed with the test bot promoted to admin (see README): Telegram now ACCEPTS the
-// call, but the returned `Message.MessageId` is always `0` — the real per-send identifier
-// lives in `EphemeralMessageId` instead, a totally different (much larger) id space than
-// the chat's normal sequential message ids. Callers that log the sent message to
-// `message_log` (`UNIQUE(chat_id, message_id)`) must use `loggableMessageId`, NOT
-// `sent.MessageId` directly — every ephemeral send after the first one in a chat would
-// otherwise collide on `(chatId, 0)` and get silently dropped by `ON CONFLICT DO NOTHING`.
-
-/// Chats where an ephemeral send has already failed once — permanently (process-lifetime)
-/// falls back to a normal reply for the rest of the process, mirroring DraftRenderer's
-/// per-chat fallback memo (Services/ReplyRenderer.fs, docs/TECH-DEBT.md) so a chat type
-/// that rejects receiver-scoped messages isn't re-probed on every /summary call.
-let private ephemeralUnsupportedChats = ConcurrentDictionary<int64, byte>()
-
-/// Sends `text` visible only to `receiverUserId` (Bot API 10.2 ephemeral message) as a
-/// reply to `replyToMessageId`. On any Telegram API failure — including a chat type that
-/// rejects receiver-scoped messages outright — logs a Warning, remembers the chat
-/// (see `ephemeralUnsupportedChats`), and falls back to a normal reply (visible to the
-/// whole chat) instead. Once a chat is remembered, later calls skip the ephemeral attempt
-/// entirely and go straight to the normal reply.
-let trySendEphemeralOrReply
-    (tg: ITelegramApi)
-    (logger: ILogger)
-    (chatId: int64)
-    (receiverUserId: int64)
-    (text: string)
-    (replyToMessageId: int64)
-    : Task<Message> =
-    task {
-        let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
-        if ephemeralUnsupportedChats.ContainsKey chatId then
-            return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
-        else
-            try
-                let! sent =
-                    tg.CallExn(
-                        Req.SendMessage.Make(chatId, text, receiverUserId = receiverUserId, replyParameters = replyParams))
-                logger.LogInformation(
-                    "Ephemeral send accepted for chat {ChatId}, receiver {ReceiverUserId} — MessageId={MessageId} EphemeralMessageId={EphemeralMessageId}",
-                    chatId,
-                    receiverUserId,
-                    sent.MessageId,
-                    (sent.EphemeralMessageId |> Option.map string |> Option.defaultValue "<none>"))
-                return sent
-            with ex ->
-                logger.LogWarning(
-                    ex,
-                    "Ephemeral send rejected for chat {ChatId} — falling back to a normal reply and remembering for the rest of this process",
-                    chatId)
-                ephemeralUnsupportedChats[chatId] <- 0uy
-                return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
-    }
-
-/// The id to log to `message_log` for a `Message` returned by `trySendEphemeralOrReply`
-/// (or any other send): normally just `MessageId`, but an ACCEPTED ephemeral send always
-/// reports `MessageId = 0` (see the comment above `trySendEphemeralOrReply`) — using that
-/// verbatim would collide with every other ephemeral reply ever logged for the same chat
-/// (`UNIQUE(chat_id, message_id)`) after the first one, silently dropped by `ON CONFLICT DO
-/// NOTHING`. Falls back to `EphemeralMessageId` in that case, which is unique per send.
-let loggableMessageId (sent: Message) : int64 =
-    match sent.MessageId, sent.EphemeralMessageId with
-    | 0L, Some ephemeralId -> ephemeralId
-    | messageId, _ -> messageId
+// AlitaBot briefly sent /summary replies via Bot API 10.2's ephemeral `sendMessage`
+// (`receiver_user_id`, visible only to the requester). Retired after staging feedback
+// ("ephemeral messages are not useful") — every /summary reply is now a normal,
+// whole-chat-visible `sendTextReply` like every other command. Confirmed by real-Telegram
+// probing (see src/AlitaBot/README.md's "Ephemeral message probe [RETIRED]" and
+// docs/TECH-DEBT.md) that even when Telegram accepted the ephemeral call, the message was
+// never observably delivered to the receiving account — an accepted ephemeral send always
+// reported `Message.MessageId = 0`, which is exactly why /summary's replies were invisible
+// in staging. `trySendEphemeralOrReply`/`loggableMessageId` (formerly here) and the
+// `receiver_user_id` wire field are no longer used anywhere in AlitaBot; the full empirical
+// writeup is kept in the docs above rather than deleted.
 
 /// Largest PhotoSize of a message's Photo array (Telegram orders smallest -> largest),
 /// or None for a message with no photo. Shared by BotService (detecting a photo message)

@@ -486,6 +486,56 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
         | true, e -> e
         | _ -> [||]
 
+    /// Text last recorded for `msgId` (new-message OR edit) — a synchronous, non-blocking
+    /// read of `lastActivity`, unlike `AwaitEditsSettled` which waits for a quiet period.
+    /// `None` if nothing has been recorded for that id yet. Used by
+    /// `AwaitMediaOrPlaceholderEdit` to poll a placeholder's current text without waiting.
+    member _.LastTextOf(chatId: int64, msgId: int) : string option =
+        match lastActivity.TryGetValue(struct (peerKey chatId, msgId)) with
+        | true, struct (_, text) -> Some text
+        | _ -> None
+
+    /// Races a media-carrying reply (`tryAwaitMedia`, e.g. `TryAwaitPhotoReplyTo`/
+    /// `TryAwaitAudioReplyTo` partially applied, called in short slices) against
+    /// `placeholderMsgId` (AlitaBot's "рисую.../сочиняю..." command placeholder) being
+    /// edited away from `placeholderText`. Needed because AlitaBot's `/img`/`/song`
+    /// failure path (see BotService.fs's `handleImageCommand`/`handleSongCommand`) EDITS
+    /// the placeholder in place on failure rather than sending a new message — a plain
+    /// `AwaitPhotoReplyTo`/`AwaitAudioReplyTo` alone would just time out with no way to
+    /// tell "genuinely still generating" apart from "already failed", burning the full
+    /// timeout (and, via `TestRetry.withTimeoutRetry`, a second paid attempt) even when
+    /// the failure — and specifically a Gemini transient "high demand" one, see
+    /// `GeminiTransientDetection` — was observable within a second of it happening.
+    /// Polls every ~500ms so a placeholder edit is noticed promptly instead of only after
+    /// the full `timeout` elapses.
+    member this.AwaitMediaOrPlaceholderEdit
+        (tryAwaitMedia: TimeSpan -> Task<'media option>)
+        (chatId: int64)
+        (placeholderMsgId: int)
+        (placeholderText: string)
+        (timeout: TimeSpan)
+        : Task<Choice<'media, string>> =
+        task {
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                match! tryAwaitMedia (TimeSpan.FromMilliseconds 500.) with
+                | Some media -> result <- Some(Choice1Of2 media)
+                | None ->
+                    match this.LastTextOf(chatId, placeholderMsgId) with
+                    | Some text when text <> placeholderText -> result <- Some(Choice2Of2 text)
+                    | _ -> ()
+
+            match result with
+            | Some r -> return r
+            | None ->
+                return
+                    raise (
+                        AwaitTimeoutException
+                            $"No media reply and no placeholder edit for message {placeholderMsgId} in chat {chatId} within {timeout.TotalSeconds}s")
+        }
+
     /// Human-readable dialog list with Bot API chat id conventions (-100… for channels).
     member _.ListDialogsAsync() =
         task {

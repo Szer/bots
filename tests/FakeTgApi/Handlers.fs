@@ -104,33 +104,12 @@ module Handlers =
     let private isMdv2Request (body: string) =
         not (isNull body) && body.Contains("MarkdownV2", StringComparison.Ordinal)
 
-    /// Bot API 10.2 ephemeral messages (AlitaBot /summary, Phase-1 Slice 4): when the
-    /// request carries `receiver_user_id`, real Telegram accepts it and returns
-    /// `message_id: 0` (NOT the chat's normal sequential id) plus a separate
-    /// `ephemeral_message_id` carrying the real per-send identifier — confirmed against
-    /// real Telegram with the test bot promoted to group admin (see src/AlitaBot/README.md's
-    /// "Ephemeral message probe", round 2). Faked precisely here (rather than echoing the
-    /// same allocated id for both fields, as an earlier version of this fake did) so the
-    /// fake suite exercises `BotHelpers.loggableMessageId`'s `MessageId = 0` fallback path —
-    /// a real bug (message_log silently dropping every ephemeral reply after the first one
-    /// per chat) hid behind the old, less accurate fake. The fake never rejects
-    /// `receiver_user_id` outright (see the README for what real Telegram does per chat
-    /// type/admin status).
     let private handleSendMessage ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         let msgId = Store.allocMessageId()
-        let hasReceiverUserId =
-            try
-                use doc = JsonDocument.Parse(body: string)
-                match doc.RootElement.TryGetProperty("receiver_user_id") with
-                | true, v -> v.ValueKind = JsonValueKind.Number
-                | _ -> false
-            with _ -> false
-        let reportedMessageId = if hasReceiverUserId then 0L else msgId
-        let ephemeralField = if hasReceiverUserId then $""","ephemeral_message_id":{msgId}""" else ""
         let resultJson =
-            $"""{{"message_id":{reportedMessageId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"{ephemeralField}}}"""
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleSendPhoto ctx body =

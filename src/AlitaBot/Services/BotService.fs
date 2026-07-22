@@ -62,6 +62,13 @@ type SayVoiceArg =
     /// there's no other plausible reading (see BotService.parseSayArgs).
     | Invalid of string
 
+/// One entry of the LLM_MODELS bot_setting (`/model`'s catalog) — module-level for the
+/// same reason as RoastTarget/MemeAction above. A real, user-facing model name paired
+/// with the Azure AI Foundry deployment id that actually serves it. `Deployment` is
+/// wire-call plumbing ONLY — see BotService.handleModelCommand's doc comment for why it
+/// must never reach a user-facing string.
+type LlmModelEntry = { Model: string; Deployment: string }
+
 type BotService(
     options: IOptions<BotConfiguration>,
     db: DbService,
@@ -785,9 +792,19 @@ type BotService(
                     countOutcome outcome
                 | Error err ->
                     logger.LogWarning("Image generation failed: {Error}", string err)
-                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось нарисовать 🙁"
-                    %a.SetTag("outcome", "image_failed")
-                    countOutcome "image_failed"
+                    // Transient (rate-limited / Gemini 503 "high demand") gets a distinct RU
+                    // reply that tells the user retrying might actually help, instead of the
+                    // generic shrug — see LlmTypes.LlmError.isTransient's doc comment (prod
+                    // evidence: a Gemini 503 UNAVAILABLE /img failure with no such hint).
+                    let failText =
+                        if LlmError.isTransient err then
+                            "Модель перегружена, попробуй ещё раз через минутку 🙏"
+                        else
+                            "Не получилось нарисовать 🙁"
+                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId failText
+                    let outcome = if LlmError.isTransient err then "image_failed_transient" else "image_failed"
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
         }
 
     // ── Command registry (Phase-1 Slice 4) ──────────────────────────────────
@@ -802,8 +819,9 @@ type BotService(
     /// command message as `[<name>-cmd] {args}` — idempotent, same webhook-redelivery
     /// guard as handleImageCommand/handleTriggerableMessage — then on first delivery runs
     /// `body ()` to produce (replyText, outcome), sends it as a normal reply, and logs the
-    /// bot's own reply row. /summary doesn't use this: its reply is (probably) ephemeral,
-    /// not a plain sendTextReply, and it has more outcome branches.
+    /// bot's own reply row. /summary doesn't use this: it has more outcome branches (empty
+    /// history, empty LLM response, LLM failure), not because of any ephemeral send — its
+    /// reply is a plain sendTextReply like every other command (see handleSummaryCommand).
     let handleSimpleCommand
         (name: string)
         (conf: BotConfiguration)
@@ -837,40 +855,69 @@ type BotService(
                 countOutcome outcome
         }
 
-    /// Lenient parse of the MODEL_ALLOWLIST bot_setting (JSON_BLOB array of strings),
-    /// e.g. ["alita-gpt-5-mini"]. Malformed JSON or a non-array value -> [] (nothing
-    /// switchable — /model's arg form always refuses until the setting is fixed).
-    let parseModelAllowlist (json: string) : string list =
+    /// Lenient parse of the LLM_MODELS bot_setting (JSON_BLOB array of
+    /// `{"model": "...", "deployment": "..."}`). Malformed JSON, a non-array value, or an
+    /// entry missing either field (or with an empty one) is skipped — /model's switchable
+    /// list is whatever parses cleanly, same lenient posture the old MODEL_ALLOWLIST parse
+    /// had.
+    let parseLlmModels (json: string) : LlmModelEntry list =
         try
             use doc = JsonDocument.Parse(json: string)
             if doc.RootElement.ValueKind <> JsonValueKind.Array then
                 []
             else
                 [ for el in doc.RootElement.EnumerateArray() do
-                    if el.ValueKind = JsonValueKind.String then el.GetString() ]
+                    if el.ValueKind = JsonValueKind.Object then
+                        let str (name: string) =
+                            match el.TryGetProperty name with
+                            | true, v when v.ValueKind = JsonValueKind.String -> Some(v.GetString())
+                            | _ -> None
+                        match str "model", str "deployment" with
+                        | Some model, Some deployment when model <> "" && deployment <> "" ->
+                            { Model = model; Deployment = deployment }
+                        | _ -> () ]
         with _ -> []
 
-    /// `/model` — no arg: shows the current LLM_DEPLOYMENT + the MODEL_ALLOWLIST.
-    /// With an arg: if it's in MODEL_ALLOWLIST, upserts LLM_DEPLOYMENT and reloads the
+    /// `/model` — no arg: shows the current model + every model in the LLM_MODELS
+    /// catalog (bot_setting, JSON_BLOB array of {"model","deployment"} — see
+    /// `LlmModelEntry`/`parseLlmModels`). With an arg: if it matches an entry's `Model`
+    /// EXACTLY (zero string transformation — no prefix stripping, no substring
+    /// matching), upserts LLM_DEPLOYMENT to that entry's `Deployment` and reloads the
     /// live BotConfiguration in-process (ISettingsReloader — the same path
-    /// `/reload-settings` uses) so the switch takes effect on the very next LLM call,
-    /// not just after a restart; otherwise a RU refusal + the allowlist.
+    /// `/reload-settings` uses) so the switch takes effect on the very next LLM call, not
+    /// just after a restart; otherwise a RU refusal + the model list.
+    ///
+    /// `Deployment` (the Azure AI Foundry deployment id, e.g. "alita-gpt-5-mini" — this
+    /// bot's namespacing convention on a Foundry account shared with other bots, see
+    /// dev-bot-settings.sql) is wire-call plumbing ONLY: it is never displayed, and users
+    /// never type it — staging feedback was explicit that deployment ids read as fake
+    /// model names ("we don't have our own models"). The current LLM_DEPLOYMENT is looked
+    /// up in the catalog to find its display name; if nothing matches (a deployment not
+    /// in LLM_MODELS, e.g. the setting is stale or empty), it's shown VERBATIM — no
+    /// cleverness, just whatever's actually configured.
     let handleModelCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         handleSimpleCommand "model" conf msg from args (fun () ->
             task {
-                let allowlist = parseModelAllowlist conf.ModelAllowlistJson
-                let listText = if allowlist.IsEmpty then "(пусто)" else allowlist |> String.concat ", "
+                let models = parseLlmModels conf.LlmModelsJson
+                let modelList = if models.IsEmpty then "(пусто)" else models |> List.map (fun m -> m.Model) |> String.concat ", "
+                let currentModel =
+                    models
+                    |> List.tryFind (fun m -> m.Deployment = conf.LlmDeployment)
+                    |> Option.map (fun m -> m.Model)
+                    |> Option.defaultValue conf.LlmDeployment
 
                 if String.IsNullOrWhiteSpace args then
-                    return $"Текущая модель: {conf.LlmDeployment}\nДоступные модели: {listText}", "model_shown"
-                elif allowlist |> List.contains args then
-                    do! db.UpsertBotSetting("LLM_DEPLOYMENT", args, "FREE_FORM", "llm")
-                    do! settingsReloader.Reload()
-                    return $"Модель переключена на {args} ✅", "model_switched"
+                    return $"Текущая модель: {currentModel}\nДоступные модели: {modelList}", "model_shown"
                 else
-                    return
-                        $"Такую модель не знаю и выдумывать не буду: «{args}». Выбирай из списка: {listText}",
-                        "model_refused"
+                    match models |> List.tryFind (fun m -> m.Model = args) with
+                    | Some entry ->
+                        do! db.UpsertBotSetting("LLM_DEPLOYMENT", entry.Deployment, "FREE_FORM", "llm")
+                        do! settingsReloader.Reload()
+                        return $"Модель переключена на {entry.Model} ✅", "model_switched"
+                    | None ->
+                        return
+                            $"Такую модель не знаю и выдумывать не буду: «{args}». Выбирай из списка: {modelList}",
+                            "model_refused"
             })
 
     /// $-USD with 4 decimal places, invariant culture (never locale-dependent commas).
@@ -959,12 +1006,12 @@ type BotService(
 
     /// `/summary [count]` — speaker-attributed transcript of the last `count` (default
     /// SummaryDefaultCount, capped SummaryMaxCount) message_log rows for this chat, fed
-    /// to a non-stream LLM call with the SUMMARY_PROMPT bot_setting, replied back.
-    /// Ephemeral twist (Bot API 10.2 probe — see BotHelpers.trySendEphemeralOrReply and
-    /// the "Ephemeral message probe" section of src/AlitaBot/README.md): the digest is
-    /// sent visible only to the requester (`from.Id`) whenever Telegram accepts a
-    /// receiver-scoped message for this chat, and falls back to a normal (whole-chat-
-    /// visible) reply otherwise — permanently, per chat, for the rest of the process.
+    /// to a non-stream LLM call with the SUMMARY_PROMPT bot_setting, replied back as a
+    /// normal, whole-chat-visible reply. (Previously sent via Bot API 10.2's ephemeral
+    /// `sendMessage`, visible only to the requester — retired after staging feedback
+    /// found those replies invisible in practice; see the "Ephemeral message probe
+    /// [RETIRED]" section of src/AlitaBot/README.md and docs/TECH-DEBT.md for the
+    /// empirical writeup.)
     let handleSummaryCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
             use a = botActivity.StartActivity("handleSummaryCommand")
@@ -979,9 +1026,9 @@ type BotService(
 
             let reply (text: string) (outcome: string) =
                 task {
-                    let! sent = BotHelpers.trySendEphemeralOrReply tg logger msg.Chat.Id from.Id text msg.MessageId
+                    let! sent = BotHelpers.sendTextReply tg msg.Chat.Id text msg.MessageId
                     do! logAndEmbed conf (
-                            logRow msg.Chat.Id (BotHelpers.loggableMessageId sent) (botUserId conf) conf.BotUsername
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername
                                 conf.BotUsername true (Some msg.MessageId) text)
                         |> taskIgnore
                     %a.SetTag("outcome", outcome)
@@ -1865,9 +1912,17 @@ type BotService(
                         match! musicGen.Generate(prompt, usageCtx, CancellationToken.None) with
                         | Error err ->
                             logger.LogWarning("Music generation failed: {Error}", string err)
-                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось сочинить 🙁"
-                            %a.SetTag("outcome", "song_failed")
-                            countOutcome "song_failed"
+                            // Same transient-vs-generic split as handleImageCommand — see
+                            // LlmTypes.LlmError.isTransient's doc comment.
+                            let failText =
+                                if LlmError.isTransient err then
+                                    "Модель перегружена, попробуй сочинить чуть позже 🙏"
+                                else
+                                    "Не получилось сочинить 🙁"
+                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId failText
+                            let outcome = if LlmError.isTransient err then "song_failed_transient" else "song_failed"
+                            %a.SetTag("outcome", outcome)
+                            countOutcome outcome
                         | Ok(bytes, _usage) when bytes.Length = 0 ->
                             logger.LogWarning("Music generation returned no audio")
                             do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось сочинить 🙁"
@@ -1893,7 +1948,7 @@ type BotService(
     // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
 
     /// Parses the ADMIN_USER_IDS bot_setting (JSON_BLOB array of ints) — lenient like
-    /// parseModelAllowlist/parseAwardsJson: malformed JSON or a non-array value -> []
+    /// parseLlmModels/parseAwardsJson: malformed JSON or a non-array value -> []
     /// (nobody is admin until the setting is fixed, never "everybody").
     let parseAdminUserIds (json: string) : int64 list =
         try

@@ -358,7 +358,15 @@ module internal AzureHttp =
     /// Sends a non-streaming request with the D3 429 policy: max 2 retries, honor
     /// Retry-After capped at 10s, full-jitter backoff otherwise. Returns the response
     /// body (or in-band error) plus the number of retries performed.
+    ///
+    /// `logger`/`model` exist so every non-success response is logged in FULL — status,
+    /// model, attempt number, and the raw response body — at Warning, BEFORE the
+    /// retry-vs-give-up decision (user rule: "read errors before retrying"; same gap as
+    /// GeminiHttp.sendWithRetry, spot-checked here since a silently-retried 429 never had
+    /// its body logged anywhere unless every retry was also exhausted).
     let sendWithRetry
+        (logger: ILogger)
+        (model: string)
         (client: HttpClient)
         (makeRequest: unit -> HttpRequestMessage)
         (ct: CancellationToken)
@@ -375,6 +383,9 @@ module internal AzureHttp =
                     if resp.IsSuccessStatusCode then
                         result <- Some(Ok body)
                     else
+                        logger.LogWarning(
+                            "Azure LLM API non-success response: model={Model} status={Status} attempt={Attempt} body={Body}",
+                            model, int resp.StatusCode, retries + 1, body)
                         let err = AzureWire.classifyError (int resp.StatusCode) (AzureWire.retryAfterOf resp) body
                         match err with
                         | LlmError.RateLimited retryAfter when retries < maxRetries ->
@@ -382,14 +393,17 @@ module internal AzureHttp =
                             retries <- retries + 1
                         | _ -> result <- Some(Error err)
                 with ex ->
+                    logger.LogWarning(ex, "Azure LLM network error: model={Model} attempt={Attempt}", model, retries + 1)
                     result <- Some(Error(LlmError.NetworkError ex.Message))
             return result.Value, retries
         }
 
-    /// Same 429 policy as `sendWithRetry`, but reads the success body as raw bytes
-    /// (audio) instead of a UTF-8 string — TTS responses are binary and would be
-    /// corrupted by a string round-trip.
+    /// Same 429 policy as `sendWithRetry` (incl. the same per-attempt Warning logging),
+    /// but reads the success body as raw bytes (audio) instead of a UTF-8 string — TTS
+    /// responses are binary and would be corrupted by a string round-trip.
     let sendBinaryWithRetry
+        (logger: ILogger)
+        (model: string)
         (client: HttpClient)
         (makeRequest: unit -> HttpRequestMessage)
         (ct: CancellationToken)
@@ -407,6 +421,9 @@ module internal AzureHttp =
                         result <- Some(Ok bytes)
                     else
                         let! body = resp.Content.ReadAsStringAsync(ct)
+                        logger.LogWarning(
+                            "Azure LLM API non-success response: model={Model} status={Status} attempt={Attempt} body={Body}",
+                            model, int resp.StatusCode, retries + 1, body)
                         let err = AzureWire.classifyError (int resp.StatusCode) (AzureWire.retryAfterOf resp) body
                         match err with
                         | LlmError.RateLimited retryAfter when retries < maxRetries ->
@@ -414,6 +431,7 @@ module internal AzureHttp =
                             retries <- retries + 1
                         | _ -> result <- Some(Error err)
                 with ex ->
+                    logger.LogWarning(ex, "Azure LLM network error: model={Model} attempt={Attempt}", model, retries + 1)
                     result <- Some(Error(LlmError.NetworkError ex.Message))
             return result.Value, retries
         }
@@ -437,7 +455,12 @@ type AzureFoundryChat(httpFactory: IHttpClientFactory, options: IOptions<BotConf
                 let uri = AzureWire.chatUri conf.AzureFoundryEndpoint request.Deployment
                 let bodyJson = AzureWire.buildChatBody request false
                 let! result, retries =
-                    AzureHttp.sendWithRetry client (fun () -> AzureWire.newRequest conf.AzureFoundryKey uri bodyJson) ct
+                    AzureHttp.sendWithRetry
+                        logger
+                        request.Deployment
+                        client
+                        (fun () -> AzureWire.newRequest conf.AzureFoundryKey uri bodyJson)
+                        ct
                 match result with
                 | Ok body ->
                     match AzureWire.tryParseChatResponse body with
@@ -637,7 +660,12 @@ type AzureFoundryEmbeddings(httpFactory: IHttpClientFactory, options: IOptions<B
                 let uri = AzureWire.embeddingsUri conf.AzureFoundryEndpoint deployment
                 let bodyJson = AzureWire.buildEmbeddingsBody texts
                 let! result, retries =
-                    AzureHttp.sendWithRetry client (fun () -> AzureWire.newRequest conf.AzureFoundryKey uri bodyJson) ct
+                    AzureHttp.sendWithRetry
+                        logger
+                        deployment
+                        client
+                        (fun () -> AzureWire.newRequest conf.AzureFoundryKey uri bodyJson)
+                        ct
                 match result with
                 | Ok body ->
                     match AzureWire.tryParseEmbeddings body with
@@ -679,7 +707,7 @@ type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotCo
                     req.Content <- content
                     req
 
-                let! result, retries = AzureHttp.sendWithRetry client makeRequest ct
+                let! result, retries = AzureHttp.sendWithRetry logger conf.SttDeployment client makeRequest ct
                 match result with
                 | Ok body ->
                     let text = AzureWire.parseTranscript body
@@ -701,7 +729,7 @@ type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotCo
                 let bodyJson = AzureWire.buildSpeechBody text voiceName
                 let makeRequest () = AzureWire.newRequest conf.AzureFoundryKey uri bodyJson
 
-                let! result, retries = AzureHttp.sendBinaryWithRetry client makeRequest ct
+                let! result, retries = AzureHttp.sendBinaryWithRetry logger conf.TtsDeployment client makeRequest ct
                 match result with
                 | Ok bytes ->
                     call.Succeeded(None, None, retries)
@@ -743,7 +771,7 @@ type AzureFoundryImageGen(httpFactory: IHttpClientFactory, options: IOptions<Bot
                         let bodyJson = AzureWire.buildImageGenBody prompt conf.ImageSize conf.ImageQuality
                         AzureWire.newRequest conf.AzureFoundryKey uri bodyJson
 
-                let! result, retries = AzureHttp.sendWithRetry client makeRequest ct
+                let! result, retries = AzureHttp.sendWithRetry logger conf.ImageDeployment client makeRequest ct
                 match result with
                 | Ok body ->
                     match AzureWire.tryParseImageResponse body with

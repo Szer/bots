@@ -79,9 +79,10 @@ type AlitaTestContainers() =
                 "SONG_MAX_CHARS",          "1000",                             "FREE_FORM", "llm"
                 "SONG_COOLDOWN_SECONDS",   "120",                              "FREE_FORM", "llm"
                 "LLM_PRICING",             """{"gpt-5-mini":{"input_per_1m":0.25,"output_per_1m":2.00},"alita-image":{"per_image_low":0.02,"per_image_medium":0.04,"per_image_high":0.08},"gemini-test-image":{"per_image":0.02},"lyria-test-music":{"per_track":0.06}}""", "JSON_BLOB", "llm"
-                // Two entries so /model switch tests have a real allowlisted alternative
-                // to switch to (distinct from the initial LLM_DEPLOYMENT below).
-                "MODEL_ALLOWLIST",         """["alita-gpt-5-mini","alita-gpt-5-mini-2"]""", "JSON_BLOB", "llm"
+                // Two entries so /model switch tests have a real catalog alternative to
+                // switch to (distinct from the initial LLM_DEPLOYMENT below) — "model" is
+                // what /model shows/accepts, "deployment" is wire-call-only plumbing.
+                "LLM_MODELS",              """[{"model":"gpt-5-mini","deployment":"alita-gpt-5-mini"},{"model":"gpt-5-mini-2","deployment":"alita-gpt-5-mini-2"}]""", "JSON_BLOB", "llm"
                 "SUMMARY_PROMPT",          "Summarize the chat discussion below, by topic, noting who said what. Be brief.", "FREE_FORM", "llm"
                 "TEST_MODE",               "true",                              "FEATURE_FLAG", "diagnostics"
                 // Slice 5a: memory foundation + /ask semantic search.
