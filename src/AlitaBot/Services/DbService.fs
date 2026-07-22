@@ -750,14 +750,24 @@ WHERE chat_id = @chat_id AND is_bot = FALSE AND sent_at >= @since;
             return! conn.QuerySingleAsync<BurstStatsRow>(sql, {| chat_id = chatId; since = since |})
         }
 
-    /// True when `chatId` has at least one bot (`is_bot = TRUE`) `message_log` row since
-    /// `since` — Slice 8's interjection cooldown check. A fresh interjection is logged the
-    /// same as any other bot reply, so it naturally self-cools the chat for the next one.
+    /// True when `chatId` has at least one bot (`is_bot = TRUE`) `message_log` row strictly
+    /// after `since` — Slice 8's interjection cooldown check. A fresh interjection is logged
+    /// the same as any other bot reply, so it naturally self-cools the chat for the next one.
+    /// Deliberately `sent_at > @since`, not `>=`: `since` is `now - INTERJECT_COOLDOWN_MINUTES`,
+    /// and by causality no message's `sent_at` can be later than the `now` used to compute it,
+    /// so with `INTERJECT_COOLDOWN_MINUTES=0` (`since = now`) a `>=` comparison degenerates to
+    /// "was any bot message EVER logged in this chat, at exactly `now` or earlier" — always
+    /// true once the bot has spoken once — instead of "no cooldown at all" as `0` should mean.
+    /// This only bites under TEST_MODE's frozen `FakeTimeProvider` (`Program.fs`), where every
+    /// `sent_at` stamped during a whole real-test run shares the identical instant (see
+    /// `BotService.logRow`/`DigestService.logRow`'s `time.GetUtcNow()`) — real production
+    /// traffic uses a live, monotonically-advancing clock, so `sent_at` is always strictly
+    /// less than a `since` computed afterward and `>` vs `>=` never mattered there.
     member _.HasBotMessageSince(chatId: int64, since: DateTime) : Task<bool> =
         task {
             use! conn = openConn()
             //language=postgresql
-            let sql = "SELECT EXISTS(SELECT 1 FROM message_log WHERE chat_id = @chat_id AND is_bot = TRUE AND sent_at >= @since);"
+            let sql = "SELECT EXISTS(SELECT 1 FROM message_log WHERE chat_id = @chat_id AND is_bot = TRUE AND sent_at > @since);"
             return! conn.QuerySingleAsync<bool>(sql, {| chat_id = chatId; since = since |})
         }
 
