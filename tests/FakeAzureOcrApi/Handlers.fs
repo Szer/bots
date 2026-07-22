@@ -302,6 +302,48 @@ module Handlers =
             | None -> do! respondJson ctx 200 """{"text":""}"""
         }
 
+    /// Fake Azure OpenAI audio/speech (TTS) handler (AlitaBot /say, Slice 9 stretch).
+    /// Doesn't parse the JSON request body — just logs a call entry and returns the next
+    /// scripted response, dequeued same as the other script queues. A scripted 200's
+    /// `body` is treated as BASE64-ENCODED audio bytes (unlike the JSON-bodied endpoints
+    /// elsewhere in this file) and written back as the raw binary response
+    /// AzureFoundrySpeech.Synthesize expects (`sendBinaryWithRetry` reads the response body
+    /// as raw bytes, not JSON); a non-200 scripted status is written as plain JSON/text
+    /// error body, same convention as every other endpoint. An empty queue falls back to
+    /// `Store.defaultTtsBytes`.
+    let handleAudioSpeech (ctx: HttpContext) =
+        task {
+            let url = ctx.Request.Path.ToString() + ctx.Request.QueryString.ToString()
+            let! body = readBody ctx
+            Console.WriteLine($"FAKE OPENAI IN {ctx.Request.Method} {url} bodyLen={body.Length}")
+            Store.logCall ctx.Request.Method url body
+
+            let scripted =
+                let mutable item = Unchecked.defaultof<ScriptedResponse>
+                if Store.ttsResponseScript.TryDequeue(&item) then Some item else None
+
+            let respondBinary (bytes: byte[]) =
+                task {
+                    ctx.Response.StatusCode <- 200
+                    ctx.Response.ContentType <- "audio/ogg"
+                    do! ctx.Response.Body.WriteAsync(bytes.AsMemory(0, bytes.Length))
+                }
+
+            match scripted with
+            | Some s ->
+                if s.delayMs > 0 then do! Task.Delay(s.delayMs)
+                match (if isNull (box s.errorMode) then "" else s.errorMode) with
+                | "network" -> ctx.Abort()
+                | "timeout" ->
+                    do! Task.Delay(10_000)
+                    do! respondJson ctx s.status s.body
+                | _ when s.status = 200 ->
+                    let bytes = try Convert.FromBase64String s.body with _ -> Encoding.UTF8.GetBytes s.body
+                    do! respondBinary bytes
+                | _ -> do! respondJson ctx s.status s.body
+            | None -> do! respondBinary Store.defaultTtsBytes
+        }
+
     /// Fake Azure OpenAI images/generations handler (AlitaBot image generation, text->image).
     let handleImagesGenerations (ctx: HttpContext) =
         task {
@@ -489,6 +531,26 @@ module Handlers =
                     if not (isNull (box payload.responses)) then
                         for r in payload.responses do
                             Store.sttResponseScript.Enqueue r
+                    do! respondJson ctx 200 """{"ok":true}"""
+            with _ ->
+                do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+        }
+
+    /// Sets the scripted-response queue for the audio/speech (TTS) endpoint. An
+    /// empty/absent `responses` array clears it (calls fall back to Store.defaultTtsBytes).
+    let setTtsScript (ctx: HttpContext) =
+        task {
+            let! body = readBody ctx
+            try
+                let payload =
+                    JsonSerializer.Deserialize<ResponseScriptDto>(body, JsonSerializerOptions(JsonSerializerDefaults.Web))
+                match payload with
+                | null -> do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""
+                | payload ->
+                    Store.clearTtsScript ()
+                    if not (isNull (box payload.responses)) then
+                        for r in payload.responses do
+                            Store.ttsResponseScript.Enqueue r
                     do! respondJson ctx 200 """{"ok":true}"""
             with _ ->
                 do! respondJson ctx (int HttpStatusCode.BadRequest) """{"ok":false}"""

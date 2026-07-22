@@ -258,6 +258,30 @@ type ResponderService(
           Temperature = None
           MaxTokens = None }
 
+    /// Slice 9 (stretch) cost footer: when COST_FOOTER_ENABLED and `usage` is available,
+    /// appends a "⛽ $0.0021" line to the ALREADY-SENT message `sent` via one extra MDV2
+    /// edit — works uniformly for every responder path (streaming renderers, the rewriter
+    /// pass's single non-stream send) since it always runs strictly after the normal final
+    /// send/edit ("append at final edit"). Cost is computed from `usage` against
+    /// LLM_PRICING keyed by the DEPLOYMENT name (not the response's own `model` field,
+    /// which this layer never sees — LlmPricing.tryCost matches by substring, so the
+    /// deployment name resolves the same pricing entry the response model would have).
+    /// The returned/logged reply text is never touched by this call — message_log (and so
+    /// the model's own future context) never sees its own cost, only the Telegram reader
+    /// does (Альфа's trick).
+    let maybeAppendCostFooter (conf: BotConfiguration) (usage: TokenUsage option) (chatId: int64) (sent: Message) (replyText: string) : Task<unit> =
+        task {
+            if conf.CostFooterEnabled then
+                match usage with
+                | None -> ()
+                | Some u ->
+                    match LlmPricing.tryCost logger conf.LlmPricingJson conf.LlmDeployment u with
+                    | None -> ()
+                    | Some cost ->
+                        let costStr = cost.ToString("F4", System.Globalization.CultureInfo.InvariantCulture)
+                        do! Mdv2Delivery.editFinal tg logger chatId sent.MessageId $"{replyText}\n\n⛽ ${costStr}"
+        }
+
     /// Rewriter pass ON: forces the main call to non-stream (`IChatCompletion.Complete`)
     /// so a second cheap non-stream call can rewrite its text before anything is rendered
     /// — plan §2's documented tradeoff (no streaming while REWRITER_ENABLED). Mirrors
@@ -290,6 +314,7 @@ type ResponderService(
                             return resp.Text
                     }
                 let! sent = Mdv2Delivery.sendFinal tg logger msg.Chat.Id msg.MessageId finalText
+                do! maybeAppendCostFooter conf resp.Usage msg.Chat.Id sent finalText
                 return Some(sent, finalText)
         }
 
@@ -319,7 +344,9 @@ type ResponderService(
                     let renderer = renderers.ForMode(conf.StreamMode)
                     let! result = renderer.Render(msg.Chat.Id, msg.MessageId, chunks, CancellationToken.None)
                     match result.FinalMessage with
-                    | Some sent -> return Some(sent, result.FullText)
+                    | Some sent ->
+                        do! maybeAppendCostFooter conf result.Usage msg.Chat.Id sent result.FullText
+                        return Some(sent, result.FullText)
                     | None -> return None
             | mode ->
                 logger.LogWarning("Unknown RESPONDER_MODE '{Mode}' — staying silent", mode)

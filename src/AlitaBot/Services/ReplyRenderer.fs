@@ -24,7 +24,11 @@ type RenderOutcome =
 type RenderResult =
     { FinalMessage: Message option
       FullText: string
-      Outcome: RenderOutcome }
+      Outcome: RenderOutcome
+      /// Token usage of the completed call, when the stream reached `ChatChunk.Completed`
+      /// (Slice 9 stretch: ResponderService's cost footer). `None` on any failure path, or
+      /// when the underlying response carried no usage block.
+      Usage: TokenUsage option }
 
 /// Turns a chunk stream into Telegram message(s). Failure policy shared by all
 /// implementations: ContentFiltered before any text → fixed RU reply; any other
@@ -203,6 +207,7 @@ type PlainRenderer(tg: ITelegramApi, logger: ILogger<PlainRenderer>) =
             task {
                 let text = StringBuilder()
                 let mutable outcome = RenderOutcome.Completed FinishReason.Stop
+                let mutable usage: TokenUsage option = None
                 use enumerator = chunks.GetAsyncEnumerator(ct)
                 let mutable go = true
                 while go do
@@ -213,27 +218,29 @@ type PlainRenderer(tg: ITelegramApi, logger: ILogger<PlainRenderer>) =
                         match enumerator.Current with
                         | ChatChunk.TextDelta t -> %text.Append(t)
                         | ChatChunk.ToolCallDelta _ -> ()
-                        | ChatChunk.Completed response -> outcome <- RenderOutcome.Completed response.FinishReason
+                        | ChatChunk.Completed response ->
+                            outcome <- RenderOutcome.Completed response.FinishReason
+                            usage <- response.Usage
                         | ChatChunk.Failed err -> outcome <- RenderOutcome.Failed err
 
                 let fullText = text.ToString()
                 match outcome with
                 | RenderOutcome.Failed(LlmError.ContentFiltered _) when fullText.Length = 0 ->
                     let! sent = BotHelpers.sendTextReply tg chatId ReplyRenderer.ContentFilteredReply replyToMessageId
-                    return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome }
+                    return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome; Usage = usage }
                 | RenderOutcome.Failed err when fullText.Length = 0 ->
                     logger.LogWarning("LLM stream failed before any text — staying silent: {Error}", string err)
-                    return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                    return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                 | _ when fullText.Length = 0 ->
                     logger.LogWarning("LLM stream completed with empty text — nothing to send")
-                    return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                    return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                 | _ ->
                     match outcome with
                     | RenderOutcome.Failed err ->
                         logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                     | _ -> ()
                     let! sent = Mdv2Delivery.sendFinal tg logger chatId replyToMessageId fullText
-                    return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome }
+                    return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome; Usage = usage }
             }
 
 /// Streams by editing one message: sends on the first meaningful chunk, then edits
@@ -247,6 +254,7 @@ type EditThrottleRenderer(tg: ITelegramApi, time: TimeProvider, logger: ILogger<
             task {
                 let text = StringBuilder()
                 let mutable outcome = RenderOutcome.Completed FinishReason.Stop
+                let mutable usage: TokenUsage option = None
                 let mutable sentMsg: Message option = None
                 let mutable lastSentLen = 0
                 let mutable lastSentAt = time.GetTimestamp()
@@ -275,7 +283,9 @@ type EditThrottleRenderer(tg: ITelegramApi, time: TimeProvider, logger: ILogger<
                                     lastSentAt <- time.GetTimestamp()
                         | ChatChunk.TextDelta _
                         | ChatChunk.ToolCallDelta _ -> ()
-                        | ChatChunk.Completed response -> outcome <- RenderOutcome.Completed response.FinishReason
+                        | ChatChunk.Completed response ->
+                            outcome <- RenderOutcome.Completed response.FinishReason
+                            usage <- response.Usage
                         | ChatChunk.Failed err -> outcome <- RenderOutcome.Failed err
 
                 let fullText = text.ToString()
@@ -284,13 +294,13 @@ type EditThrottleRenderer(tg: ITelegramApi, time: TimeProvider, logger: ILogger<
                     match outcome with
                     | RenderOutcome.Failed(LlmError.ContentFiltered _) ->
                         let! sent = BotHelpers.sendTextReply tg chatId ReplyRenderer.ContentFilteredReply replyToMessageId
-                        return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome }
+                        return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome; Usage = usage }
                     | RenderOutcome.Failed err ->
                         logger.LogWarning("LLM stream failed before any text — staying silent: {Error}", string err)
-                        return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                        return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                     | RenderOutcome.Completed _ ->
                         logger.LogWarning("LLM stream completed with empty text — nothing to send")
-                        return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                        return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                 | Some m ->
                     match outcome with
                     | RenderOutcome.Failed err ->
@@ -301,7 +311,7 @@ type EditThrottleRenderer(tg: ITelegramApi, time: TimeProvider, logger: ILogger<
                     // (Mdv2Delivery applies only at the FINAL message), so this edit is
                     // what actually switches the message over to its MDV2-formatted form.
                     do! Mdv2Delivery.editFinal tg logger chatId m.MessageId fullText
-                    return { FinalMessage = Some m; FullText = fullText; Outcome = outcome }
+                    return { FinalMessage = Some m; FullText = fullText; Outcome = outcome; Usage = usage }
             }
 
 /// Streams via `sendMessageDraft` (Bot API 10.2): a throttled (≥500ms) draft
@@ -343,6 +353,7 @@ type DraftRenderer(tg: ITelegramApi, time: TimeProvider, fallback: EditThrottleR
                     let draftId = Random.Shared.NextInt64(1L, Int64.MaxValue)
                     let sb = StringBuilder()
                     let mutable outcome = RenderOutcome.Completed FinishReason.Stop
+                    let mutable usage: TokenUsage option = None
 
                     // While draftSupported: no real message exists yet, only draft
                     // updates. Once it flips false (draft rejected mid-stream), we
@@ -408,7 +419,9 @@ type DraftRenderer(tg: ITelegramApi, time: TimeProvider, fallback: EditThrottleR
                                             lastSentAt <- time.GetTimestamp()
                             | ChatChunk.TextDelta _
                             | ChatChunk.ToolCallDelta _ -> ()
-                            | ChatChunk.Completed response -> outcome <- RenderOutcome.Completed response.FinishReason
+                            | ChatChunk.Completed response ->
+                                outcome <- RenderOutcome.Completed response.FinishReason
+                                usage <- response.Usage
                             | ChatChunk.Failed err -> outcome <- RenderOutcome.Failed err
 
                     let fullText = sb.ToString()
@@ -422,27 +435,27 @@ type DraftRenderer(tg: ITelegramApi, time: TimeProvider, fallback: EditThrottleR
                             logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                         | _ -> ()
                         do! Mdv2Delivery.editFinal tg logger chatId m.MessageId fullText
-                        return { FinalMessage = Some m; FullText = fullText; Outcome = outcome }
+                        return { FinalMessage = Some m; FullText = fullText; Outcome = outcome; Usage = usage }
                     | None ->
                         // Draft-only the whole time (or an empty stream) — drafts never
                         // persist, so the FIRST and ONLY real message is sent right now.
                         match outcome with
                         | RenderOutcome.Failed(LlmError.ContentFiltered _) ->
                             let! sent = BotHelpers.sendTextReply tg chatId ReplyRenderer.ContentFilteredReply replyToMessageId
-                            return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome }
+                            return { FinalMessage = Some sent; FullText = ReplyRenderer.ContentFilteredReply; Outcome = outcome; Usage = usage }
                         | RenderOutcome.Failed err when fullText.Length = 0 ->
                             logger.LogWarning("LLM stream failed before any text — staying silent: {Error}", string err)
-                            return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                            return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                         | _ when fullText.Length = 0 ->
                             logger.LogWarning("LLM stream completed with empty text — nothing to send")
-                            return { FinalMessage = None; FullText = ""; Outcome = outcome }
+                            return { FinalMessage = None; FullText = ""; Outcome = outcome; Usage = usage }
                         | _ ->
                             match outcome with
                             | RenderOutcome.Failed err ->
                                 logger.LogWarning("LLM stream failed after partial text — finalizing partial reply: {Error}", string err)
                             | _ -> ()
                             let! sent = Mdv2Delivery.sendFinal tg logger chatId replyToMessageId fullText
-                            return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome }
+                            return { FinalMessage = Some sent; FullText = fullText; Outcome = outcome; Usage = usage }
                 }
 
 /// Selects a renderer for a STREAM_MODE value ("plain" | "edit" | "draft").

@@ -166,6 +166,8 @@ reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
 | `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below. |
 | `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
 | `/ask <question>` | — | Semantic search over this chat's message history (see "Memory" below): answers grounded in the nearest matching quotes, cited by author and date. Empty question → RU usage hint. |
+| `/say [voice] <text>` | — | Synthesize `text` as a voice note (see "`/say`, `/sql`, cost footer" below); reply-to-message with no text of its own → voices ITS text. |
+| `/sql <question>` | — | Admin-gated (`ADMIN_USER_IDS`) natural-language SQL over Alita's own database, rendered as a table (see "`/say`, `/sql`, cost footer" below). |
 | `/help` | `/start` | Auto-generated list of the above, from the registry. |
 
 ### Usage accounting (`llm_usage`, V2 migration)
@@ -567,6 +569,109 @@ UPDATE bot_setting SET value = 'true' WHERE key = 'DIGEST_ENABLED';
 UPDATE bot_setting SET value = '0.02' WHERE key = 'INTERJECT_PROBABILITY';  -- ~1-in-50 eligible burst
 UPDATE bot_setting SET value = '0.05' WHERE key = 'MEME_REACT_PROBABILITY'; -- ~1-in-20 photo
 ```
+
+## `/say`, `/sql`, cost footer (Phase-1 Slice 9, stretch)
+
+Three small, independent stretch features on top of the LLM foundation above: a TTS
+voice-reply command, an admin-gated natural-language SQL console, and an optional
+per-reply cost footer.
+
+### `/say [voice] <text>`
+
+Synthesizes `text` via `ISpeech.Synthesize` (the same `alita-tts` deployment S1 wired up)
+and sends it as a voice note (`Req.SendVoice`, `BotHelpers.sendVoiceReply`). `voice` is
+optional — the first whitespace-separated token of the args is read as an explicit voice
+selector in two cases: it's followed by more text (`/say nova привет` → voice `nova`, text
+"привет"), or it's the ONLY token and the command replies to another message (that
+message's text supplies what gets spoken — `/say nova` replying to "привет" → voice
+`nova`, text "привет"). A lone token that isn't a recognized voice name is left as plain
+text UNLESS it's that reply-only case, where there's no other plausible reading — that's
+reported as an invalid-voice refusal (`BotService.parseSayArgs`). No voice arg at all falls
+back to `TTS_DEFAULT_VOICE` (bot_setting, default `"alloy"`). Recognized voices
+(`BotService.validTtsVoices`): `alloy, ash, ballad, coral, echo, fable, nova, onyx, sage,
+shimmer, verse` — the OpenAI/Azure `gpt-4o-mini-tts` roster.
+
+Text is capped at `SAY_MAX_CHARS` (bot_setting, default `500`) — over that, a RU refusal
+and no TTS call at all. Azure's `audio/speech` with `response_format=opus` normally
+already returns a proper Ogg/Opus container (confirmed against the real `alita-tts`
+deployment, see `tests/AlitaBot.RealTests/VoiceRealTests.fs`'s curl-equivalent
+verification) — `BotService.isOggContainer` checks the 4-byte `"OggS"` magic and sends
+straight through as a voice note in that case. For the rare voice/model combination that
+doesn't, `BotService.tryConvertToOggOpus` shells out to `ffmpeg` (if it's on `PATH`) to
+re-encode; if `ffmpeg` is missing or the conversion fails, the raw bytes go out as a
+regular audio attachment (`Req.SendAudio`) instead of a voice note. The bot's own
+`message_log` row is tagged `"[voice] {text}"` — the same convention S1's voice-
+transcription reply already uses, so a `/say` reply reads identically to a transcribed
+voice message in later LLM context. `llm_usage` records it under `kind='tts'` (the
+existing `ISpeech.Synthesize` telemetry path, unchanged).
+
+**Found in the process:** `AzureFoundryProvider.fs`'s `AzureWire.speechUri` had been using
+the same shared `api-version=2024-10-21` as chat/embeddings/transcriptions since S1 — which
+404s against the real `alita-tts` deployment's `audio/speech` route. Nothing had ever
+called `ISpeech.Synthesize` end-to-end against real Azure before `/say` (S1's own
+verification bypassed the app entirely with a hand-rolled curl-equivalent call using
+`api-version=2024-08-01-preview`); `/say`'s real-test caught the latent bug, fixed by
+giving `audio/speech` its own `SpeechApiVersion = "2024-08-01-preview"`.
+
+### `/sql <question>` — admin-gated natural-language SQL
+
+Gated by `ADMIN_USER_IDS` (bot_setting, `JSON_BLOB` array of Telegram user ids, seeded
+`[]` — nobody is admin until hand-seeded, see AGENTS.md's "Settings seeds, not
+migrations"). A non-admin gets a flat, Алита-styled troll refusal
+(`"Куда лезёшь? SQL-консоль не для тебя."`) with **no LLM call at all**.
+
+For an admin: `SQL_PROMPT` (bot_setting) inlines a compact description of Alita's own
+schema (`message_log`, `message_embedding`, `interaction_memory`, `person_dossier`,
+`llm_usage`, `karma`, `bot_setting`, `scheduled_job`) and asks the model for a single JSON
+object `{"sql": "..."}` containing one read-only `SELECT`/`WITH` statement — same
+free-text-JSON-with-one-retry contract (`completeJsonWithRetry`) `/awards`/`/quote` use,
+not a server-side JSON-mode parameter.
+
+Layered safety, belt and braces:
+1. **`AlitaBot.Services.SqlGuard.validate`** (text-level, before the query ever reaches
+   Postgres): must start with `SELECT`/`WITH`, at most one trailing semicolon and none
+   elsewhere, and none of `INSERT`/`UPDATE`/`DELETE`/`DROP`/`ALTER`/`CREATE`/`GRANT`
+   appearing outside a quoted string literal (single-quoted string contents are blanked
+   out first, so a legitimate `WHERE text = '...update...'` literal never trips the guard).
+2. **`DbService.ExecuteReadOnlySelect`** opens a FRESH connection, runs `SET
+   default_transaction_read_only = on`, sets a 5-second command timeout, and wraps the
+   validated statement in an outer `SELECT * FROM (...) AS sql_limited LIMIT 50` — so even
+   a query that somehow slipped past step 1 could still only `SELECT`, and only up to 50
+   rows.
+
+A rejected or failed query shows the generated SQL plus a short RU reason; a successful one
+renders as an MDV2 code-block table (`BotService.renderSqlTable`, column values capped at
+30 chars each), delivered via `Mdv2Delivery.sendFinal` — same pipeline `/roast`/`/awards`
+use, since the SQL text itself needs a fenced code block, not plain-text escaping.
+
+### Cost footer (`COST_FOOTER_ENABLED`)
+
+When on (bot_setting, `FEATURE_FLAG`, default `false`), every LLM **responder** reply
+(never a command reply) gets an appended `⛽ $0.0021`-shaped line showing that call's USD
+cost, computed the same way `/img`'s caption cost line and `llm_usage.cost_usd` are
+(`AlitaBot.Llm.LlmPricing.tryCost` against `LLM_PRICING`, keyed by the `LLM_DEPLOYMENT`
+name since the responder layer never sees the raw response `model` field a provider-level
+`LlmCall` does). The footer is delivered as **one extra edit after the normal final
+send/edit** (`ResponderService.maybeAppendCostFooter`, called from both the streaming-
+renderer path and the `REWRITER_ENABLED` non-stream path) — works uniformly regardless of
+`STREAM_MODE`. Critically, the footer is applied ONLY to what goes out over the wire: the
+text returned to `BotService` for `message_log`/the embedding pipeline is always the
+unfootered original, so the model never sees its own cost in later conversational context
+(Альфа's trick — users see it, the model's context never does). `RenderResult` (Services/
+ReplyRenderer.fs) grew a `Usage: TokenUsage option` field for exactly this — none of the
+three renderers change their actual rendering behavior, they just also thread the
+completed call's token usage back out.
+
+### Fake-suite testing (`tests/AlitaBot.Tests/StretchTests.fs`)
+
+`FakeAzureOcrApi` gained an `/openai/deployments/{deployment}/audio/speech` route
+(`Handlers.handleAudioSpeech`) — unlike the JSON-bodied endpoints elsewhere in that file, a
+scripted 200's `body` is BASE64-ENCODED audio bytes, written back as the raw binary
+response `AzureFoundrySpeech.Synthesize`'s `sendBinaryWithRetry` expects; the default
+(unscripted) fallback is a tiny `"OggS"`-prefixed buffer so `/say` tests exercise the
+`sendVoice` fast path without needing `ffmpeg` in the fake-test container. `FakeTgApi`
+gained explicit `sendVoice`/`sendAudio` handlers (Funogram's response parser needs a real
+`Types.Message`-shaped result, not the dispatcher's generic bare-`true` fallback).
 
 ## Empirical draft-semantics findings (M5)
 

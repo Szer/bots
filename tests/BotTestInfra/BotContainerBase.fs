@@ -429,6 +429,18 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Scripts the Azure OpenAI audio/speech (TTS) endpoint (AlitaBot /say, Slice 9
+    /// stretch). An empty array clears the script (calls fall back to the fake's default
+    /// "OggS"-prefixed bytes — see FakeAzureOcrApi.Store.defaultTtsBytes).
+    member _.SetAzureTtsScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/tts-script", payload)
+            return ()
+        }
+
     /// Scripts the images/generations + images/edits endpoints (AlitaBot image generation, S3)
     /// — one shared queue for both, dequeued per call. An empty array clears the script (calls
     /// fall back to the fake's default scripted tiny PNG).

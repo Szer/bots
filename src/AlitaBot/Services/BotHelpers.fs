@@ -50,6 +50,21 @@ let sendPhotoReply (tg: ITelegramApi) (chatId: int64) (bytes: byte[]) (caption: 
     let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
     tg.CallExn(Req.SendPhoto.Make(chatId, InputFile.FileBytes("image.png", bytes), caption = caption, replyParameters = replyParams))
 
+/// Sends a voice note reply (Bot API `sendVoice`) — used by `/say` when the TTS bytes are
+/// already (or were converted to) a proper Ogg/Opus container, which is what makes
+/// Telegram clients render it as a playable voice bubble rather than a generic file.
+let sendVoiceReply (tg: ITelegramApi) (chatId: int64) (bytes: byte[]) (replyToMessageId: int64) : Task<Message> =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(Req.SendVoice.Make(chatId, InputFile.FileBytes("voice.ogg", bytes), replyParameters = replyParams))
+
+/// Sends a regular audio attachment reply (Bot API `sendAudio`) — `/say`'s fallback when
+/// the TTS bytes aren't a proper Ogg/Opus container and no `ffmpeg` was available to
+/// convert them (see BotService.tryConvertToOggOpus): still delivers the audio, just not
+/// as a round voice-note bubble.
+let sendAudioReply (tg: ITelegramApi) (chatId: int64) (bytes: byte[]) (replyToMessageId: int64) : Task<Message> =
+    let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+    tg.CallExn(Req.SendAudio.Make(chatId, InputFile.FileBytes("voice.mp3", bytes), replyParameters = replyParams))
+
 /// Sends a text reply carrying explicit entities (e.g. expandable_blockquote for
 /// voice transcripts) — entities are mutually exclusive with parse_mode on the wire,
 /// so callers that need formatting without a parse_mode use this instead of sendTextReply.

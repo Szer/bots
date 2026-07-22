@@ -9,6 +9,9 @@ module AlitaTestConfig =
     let secret = "OUR_SECRET"
     let targetChatId = -4242L
     let botUsername = "alita_test_bot"
+    /// Slice 9 stretch: the user id StretchTests seeds into ADMIN_USER_IDS for its /sql
+    /// admin-path tests.
+    let adminUserId = 9001L
 
     let config: BotContainerConfig =
         { BotProject = "AlitaBot"
@@ -101,6 +104,14 @@ type AlitaTestContainers() =
                 "INTERJECT_PROMPT",       "You may drop ONE sharp one-liner into this conversation, or reply with exactly PASS if you have nothing worth adding.", "FREE_FORM", "proactive"
                 "MEME_REACT_PROBABILITY", "0.0",                               "FREE_FORM", "proactive"
                 "MEME_REACT_PROMPT",      """Rate this photo. Reply with ONLY strict JSON {"action":"react|comment|pass","emoji":"...","text":"..."} — react: one fitting emoji reaction; comment: one short witty reply; pass: if the photo doesn't deserve a reaction. No text outside the JSON.""", "FREE_FORM", "proactive"
+                // Slice 9 (stretch): /say voice replies, admin-gated /sql, cost footer.
+                // ADMIN_USER_IDS starts empty like prod/dev — SocialTests-style, individual
+                // tests seed AlitaTestConfig.adminUserId in and restore "[]" afterwards.
+                "TTS_DEFAULT_VOICE",      "alloy",                             "FREE_FORM", "llm"
+                "SAY_MAX_CHARS",          "500",                               "FREE_FORM", "llm"
+                "ADMIN_USER_IDS",         "[]",                                "JSON_BLOB", "admin"
+                "SQL_PROMPT",             """You translate a natural-language question into ONE read-only SQL SELECT statement against the bot's own PostgreSQL database. Tables: message_log(id, chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at) — the full chat text log; message_embedding(message_log_id, embedding vector(1536), embedded_at); interaction_memory(id, user_id, content, embedding, valid_from, valid_to, created_at) — valid_to IS NULL means an active fact; person_dossier(user_id, display_name, summary, updated_at); llm_usage(id, called_at, kind, model, input_tokens, output_tokens, cost_usd, chat_id, user_id); karma(id, user_id, username, title, evidence, awarded_at); bot_setting(key, value, type, feature_group, description, created_at, updated_at); scheduled_job(job_name, last_completed_at, locked_until, locked_by). Reply with ONLY strict JSON {"sql": "..."} containing a single SELECT or WITH statement (no semicolons inside, no INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/GRANT). No text outside the JSON.""", "FREE_FORM", "llm"
+                "COST_FOOTER_ENABLED",    "false",                             "FEATURE_FLAG", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

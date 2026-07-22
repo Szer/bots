@@ -105,6 +105,12 @@ let buildBotConf () =
       InterjectPrompt = getSettingOr "INTERJECT_PROMPT" ""
       MemeReactProbability = getSettingOr "MEME_REACT_PROBABILITY" "0.0" |> float
       MemeReactPrompt = getSettingOr "MEME_REACT_PROMPT" ""
+      // Slice 9 (stretch): /say voice replies, admin-gated /sql analytics, cost footer.
+      TtsDefaultVoice = getSettingOr "TTS_DEFAULT_VOICE" "alloy"
+      SayMaxChars = getSettingOr "SAY_MAX_CHARS" "500" |> int
+      AdminUserIdsJson = getSettingOr "ADMIN_USER_IDS" "[]"
+      SqlPrompt = getSettingOr "SQL_PROMPT" ""
+      CostFooterEnabled = getSettingOr "COST_FOOTER_ENABLED" "false" |> bool.Parse
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
