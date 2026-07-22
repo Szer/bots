@@ -1,0 +1,46 @@
+name: "Alita: Deploy"
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - 'src/AlitaBot/**'
+      - 'src/alita-bot/**'
+      - 'src/Dockerfile.bot'
+      - 'tests/AlitaBot.Tests/**'
+      - '.github/workflows/alita-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/_bot-deploy.yml
+    with:
+      test-command: |
+        dotnet test tests/AlitaBot.Tests/AlitaBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
+      migrations-path: src/alita-bot/migrations
+      db-name: alita_bot
+      docker-image: ghcr.io/szer/alita-bot
+      bot-project: AlitaBot
+      argocd-app-name: alita-bot
+      container-name: alita-bot
+      # TODO: flip to true (or drop the override) once alita-bot has shipped
+      # to prod and settled — SRE coverage (deploy-failure issue -> SRE agent)
+      # is "automatic for every bot on _bot-deploy.yml" per AGENTS.md, but a
+      # brand-new bot's first deploys are exactly when a human should be
+      # reading verify-deploy.sh output directly, not routing it to an agent
+      # that has no track record with this bot yet.
+      sre-enabled: false
+    secrets:
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+      DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
+      DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
+      DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
