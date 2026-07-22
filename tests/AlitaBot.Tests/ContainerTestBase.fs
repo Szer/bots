@@ -82,6 +82,11 @@ type AlitaTestContainers() =
                 "REWRITER_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
                 "REWRITER_PROMPT",        "Rewrite the following reply as if a real human chat member wrote it: strip assistant-isms, shorten where possible, keep the meaning and all facts. Reply with only the rewritten text.", "FREE_FORM", "llm"
                 "OUTCOME_WEIGHTS",        """{"reply":100,"silence":0,"emoji":0}""", "JSON_BLOB", "llm"
+                // Slice 7: social engine (/roast, /awards, /quote, /karma).
+                "ROAST_PROMPT",           "Roast this person like a mean stand-up comedian — specific, grounded in their dossier facts and their own quotes, quote them verbatim where funniest, no disclaimers, no softening. 4-6 sentences.", "FREE_FORM", "llm"
+                "ROAST_COOLDOWN_SECONDS", "300",                                   "FREE_FORM", "llm"
+                "AWARDS_PROMPT",          """Below are this chat's messages from the last 7 days, each tagged [handle]: text. Pick 3-5 members and invent a witty title for each based on what they wrote. Reply with ONLY a strict JSON array of {"title": "...", "user": "...", "evidence_quote": "..."} objects — user must be ONLY the handle itself, WITHOUT the surrounding [] brackets, evidence_quote a short verbatim quote backing the title. No text outside the JSON.""", "FREE_FORM", "llm"
+                "QUOTE_PROMPT",           """Below are this chat's messages from the last 24 hours, each tagged with its author. Pick the ONE most absurd or quotable line. Reply with ONLY a strict JSON object {"author": "...", "quote": "...", "comment": "..."} — quote verbatim, comment a short wry remark. No text outside the JSON.""", "FREE_FORM", "llm"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(
@@ -126,6 +131,19 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             let! _ =
                 conn.ExecuteAsync(
                     "TRUNCATE message_log, message_embedding, interaction_memory, person_dossier, memory_opt_out RESTART IDENTITY CASCADE;")
+            return ()
+        }
+
+    /// Truncates Slice-7's `karma`/`roast_cooldown` tables (owner-only op, same
+    /// AdminDbConnectionString reasoning as `TruncateMemoryTables`) — SocialTests' /karma
+    /// and /roast-cooldown assertions need a clean slate, otherwise karma rows/cooldown
+    /// stamps from an earlier test in this shared, `DisableTestParallelization = true`
+    /// assembly fixture would leak into a later test's counts.
+    member this.TruncateSocialTables() =
+        task {
+            use conn = new NpgsqlConnection(this.AdminDbConnectionString)
+            do! conn.OpenAsync()
+            let! _ = conn.ExecuteAsync("TRUNCATE karma, roast_cooldown RESTART IDENTITY CASCADE;")
             return ()
         }
 

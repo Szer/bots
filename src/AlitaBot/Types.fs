@@ -92,4 +92,19 @@ type BotConfiguration =
       /// non-command message — {"reply":100,"silence":0,"emoji":0}. Default keeps the
       /// pre-S6 behavior (always reply). See Services/OutcomeRouter.fs.
       OutcomeWeightsJson: string
+      /// ROAST_PROMPT bot_setting: system prompt for the /roast command — must instruct
+      /// the model to roast the target using their dossier/facts/quotes, no disclaimers.
+      /// Default "".
+      RoastPrompt: string
+      /// ROAST_COOLDOWN_SECONDS bot_setting: minimum seconds between two /roast calls
+      /// against the same target. Default 300.
+      RoastCooldownSeconds: int
+      /// AWARDS_PROMPT bot_setting: system prompt for the /awards command — must
+      /// instruct the model to answer with a strict JSON array of
+      /// {title,user,evidence_quote} objects. Default "".
+      AwardsPrompt: string
+      /// QUOTE_PROMPT bot_setting: system prompt for the /quote command — must instruct
+      /// the model to answer with a strict JSON object {author,quote,comment}.
+      /// Default "".
+      QuotePrompt: string
       TestMode: bool }

@@ -18,6 +18,32 @@ open BotInfra
 
 module Req = Funogram.Telegram.Req
 
+// ── Social engine (Slice 7) request/response shapes ─────────────────────────
+//
+// Module-level (not nested in BotService) — F# doesn't support type declarations inside
+// a class's `let`-bound implementation section, only at module/namespace scope.
+
+/// `/roast`'s resolved target: a user_id plus the display name shown in the LLM prompt.
+type RoastTarget = { UserId: int64; DisplayName: string }
+
+/// `/roast`'s gathered ammunition — see `BotService.gatherRoastAmmo`.
+type RoastAmmo =
+    { DossierSummary: string option
+      Facts: string list
+      Messages: string list }
+
+/// One entry of the `/awards` LLM's JSON array — see `BotService.parseAwardsJson`.
+type AwardEntry =
+    { Title: string
+      User: string
+      EvidenceQuote: string }
+
+/// The `/quote` LLM's JSON object — see `BotService.parseQuoteJson`.
+type QuoteEntry =
+    { Author: string
+      Quote: string
+      Comment: string }
+
 type BotService(
     options: IOptions<BotConfiguration>,
     db: DbService,
@@ -900,6 +926,422 @@ type BotService(
                     "forget_me_done"
             })
 
+    // ── /roast, /awards, /quote, /karma (Slice 7: social engine) ───────────────
+    //
+    // /roast and /awards deliver their reply via Mdv2Delivery (MarkdownV2, same pipeline
+    // the LLM responder's own renderers use) — the LLM output is free text that may
+    // legitimately contain markdown; /quote and /karma render fixed/templated RU text
+    // with no markdown-sensitive content, so they stay on handleSimpleCommand's plain
+    // sendTextReply like /usage, /dossier, /forget-me.
+
+    /// Calls `chat.Complete(request, ...)` and applies `tryParse` to the raw response
+    /// text; on an LLM failure OR a malformed/unparseable response, retries ONCE with the
+    /// exact same request before giving up. `/awards`/`/quote` both need a strict JSON
+    /// shape out of a free-text-capable model — this is the one retry the plan asks for,
+    /// shared so both commands get identical behavior. Returns `None` only after both
+    /// attempts fail — callers render a fixed RU failure reply in that case, never crash
+    /// or leave a half-written state (no karma rows / no quote) behind.
+    let completeJsonWithRetry (usageCtx: UsageContext) (request: ChatRequest) (tryParse: string -> 'a option) : Task<'a option> =
+        task {
+            let attempt () =
+                task {
+                    match! chat.Complete(request, usageCtx, CancellationToken.None) with
+                    | Ok resp -> return tryParse resp.Text
+                    | Error err ->
+                        logger.LogWarning("Social JSON LLM call failed: {Error}", string err)
+                        return None
+                }
+            match! attempt () with
+            | Some v -> return Some v
+            | None ->
+                logger.LogWarning("Social JSON LLM response malformed or the call failed — retrying once")
+                return! attempt ()
+        }
+
+    /// The handle a `/awards`/`/quote` transcript line attributes a message to: `@username`
+    /// when the sender has one, their `display_name` otherwise (not everyone sets a
+    /// Telegram username) — also what `/awards` asks the LLM to echo back verbatim in its
+    /// "user" field, so `handleAwardsCommand` can try to resolve it against
+    /// `message_log.username` afterwards.
+    let socialHandleOf (r: MessageLogRow) =
+        if String.IsNullOrWhiteSpace(r.username: string) then r.display_name else $"@{r.username}"
+
+    let buildHandleTranscript (rows: MessageLogRow[]) : string =
+        rows |> Array.map (fun r -> $"[{socialHandleOf r}]: {r.text}") |> String.concat "\n"
+
+    /// Defensive cleanup for a `/awards` "user" field: despite the prompt explicitly
+    /// asking for the handle WITHOUT its surrounding `[...]`, a real model (confirmed
+    /// against Azure AI Foundry in `SocialRealTests.fs`) sometimes echoes the bracketed
+    /// form verbatim from the transcript line (e.g. `"[Ayrat Ru]"` instead of `"Ayrat Ru"`)
+    /// — stripped here so both the `@username` resolution check and the rendered
+    /// announcement/stored `karma.username` are never left with stray brackets.
+    let stripUserHandleBrackets (s: string) =
+        let t = s.Trim()
+        if t.Length >= 2 && t.StartsWith "[" && t.EndsWith "]" then t.Substring(1, t.Length - 2).Trim() else t
+
+    // ── /roast ───────────────────────────────────────────────────────────────
+
+    [<Literal>]
+    let RoastMessagesLimit = 50
+
+    [<Literal>]
+    let RoastFactsK = 8
+
+    [<Literal>]
+    let NoRoastDataText = "этого кадра я ещё не изучила"
+
+    [<Literal>]
+    let RoastCooldownText = "этого уже жарили, дай остыть"
+
+    /// Resolves `/roast`'s target: an explicit `@username`/`username` arg (message_log
+    /// lookup for user_id + display_name — `None` when nobody with that username has ever
+    /// been logged, treated the same as "no data" by the caller); otherwise the message
+    /// being replied to's author; otherwise the invoker themselves.
+    let resolveRoastTarget (msg: Message) (from: User) (args: string) : Task<RoastTarget option> =
+        task {
+            let trimmed = args.Trim().TrimStart('@')
+            if trimmed <> "" then
+                match! db.ResolveUserByUsername(trimmed) with
+                | Some(uid, name) -> return Some { UserId = uid; DisplayName = name }
+                | None -> return None
+            else
+                match msg.ReplyToMessage |> Option.bind (fun r -> r.From) with
+                | Some u -> return Some { UserId = u.Id; DisplayName = displayNameOf u }
+                | None -> return Some { UserId = from.Id; DisplayName = displayNameOf from }
+        }
+
+    let roastAmmoIsEmpty (ammo: RoastAmmo) =
+        ammo.DossierSummary.IsNone && ammo.Facts.IsEmpty && ammo.Messages.IsEmpty
+
+    /// Gathers `/roast`'s ammunition for `target`: dossier summary + up to RoastFactsK
+    /// newest active interaction_memory facts (no similarity filter — same "just take the
+    /// newest" posture as `/dossier`'s NewestActiveFacts, unlike ResponderService's
+    /// similarity-scored recall) + up to RoastMessagesLimit of the target's own recent
+    /// message_log texts. An opted-out (`memory_opt_out`) target gets roasted ONLY from
+    /// their recent messages — dossier/facts are never read for them, respecting the same
+    /// boundary `/forget-me` established elsewhere in the bot.
+    let gatherRoastAmmo (target: RoastTarget) : Task<RoastAmmo> =
+        task {
+            let! optedOut = db.IsOptedOut(target.UserId)
+            let! recentRows = db.UserRecentMessages(target.UserId, RoastMessagesLimit)
+            let messages = recentRows |> Array.map (fun r -> r.text) |> Array.toList
+            if optedOut then
+                return { DossierSummary = None; Facts = []; Messages = messages }
+            else
+                let! dossierOpt = db.GetPersonDossier(target.UserId)
+                let! facts = db.NewestActiveFacts(target.UserId, RoastFactsK)
+                return
+                    { DossierSummary = dossierOpt |> Option.map (fun d -> d.summary)
+                      Facts = facts |> Array.map (fun f -> f.content) |> Array.toList
+                      Messages = messages }
+        }
+
+    let roastRequest (conf: BotConfiguration) (targetName: string) (ammo: RoastAmmo) : ChatRequest =
+        let parts =
+            [ ammo.DossierSummary |> Option.map (fun s -> $"Досье:\n{s}")
+              (if ammo.Facts.IsEmpty then
+                   None
+               else
+                   Some("Факты:\n" + (ammo.Facts |> List.map (fun f -> $"- {f}") |> String.concat "\n")))
+              (if ammo.Messages.IsEmpty then
+                   None
+               else
+                   Some("Сообщения:\n" + (ammo.Messages |> List.map (fun m -> $"- {m}") |> String.concat "\n"))) ]
+            |> List.choose id
+        let body = String.concat "\n\n" parts
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.RoastPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text $"Цель: {targetName}\n\n{body}" ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    /// `/roast [@username | reply-to-target]` — see `resolveRoastTarget`/`gatherRoastAmmo`
+    /// for target resolution and ammunition gathering. Delivered via `Mdv2Delivery.sendFinal`
+    /// (non-stream LLM call -> MDV2 render -> reply), `ROAST_COOLDOWN_SECONDS` (default 300)
+    /// per target — a fresh roast only stamps `roast_cooldown` on an actual successful
+    /// delivery, never on a cooldown/no-data/failed attempt.
+    let handleRoastCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        task {
+            use a = botActivity.StartActivity("handleRoastCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then "[roast-cmd]" else $"[roast-cmd] {args}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = Mdv2Delivery.sendFinal tg logger msg.Chat.Id msg.MessageId text
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                match! resolveRoastTarget msg from args with
+                | None -> do! reply NoRoastDataText "roast_unknown_target"
+                | Some target ->
+                    let now = time.GetUtcNow().UtcDateTime
+                    let! lastRoasted = db.LastRoastedAt(target.UserId)
+                    match lastRoasted with
+                    | Some last when (now - last).TotalSeconds < float conf.RoastCooldownSeconds ->
+                        do! reply RoastCooldownText "roast_cooldown"
+                    | _ ->
+                        let! ammo = gatherRoastAmmo target
+                        if roastAmmoIsEmpty ammo then
+                            do! reply NoRoastDataText "roast_no_data"
+                        else
+                            let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                            match! chat.Complete(roastRequest conf target.DisplayName ammo, usageCtx, CancellationToken.None) with
+                            | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) ->
+                                do! db.RecordRoast(target.UserId, now)
+                                do! reply resp.Text "roast_delivered"
+                            | Ok _ -> do! reply "Слов не нашлось — то ещё достижение." "roast_empty_response"
+                            | Error err ->
+                                logger.LogWarning("Roast generation failed: {Error}", string err)
+                                do! reply "Не получилось прожарить 🙁" "roast_failed"
+        }
+
+    // ── /awards ──────────────────────────────────────────────────────────────
+
+    [<Literal>]
+    let AwardsWindowDays = 7.0
+
+    [<Literal>]
+    let AwardsTranscriptCap = 800
+
+    /// Lenient-but-strict parse of the awards LLM's JSON contract: an array of
+    /// `{title, user, evidence_quote}` objects, all three string fields required and
+    /// non-blank for title/user. Unlike `DossierService.parseFactsJson` (which silently
+    /// drops malformed elements), a single malformed entry fails the WHOLE parse — the
+    /// plan's "malformed JSON after 1 retry -> graceful failure" applies to the response
+    /// as a whole, not per-entry, so `completeJsonWithRetry` retries the entire call
+    /// rather than shipping a partially-understood awards list.
+    let parseAwardsJson (json: string) : AwardEntry list option =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Array then
+                None
+            else
+                let elements = doc.RootElement.EnumerateArray() |> Seq.toList
+                if elements.IsEmpty then
+                    None
+                else
+                    let parsed =
+                        elements
+                        |> List.map (fun el ->
+                            if el.ValueKind <> JsonValueKind.Object then
+                                None
+                            else
+                                match el.TryGetProperty "title", el.TryGetProperty "user", el.TryGetProperty "evidence_quote" with
+                                | (true, t), (true, u), (true, e) when
+                                    t.ValueKind = JsonValueKind.String
+                                    && u.ValueKind = JsonValueKind.String
+                                    && e.ValueKind = JsonValueKind.String
+                                    && not (String.IsNullOrWhiteSpace(t.GetString()))
+                                    && not (String.IsNullOrWhiteSpace(u.GetString())) ->
+                                    Some
+                                        { Title = t.GetString()
+                                          User = stripUserHandleBrackets (u.GetString())
+                                          EvidenceQuote = e.GetString() }
+                                | _ -> None)
+                    if parsed |> List.exists Option.isNone then None else Some(parsed |> List.choose id)
+        with _ ->
+            None
+
+    let awardsRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.AwardsPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    let renderAwards (awards: AwardEntry list) : string =
+        let lines = awards |> List.map (fun a -> $"🏆 {a.Title} — {a.User}: „{a.EvidenceQuote}\"")
+        "Награды недели:\n" + String.concat "\n" lines
+
+    /// `/awards` — over the last AwardsWindowDays (7) of this chat's message_log (capped
+    /// AwardsTranscriptCap (~800) rows, human messages only — see `HumanMessagesSince`),
+    /// the AWARDS_PROMPT LLM call returns a strict JSON array of 3-5 witty
+    /// {title, user, evidence_quote} awards, rendered as one line each and written to
+    /// `karma` (user_id resolved from message_log.username when the LLM's "user" field is
+    /// a "@handle" it can match — see `socialHandleOf`; kept unresolved otherwise rather
+    /// than dropped). Malformed JSON after one retry -> a fixed RU failure reply, no karma
+    /// rows written, never a crash.
+    let handleAwardsCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        task {
+            use a = botActivity.StartActivity("handleAwardsCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then "[awards-cmd]" else $"[awards-cmd] {args}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = Mdv2Delivery.sendFinal tg logger msg.Chat.Id msg.MessageId text
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                let since = time.GetUtcNow().UtcDateTime.AddDays(-AwardsWindowDays)
+                let! rows = db.HumanMessagesSince(msg.Chat.Id, since, AwardsTranscriptCap)
+
+                if rows.Length = 0 then
+                    do! reply "Не за что вручать — эта неделя прошла на редкость тихо." "awards_empty"
+                else
+                    let transcript = buildHandleTranscript rows
+                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                    match! completeJsonWithRetry usageCtx (awardsRequest conf transcript) parseAwardsJson with
+                    | None -> do! reply "Не получилось раздать награды 🙁" "awards_failed"
+                    | Some awards when awards.IsEmpty -> do! reply "Не получилось раздать награды 🙁" "awards_failed"
+                    | Some awards ->
+                        for aw in awards do
+                            let! resolvedId =
+                                if aw.User.StartsWith "@" then db.ResolveUserIdByUsername(aw.User.TrimStart '@')
+                                else Task.FromResult None
+                            do! db.InsertKarmaAward(resolvedId, aw.User, aw.Title, aw.EvidenceQuote)
+                        do! reply (renderAwards awards) "awards_delivered"
+        }
+
+    // ── /quote ───────────────────────────────────────────────────────────────
+
+    [<Literal>]
+    let QuoteWindowHours = 24.0
+
+    [<Literal>]
+    let QuoteTranscriptCap = 500
+
+    let parseQuoteJson (json: string) : QuoteEntry option =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Object then
+                None
+            else
+                match
+                    doc.RootElement.TryGetProperty "author", doc.RootElement.TryGetProperty "quote", doc.RootElement.TryGetProperty "comment"
+                with
+                | (true, a), (true, q), (true, c) when
+                    a.ValueKind = JsonValueKind.String
+                    && q.ValueKind = JsonValueKind.String
+                    && c.ValueKind = JsonValueKind.String
+                    && not (String.IsNullOrWhiteSpace(q.GetString())) ->
+                    Some { Author = a.GetString(); Quote = q.GetString(); Comment = c.GetString() }
+                | _ -> None
+        with _ ->
+            None
+
+    let quoteRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.QuotePrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    let renderQuote (q: QuoteEntry) : string =
+        $"💬 Цитата дня: „{q.Quote}\" — {q.Author}. {q.Comment}"
+
+    /// `/quote` — the last QuoteWindowHours (24) of this chat's human, non-command
+    /// message_log rows (capped QuoteTranscriptCap (~500) — see `HumanMessagesSince`)
+    /// feed the QUOTE_PROMPT LLM call, which must answer with a strict JSON
+    /// `{author, quote, comment}` picking the single most absurd/quotable line. No
+    /// messages in the window -> a fixed RU "nothing to quote" reply, no LLM call.
+    let handleQuoteCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "quote" conf msg from args (fun () ->
+            task {
+                let since = time.GetUtcNow().UtcDateTime.AddHours(-QuoteWindowHours)
+                let! rows = db.HumanMessagesSince(msg.Chat.Id, since, QuoteTranscriptCap)
+
+                if rows.Length = 0 then
+                    return "За последние сутки цитировать особо некого.", "quote_empty"
+                else
+                    let transcript = buildHandleTranscript rows
+                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                    match! completeJsonWithRetry usageCtx (quoteRequest conf transcript) parseQuoteJson with
+                    | Some q -> return renderQuote q, "quote_generated"
+                    | None -> return "Не получилось выбрать цитату дня 🙁", "quote_failed"
+            })
+
+    // ── /karma ───────────────────────────────────────────────────────────────
+
+    [<Literal>]
+    let KarmaRecentTitles = 3
+
+    [<Literal>]
+    let NoKarmaText = "пока без наград"
+
+    let renderKarma (count: int64) (titles: string[]) : string =
+        let titlesText = titles |> Array.map (fun t -> $"- {t}") |> String.concat "\n"
+        $"Наград: {count}\nПоследние:\n{titlesText}"
+
+    /// `/karma [@user]` — self (no arg) or another chat member's totals from `karma`: a
+    /// count plus the newest KarmaRecentTitles (3) titles. An unresolvable `@username` or
+    /// a known user with zero karma rows both render the same fixed "no awards yet" reply
+    /// (same "don't leak who's ever been seen" posture as `/dossier`'s NoDossierText).
+    let handleKarmaCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "karma" conf msg from args (fun () ->
+            task {
+                let trimmedArg = args.Trim().TrimStart('@')
+                let! targetIdOpt =
+                    if trimmedArg = "" then Task.FromResult(Some from.Id) else db.ResolveUserIdByUsername(trimmedArg)
+
+                match targetIdOpt with
+                | None -> return NoKarmaText, "karma_unknown_user"
+                | Some targetId ->
+                    let! count = db.KarmaCount(targetId)
+                    if count = 0L then
+                        return NoKarmaText, "karma_empty"
+                    else
+                        let! titles = db.KarmaNewestTitles(targetId, KarmaRecentTitles)
+                        return renderKarma count titles, "karma_shown"
+            })
+
     let commandsWithoutHelp: CommandDef list =
         [ { Name = "img"
             Aliases = []
@@ -929,7 +1371,23 @@ type BotService(
           { Name = "forget-me"
             Aliases = []
             Description = "забыть всё личное — выйти из системы памяти и удалить накопленное досье"
-            Handler = handleForgetMeCommand } ]
+            Handler = handleForgetMeCommand }
+          { Name = "roast"
+            Aliases = []
+            Description = "прожарить: /roast @username, ответом на сообщение, или без аргумента — себя"
+            Handler = handleRoastCommand }
+          { Name = "awards"
+            Aliases = []
+            Description = "награды недели по итогам последних 7 дней в чате"
+            Handler = handleAwardsCommand }
+          { Name = "quote"
+            Aliases = []
+            Description = "цитата дня — самая абсурдная реплика за последние 24 часа"
+            Handler = handleQuoteCommand }
+          { Name = "karma"
+            Aliases = []
+            Description = "карма: своя (без аргумента) или чужая — /karma @username"
+            Handler = handleKarmaCommand } ]
 
     /// `/help` (and `/start`, for a newcomer's first message) — auto-generated from the
     /// registry (Commands.helpText), so it can never list a command that doesn't exist

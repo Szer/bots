@@ -18,6 +18,7 @@
     <Compile Include="MemoryTests.fs" />
     <Compile Include="DossierTests.fs" />
     <Compile Include="PersonaTests.fs" />
+    <Compile Include="SocialTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

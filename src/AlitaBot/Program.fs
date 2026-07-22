@@ -86,6 +86,10 @@ let buildBotConf () =
       RewriterEnabled = getSettingOr "REWRITER_ENABLED" "false" |> bool.Parse
       RewriterPrompt = getSettingOr "REWRITER_PROMPT" ""
       OutcomeWeightsJson = getSettingOr "OUTCOME_WEIGHTS" """{"reply":100,"silence":0,"emoji":0}"""
+      RoastPrompt = getSettingOr "ROAST_PROMPT" ""
+      RoastCooldownSeconds = getSettingOr "ROAST_COOLDOWN_SECONDS" "300" |> int
+      AwardsPrompt = getSettingOr "AWARDS_PROMPT" ""
+      QuotePrompt = getSettingOr "QUOTE_PROMPT" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
