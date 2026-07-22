@@ -7,7 +7,7 @@ COMPOSE   = $(DOCKER) compose -f src/alita-bot/docker-compose.dev.yml
 ALITA_ENV = $(HOME)/.alita-test/env
 ARTIFACTS = test-artifacts/AlitaBot.RealTests
 
-.PHONY: alita-db alita-build alita-test real-test selfcheck smoke alita-logs tg-login tg-chats probe-draft alita-clean
+.PHONY: alita-db alita-build alita-test real-test selfcheck smoke alita-logs tg-login tg-chats probe-draft probe-ephemeral alita-clean
 
 alita-db:
 	$(COMPOSE) up -d
@@ -38,6 +38,9 @@ tg-chats:
 
 probe-draft:
 	dotnet run --project tests/AlitaBot.RealTests -c Release -- probe-draft
+
+probe-ephemeral:
+	dotnet run --project tests/AlitaBot.RealTests -c Release -- probe-ephemeral
 
 alita-clean:
 	# --profile smoke: `down` only tears down containers belonging to profiles

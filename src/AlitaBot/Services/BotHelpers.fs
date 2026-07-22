@@ -115,9 +115,16 @@ let trySendEphemeralOrReply
             return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
         else
             try
-                return!
+                let! sent =
                     tg.CallExn(
                         Req.SendMessage.Make(chatId, text, receiverUserId = receiverUserId, replyParameters = replyParams))
+                logger.LogInformation(
+                    "Ephemeral send accepted for chat {ChatId}, receiver {ReceiverUserId} — MessageId={MessageId} EphemeralMessageId={EphemeralMessageId}",
+                    chatId,
+                    receiverUserId,
+                    sent.MessageId,
+                    (sent.EphemeralMessageId |> Option.map string |> Option.defaultValue "<none>"))
+                return sent
             with ex ->
                 logger.LogWarning(
                     ex,
