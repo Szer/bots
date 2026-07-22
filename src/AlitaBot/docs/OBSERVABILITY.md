@@ -21,6 +21,12 @@ This file only documents what's specific to AlitaBot.
   `llm.embeddings`, `llm.image` (`src/AlitaBot/Llm/LlmTelemetry.fs`) — tagged
   `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.{input,output}_tokens`,
   `llm.cost_usd`, `llm.retries`, `error.type` on failure.
+- Dossier job spans (Slice 5b, `src/AlitaBot/Services/DossierService.fs`, one pair per
+  processed user, per nightly run — not parented under `postUpdate`, since the job runs on
+  `SchedulerHostedService`'s own background timer, outside any webhook request): `dossier.
+  extract` (tagged `userId`, `candidateFacts`, `insertedFacts`, `outcome` on failure) and
+  `dossier.merge` (tagged `userId`, `newFacts`, `outcome` ∈ `merged`/`empty_response`/
+  `merge_failed` — only started when at least one fact was actually new).
 
 ## Logging
 

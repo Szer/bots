@@ -16,6 +16,7 @@
     <Compile Include="ImageGenTests.fs" />
     <Compile Include="CommandsTests.fs" />
     <Compile Include="MemoryTests.fs" />
+    <Compile Include="DossierTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
