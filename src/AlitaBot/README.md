@@ -425,6 +425,57 @@ nightly job scans *all* of `message_log` for "active users", and this fixture's 
 test class) shares one `sent_at`, so without truncating, unrelated users from earlier test
 classes would show up as "active" too.
 
+## Social engine: /roast, /awards, /quote, /karma (Phase-1 Slice 7)
+
+Command-only fun features for a small (~30-person), zero-censorship, dark-humor-normal
+IT chat — a private consenting friend group. The bot only roasts on explicit command;
+nothing here runs unsolicited. `ROAST_PROMPT`/`AWARDS_PROMPT`/`QUOTE_PROMPT` are
+deliberately written sharp, not corporate-soft (`src/alita-bot/dev-bot-settings.sql`
+carries the dev/test seed, tuned live in prod exactly like `SYSTEM_PROMPT` — see
+AGENTS.md's "Settings seeds, not migrations").
+
+| Command | Description |
+|---|---|
+| `/roast [@username]` | Roasts a target: an explicit `@username` arg, otherwise the author of the message being replied to, otherwise the invoker themselves. Ammunition: the target's `person_dossier` summary + up to 8 newest active `interaction_memory` facts (no similarity filter — same "just take the newest" posture as `/dossier`) + up to 50 of their own recent `message_log` texts. An opted-out (`/forget-me`) target is roasted ONLY from their recent messages — dossier/facts are never read for them. `ROAST_COOLDOWN_SECONDS` (bot_setting, default 300) per target; a fresh cooldown stamp is only written after an actual successful roast (never on a "no data"/cooldown/failed attempt). No ammunition at all → "этого кадра я ещё не изучила"; still cooling down → "этого уже жарили, дай остыть". Delivered via `Mdv2Delivery.sendFinal` (non-stream LLM call → MarkdownV2 render → reply), same pipeline the LLM responder's own renderers use — the roast text is free-form LLM output that may legitimately contain markdown. |
+| `/awards` | Over the last 7 days of this chat's `message_log` (human messages only, capped ~800 rows — `DbService.HumanMessagesSince`), a JSON-mode-style LLM call (`AWARDS_PROMPT`) returns a strict JSON array of 3-5 `{title, user, evidence_quote}` awards, rendered as one `🏆 title — user: „quote"` line each and written to the new `karma` table (`user_id` resolved from `message_log.username` when the LLM's `user` field is a `@handle` it can match — kept unresolved, not dropped, otherwise). Malformed JSON retries once (`completeJsonWithRetry`); still malformed → a fixed RU failure reply, no karma rows written, never a crash. |
+| `/quote` | The single most absurd/quotable line from the last 24h of this chat's human, non-command `message_log` rows (capped ~500) — `QUOTE_PROMPT` LLM call returns strict JSON `{author, quote, comment}`, rendered `💬 Цитата дня: „quote" — author. comment`. No messages in the window → a fixed RU reply, no LLM call. |
+| `/karma [@user]` | Self (no arg) or another chat member's totals from `karma`: a count plus the newest 3 titles. An unresolvable `@username` or a known user with zero karma rows both render the same fixed "no awards yet" reply (same "don't leak who's ever been seen" posture as `/dossier`'s `NoDossierText`). |
+
+### Storage (V5 migration)
+
+- **`karma`** — one row per awarded title (`/awards`): `id`, `user_id` (nullable — best-
+  effort resolution, see above), `username` (the LLM's raw `user` field, always kept),
+  `title`, `evidence`, `awarded_at`.
+- **`roast_cooldown`** — one row per person who has ever been roasted: `target_user_id`
+  PK, `last_roasted_at`. Stamped via the app's own `TimeProvider` (`BotService`'s `now`,
+  passed into `DbService.RecordRoast`), not SQL `NOW()` — consistent with the rest of the
+  codebase (e.g. `logRow`'s `sent_at`) and required for the cooldown check to behave
+  correctly under `TEST_MODE`'s `FakeTimeProvider`, which never agrees with the
+  database's own wall clock.
+
+### JSON contracts
+
+Neither `/awards` nor `/quote` uses a server-side "JSON mode" parameter — `ChatRequest`
+has no `response_format` field (Azure Foundry's chat-completions plumbing here is a thin
+wrapper, see `Llm/AzureFoundryProvider.fs`) — instead the prompt itself instructs the
+model to answer with ONLY the JSON, and the response is parsed leniently-but-strictly:
+`/awards`' `parseAwardsJson` requires every array element to be a well-formed
+`{title, user, evidence_quote}` object (unlike `DossierService.parseFactsJson`, which
+silently drops individual malformed entries, a single malformed award entry fails the
+WHOLE parse — the plan's "malformed JSON after 1 retry → graceful failure" is a property
+of the response as a whole). `completeJsonWithRetry` (`BotService.fs`) is the shared
+one-retry-then-give-up helper both commands use.
+
+### Fake-suite testing (`tests/AlitaBot.Tests/SocialTests.fs`)
+
+Same idioms as `DossierTests.fs`: the nightly dossier job seeds a real
+`person_dossier`/`interaction_memory` fact (via scripted extraction/merge LLM calls)
+before the `/roast` tests exercise it, so `fixture.TruncateMemoryTables()` runs first for
+the same "clean active-users slate" reason `DossierTests.fs` needs it. A new
+`fixture.TruncateSocialTables()` (`karma`/`roast_cooldown`) keeps `/awards`/`/karma`
+row-count assertions deterministic across the shared, `DisableTestParallelization=true`
+assembly fixture.
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

@@ -73,6 +73,11 @@ type ActiveFactRow = { content: string; created_at: DateTime }
 [<CLIMutable>]
 type RecalledFactRow = { content: string; similarity: float }
 
+/// One `message_log` row resolved by username (Slice 7 /roast target resolution) — the
+/// user_id plus their most recently seen display_name, in one round trip.
+[<CLIMutable>]
+type ResolvedUserRow = { user_id: int64; display_name: string }
+
 /// F# option -> Dapper-friendly Nullable<'a>, for optional numeric columns.
 [<AutoOpen>]
 module private DbServiceHelpers =
@@ -421,6 +426,145 @@ WHERE message_log_id IN (SELECT id FROM message_log WHERE user_id = @user_id);
 """
             let! _ = conn.ExecuteAsync(sql, {| user_id = userId |})
             return ()
+        }
+
+    // ── Social engine (Slice 7: /roast, /awards, /quote, karma) ────────────────
+
+    /// Resolves a `@username` (no leading `@`) to the most recently seen `(user_id,
+    /// display_name)` for it in `message_log` — `/roast`'s target resolution. `None` when
+    /// nobody with that username has ever been logged. Same lookup shape as
+    /// `ResolveUserIdByUsername`, just also returning the display_name /roast needs to
+    /// personalize the LLM prompt without a second round trip.
+    member _.ResolveUserByUsername(username: string) : Task<(int64 * string) option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT user_id, display_name FROM message_log
+WHERE username = @username
+ORDER BY sent_at DESC LIMIT 1;
+"""
+            let! row = conn.QuerySingleOrDefaultAsync<ResolvedUserRow>(sql, {| username = username |})
+            return if box row = null then None else Some(row.user_id, row.display_name)
+        }
+
+    /// `userId`'s last `limit` own (non-bot) messages, all-time, chronological order — the
+    /// `/roast` ammunition's "their own quotes" ingredient (K=8 dossier facts get their
+    /// newness from `NewestActiveFacts`; this is the analogous "newest N raw quotes" pull,
+    /// deliberately not time-boxed to 24h the way the nightly job's extraction input is).
+    member _.UserRecentMessages(userId: int64, limit: int) : Task<MessageLogRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at
+FROM (SELECT * FROM message_log WHERE user_id = @user_id AND is_bot = FALSE ORDER BY sent_at DESC, id DESC LIMIT @limit) recent
+ORDER BY sent_at ASC, id ASC;
+"""
+            let! rows = conn.QueryAsync<MessageLogRow>(sql, {| user_id = userId; limit = limit |})
+            return rows |> Seq.toArray
+        }
+
+    /// This chat's human (non-bot) message_log rows since `since`, excluding pure command
+    /// invocations (`/xxx`, `!xxx`, or the `"[xxx-cmd] ..."` tagging convention — same
+    /// pattern as `BotService.isPureCommandText`), capped at `limit` and chronological.
+    /// Shared by `/awards` (7-day window, ~800 cap) and `/quote` (24h window) — neither
+    /// wants the bot's own replies or command noise polluting the transcript the awards/
+    /// quote-pick LLM call reasons over.
+    member _.HumanMessagesSince(chatId: int64, since: DateTime, limit: int) : Task<MessageLogRow[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT chat_id, message_id, user_id, username, display_name, is_bot, reply_to_message_id, text, sent_at FROM (
+    SELECT * FROM message_log
+    WHERE chat_id = @chat_id AND is_bot = FALSE AND sent_at >= @since
+      AND text !~ '^(/|!|\[[a-zA-Z0-9_-]+-cmd\])'
+    ORDER BY sent_at DESC, id DESC
+    LIMIT @limit
+) recent
+ORDER BY sent_at ASC, id ASC;
+"""
+            let! rows = conn.QueryAsync<MessageLogRow>(sql, {| chat_id = chatId; since = since; limit = limit |})
+            return rows |> Seq.toArray
+        }
+
+    /// Most recent `/roast` timestamp for `targetUserId`, or `None` if they've never been
+    /// roasted — `ROAST_COOLDOWN_SECONDS`'s cooldown check.
+    member _.LastRoastedAt(targetUserId: int64) : Task<DateTime option> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT last_roasted_at FROM roast_cooldown WHERE target_user_id = @target_user_id;"
+            let! at = conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(sql, {| target_user_id = targetUserId |})
+            return if at.HasValue then Some at.Value else None
+        }
+
+    /// Stamps `targetUserId` as roasted at `roastedAt` — called only after a successful
+    /// `/roast` reply actually went out (never on a "no data"/cooldown/failed attempt).
+    /// `roastedAt` is caller-supplied (the app's `TimeProvider`, matching `LastRoastedAt`'s
+    /// caller-side cooldown comparison) rather than SQL `NOW()` — the rest of the codebase
+    /// (e.g. `BotService.logRow`'s `sent_at`) never mixes the app's `TimeProvider` with the
+    /// database's own wall clock, and TEST_MODE's `FakeTimeProvider` would otherwise never
+    /// agree with a DB-side `NOW()`.
+    member _.RecordRoast(targetUserId: int64, roastedAt: DateTime) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO roast_cooldown (target_user_id, last_roasted_at) VALUES (@target_user_id, @roasted_at)
+ON CONFLICT (target_user_id) DO UPDATE SET last_roasted_at = EXCLUDED.last_roasted_at;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| target_user_id = targetUserId; roasted_at = roastedAt |})
+            return ()
+        }
+
+    /// Inserts one `karma` row (`/awards`, one per awarded title). `userId` is `None` when
+    /// the LLM's "user" field couldn't be resolved to a known `message_log.username` — the
+    /// row is still kept (with the raw `username` text) so the announcement itself is never
+    /// lost, just not queryable by `/karma <user>` for that award.
+    member _.InsertKarmaAward(userId: int64 option, username: string, title: string, evidence: string) : Task<unit> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO karma (user_id, username, title, evidence) VALUES (@user_id, @username, @title, @evidence);
+"""
+            let! _ =
+                conn.ExecuteAsync(
+                    sql,
+                    {| user_id = toNullable userId
+                       username = username
+                       title = title
+                       evidence = evidence |})
+            return ()
+        }
+
+    /// Total `karma` rows for `userId` — `/karma`'s headline count.
+    member _.KarmaCount(userId: int64) : Task<int64> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT COUNT(*) FROM karma WHERE user_id = @user_id;"
+            return! conn.QuerySingleAsync<int64>(sql, {| user_id = userId |})
+        }
+
+    /// `userId`'s newest `limit` karma titles, newest first — `/karma`'s "last 3" listing.
+    member _.KarmaNewestTitles(userId: int64, limit: int) : Task<string[]> =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT title FROM karma WHERE user_id = @user_id ORDER BY awarded_at DESC LIMIT @limit;
+"""
+            let! rows = conn.QueryAsync<string>(sql, {| user_id = userId; limit = limit |})
+            return rows |> Seq.toArray
         }
 
     /// Inserts one `llm_usage` row (Phase-1 Slice 4) — see IUsageRecorder. Called from the
