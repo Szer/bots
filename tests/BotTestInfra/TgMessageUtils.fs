@@ -307,8 +307,11 @@ type Tg() =
                 )
         )
 
-    /// Builds an Update with a text message in a group/supergroup chat.
-    static member groupMessage(text: string, fromUser: User, chatId: int64, ?replyToMessageId: int64) =
+    /// Builds an Update with a text message in a group/supergroup chat. `replyToMessage`
+    /// (a full Message, e.g. one returned by another Tg.group*Message call — needed when
+    /// the reply target itself must carry data like a photo) takes priority over the
+    /// synthetic bare-id form built from `replyToMessageId`.
+    static member groupMessage(text: string, fromUser: User, chatId: int64, ?replyToMessageId: int64, ?replyToMessage: Message) =
         let chat = Tg.groupChat(id = chatId)
         Update.Create(
             updateId = next(),
@@ -320,13 +323,16 @@ type Tg() =
                     from = fromUser,
                     text = text,
                     ?replyToMessage =
-                        (replyToMessageId
-                         |> Option.map (fun rid -> Message.Create(messageId = rid, date = DateTime.UtcNow, chat = chat)))
+                        (replyToMessage
+                         |> Option.orElse (
+                             replyToMessageId
+                             |> Option.map (fun rid -> Message.Create(messageId = rid, date = DateTime.UtcNow, chat = chat))))
                 )
         )
 
-    /// Builds an Update with a photo in a group/supergroup chat.
-    static member groupPhotoMessage(fromUser: User, chatId: int64, ?caption: string, ?fileId: string) =
+    /// Builds an Update with a photo in a group/supergroup chat. `captionEntities` lets
+    /// tests exercise mention detection on the caption (e.g. "@bot ..." trigger).
+    static member groupPhotoMessage(fromUser: User, chatId: int64, ?caption: string, ?fileId: string, ?captionEntities: MessageEntity[]) =
         let chat = Tg.groupChat(id = chatId)
         let fid = defaultArg fileId ($"group-photo-{next ()}")
         Update.Create(
@@ -338,7 +344,27 @@ type Tg() =
                     chat = chat,
                     from = fromUser,
                     ?caption = caption,
+                    ?captionEntities = captionEntities,
                     photo = [| PhotoSize.Create(fid, fid + "-uid", 10L, 10L, fileSize = 1024L) |]
+                )
+        )
+
+    /// Builds an Update with a voice message in a group/supergroup chat.
+    static member groupVoiceMessage(fromUser: User, chatId: int64, ?fileId: string, ?duration: int64, ?replyToMessageId: int64) =
+        let chat = Tg.groupChat(id = chatId)
+        let fid = defaultArg fileId ($"voice-{next ()}")
+        Update.Create(
+            updateId = next(),
+            message =
+                Message.Create(
+                    messageId = next(),
+                    date = DateTime.UtcNow,
+                    chat = chat,
+                    from = fromUser,
+                    voice = Voice.Create(fid, fid + "-uid", defaultArg duration 3L),
+                    ?replyToMessage =
+                        (replyToMessageId
+                         |> Option.map (fun rid -> Message.Create(messageId = rid, date = DateTime.UtcNow, chat = chat)))
                 )
         )
 

@@ -1,0 +1,96 @@
+---
+# Transient Postgres for AlitaBot's CI real-test flow (M7). Applied and torn
+# down by .github/workflows/alita-real-test.yml every run — emptyDir storage
+# is intentional, data never needs to survive past one CI run.
+#
+# `alita-ci: transient` (never `app.kubernetes.io/instance`) is the ONLY
+# label CI teardown keys off — the ArgoCD instance label would make this
+# object a prune target of some unrelated Application and get deleted
+# mid-run.
+#
+# Requires a ConfigMap named `alita-test-postgres-init` (created by the
+# workflow from src/alita-bot/init.sql — same file the local dev compose
+# stack mounts) to exist in this namespace before this is applied; it seeds
+# the `admin` / `alita_bot_service` roles and the `alita_bot` database on
+# first boot via /docker-entrypoint-initdb.d.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alita-test-postgres
+  namespace: alita-test
+  labels:
+    alita-ci: transient
+    app: alita-test-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alita-test-postgres
+  template:
+    metadata:
+      labels:
+        alita-ci: transient
+        app: alita-test-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17.10
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 20
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        # Explicit + minimal: the cluster is a single ARM node with tight
+        # headroom (measured 2026-07-21: ~428m CPU / ~4.4Gi memory free
+        # after steady-state workloads — see README's M7 doc section). CPU
+        # request matches what the production bots actually use on this
+        # node (20m); the 500m limit is just a safety cap — limits don't
+        # count against scheduling quota, only requests do.
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "20m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: data
+        emptyDir: {}
+      - name: initdb
+        configMap:
+          name: alita-test-postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alita-test-postgres
+  namespace: alita-test
+  labels:
+    alita-ci: transient
+spec:
+  selector:
+    app: alita-test-postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  type: ClusterIP

@@ -1,0 +1,720 @@
+namespace AlitaBot.Services
+
+open System
+open System.Collections.Concurrent
+open System.Collections.Generic
+open System.Diagnostics
+open System.Text.Json
+open System.Text.RegularExpressions
+open System.Threading
+open System.Threading.Tasks
+open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
+open Funogram.Telegram.Types
+open AlitaBot
+open AlitaBot.Llm
+open AlitaBot.Telemetry
+open BotInfra
+
+module Req = Funogram.Telegram.Req
+
+type BotService(
+    options: IOptions<BotConfiguration>,
+    db: DbService,
+    responder: ResponderService,
+    tg: ITelegramApi,
+    speech: ISpeech,
+    chat: IChatCompletion,
+    imageGen: IImageGen,
+    settingsReloader: ISettingsReloader,
+    logger: ILogger<BotService>,
+    time: TimeProvider
+) =
+    let nameTriggerRegex = Regex(@"(?i)\bалита\b|\balita\b", RegexOptions.Compiled)
+
+    /// Transcripts longer than this get a one-line TL;DR appended (outside the blockquote).
+    [<Literal>]
+    let TldrThreshold = 400
+
+    /// Bot API 7.7+ entity type — collapses long quoted text behind a "Show more" toggle.
+    /// Funogram's MessageEntity.Type is a plain string (no closed DU), so any Bot-API-valid
+    /// value passes straight through the wire; no Funogram version bump needed to use it.
+    [<Literal>]
+    let ExpandableBlockquote = "expandable_blockquote"
+
+    let countOutcome (outcome: string) =
+        Metrics.messagesTotal.Add(1L, KeyValuePair("outcome", box outcome))
+
+    /// Serializes all processing for one chat (SemaphoreSlim, count 1): a burst of
+    /// rapid triggers in the same chat — or a webhook redelivery racing the original
+    /// attempt — runs one at a time instead of two concurrent LLM streams reading the
+    /// same message_log snapshot and posting overlapping replies. Bounded by
+    /// TargetChatIds (the bot only ever locks chats it's configured to listen to), so
+    /// the dictionary can't grow unbounded over the process lifetime.
+    let chatLocks = ConcurrentDictionary<int64, SemaphoreSlim>()
+
+    let withChatLock (chatId: int64) (work: unit -> Task<'a>) : Task<'a> =
+        task {
+            let sem = chatLocks.GetOrAdd(chatId, fun _ -> new SemaphoreSlim(1, 1))
+            do! sem.WaitAsync()
+            try
+                return! work()
+            finally
+                %sem.Release()
+        }
+
+    let displayNameOf (u: User) =
+        match u.LastName with
+        | Some last -> $"{u.FirstName} {last}"
+        | None -> u.FirstName
+
+    /// Bot user id is the numeric prefix of the bot token ("123456:ABC-..." -> 123456).
+    let botUserId (conf: BotConfiguration) =
+        match conf.BotToken.Split(':') with
+        | [||] -> 0L
+        | parts ->
+            match Int64.TryParse parts[0] with
+            | true, v -> v
+            | _ -> 0L
+
+    /// Checks a `@username` mention against whichever entity array corresponds to
+    /// `text` — `Entities` for a text message, `CaptionEntities` for a photo's caption
+    /// (Telegram never populates both on the same message, so trying both is safe).
+    let mentionsBot (conf: BotConfiguration) (text: string) (msg: Message) =
+        let mention = "@" + conf.BotUsername
+        let matchesIn (entities: MessageEntity[]) =
+            entities
+            |> Array.exists (fun e ->
+                e.Type = "mention"
+                && int e.Offset + int e.Length <= text.Length
+                && text.Substring(int e.Offset, int e.Length) = mention)
+        match msg.Entities with
+        | Some entities when matchesIn entities -> true
+        | _ ->
+            match msg.CaptionEntities with
+            | Some entities -> matchesIn entities
+            | None -> false
+
+    let isReplyToBot (conf: BotConfiguration) (msg: Message) =
+        match msg.ReplyToMessage with
+        | Some reply -> reply.From |> Option.exists (fun u -> u.Username = Some conf.BotUsername)
+        | None -> false
+
+    let isTriggered (conf: BotConfiguration) (text: string) (msg: Message) =
+        mentionsBot conf text msg || isReplyToBot conf msg || nameTriggerRegex.IsMatch text
+
+    /// (fileId, duration) of a Voice/VideoNote/Audio message, or None for anything else.
+    let voiceSource (msg: Message) : string option =
+        match msg.Voice with
+        | Some v -> Some v.FileId
+        | None ->
+            match msg.VideoNote with
+            | Some vn -> Some vn.FileId
+            | None ->
+                match msg.Audio with
+                | Some a -> Some a.FileId
+                | None -> None
+
+    /// Truncation length for the /img photo caption's echoed prompt (plan §B2).
+    [<Literal>]
+    let ImgCaptionPromptMaxLen = 100
+
+    let logRow (chatId: int64) (messageId: int64) (userId: int64) (username: string) (displayName: string) (isBot: bool) (replyTo: int64 option) (text: string) : MessageLogRow =
+        { chat_id = chatId
+          message_id = messageId
+          user_id = userId
+          username = username
+          display_name = displayName
+          is_bot = isBot
+          reply_to_message_id = (match replyTo with Some r -> Nullable r | None -> Nullable())
+          text = text
+          sent_at = time.GetUtcNow().UtcDateTime }
+
+    let tldrRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content =
+                  [ ContentPart.Text
+                        "Summarize the following voice-message transcript in ONE short sentence, in the same language as the transcript. Output only the summary, no preamble, no quotes." ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = Some 60 }
+
+    /// Cheap non-stream TL;DR for long transcripts. Best-effort: any failure just
+    /// means the reply ships without a TL;DR line, never blocks the transcript reply.
+    let tryTldr (conf: BotConfiguration) (ctx: UsageContext) (transcript: string) =
+        task {
+            if transcript.Length <= TldrThreshold then
+                return None
+            else
+                match! chat.Complete(tldrRequest conf transcript, ctx, CancellationToken.None) with
+                | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> return Some(resp.Text.Trim())
+                | Ok _ -> return None
+                | Error err ->
+                    logger.LogWarning("TL;DR generation failed for a voice transcript: {Error}", string err)
+                    return None
+        }
+
+    /// Shared by plain text messages and photo messages: logs `logText` to message_log,
+    /// checks `triggerText` (raw text/caption, matching whatever entity array the mention
+    /// offsets are relative to) for a trigger, and dispatches to the responder.
+    let handleTriggerableMessage (conf: BotConfiguration) (msg: Message) (from: User) (logText: string) (triggerText: string) =
+        task {
+            use a = botActivity.StartActivity("handleMessage")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None) logText)
+
+            if not inserted then
+                // A webhook redelivery of an update we already fully handled (e.g. Telegram
+                // retried after a slow LLM reply held the connection open past its timeout).
+                // message_log's UNIQUE(chat_id, message_id) is the idempotency source of
+                // truth: skip re-triggering the responder so the retry can't send a second,
+                // distinct reply on top of the one already sent.
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif isTriggered conf triggerText msg then
+                match! responder.Respond(msg) with
+                | Some(sent, replyText) ->
+                    do! db.LogMessage(
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) replyText)
+                        |> taskIgnore
+                    %a.SetTag("outcome", "replied")
+                    countOutcome "replied"
+                | None ->
+                    %a.SetTag("outcome", "logged")
+                    countOutcome "logged"
+            else
+                %a.SetTag("outcome", "logged")
+                countOutcome "logged"
+        }
+
+    let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
+        handleTriggerableMessage conf msg from text text
+
+    /// Photo message flow: logs as `[photo] {caption}` (bare `[photo]` for no caption,
+    /// mirroring S1's `[voice]` convention) and checks the RAW caption — not the logged
+    /// text — against CaptionEntities for a mention, since entity offsets are relative to
+    /// the caption Telegram sent, not our logging prefix. The image itself is fetched by
+    /// ResponderService at respond time (from msg.Photo directly, via ITelegramApi), not
+    /// stored here — message_log only ever holds text.
+    let handlePhotoMessage (conf: BotConfiguration) (msg: Message) (from: User) =
+        let caption = msg.Caption |> Option.defaultValue ""
+        let logText = if caption = "" then "[photo]" else $"[photo] {caption}"
+        handleTriggerableMessage conf msg from logText caption
+
+    /// Voice/VideoNote/Audio flow: download -> transcribe -> reply as an expandable
+    /// blockquote (+ TL;DR when long) -> log both the sender's transcript and the bot's
+    /// reply -> optionally hand the transcript to the normal trigger/responder path
+    /// (e.g. a voice message saying "алита ...") without ever auto-triggering by itself.
+    let handleVoiceMessage (conf: BotConfiguration) (msg: Message) (from: User) (fileId: string) =
+        task {
+            use a = botActivity.StartActivity("handleVoiceMessage")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let countVoice (outcome: string) =
+                Metrics.voiceTranscribeTotal.Add(1L, KeyValuePair("outcome", box outcome))
+
+            let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+            if not conf.VoiceTranscribeEnabled then
+                %a.SetTag("outcome", "voice_disabled")
+                countVoice "disabled"
+            else
+                // Covers Telegram file download + the STT call — not recorded for the
+                // voice_disabled case above, since no transcription is attempted there.
+                let sw = Stopwatch.StartNew()
+                let! file = tg.CallExn(Req.GetFile.Make(fileId))
+                match file.FilePath with
+                | None ->
+                    logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
+                    %a.SetTag("outcome", "voice_no_filepath")
+                    countVoice "no_filepath"
+                | Some filePath when String.IsNullOrWhiteSpace filePath ->
+                    logger.LogWarning("Voice message file {FileId} has no FilePath — skipping transcription", fileId)
+                    %a.SetTag("outcome", "voice_no_filepath")
+                    countVoice "no_filepath"
+                | Some filePath ->
+                    let! bytes = tg.DownloadFile filePath
+                    match! speech.Transcribe(bytes, usageCtx, CancellationToken.None) with
+                    | Error err ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
+                        logger.LogWarning("Voice transcription failed: {Error}", string err)
+                        %a.SetTag("outcome", "voice_transcribe_failed")
+                        countVoice "failed"
+                    | Ok transcript when String.IsNullOrWhiteSpace transcript ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
+                        %a.SetTag("outcome", "voice_empty_transcript")
+                        countVoice "empty_transcript"
+                    | Ok transcript ->
+                        Metrics.voiceTranscribeDurationMs.Record(sw.Elapsed.TotalMilliseconds)
+                        countVoice "transcribed"
+
+                        // Sender's voice content enters the conversational log verbatim
+                        // (prefixed) so it feeds later LLM context like any text message.
+                        let! inserted =
+                            db.LogMessage(
+                                logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                                    (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                                    $"[voice] {transcript}")
+
+                        if not inserted then
+                            // Webhook redelivery: the STT call above is unavoidably repeated
+                            // (the log text is only known after transcribing), but
+                            // message_log's UNIQUE constraint still stops a second reply
+                            // from going out for the same voice message.
+                            %a.SetTag("outcome", "voice_duplicate_update")
+                            countOutcome "voice_duplicate_update"
+                        else
+
+                        let! tldr = tryTldr conf usageCtx transcript
+                        let quoted = $"🎙️ {transcript}"
+                        let entities = [| MessageEntity.Create(``type`` = ExpandableBlockquote, offset = 0L, length = int64 quoted.Length) |]
+                        let fullText =
+                            match tldr with
+                            | Some t -> $"{quoted}\n\nTL;DR: {t}"
+                            | None -> quoted
+
+                        let! sent = BotHelpers.sendTextReplyWithEntities tg msg.Chat.Id fullText entities msg.MessageId
+                        do! db.LogMessage(
+                                logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                    (Some msg.MessageId) fullText)
+                            |> taskIgnore
+
+                        // Transcription itself never triggers the responder — but a
+                        // transcript that independently matches the normal trigger rules
+                        // (name/mention/reply-to-bot) may, exactly like a text message.
+                        let transcribedMsg = { msg with Text = Some transcript }
+                        if isTriggered conf transcript transcribedMsg then
+                            match! responder.Respond(transcribedMsg) with
+                            | Some(replySent, replyText) ->
+                                do! db.LogMessage(
+                                        logRow msg.Chat.Id replySent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                            (Some msg.MessageId) replyText)
+                                    |> taskIgnore
+                                %a.SetTag("outcome", "voice_transcribed_and_triggered")
+                                countOutcome "voice_transcribed_and_triggered"
+                            | None ->
+                                %a.SetTag("outcome", "voice_transcribed")
+                                countOutcome "voice_transcribed"
+                        else
+                            %a.SetTag("outcome", "voice_transcribed")
+                            countOutcome "voice_transcribed"
+        }
+
+    /// Downloads the largest photo of `msg`'s reply target, if any — the img2img source
+    /// image for a `/img` reply-to-a-photo prompt. Best-effort: any failure (API error,
+    /// missing FilePath) logs a Warning and returns None, degrading to text-to-image
+    /// instead of failing the whole command (mirrors ResponderService's vision fetch).
+    let tryFetchReplySourceImage (msg: Message) : Task<byte[] option> =
+        task {
+            match msg.ReplyToMessage |> Option.bind BotHelpers.largestPhoto with
+            | None -> return None
+            | Some photo ->
+                try
+                    let! file = tg.CallExn(Req.GetFile.Make(photo.FileId))
+                    match file.FilePath with
+                    | None -> return None
+                    | Some fp when String.IsNullOrWhiteSpace fp -> return None
+                    | Some fp ->
+                        let! bytes = tg.DownloadFile fp
+                        return Some bytes
+                with ex ->
+                    logger.LogWarning(
+                        ex,
+                        "Image gen: failed to fetch reply-to photo {FileId} — falling back to text-to-image",
+                        photo.FileId)
+                    return None
+        }
+
+    /// `/img` / `!img` command flow (plan §B2). Always logs the command as
+    /// `[img-cmd] {prompt}` first, then branches: empty prompt -> RU usage hint;
+    /// IMAGE_GEN_ENABLED=false -> RU "disabled" reply; otherwise sends a "рисую..."
+    /// placeholder, resolves an optional img2img source image from the reply target,
+    /// generates, deletes the placeholder and sends the photo (or edits the placeholder
+    /// into an apology on failure). Never dispatches to ResponderService — a command
+    /// message is fully handled here, regardless of whether it also happens to contain
+    /// the bot's name/mention. `alitabot_command_total` is incremented centrally by the
+    /// dispatcher (see `commands`/OnUpdate), not here.
+    let handleImageCommand (conf: BotConfiguration) (msg: Message) (from: User) (prompt: string) =
+        task {
+            use a = botActivity.StartActivity("handleImageCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        $"[img-cmd] {prompt}")
+
+            if not inserted then
+                // Webhook redelivery of a command we already handled (image generation is
+                // the slowest path in the bot — the one most likely to outlast Telegram's
+                // webhook timeout and trigger a retry). Skip re-generating and re-sending.
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif String.IsNullOrWhiteSpace prompt then
+                let hint =
+                    "Напиши, что нарисовать: `/img рыжий кот на подоконнике`. Ответь этой командой на фото — перерисую его по описанию."
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id hint msg.MessageId
+                do! db.LogMessage(
+                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                            (Some msg.MessageId) hint)
+                    |> taskIgnore
+                %a.SetTag("outcome", "image_empty_prompt")
+                countOutcome "image_empty_prompt"
+            elif not conf.ImageGenEnabled then
+                let disabledText = "Генерация картинок сейчас выключена."
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id disabledText msg.MessageId
+                do! db.LogMessage(
+                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                            (Some msg.MessageId) disabledText)
+                    |> taskIgnore
+                %a.SetTag("outcome", "image_disabled")
+                countOutcome "image_disabled"
+            else
+                let! sourceImage = tryFetchReplySourceImage msg
+                let! placeholder = BotHelpers.sendTextReply tg msg.Chat.Id "рисую..." msg.MessageId
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                match! imageGen.Generate(prompt, sourceImage, usageCtx, CancellationToken.None) with
+                | Ok(bytes, _usage) ->
+                    let truncated =
+                        if prompt.Length > ImgCaptionPromptMaxLen then prompt.Substring(0, ImgCaptionPromptMaxLen)
+                        else prompt
+                    let caption =
+                        match ImagePricing.tryCost logger conf.LlmPricingJson conf.ImageDeployment conf.ImageQuality with
+                        | Some cost ->
+                            let costStr = cost.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)
+                            $"{truncated}\n${costStr}"
+                        | None -> truncated
+                    let! sentPhoto = BotHelpers.sendPhotoReply tg msg.Chat.Id bytes caption msg.MessageId
+                    do! db.LogMessage(
+                            logRow msg.Chat.Id sentPhoto.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) $"[image] {truncated}")
+                        |> taskIgnore
+                    do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
+                    let outcome = if sourceImage.IsSome then "image_edited" else "image_generated"
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                | Error err ->
+                    logger.LogWarning("Image generation failed: {Error}", string err)
+                    do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось нарисовать 🙁"
+                    %a.SetTag("outcome", "image_failed")
+                    countOutcome "image_failed"
+        }
+
+    // ── Command registry (Phase-1 Slice 4) ──────────────────────────────────
+    //
+    // Grows S3's single-purpose /img parsing into a small registry: name, aliases,
+    // description, handler (Commands.fs). /help is auto-generated from it, so there's
+    // no separate hand-written command list to fall out of sync. `alitabot_command_total`
+    // is incremented once per dispatch, centrally, in OnUpdate — individual handlers don't
+    // touch it (see handleImageCommand's comment).
+
+    /// Shared skeleton for a "simple" command (/help, /usage, /model): logs the incoming
+    /// command message as `[<name>-cmd] {args}` — idempotent, same webhook-redelivery
+    /// guard as handleImageCommand/handleTriggerableMessage — then on first delivery runs
+    /// `body ()` to produce (replyText, outcome), sends it as a normal reply, and logs the
+    /// bot's own reply row. /summary doesn't use this: its reply is (probably) ephemeral,
+    /// not a plain sendTextReply, and it has more outcome branches.
+    let handleSimpleCommand
+        (name: string)
+        (conf: BotConfiguration)
+        (msg: Message)
+        (from: User)
+        (args: string)
+        (body: unit -> Task<string * string>)
+        =
+        task {
+            use a = botActivity.StartActivity($"handle{name}Command")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then $"[{name}-cmd]" else $"[{name}-cmd] {args}"))
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                let! replyText, outcome = body()
+                let! sent = BotHelpers.sendTextReply tg msg.Chat.Id replyText msg.MessageId
+                do! db.LogMessage(
+                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                            (Some msg.MessageId) replyText)
+                    |> taskIgnore
+                %a.SetTag("outcome", outcome)
+                countOutcome outcome
+        }
+
+    /// Lenient parse of the MODEL_ALLOWLIST bot_setting (JSON_BLOB array of strings),
+    /// e.g. ["alita-gpt-5-mini"]. Malformed JSON or a non-array value -> [] (nothing
+    /// switchable — /model's arg form always refuses until the setting is fixed).
+    let parseModelAllowlist (json: string) : string list =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Array then
+                []
+            else
+                [ for el in doc.RootElement.EnumerateArray() do
+                    if el.ValueKind = JsonValueKind.String then el.GetString() ]
+        with _ -> []
+
+    /// `/model` — no arg: shows the current LLM_DEPLOYMENT + the MODEL_ALLOWLIST.
+    /// With an arg: if it's in MODEL_ALLOWLIST, upserts LLM_DEPLOYMENT and reloads the
+    /// live BotConfiguration in-process (ISettingsReloader — the same path
+    /// `/reload-settings` uses) so the switch takes effect on the very next LLM call,
+    /// not just after a restart; otherwise a RU refusal + the allowlist.
+    let handleModelCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "model" conf msg from args (fun () ->
+            task {
+                let allowlist = parseModelAllowlist conf.ModelAllowlistJson
+                let listText = if allowlist.IsEmpty then "(пусто)" else allowlist |> String.concat ", "
+
+                if String.IsNullOrWhiteSpace args then
+                    return $"Текущая модель: {conf.LlmDeployment}\nДоступные модели: {listText}", "model_shown"
+                elif allowlist |> List.contains args then
+                    do! db.UpsertBotSetting("LLM_DEPLOYMENT", args, "FREE_FORM", "llm")
+                    do! settingsReloader.Reload()
+                    return $"Модель переключена на {args} ✅", "model_switched"
+                else
+                    return
+                        $"Такую модель не знаю и выдумывать не буду: «{args}». Выбирай из списка: {listText}",
+                        "model_refused"
+            })
+
+    /// $-USD with 4 decimal places, invariant culture (never locale-dependent commas).
+    let formatUsd (v: decimal) =
+        "$" + v.ToString("F4", System.Globalization.CultureInfo.InvariantCulture)
+
+    /// Compact monospace-ish RU rendering of /usage's totals — no Markdown/parse_mode
+    /// (avoids escaping model/display-name text), alignment via plain padding instead.
+    let renderUsage
+        (today: UsageTotalsRow)
+        (week: UsageTotalsRow)
+        (byModel: UsageByModelRow[])
+        (byUser: UsageByUserRow[])
+        : string =
+        let header =
+            [ "📊 Usage"
+              ""
+              $"Сегодня:  {today.calls,4} выз.  {formatUsd today.cost_usd}"
+              $"7 дней:   {week.calls,4} выз.  {formatUsd week.cost_usd}" ]
+        let modelLines =
+            if byModel.Length = 0 then
+                []
+            else
+                ""
+                :: "По моделям (7 дней):"
+                :: [ for m in byModel -> $"  {m.model,-24} {m.calls,4} выз.  {formatUsd m.cost_usd}" ]
+        let userLines =
+            if byUser.Length = 0 then
+                []
+            else
+                ""
+                :: "Топ пользователей (7 дней):"
+                :: [ for u in byUser ->
+                        let name = u.display_name |> Option.ofObj |> Option.defaultValue $"id{u.user_id}"
+                        $"  {name,-24} {u.calls,4} выз.  {formatUsd u.cost_usd}" ]
+        let footer = [ ""; $"Итого за 7 дней: {formatUsd week.cost_usd}" ]
+        header @ modelLines @ userLines @ footer |> String.concat "\n"
+
+    /// `/usage` — today + last 7 days totals, by-model and top-5-by-user breakdowns
+    /// (7-day window), all read straight from `llm_usage` (see DbService).
+    let handleUsageCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "usage" conf msg from args (fun () ->
+            task {
+                let now = time.GetUtcNow().UtcDateTime
+                let todayStart = DateTime(now.Year, now.Month, now.Day, 0, 0, 0, DateTimeKind.Utc)
+                let weekStart = now.AddDays(-7.0)
+                let! today = db.UsageTotals(todayStart)
+                let! week = db.UsageTotals(weekStart)
+                let! byModel = db.UsageByModel(weekStart)
+                let! byUser = db.UsageByUser(weekStart, 5)
+                return renderUsage today week byModel byUser, "usage_shown"
+            })
+
+    [<Literal>]
+    let SummaryDefaultCount = 200
+
+    [<Literal>]
+    let SummaryMaxCount = 500
+
+    /// `/summary [count]` arg parsing: a positive integer arg is capped at
+    /// SummaryMaxCount; anything else (missing, non-numeric, <= 0) falls back to
+    /// SummaryDefaultCount.
+    let parseSummaryCount (args: string) =
+        match Int32.TryParse(args.Trim()) with
+        | true, v when v > 0 -> min v SummaryMaxCount
+        | _ -> SummaryDefaultCount
+
+    let summaryRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.SummaryPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    let buildTranscript (rows: MessageLogRow[]) : string =
+        rows |> Array.map (fun r -> $"[{r.display_name}]: {r.text}") |> String.concat "\n"
+
+    /// `/summary [count]` — speaker-attributed transcript of the last `count` (default
+    /// SummaryDefaultCount, capped SummaryMaxCount) message_log rows for this chat, fed
+    /// to a non-stream LLM call with the SUMMARY_PROMPT bot_setting, replied back.
+    /// Ephemeral twist (Bot API 10.2 probe — see BotHelpers.trySendEphemeralOrReply and
+    /// the "Ephemeral message probe" section of src/AlitaBot/README.md): the digest is
+    /// sent visible only to the requester (`from.Id`) whenever Telegram accepts a
+    /// receiver-scoped message for this chat, and falls back to a normal (whole-chat-
+    /// visible) reply otherwise — permanently, per chat, for the rest of the process.
+    let handleSummaryCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        task {
+            use a = botActivity.StartActivity("handleSummaryCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                db.LogMessage(
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then "[summary-cmd]" else $"[summary-cmd] {args}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = BotHelpers.trySendEphemeralOrReply tg logger msg.Chat.Id from.Id text msg.MessageId
+                    do! db.LogMessage(
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                let count = parseSummaryCount args
+                let! rows = db.RecentContext(msg.Chat.Id, count)
+
+                if rows.Length = 0 then
+                    do! reply "Пока обсуждать нечего — история этого чата пуста." "summary_empty_history"
+                else
+                    let transcript = buildTranscript rows
+                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                    match! chat.Complete(summaryRequest conf transcript, usageCtx, CancellationToken.None) with
+                    | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> do! reply resp.Text "summary_generated"
+                    | Ok _ -> do! reply "Модель промолчала — не смогла подвести итоги." "summary_empty_response"
+                    | Error err ->
+                        logger.LogWarning("Summary generation failed: {Error}", string err)
+                        do! reply "Не получилось подвести итоги 🙁" "summary_failed"
+        }
+
+    let commandsWithoutHelp: CommandDef list =
+        [ { Name = "img"
+            Aliases = []
+            Description = "сгенерировать картинку по описанию (ответом на фото — перерисовать его)"
+            Handler = handleImageCommand }
+          { Name = "model"
+            Aliases = []
+            Description = "показать текущую LLM-модель, или переключить: /model <имя>"
+            Handler = handleModelCommand }
+          { Name = "summary"
+            Aliases = [ "tldr" ]
+            Description =
+              $"итоги последних N сообщений чата (по умолчанию {SummaryDefaultCount}, максимум {SummaryMaxCount}): /summary [N]"
+            Handler = handleSummaryCommand }
+          { Name = "usage"
+            Aliases = []
+            Description = "расход и статистика использования LLM"
+            Handler = handleUsageCommand } ]
+
+    /// `/help` (and `/start`, for a newcomer's first message) — auto-generated from the
+    /// registry (Commands.helpText), so it can never list a command that doesn't exist
+    /// or omit one that does.
+    let handleHelpCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        handleSimpleCommand "help" conf msg from args (fun () ->
+            task {
+                let displayDefs =
+                    commandsWithoutHelp
+                    @ [ { Name = "help"
+                          Aliases = [ "start" ]
+                          Description = "список команд"
+                          Handler = fun _ _ _ _ -> Task.FromResult(()) } ]
+                return Commands.helpText displayDefs, "help_shown"
+            })
+
+    let commands: CommandDef list =
+        commandsWithoutHelp
+        @ [ { Name = "help"
+              Aliases = [ "start" ]
+              Description = "список команд"
+              Handler = handleHelpCommand } ]
+
+    member _.OnUpdate(update: Update) =
+        task {
+            let conf = options.Value
+            match update.Message with
+            | Some msg ->
+                match msg.From with
+                | Some from ->
+                    // Serializes everything below per chat: two rapid triggers (or a
+                    // webhook retry racing the original attempt) in the same chat no
+                    // longer run concurrently — see withChatLock. Different chats still
+                    // process fully in parallel.
+                    do!
+                        withChatLock msg.Chat.Id (fun () ->
+                            task {
+                                match msg.Text with
+                                | Some text ->
+                                    if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                        match Commands.tryMatch conf commands text with
+                                        | Some(cmdDef, args) ->
+                                            Metrics.commandTotal.Add(1L, KeyValuePair("command", box cmdDef.Name))
+                                            do! cmdDef.Handler conf msg from args
+                                        | None -> do! handleMessage conf msg from text
+                                    else
+                                        countOutcome "ignored"
+                                | None ->
+                                    match BotHelpers.largestPhoto msg with
+                                    | Some _ ->
+                                        if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                            do! handlePhotoMessage conf msg from
+                                        // else: silently ignored — same privacy gate as text messages.
+                                    | None ->
+                                        match voiceSource msg with
+                                        | Some fileId ->
+                                            if conf.TargetChatIds |> List.contains msg.Chat.Id then
+                                                do! handleVoiceMessage conf msg from fileId
+                                            // else: silently ignored — same privacy gate as text messages.
+                                        | None -> ()
+                            })
+                | None -> ()
+            | None -> ()
+        }

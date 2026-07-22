@@ -373,6 +373,22 @@ type BotContainerBase(config: BotContainerConfig) =
             return ()
         }
 
+    /// Configures the fake chat-completions SSE streaming behavior: artificial delay before each
+    /// chunk, mid-stream connection reset once N data lines were written (pair it with a nonzero
+    /// chunkDelayMs so already-flushed chunks reach the client before the reset), and a Retry-After
+    /// header (seconds) on scripted 429 responses. All zeros resets to defaults.
+    member _.SetAzureLlmStreamOptions(chunkDelayMs: int, abortAfterChunks: int, retryAfterSeconds: int) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureLlmStreamOptionsMock =
+                { chunkDelayMs = chunkDelayMs
+                  abortAfterChunks = abortAfterChunks
+                  retryAfterSeconds = retryAfterSeconds }
+            let! resp = fakeAzureHttp.PostAsJsonAsync("/test/mock/azure-llm-stream-options", payload)
+            resp.EnsureSuccessStatusCode() |> ignore
+        }
+
     /// Scripts the REACTION-triage chat-completions calls (separate queue from SetAzureLlmScript, so
     /// it never collides with text triage). Used to inject a 429 and assert the reaction path fails
     /// fast (one call, ERROR) instead of retrying into a storm. An empty array clears the script.
@@ -382,6 +398,29 @@ type BotContainerBase(config: BotContainerConfig) =
                 invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
             let payload: AzureScriptMock = { responses = responses }
             let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/reaction-llm-script", payload)
+            return ()
+        }
+
+    /// Scripts the Azure OpenAI audio/transcriptions (STT) endpoint (AlitaBot voice
+    /// transcription). An empty array clears the script (calls fall back to an empty transcript).
+    member _.SetAzureSttScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/stt-script", payload)
+            return ()
+        }
+
+    /// Scripts the images/generations + images/edits endpoints (AlitaBot image generation, S3)
+    /// — one shared queue for both, dequeued per call. An empty array clears the script (calls
+    /// fall back to the fake's default scripted tiny PNG).
+    member _.SetAzureImageScript(responses: AzureScriptedResponse array) =
+        task {
+            if not config.OcrEnabled then
+                invalidOp "This fixture has OCR disabled (no FakeAzureOcrApi container)."
+            let payload: AzureScriptMock = { responses = responses }
+            let! _ = fakeAzureHttp.PostAsJsonAsync("/test/mock/image-script", payload)
             return ()
         }
 

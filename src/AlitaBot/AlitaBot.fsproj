@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <Compile Include="Telemetry.fs" />
+    <Compile Include="Types.fs" />
+    <Compile Include="Llm/LlmTypes.fs" />
+    <Compile Include="Llm/LlmInterfaces.fs" />
+    <Compile Include="Llm/LlmTelemetry.fs" />
+    <Compile Include="Llm/AzureFoundryProvider.fs" />
+    <Compile Include="Services/DbService.fs" />
+    <Compile Include="Services/BotHelpers.fs" />
+    <Compile Include="Services/ReplyRenderer.fs" />
+    <Compile Include="Services/ResponderService.fs" />
+    <Compile Include="Services/Commands.fs" />
+    <Compile Include="Services/BotService.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- FakeTimeProvider for the test-only /test/clock/advance endpoint. Stable, ~30KB. -->
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+    <!-- taskSeq CE: IAsyncEnumerable production for CompleteStream -->
+    <PackageReference Include="FSharp.Control.TaskSeq" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BotInfra\BotInfra.fsproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="ContainerTestBase.fs" />
+    <Compile Include="SkeletonTests.fs" />
+    <Compile Include="LlmTests.fs" />
+    <Compile Include="VoiceTests.fs" />
+    <Compile Include="VisionTests.fs" />
+    <Compile Include="ImageGenTests.fs" />
+    <Compile Include="CommandsTests.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Funogram" />
+    <PackageReference Include="Funogram.Telegram" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Testcontainers" />
+    <PackageReference Include="Testcontainers.PostgreSql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AlitaBot\AlitaBot.fsproj" />
+    <ProjectReference Include="..\BotTestInfra\BotTestInfra.fsproj" />
+  </ItemGroup>
+
+</Project>

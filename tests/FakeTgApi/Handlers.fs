@@ -92,12 +92,26 @@ module Handlers =
     let private handleSimulatedError ctx =
         respondJson ctx 400 """{"ok":false,"error_code":400,"description":"Simulated error by test"}"""
 
+    /// Bot API 10.2 ephemeral messages (AlitaBot /summary, Phase-1 Slice 4): when the
+    /// request carries `receiver_user_id`, real Telegram's response Message would carry
+    /// an `ephemeral_message_id` — faked additively here (both fields just echo the same
+    /// allocated id) purely so a fake-suite test can assert `receiver_user_id` reached
+    /// the wire; the fake never rejects it (see src/AlitaBot/README.md for what real
+    /// Telegram does per chat type).
     let private handleSendMessage ctx body =
         let chatId = parseChatId body
         let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
         let msgId = Store.allocMessageId()
+        let hasReceiverUserId =
+            try
+                use doc = JsonDocument.Parse(body: string)
+                match doc.RootElement.TryGetProperty("receiver_user_id") with
+                | true, v -> v.ValueKind = JsonValueKind.Number
+                | _ -> false
+            with _ -> false
+        let ephemeralField = if hasReceiverUserId then $""","ephemeral_message_id":{msgId}""" else ""
         let resultJson =
-            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"}}"""
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"text":"ok"{ephemeralField}}}"""
         respondJson ctx 200 (okResult resultJson)
 
     let private handleSendPhoto ctx body =

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "http": {
+      "commandName": "Project",
+      "dotnetRunMessages": true,
+      "launchBrowser": false,
+      "applicationUrl": "http://localhost:5010/healthz",
+      "environmentVariables": {
+        "BOT_TELEGRAM_TOKEN": "123:456",
+        "BOT_AUTH_TOKEN": "OUR_SECRET",
+        "DATABASE_URL": "Server=localhost;Database=alita_bot;Port=15433;User Id=alita_bot_service;Password=alita_bot_service;Include Error Detail=true;",
+        "TELEGRAM_API_URL": "http://localhost:8080",
+        "AZURE_FOUNDRY_KEY": "",
+        "TEST_MODE": "true",
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "ASPNETCORE_URLS": "http://*:5010"
+      }
+    }
+  }
+}

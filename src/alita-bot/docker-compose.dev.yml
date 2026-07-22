@@ -1,0 +1,83 @@
+# Default `podman compose up` (or `docker compose`, where `docker` is a real
+# binary) brings only Postgres + Flyway — matches the workflow where the bot
+# runs on the host with a debugger attached.
+# For the end-to-end smoke test (bot inside a container, ngrok in front, real Telegram):
+#   podman compose -f src/alita-bot/docker-compose.dev.yml --profile smoke up -d --build
+# The `bot` service reads its secrets from ./.env.local (gitignored).
+# Bind mounts use the `z` SELinux relabel flag — required for rootless podman
+# on enforcing hosts (Fedora); harmless under Docker.
+
+services:
+  postgres:
+    image: postgres:17.10
+    container_name: alita-bot-postgres-dev
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "15433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro,z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  flyway:
+    image: flyway/flyway
+    container_name: alita-bot-flyway-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/flyway/sql:ro,z
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/alita_bot
+      FLYWAY_USER: admin
+      FLYWAY_PASSWORD: admin
+    command: migrate -schemas=public
+    restart: "no"
+
+  seed-bot-settings:
+    image: postgres:17.10
+    container_name: alita-bot-seed-bot-settings-dev
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    volumes:
+      - ./dev-bot-settings.sql:/seed.sql:ro,z
+    environment:
+      PGPASSWORD: admin
+    command: psql -h postgres -U admin -d alita_bot -v ON_ERROR_STOP=1 -f /seed.sql
+    restart: "no"
+
+  bot:
+    profiles: [smoke]
+    image: alita-bot-dev:latest
+    container_name: alita-bot-dev
+    build:
+      context: ../..
+      dockerfile: src/Dockerfile.bot
+      args:
+        BOT_PROJECT: AlitaBot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+      seed-bot-settings:
+        condition: service_completed_successfully
+    env_file:
+      - path: ./.env.local
+        required: true
+    environment:
+      # DB lives on the docker network; override whatever .env.local has.
+      DATABASE_URL: "Server=postgres;Port=5432;Database=alita_bot;User Id=alita_bot_service;Password=alita_bot_service;Include Error Detail=true;"
+      ASPNETCORE_URLS: "http://0.0.0.0:5010"
+    ports:
+      - "5010:5010"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

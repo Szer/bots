@@ -1,0 +1,70 @@
+---
+# Transient AlitaBot deployment for the CI real-Telegram test suite (M7).
+# Applied/torn down every run by .github/workflows/alita-real-test.yml.
+#
+# `image: IMAGE_PLACEHOLDER` is replaced in-place by the workflow (sed) with
+# the just-built/pushed ghcr.io/szer/alita-bot:test-<sha> tag before apply.
+#
+# Env comes entirely from the `alita-bot-env` Secret the workflow creates
+# from GH secrets (DATABASE_URL points at the in-cluster alita-test-postgres
+# service; BOT_TELEGRAM_TOKEN/BOT_AUTH_TOKEN/AZURE_FOUNDRY_* etc.) — nothing
+# here is a value, only the key name of what the Secret must provide.
+#
+# `alita-ci: transient` (never `app.kubernetes.io/instance`) is the only
+# label CI teardown keys off — see postgres.yaml for why.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alita-bot
+  namespace: alita-test
+  labels:
+    alita-ci: transient
+    app: alita-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alita-bot
+  template:
+    metadata:
+      labels:
+        alita-ci: transient
+        app: alita-bot
+    spec:
+      containers:
+      - name: alita-bot
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5010
+          name: http
+        envFrom:
+        - secretRef:
+            name: alita-bot-env
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 5010
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 5010
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        # Explicit + minimal: the cluster is a single ARM node with tight
+        # headroom (measured 2026-07-21: ~428m CPU / ~4.4Gi memory free
+        # after steady-state workloads — see README's M7 doc section). CPU
+        # request matches what the production bots actually use on this
+        # node (20m); the 500m limit is just a safety cap — limits don't
+        # count against scheduling quota, only requests do.
+        resources:
+          requests:
+            memory: "192Mi"
+            cpu: "20m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
