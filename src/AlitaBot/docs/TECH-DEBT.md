@@ -121,6 +121,19 @@ reply completes. That's a scoped follow-up, not a mid-pass redesign.
 reply), rework the webhook handler to ack fast and move `BotService.OnUpdate`'s body behind
 `fireAndForget`, and update the fake-suite fixtures to poll instead of asserting immediately.
 
+## `trySendEphemeralOrReply` fallback memo is process-lifetime
+
+Same shape as the `DraftRenderer` entry below: `BotHelpers.trySendEphemeralOrReply`
+(`/summary`'s ephemeral send, Phase-1 Slice 4) remembers per-`chatId`, in an in-process
+`ConcurrentDictionary`, that an ephemeral (`receiver_user_id`) `sendMessage` already failed for
+that chat — not in `bot_setting`/the database. A pod/process restart forgets every chat's
+fallback state and re-probes the ephemeral send from scratch on the next `/summary` in that chat.
+
+Deliberate simplification, not a bug — same reasoning as `DraftRenderer`: worst case is one
+extra failed `sendMessage` call per chat per restart, immediately caught and degraded to a
+normal reply, not a user-visible failure. No action needed unless restart frequency ever gets
+high enough for the repeated probe calls to matter (unlikely).
+
 ## `DraftRenderer` fallback memo is process-lifetime
 
 `Services/ReplyRenderer.fs`'s `DraftRenderer` remembers, per `chatId`, that `sendMessageDraft`

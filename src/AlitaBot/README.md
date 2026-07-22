@@ -65,6 +65,88 @@ is set; the fake-suite tests (`tests/AlitaBot.Tests/ImageGenTests.fs`) exercise 
 command/plumbing behavior against `FakeAzureOcrApi`'s images/generations + images/edits routes
 in the meantime.
 
+## Commands (Phase-1 Slice 4)
+
+`Services/Commands.fs` grows S3's single-purpose `/img` parsing into a small registry —
+name, aliases, description, handler (`AlitaBot.Services.CommandDef`) — that both dispatches
+`/cmd`, `!cmd`, and `/cmd@{BOT_USERNAME}` messages (`Commands.tryMatch`) and auto-generates
+`/help`'s text (`Commands.helpText`), so the two can never drift out of sync. A command
+addressed to a different bot (`/cmd@someOtherBot`) never matches — it falls through to the
+normal message/trigger path exactly like an unrecognized command. Command messages never
+reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
+`alitabot_command_total{command=...}` is incremented once per dispatch, centrally, in
+`BotService.OnUpdate` — not by individual handlers.
+
+| Command | Aliases | Description |
+|---|---|---|
+| `/img <prompt>` | — | Generate an image (see "Image generation" above); reply-to-photo → img2img. |
+| `/model [name]` | — | No arg: show the current `LLM_DEPLOYMENT` + the `MODEL_ALLOWLIST`. With an allowlisted arg: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
+| `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below. |
+| `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
+| `/help` | `/start` | Auto-generated list of the above, from the registry. |
+
+### Usage accounting (`llm_usage`, V2 migration)
+
+Every successful LLM/STT/TTS/image-gen call writes one row to `llm_usage`
+(`src/alita-bot/migrations/V2__llm_usage.sql`) from the provider telemetry path
+(`AlitaBot.Llm.LlmTelemetry`'s `LlmCall`/`ImageCall`, via the new `IUsageRecorder` —
+implemented by `DbService`, injected into `AzureFoundryChat`/`AzureFoundryEmbeddings`/
+`AzureFoundrySpeech`/`AzureFoundryImageGen`) — additive to the existing OTel metrics
+(`alitabot_llm_tokens_total`/`alitabot_llm_cost_usd_total`), which are unchanged. The write is
+fire-and-forget (`BotInfra.Utils.fireAndForget`) so a slow/failed insert never holds up or fails
+the actual reply. `chat_id`/`user_id` are threaded through every provider call via a small
+`UsageContext` record (`{ ChatId: int64 option; UserId: int64 option }`) — `None` for a call with
+no natural chat/user context, stored as `NULL`. `input_tokens`/`output_tokens`/`cost_usd` are also
+nullable: STT's wire response carries no usage block at all, and cost is `NULL` whenever
+`LLM_PRICING` has no matching entry for that model/deployment (same "no matching entry" case the
+existing metrics already tolerate).
+
+### Ephemeral message probe (`/summary`, Bot API 10.2)
+
+Bot API 10.2 added ephemeral messages — visible only to one user in a group. Decompiling
+`Funogram.Telegram.dll` 10.2.0 (`ilspycmd -t Funogram.Telegram.Req`) confirms the surface exists:
+`Req.SendMessage`'s constructor and `Make` factory both carry an optional
+`receiverUserId: int64` (wire: `receiver_user_id`); the response `Message` carries a matching
+`EphemeralMessageId: int64 option`. There is no separate "SendEphemeralMessage" request type —
+it's a normal `sendMessage` call with one extra field.
+
+`BotHelpers.trySendEphemeralOrReply` tries the ephemeral form first (`receiverUserId` = the
+`/summary` requester), sends visible only to them; on any Telegram API failure it logs a
+Warning, falls back to a normal (whole-chat-visible) reply, and **remembers the chat**
+(an in-process `ConcurrentDictionary<int64, byte>`, process-lifetime — mirrors `DraftRenderer`'s
+per-chat fallback memo, see `docs/TECH-DEBT.md`) so later `/summary` calls in that chat skip the
+ephemeral attempt entirely instead of re-probing it every time.
+
+**Empirical findings** (`tests/AlitaBot.RealTests/CommandRealTests.fs`, run against the basic-
+group test chat — this repo's only real test chat, same caveat as the draft-semantics probe
+above; the bot account is a plain member of the chat, not an admin):
+
+| Chat type | `receiver_user_id` on `sendMessage` | Result |
+|---|---|---|
+| Basic group (this repo's test chat, bot is a plain member) | `400 Bad Request: BOT_NOT_ADMIN` — rejected outright, same call shape as `TEXTDRAFT_PEER_INVALID` for drafts (both fail before Telegram fans anything out) | `trySendEphemeralOrReply` falls back to a normal reply automatically; the requester still gets an answer, just visible to the whole chat |
+| Basic/supergroup, bot **promoted to admin** | Not probed — the test bot in this repo's chat is deliberately a plain member (matches production: AlitaBot doesn't need admin rights for anything else it does) | Genuinely unknown; `BOT_NOT_ADMIN` reads as "needs the bot to be an admin", not "rejected in this chat type" the way `TEXTDRAFT_PEER_INVALID` does — worth re-probing if/when a chat with an admin bot is available |
+| Private chat (DM) | Not probed | — |
+
+`BOT_NOT_ADMIN` is a genuinely different rejection shape than the draft probe's
+`TEXTDRAFT_PEER_INVALID` — it reads as a *permission* requirement (Telegram wants the bot to be
+able to moderate/manage the chat before it will scope a message to one member), not a *chat-type*
+restriction. That's an inference from the error string, not a probed fact — confirmed behavior
+in an admin-bot chat is still open. Real log line from the probe run
+(`test-artifacts/AlitaBot.RealTests/bot.log`):
+
+```
+Ephemeral send rejected for chat -5236484897 — falling back to a normal reply and
+remembering for the rest of this process
+BotInfra.TelegramApiException: Telegram API error 400: Bad Request: BOT_NOT_ADMIN
+```
+
+**Action:** if/when AlitaBot is promoted to admin in a real deployment chat (or a second test
+chat with an admin bot becomes available), re-run `RESPONDER_MODE=llm make real-test` and update
+this table with what an admin-bot `sendMessage(receiver_user_id=...)` actually does — including
+whether the response `Message.EphemeralMessageId` gets populated and whether the message is
+genuinely invisible to other chat members (needs a second real user account to observe from,
+which this harness doesn't have yet — see `TgUserClient`'s single-account limitation).
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

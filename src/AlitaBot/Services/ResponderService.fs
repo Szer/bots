@@ -152,7 +152,8 @@ type ResponderService(
                 let conf = options.Value
                 let! rows = db.RecentContext(msg.Chat.Id, conf.ContextWindowMessages)
                 let! request = buildRequest conf rows msg
-                let chunks = chat.CompleteStream(request, CancellationToken.None)
+                let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = msg.From |> Option.map (fun u -> u.Id) }
+                let chunks = chat.CompleteStream(request, ctx, CancellationToken.None)
                 let renderer = renderers.ForMode(conf.StreamMode)
                 let! result = renderer.Render(msg.Chat.Id, msg.MessageId, chunks, CancellationToken.None)
                 match result.FinalMessage with

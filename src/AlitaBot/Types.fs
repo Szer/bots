@@ -43,4 +43,9 @@ type BotConfiguration =
       /// IMAGE_QUALITY bot_setting: images/generations `quality` param ("low"|"medium"|"high").
       /// Default "medium".
       ImageQuality: string
+      /// MODEL_ALLOWLIST bot_setting (JSON_BLOB): array of LLM_DEPLOYMENT values /model may
+      /// switch to, e.g. ["alita-gpt-5-mini"]. Default "[]" (nothing switchable).
+      ModelAllowlistJson: string
+      /// SUMMARY_PROMPT bot_setting: system prompt for the /summary command. Default "".
+      SummaryPrompt: string
       TestMode: bool }

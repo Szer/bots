@@ -1,6 +1,8 @@
 module AlitaBot.Services.BotHelpers
 
+open System.Collections.Concurrent
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
 open BotInfra
 
@@ -46,6 +48,55 @@ let sendTextReplyWithEntities
     : Task<Message> =
     let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
     tg.CallExn(Req.SendMessage.Make(chatId, text, entities = entities, replyParameters = replyParams))
+
+// ── Ephemeral replies (Bot API 10.2, Phase-1 Slice 4 /summary probe) ───────
+//
+// Funogram.Telegram 10.2.0's Req.SendMessage carries an optional `receiverUserId`
+// (wire: `receiver_user_id`) — passing it makes Telegram deliver the message only to
+// that user (an "ephemeral" message per Bot API 10.2), everyone else in the chat never
+// sees it. Confirmed by decompiling Funogram.Telegram.dll (ilspycmd -t Funogram.Telegram.Req):
+// SendMessage's constructor/Make both carry `FSharpOption<long> receiverUserId`, and the
+// response Message carries a matching `FSharpOption<long> EphemeralMessageId`. Whether
+// Telegram actually accepts it varies by chat type — see the empirical findings in
+// src/AlitaBot/README.md ("Ephemeral message probe").
+
+/// Chats where an ephemeral send has already failed once — permanently (process-lifetime)
+/// falls back to a normal reply for the rest of the process, mirroring DraftRenderer's
+/// per-chat fallback memo (Services/ReplyRenderer.fs, docs/TECH-DEBT.md) so a chat type
+/// that rejects receiver-scoped messages isn't re-probed on every /summary call.
+let private ephemeralUnsupportedChats = ConcurrentDictionary<int64, byte>()
+
+/// Sends `text` visible only to `receiverUserId` (Bot API 10.2 ephemeral message) as a
+/// reply to `replyToMessageId`. On any Telegram API failure — including a chat type that
+/// rejects receiver-scoped messages outright — logs a Warning, remembers the chat
+/// (see `ephemeralUnsupportedChats`), and falls back to a normal reply (visible to the
+/// whole chat) instead. Once a chat is remembered, later calls skip the ephemeral attempt
+/// entirely and go straight to the normal reply.
+let trySendEphemeralOrReply
+    (tg: ITelegramApi)
+    (logger: ILogger)
+    (chatId: int64)
+    (receiverUserId: int64)
+    (text: string)
+    (replyToMessageId: int64)
+    : Task<Message> =
+    task {
+        let replyParams = ReplyParameters.Create(replyToMessageId, allowSendingWithoutReply = true)
+        if ephemeralUnsupportedChats.ContainsKey chatId then
+            return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
+        else
+            try
+                return!
+                    tg.CallExn(
+                        Req.SendMessage.Make(chatId, text, receiverUserId = receiverUserId, replyParameters = replyParams))
+            with ex ->
+                logger.LogWarning(
+                    ex,
+                    "Ephemeral send rejected for chat {ChatId} — falling back to a normal reply and remembering for the rest of this process",
+                    chatId)
+                ephemeralUnsupportedChats[chatId] <- 0uy
+                return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
+    }
 
 /// Largest PhotoSize of a message's Photo array (Telegram orders smallest -> largest),
 /// or None for a message with no photo. Shared by BotService (detecting a photo message)

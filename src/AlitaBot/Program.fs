@@ -71,6 +71,8 @@ let buildBotConf () =
       ImageGenEnabled = getSettingOr "IMAGE_GEN_ENABLED" "true" |> bool.Parse
       ImageSize = getSettingOr "IMAGE_SIZE" "1024x1024"
       ImageQuality = getSettingOr "IMAGE_QUALITY" "medium"
+      ModelAllowlistJson = getSettingOr "MODEL_ALLOWLIST" "[]"
+      SummaryPrompt = getSettingOr "SUMMARY_PROMPT" ""
       TestMode = getSettingOr "TEST_MODE" (getEnvOr "TEST_MODE" "false") |> bool.Parse }
 
 let botConfOptions = LiveOptions(buildBotConf())
@@ -119,6 +121,15 @@ if botConfOptions.Value.TestMode then
 
 %builder
     .Services
+    .AddSingleton<DbService>(fun _ -> DbService(connString))
+    // The llm_usage sink (IUsageRecorder) and the /reload-settings hook (ISettingsReloader)
+    // are registered before the services that consume them — DI resolves lazily so
+    // registration order doesn't strictly matter, but this keeps the dependency direction
+    // readable: DbService owns both, BotService/the LLM provider layer just consume them.
+    .AddSingleton<IUsageRecorder>(fun sp -> sp.GetRequiredService<DbService>() :> IUsageRecorder)
+    .AddSingleton<ISettingsReloader>(
+        { new ISettingsReloader with
+            member _.Reload() = task { reloadSettings () } :> Task })
     .AddSingleton<BotService>()
     .AddSingleton<ResponderService>()
     .AddSingleton<ReplyRendererFactory>()
@@ -126,7 +137,6 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<IEmbeddings, AzureFoundryEmbeddings>()
     .AddSingleton<ISpeech, AzureFoundrySpeech>()
     .AddSingleton<IImageGen, AzureFoundryImageGen>()
-    .AddSingleton<DbService>(fun _ -> DbService(connString))
 
 let app = builder.Build()
 

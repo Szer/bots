@@ -29,5 +29,7 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('IMAGE_GEN_ENABLED',       'true',                                                   'FEATURE_FLAG', 'llm',        'Enables the /img and !img commands'),
     ('IMAGE_SIZE',              '1024x1024',                                              'FREE_FORM',    'llm',        'images/generations size param'),
     ('IMAGE_QUALITY',           'medium',                                                 'FREE_FORM',    'llm',        'images/generations quality param: low | medium | high'),
+    ('MODEL_ALLOWLIST',         '["alita-gpt-5-mini"]',                                   'JSON_BLOB',    'llm',        '/model may switch LLM_DEPLOYMENT to any deployment name in this array'),
+    ('SUMMARY_PROMPT',          'Подведи итоги обсуждения в этом чате: с лёгким сарказмом, по темам, кто что утверждал. Коротко, без длинных вступлений.', 'FREE_FORM', 'llm', 'System prompt for the /summary command'),
     ('TEST_MODE',               'false',                                                  'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/clock/advance)')
 ON CONFLICT (key) DO NOTHING;

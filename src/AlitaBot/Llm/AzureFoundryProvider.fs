@@ -417,13 +417,13 @@ type internal ToolCallAcc() =
 
 /// IChatCompletion against Azure AI Foundry chat-completions, raw HTTP + SSE.
 /// Endpoint/deployment/pricing come from IOptions<BotConfiguration> per call (hot-reload).
-type AzureFoundryChat(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundryChat>) =
+type AzureFoundryChat(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, usageRecorder: IUsageRecorder, logger: ILogger<AzureFoundryChat>) =
 
     interface IChatCompletion with
-        member _.Complete(request: ChatRequest, ct: CancellationToken) =
+        member _.Complete(request: ChatRequest, ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new LlmCall("llm.chat", request.Deployment, false, conf.LlmPricingJson, logger)
+                use call = new LlmCall("llm.chat", "chat", request.Deployment, false, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
                 let uri = AzureWire.chatUri conf.AzureFoundryEndpoint request.Deployment
                 let bodyJson = AzureWire.buildChatBody request false
@@ -448,10 +448,10 @@ type AzureFoundryChat(httpFactory: IHttpClientFactory, options: IOptions<BotConf
 
         // NEVER retries (D3): a 429 up front or a disconnect mid-stream surfaces as an
         // in-band Failed chunk — the stream itself never throws.
-        member _.CompleteStream(request: ChatRequest, ct: CancellationToken) =
+        member _.CompleteStream(request: ChatRequest, ctx: UsageContext, ct: CancellationToken) =
             taskSeq {
                 let conf = options.Value
-                use call = new LlmCall("llm.chat", request.Deployment, true, conf.LlmPricingJson, logger)
+                use call = new LlmCall("llm.chat", "chat", request.Deployment, true, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
                 let uri = AzureWire.chatUri conf.AzureFoundryEndpoint request.Deployment
                 let bodyJson = AzureWire.buildChatBody request true
@@ -617,13 +617,13 @@ type AzureFoundryChat(httpFactory: IHttpClientFactory, options: IOptions<BotConf
                                 yield ChatChunk.Completed response
             }
 
-type AzureFoundryEmbeddings(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundryEmbeddings>) =
+type AzureFoundryEmbeddings(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, usageRecorder: IUsageRecorder, logger: ILogger<AzureFoundryEmbeddings>) =
 
     interface IEmbeddings with
-        member _.Embed(deployment: string, texts: string list, ct: CancellationToken) =
+        member _.Embed(deployment: string, texts: string list, ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new LlmCall("llm.embeddings", deployment, false, conf.LlmPricingJson, logger)
+                use call = new LlmCall("llm.embeddings", "embedding", deployment, false, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
                 let uri = AzureWire.embeddingsUri conf.AzureFoundryEndpoint deployment
                 let bodyJson = AzureWire.buildEmbeddingsBody texts
@@ -649,13 +649,13 @@ type AzureFoundryEmbeddings(httpFactory: IHttpClientFactory, options: IOptions<B
 /// ISpeech against Azure AI Foundry's audio endpoints — STT via
 /// audio/transcriptions (multipart), TTS via audio/speech (JSON in, binary out).
 /// Deployment names come from IOptions<BotConfiguration> (STT_DEPLOYMENT/TTS_DEPLOYMENT).
-type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundrySpeech>) =
+type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, usageRecorder: IUsageRecorder, logger: ILogger<AzureFoundrySpeech>) =
 
     interface ISpeech with
-        member _.Transcribe(audio: byte[], ct: CancellationToken) =
+        member _.Transcribe(audio: byte[], ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new LlmCall("llm.stt", conf.SttDeployment, false, conf.LlmPricingJson, logger)
+                use call = new LlmCall("llm.stt", "stt", conf.SttDeployment, false, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
                 let uri = AzureWire.transcriptionsUri conf.AzureFoundryEndpoint conf.SttDeployment
 
@@ -682,10 +682,10 @@ type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotCo
                     return Error err
             }
 
-        member _.Synthesize(text: string, voice: string option, ct: CancellationToken) =
+        member _.Synthesize(text: string, voice: string option, ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new LlmCall("llm.tts", conf.TtsDeployment, false, conf.LlmPricingJson, logger)
+                use call = new LlmCall("llm.tts", "tts", conf.TtsDeployment, false, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
                 let uri = AzureWire.speechUri conf.AzureFoundryEndpoint conf.TtsDeployment
                 let voiceName = voice |> Option.defaultValue "alloy"
@@ -706,13 +706,13 @@ type AzureFoundrySpeech(httpFactory: IHttpClientFactory, options: IOptions<BotCo
 /// IImageGen against Azure AI Foundry's images endpoints — text->image via
 /// images/generations, img2img via images/edits (multipart, source image attached).
 /// Deployment/size/quality come from IOptions<BotConfiguration> (hot-reload).
-type AzureFoundryImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, logger: ILogger<AzureFoundryImageGen>) =
+type AzureFoundryImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfiguration>, usageRecorder: IUsageRecorder, logger: ILogger<AzureFoundryImageGen>) =
 
     interface IImageGen with
-        member _.Generate(prompt: string, sourceImage: byte[] option, ct: CancellationToken) =
+        member _.Generate(prompt: string, sourceImage: byte[] option, ctx: UsageContext, ct: CancellationToken) =
             task {
                 let conf = options.Value
-                use call = new ImageCall(conf.ImageDeployment, conf.ImageQuality, conf.ImageSize, conf.LlmPricingJson, logger)
+                use call = new ImageCall(conf.ImageDeployment, conf.ImageQuality, conf.ImageSize, conf.LlmPricingJson, usageRecorder, ctx, logger)
                 let client = httpFactory.CreateClient(AzureFoundry.HttpClientName)
 
                 let makeRequest () =

@@ -66,6 +66,15 @@ type LlmError =
     | ApiError of status: int * body: string
     | NetworkError of message: string
 
+/// Chat/user attribution threaded through every provider call (Complete/CompleteStream/
+/// Embed/Transcribe/Synthesize/Generate) so the persisted `llm_usage` row (Phase-1 Slice 4)
+/// can be attributed — None fields become NULL columns (e.g. a call with no natural chat/user
+/// context). Purely additive: the existing OTel metrics don't use this.
+type UsageContext =
+    { ChatId: int64 option
+      UserId: int64 option }
+    static member None = { ChatId = None; UserId = None }
+
 /// One element of a streamed completion. Errors flow in-band via `Failed` —
 /// the stream itself never throws.
 [<RequireQualifiedAccess>]

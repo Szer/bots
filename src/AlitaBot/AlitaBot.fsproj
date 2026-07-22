@@ -11,6 +11,7 @@
     <Compile Include="Services/BotHelpers.fs" />
     <Compile Include="Services/ReplyRenderer.fs" />
     <Compile Include="Services/ResponderService.fs" />
+    <Compile Include="Services/Commands.fs" />
     <Compile Include="Services/BotService.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

@@ -5,6 +5,7 @@ open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
 open System.Text.Json
+open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open AlitaBot
 open BotInfra
@@ -102,7 +103,9 @@ module ImagePricing =
 /// One image-generation call's span + metrics — same lifecycle shape as LlmCall
 /// (create at call start, mark the outcome exactly once, dispose at call end) but
 /// costed via ImagePricing (per-image-per-quality) instead of LlmPricing (per-token).
-type ImageCall(deployment: string, quality: string, size: string, pricingJson: string, logger: ILogger) =
+/// `usageRecorder`/`ctx` additively persist an `llm_usage` row (kind="image") on success —
+/// see IUsageRecorder; existing OTel metrics below are unchanged.
+type ImageCall(deployment: string, quality: string, size: string, pricingJson: string, usageRecorder: IUsageRecorder, ctx: UsageContext, logger: ILogger) =
     let activity = Telemetry.botActivity.StartActivity("llm.image")
     let startedAt = Stopwatch.GetTimestamp()
 
@@ -121,11 +124,16 @@ type ImageCall(deployment: string, quality: string, size: string, pricingJson: s
             setTag "gen_ai.usage.output_tokens" usage.CompletionTokens
             LlmMetrics.tokensTotal.Add(int64 usage.PromptTokens, KeyValuePair("direction", box "input"))
             LlmMetrics.tokensTotal.Add(int64 usage.CompletionTokens, KeyValuePair("direction", box "output"))
-        match ImagePricing.tryCost logger pricingJson deployment quality with
-        | Some cost ->
-            setTag "llm.cost_usd" cost
-            LlmMetrics.costUsdTotal.Add(cost)
+        let cost = ImagePricing.tryCost logger pricingJson deployment quality
+        match cost with
+        | Some c ->
+            setTag "llm.cost_usd" c
+            LlmMetrics.costUsdTotal.Add(c)
         | None -> ()
+        let inputTokens, outputTokens =
+            if usage.TotalTokens > 0 then Some usage.PromptTokens, Some usage.CompletionTokens else None, None
+        fireAndForget logger "llm_usage.record" (fun () ->
+            usageRecorder.Record("image", deployment, inputTokens, outputTokens, cost, ctx) :> Task)
 
     member _.Failed(error: LlmError) =
         let errorType =
@@ -145,7 +153,11 @@ type ImageCall(deployment: string, quality: string, size: string, pricingJson: s
 /// One LLM call's span + metrics: create at call start, mark the outcome exactly once
 /// (Succeeded/Failed), dispose at call end (records the latency histogram). For streamed
 /// calls the scope spans the whole stream, so latency covers first byte to [DONE].
-type LlmCall(spanName: string, deployment: string, stream: bool, pricingJson: string, logger: ILogger) =
+/// `kind` is the `llm_usage.kind` value ("chat" | "stt" | "tts" | "embedding") — distinct
+/// from `spanName` since one kind can have both stream/non-stream span variants.
+/// `usageRecorder`/`ctx` additively persist an `llm_usage` row on success (fire-and-forget,
+/// never blocks the reply) — existing OTel metrics below are unchanged.
+type LlmCall(spanName: string, kind: string, deployment: string, stream: bool, pricingJson: string, usageRecorder: IUsageRecorder, ctx: UsageContext, logger: ILogger) =
     let activity = Telemetry.botActivity.StartActivity(spanName)
     let startedAt = Stopwatch.GetTimestamp()
 
@@ -159,19 +171,27 @@ type LlmCall(spanName: string, deployment: string, stream: bool, pricingJson: st
 
     member _.Succeeded(responseModel: string option, usage: TokenUsage option, retries: int) =
         setTag "llm.retries" retries
-        match usage with
-        | Some u ->
-            setTag "gen_ai.usage.input_tokens" u.PromptTokens
-            setTag "gen_ai.usage.output_tokens" u.CompletionTokens
-            LlmMetrics.tokensTotal.Add(int64 u.PromptTokens, KeyValuePair("direction", box "input"))
-            LlmMetrics.tokensTotal.Add(int64 u.CompletionTokens, KeyValuePair("direction", box "output"))
-            let model = responseModel |> Option.defaultValue deployment
-            match LlmPricing.tryCost logger pricingJson model u with
-            | Some cost ->
-                setTag "llm.cost_usd" cost
-                LlmMetrics.costUsdTotal.Add(cost)
-            | None -> ()
-        | None -> ()
+        let model = responseModel |> Option.defaultValue deployment
+        let cost =
+            match usage with
+            | Some u ->
+                setTag "gen_ai.usage.input_tokens" u.PromptTokens
+                setTag "gen_ai.usage.output_tokens" u.CompletionTokens
+                LlmMetrics.tokensTotal.Add(int64 u.PromptTokens, KeyValuePair("direction", box "input"))
+                LlmMetrics.tokensTotal.Add(int64 u.CompletionTokens, KeyValuePair("direction", box "output"))
+                match LlmPricing.tryCost logger pricingJson model u with
+                | Some cost ->
+                    setTag "llm.cost_usd" cost
+                    LlmMetrics.costUsdTotal.Add(cost)
+                    Some cost
+                | None -> None
+            | None -> None
+        // Persisted for every successful call, even ones with no TokenUsage (e.g. STT's
+        // wire format carries no usage block) — input/output tokens land as NULL then.
+        let inputTokens = usage |> Option.map (fun u -> u.PromptTokens)
+        let outputTokens = usage |> Option.map (fun u -> u.CompletionTokens)
+        fireAndForget logger "llm_usage.record" (fun () ->
+            usageRecorder.Record(kind, model, inputTokens, outputTokens, cost, ctx) :> Task)
 
     member _.Failed(error: LlmError, retries: int) =
         setTag "llm.retries" retries
