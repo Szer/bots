@@ -220,12 +220,25 @@ module internal GeminiWire =
         else
             LlmError.ApiError(status, body)
 
-    let logError (logger: ILogger) (err: LlmError) =
+    /// Logs the terminal `LlmError` for a Gemini call — always at Warning, always tagged
+    /// with `model` (user rule: "read errors before retrying", see AGENTS.md commit
+    /// history) — right before the caller returns the failure that becomes the
+    /// user-facing RU fallback ("Не получилось сочинить/нарисовать 🙁"). For `ApiError`
+    /// this duplicates what `GeminiHttp.sendWithRetry` already logged per-attempt (see its
+    /// doc comment) — kept here too since this is also the ONLY log line for a terminal
+    /// `NetworkError`/`RateLimited` that ran out of retries without ever going through
+    /// `sendWithRetry`'s non-success branch (e.g. a `NetworkError` from the `with ex ->`
+    /// catch, which already logs its own Warning — see there).
+    let logError (logger: ILogger) (model: string) (err: LlmError) =
         match err with
-        | LlmError.ContentFiltered detail -> logger.LogWarning("Gemini request blocked: {Detail}", detail)
-        | LlmError.RateLimited retryAfter -> logger.LogWarning("Gemini rate limited (retryDelay: {RetryAfter})", retryAfter)
-        | LlmError.ApiError(status, body) -> logger.LogError("Gemini API error {Status}: {Body}", status, body)
-        | LlmError.NetworkError message -> logger.LogError("Gemini network error: {Message}", message)
+        | LlmError.ContentFiltered detail ->
+            logger.LogWarning("Gemini request blocked: model={Model} detail={Detail}", model, detail)
+        | LlmError.RateLimited retryAfter ->
+            logger.LogWarning("Gemini rate limited: model={Model} retryDelay={RetryAfter}", model, retryAfter)
+        | LlmError.ApiError(status, body) ->
+            logger.LogWarning("Gemini API error: model={Model} status={Status} body={Body}", model, status, body)
+        | LlmError.NetworkError message ->
+            logger.LogWarning("Gemini network error: model={Model} message={Message}", model, message)
 
     let newRequest (apiKey: string) (uri: string) (bodyJson: string) =
         let req = new HttpRequestMessage(HttpMethod.Post, uri)
@@ -236,7 +249,16 @@ module internal GeminiWire =
 module internal GeminiHttp =
     /// Same 429 policy as AzureHttp.sendWithRetry (D3): max 2 retries, honor the parsed
     /// retryDelay capped at 10s, full-jitter backoff otherwise.
+    ///
+    /// `logger`/`model` exist so every non-success response is logged in FULL — status,
+    /// model, attempt number, and the raw response body — at Warning, BEFORE the retry-vs-
+    /// give-up decision is made (user rule: "read errors before retrying"). Without this,
+    /// a 429 that gets silently retried into a delay-and-retry loop never has its response
+    /// body logged anywhere unless every retry is also exhausted; a network exception is
+    /// logged the same way from the `with ex ->` branch.
     let sendWithRetry
+        (logger: ILogger)
+        (model: string)
         (client: HttpClient)
         (makeRequest: unit -> HttpRequestMessage)
         (ct: CancellationToken)
@@ -253,6 +275,9 @@ module internal GeminiHttp =
                     if resp.IsSuccessStatusCode then
                         result <- Some(Ok body)
                     else
+                        logger.LogWarning(
+                            "Gemini API non-success response: model={Model} status={Status} attempt={Attempt} body={Body}",
+                            model, int resp.StatusCode, retries + 1, body)
                         let err = GeminiWire.classifyError (int resp.StatusCode) body
                         match err with
                         | LlmError.RateLimited retryAfter when retries < maxRetries ->
@@ -264,6 +289,7 @@ module internal GeminiHttp =
                             retries <- retries + 1
                         | _ -> result <- Some(Error err)
                 with ex ->
+                    logger.LogWarning(ex, "Gemini network error: model={Model} attempt={Attempt}", model, retries + 1)
                     result <- Some(Error(LlmError.NetworkError ex.Message))
             return result.Value, retries
         }
@@ -297,7 +323,7 @@ type GeminiImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                     let bodyJson = GeminiWire.buildImageGenBody prompt sourceImage
                     let makeRequest () = GeminiWire.newRequest conf.GeminiApiKey uri bodyJson
 
-                    let! result, _retries = GeminiHttp.sendWithRetry client makeRequest ct
+                    let! result, _retries = GeminiHttp.sendWithRetry logger conf.GeminiImageModel client makeRequest ct
                     match result with
                     | Ok body ->
                         match GeminiWire.tryParseGenerateContentResponse body with
@@ -307,11 +333,16 @@ type GeminiImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                                 call.Succeeded(usage)
                                 return Ok(bytes, usage)
                             | None ->
-                                logger.LogWarning("Gemini image response had no image/* inlineData part")
+                                logger.LogWarning(
+                                    "Gemini image response had no image/* inlineData part: model={Model} status=200 body={Body}",
+                                    conf.GeminiImageModel, body)
                                 let err = LlmError.ApiError(200, body)
                                 call.Failed(err)
                                 return Error err
                         | Error parseError when parseError.StartsWith("blocked:") ->
+                            logger.LogWarning(
+                                "Gemini image request blocked: model={Model} status=200 reason={Reason} body={Body}",
+                                conf.GeminiImageModel, parseError, body)
                             let err = LlmError.ContentFiltered parseError
                             call.Failed(err)
                             return Error err
@@ -321,7 +352,7 @@ type GeminiImageGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                             call.Failed(err)
                             return Error err
                     | Error err ->
-                        GeminiWire.logError logger err
+                        GeminiWire.logError logger conf.GeminiImageModel err
                         call.Failed(err)
                         return Error err
             }
@@ -348,7 +379,7 @@ type GeminiMusicGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                     let bodyJson = GeminiWire.buildMusicGenBody prompt
                     let makeRequest () = GeminiWire.newRequest conf.GeminiApiKey uri bodyJson
 
-                    let! result, _retries = GeminiHttp.sendWithRetry client makeRequest ct
+                    let! result, _retries = GeminiHttp.sendWithRetry logger conf.GeminiMusicModel client makeRequest ct
                     match result with
                     | Ok body ->
                         match GeminiWire.tryParseGenerateContentResponse body with
@@ -366,11 +397,16 @@ type GeminiMusicGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                                     call.Succeeded(usage)
                                     return Ok(bytes, usage)
                                 | [] ->
-                                    logger.LogWarning("Gemini music response had no inlineData parts")
+                                    logger.LogWarning(
+                                        "Gemini music response had no inlineData parts: model={Model} status=200 body={Body}",
+                                        conf.GeminiMusicModel, body)
                                     let err = LlmError.ApiError(200, body)
                                     call.Failed(err)
                                     return Error err
                         | Error parseError when parseError.StartsWith("blocked:") ->
+                            logger.LogWarning(
+                                "Gemini music request blocked: model={Model} status=200 reason={Reason} body={Body}",
+                                conf.GeminiMusicModel, parseError, body)
                             let err = LlmError.ContentFiltered parseError
                             call.Failed(err)
                             return Error err
@@ -380,7 +416,7 @@ type GeminiMusicGen(httpFactory: IHttpClientFactory, options: IOptions<BotConfig
                             call.Failed(err)
                             return Error err
                     | Error err ->
-                        GeminiWire.logError logger err
+                        GeminiWire.logError logger conf.GeminiMusicModel err
                         call.Failed(err)
                         return Error err
             }

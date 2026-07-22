@@ -43,9 +43,15 @@ type BotConfiguration =
       /// IMAGE_QUALITY bot_setting: images/generations `quality` param ("low"|"medium"|"high").
       /// Default "medium".
       ImageQuality: string
-      /// MODEL_ALLOWLIST bot_setting (JSON_BLOB): array of LLM_DEPLOYMENT values /model may
-      /// switch to, e.g. ["alita-gpt-5-mini"]. Default "[]" (nothing switchable).
-      ModelAllowlistJson: string
+      /// LLM_MODELS bot_setting (JSON_BLOB): the model catalog /model shows and switches
+      /// between — an array of {"model": "<real model name>", "deployment": "<Azure AI
+      /// Foundry deployment id>"}, e.g. [{"model":"gpt-5-mini","deployment":"alita-gpt-5-mini"}].
+      /// `deployment` ids carry this bot's namespacing convention for the shared Foundry
+      /// account (see dev-bot-settings.sql) and are wire-call-only — /model never shows or
+      /// accepts them, only the `model` name, verbatim, no string transformation. Default
+      /// "[]" (nothing switchable — replaces the old MODEL_ALLOWLIST, a bare array of
+      /// deployment ids that made /model display those ids directly).
+      LlmModelsJson: string
       /// SUMMARY_PROMPT bot_setting: system prompt for the /summary command. Default "".
       SummaryPrompt: string
       /// FEATURE_FLAG EMBED_MESSAGES — embed every logged message (user + bot) into

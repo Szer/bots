@@ -105,7 +105,7 @@ VALUES (@called_at, @kind, @model, 100, 50, @cost_usd, @chat_id, @user_id);
 open CommandsTestHelpers
 
 /// Phase-1 Slice 4: command dispatcher (registry, aliases, @suffix, unknown-command
-/// fallthrough), /usage, /model, /summary (incl. the ephemeral-send probe field).
+/// fallthrough), /usage, /model, /summary.
 type CommandsTests(fixture: AlitaTestContainers) =
 
     let botReplyRows (replyToMessageId: int64) =
@@ -220,7 +220,7 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
     // ── /model ────────────────────────────────────────────────────────────
 
     [<Fact>]
-    let ``model with no arg shows the current deployment and the allowlist`` () =
+    let ``model with no arg shows the real model name, not the deployment id`` () =
         task {
             do! fixture.ClearFakeCalls()
             let user = Tg.user(id = 8101L, username = "model_alice", firstName = "Alice")
@@ -232,7 +232,37 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
 
             let! replies = botReplyRows msgId
             Assert.Single(replies) |> ignore
-            Assert.Contains("alita-gpt-5-mini", replies[0].text)
+            // Deployment ids ("alita-gpt-5-mini") are an infra detail — /model shows the
+            // real model name ("gpt-5-mini") instead (staging feedback: "we don't have
+            // our own models").
+            Assert.Contains("gpt-5-mini", replies[0].text)
+            Assert.DoesNotContain("alita-gpt-5-mini", replies[0].text)
+        }
+
+    [<Fact>]
+    let ``model with no arg shows LLM_DEPLOYMENT verbatim when it has no LLM_MODELS entry`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                // Unknown/missing mapping = show the stored value verbatim, no cleverness —
+                // a deployment id with no matching catalog entry (stale/incomplete LLM_MODELS)
+                // must not be silently hidden or mangled.
+                do! fixture.SetBotSetting("LLM_DEPLOYMENT", "some-unmapped-deployment")
+                do! fixture.ReloadSettings()
+
+                let user = Tg.user(id = 8107L, username = "model_henry", firstName = "Henry")
+                let update = Tg.groupMessage("/model", user, fixture.TargetChatId)
+                let msgId = update.Message.Value.MessageId
+
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! replies = botReplyRows msgId
+                Assert.Single(replies) |> ignore
+                Assert.Contains("some-unmapped-deployment", replies[0].text)
+            finally
+                fixture.SetBotSetting("LLM_DEPLOYMENT", "alita-gpt-5-mini") |> ignore
+                fixture.ReloadSettings() |> ignore
         }
 
     [<Fact>]
@@ -241,6 +271,34 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             do! fixture.ClearFakeCalls()
             let user = Tg.user(id = 8102L, username = "model_bob", firstName = "Bob")
             let update = Tg.groupMessage("/model gpt-nonexistent-9000", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! replies = botReplyRows msgId
+            Assert.Single(replies) |> ignore
+            Assert.DoesNotContain("переключена", replies[0].text)
+            // The refusal's allowlist is also shown as display names, not deployment ids.
+            Assert.Contains("gpt-5-mini", replies[0].text)
+            Assert.DoesNotContain("alita-gpt-5-mini", replies[0].text)
+
+            let! setting =
+                fixture.QuerySingleOrDefault<{| value: string |}>(
+                    "SELECT value FROM bot_setting WHERE key = 'LLM_DEPLOYMENT'",
+                    {||})
+            Assert.Equal("alita-gpt-5-mini", setting.value)
+        }
+
+    [<Fact>]
+    let ``model with a raw deployment id arg is refused — only catalog model names are accepted`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            // Zero string transformation: the deployment id is wire-call-only plumbing and
+            // is never an accepted /model arg, even though it's the LLM_MODELS entry's own
+            // "deployment" value — only the catalog's "model" name switches.
+            let user = Tg.user(id = 8106L, username = "model_grace", firstName = "Grace")
+            let update = Tg.groupMessage("/model alita-gpt-5-mini-2", user, fixture.TargetChatId)
             let msgId = update.Message.Value.MessageId
 
             let! resp = fixture.SendUpdate(update)
@@ -258,14 +316,14 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
         }
 
     [<Fact>]
-    let ``model with an allowlisted arg switches LLM_DEPLOYMENT immediately, in-process`` () =
+    let ``model with a catalog model-name arg switches LLM_DEPLOYMENT immediately, in-process`` () =
         task {
             try
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
 
                 let switcher = Tg.user(id = 8103L, username = "model_carol", firstName = "Carol")
-                let switchUpdate = Tg.groupMessage("/model alita-gpt-5-mini-2", switcher, fixture.TargetChatId)
+                let switchUpdate = Tg.groupMessage("/model gpt-5-mini-2", switcher, fixture.TargetChatId)
                 let switchMsgId = switchUpdate.Message.Value.MessageId
 
                 let! switchResp = fixture.SendUpdate(switchUpdate)
@@ -273,7 +331,37 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
 
                 let! switchReplies = botReplyRows switchMsgId
                 Assert.Single(switchReplies) |> ignore
-                Assert.Contains("alita-gpt-5-mini-2", switchReplies[0].text)
+                Assert.Contains("gpt-5-mini-2", switchReplies[0].text)
+                Assert.DoesNotContain("alita-gpt-5-mini-2", switchReplies[0].text)
+
+                let! setting =
+                    fixture.QuerySingleOrDefault<{| value: string |}>(
+                        "SELECT value FROM bot_setting WHERE key = 'LLM_DEPLOYMENT'",
+                        {||})
+                // Persisted as the real deployment id (LLM_MODELS' "deployment" field for
+                // the matched entry), not the model name typed in.
+                Assert.Equal("alita-gpt-5-mini-2", setting.value)
+            finally
+                fixture.SetBotSetting("LLM_DEPLOYMENT", "alita-gpt-5-mini") |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
+    [<Fact>]
+    let ``model switch takes effect immediately, in-process`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+
+                let switcher = Tg.user(id = 8103L, username = "model_carol", firstName = "Carol")
+                let switchUpdate = Tg.groupMessage("/model gpt-5-mini-2", switcher, fixture.TargetChatId)
+                let switchMsgId = switchUpdate.Message.Value.MessageId
+
+                let! switchResp = fixture.SendUpdate(switchUpdate)
+                switchResp.EnsureSuccessStatusCode() |> ignore
+
+                let! switchReplies = botReplyRows switchMsgId
+                Assert.Single(switchReplies) |> ignore
 
                 // No explicit fixture.ReloadSettings() call here on purpose — the switch
                 // must already be live in-process (BotInfra.ISettingsReloader), same path
@@ -339,27 +427,21 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
                 llmCalls |> Array.exists (fun c -> requestMessagesContain c "котики лучше собак"),
                 "expected the /summary transcript (seeded chat message) in the LLM request body")
 
-            // Ephemeral probe: the send must have carried receiver_user_id (visible only
-            // to the requester) — see BotHelpers.trySendEphemeralOrReply. FakeTgApi never
-            // rejects it, so this also proves the ephemeral path (not the fallback) ran.
+            // /summary replies are now plain, whole-chat-visible sends (ephemeral
+            // `receiver_user_id` delivery was retired after staging feedback found it
+            // invisible in practice — see BotHelpers.fs and src/AlitaBot/README.md's
+            // "Ephemeral message probe [RETIRED]"). Pin both halves of that: the wire
+            // request carries no receiver_user_id, and the logged reply keeps its real,
+            // nonzero sequential message_id (not the ephemeral MessageId=0 quirk).
             let! sends = fixture.GetFakeCalls("sendMessage")
             let summaryReplySend =
                 sends
                 |> Array.filter (isToChat fixture.TargetChatId)
                 |> Array.filter (fun c -> jsonString c "text" = "Итог: все спорили про котиков.")
             Assert.NotEmpty summaryReplySend
-            Assert.True(
+            Assert.False(
                 summaryReplySend |> Array.exists (fun c -> jsonHasNumberProperty c "receiver_user_id"),
-                "expected the /summary reply's sendMessage call to carry receiver_user_id")
-
-            // Regression check (see BotHelpers.loggableMessageId / docs/TECH-DEBT.md): an
-            // accepted ephemeral send reports Message.MessageId = 0 on real Telegram (and
-            // now in FakeTgApi too — see Handlers.handleSendMessage), with the real per-send
-            // id in EphemeralMessageId instead. message_log has UNIQUE(chat_id, message_id)
-            // with ON CONFLICT DO NOTHING, so logging the raw MessageId=0 verbatim would make
-            // every ephemeral reply after the first one in a chat silently vanish. Asserting
-            // a nonzero message_id here pins that handleSummaryCommand logs
-            // BotHelpers.loggableMessageId, not sent.MessageId directly.
+                "expected the /summary reply's sendMessage call to be a normal reply, not receiver-scoped")
             Assert.NotEqual(0L, replies[0].message_id)
         }
 

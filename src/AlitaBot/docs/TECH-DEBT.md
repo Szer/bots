@@ -180,58 +180,28 @@ it (the column, the index, and the "ACTIVE = `valid_to IS NULL`" convention ever
 uses) — no migration needed, just teach `ProcessUser` to `UPDATE ... SET valid_to = now()` on
 the old row when a new fact is judged to supersede rather than duplicate it.
 
-## `trySendEphemeralOrReply` fallback memo is process-lifetime
+## Ephemeral `/summary` delivery — RETIRED (staging feedback), was tech debt, now resolved
 
-Same shape as the `DraftRenderer` entry below: `BotHelpers.trySendEphemeralOrReply`
-(`/summary`'s ephemeral send, Phase-1 Slice 4) remembers per-`chatId`, in an in-process
-`ConcurrentDictionary`, that an ephemeral (`receiver_user_id`) `sendMessage` already failed for
-that chat — not in `bot_setting`/the database. A pod/process restart forgets every chat's
-fallback state and re-probes the ephemeral send from scratch on the next `/summary` in that chat.
+**Formerly three separate open entries here** (`trySendEphemeralOrReply`'s process-lifetime
+fallback memo, the never-confirmed receiver delivery, and the `message_log` `MessageId = 0`
+collision bug) — all moot now: `/summary`'s ephemeral send (`BotHelpers
+.trySendEphemeralOrReply`/`loggableMessageId`, Bot API 10.2 `receiver_user_id`) was removed
+entirely after staging feedback ("ephemeral messages are not useful"). `/summary` now sends a
+plain, whole-chat-visible reply like every other command, same as `/usage`/`/help` always did.
 
-Deliberate simplification, not a bug — same reasoning as `DraftRenderer`: worst case is one
-extra failed `sendMessage` call per chat per restart, immediately caught and degraded to a
-normal reply, not a user-visible failure. No action needed unless restart frequency ever gets
-high enough for the repeated probe calls to matter (unlikely).
+The underlying reason this was worth retiring rather than continuing to carry as tech debt:
+Telegram accepted `sendMessage(receiver_user_id=...)` (`200 OK`, `ephemeral_message_id`
+populated) once the test bot was a group admin, but the accepted message was never observed by
+the receiving account's own MTProto client — neither as a live update nor via
+`Messages_GetHistory`, even though that account WAS the exact `receiver_user_id`. That
+unconfirmed-delivery finding is exactly what staging then surfaced as a real user complaint:
+`/summary` replies were invisible. Full empirical writeup kept in
+`src/AlitaBot/README.md`'s "Ephemeral message probe [RETIRED]" section (not deleted — kept as
+the historical record of what was tried). The `message_log` `MessageId = 0` collision this used
+to require working around (`loggableMessageId`) no longer applies — normal replies always carry
+a real, unique message id.
 
-## Ephemeral `sendMessage` delivery to the receiver is unconfirmed, even as admin
-
-Re-probed with the test bot promoted to group admin (see `src/AlitaBot/README.md`'s "Ephemeral
-message probe", round 2): the `BOT_NOT_ADMIN` rejection is gone — Telegram now accepts
-`sendMessage(receiver_user_id=...)` (`200 OK`, `ephemeral_message_id` populated) — but the
-accepted message was never observed by the receiving account's own MTProto client, neither as a
-live update (`UpdateNewMessage`/anything else, 20s watch) nor via `Messages_GetHistory` before or
-after, even though that account IS the exact `receiver_user_id`. A control `sendMessage` in the
-same chat (no `receiver_user_id`) arrived and appeared in history normally in under a second, so
-this isn't a harness/update-pump problem.
-
-This is NOT necessarily proof the feature is broken for real users — an official Telegram client
-might render ephemeral messages through some mechanism outside the public MTProto schema this
-harness's third-party client (WTelegramClient) can observe, the way inline-mode results and some
-other bot-only surfaces work. But from this repo's testing/observability standpoint, it means:
-**a `200 OK` from `sendMessage(receiver_user_id=...)` is not proof anyone actually saw the
-reply.** `/summary` was left as-is (it already only falls back on an actual Telegram-side
-rejection, and shipped before this finding), but `/usage`/`/help` were deliberately NOT switched
-to prefer ephemeral delivery for this reason — see README.
-
-**Action:** the only way to confirm real delivery is either a second, independent Telegram
-account watching the same chat live, or manually checking an official Telegram client (mobile/
-desktop) receives a `/summary` reply in an admin-bot chat — neither is available in this
-environment. Until confirmed, treat ephemeral delivery as unverified rather than working; don't
-extend it to more commands, and consider whether `/summary` itself should stop preferring it.
-
-## `message_log` silently dropped ephemeral replies after the first one per chat (fixed)
-
-Found alongside the above: `handleSummaryCommand` used to log the Bot-API `Message.MessageId`
-verbatim for the sent reply — but an ACCEPTED ephemeral send always reports `MessageId = 0` (the
-real id is `EphemeralMessageId`, a different field). `message_log` has
-`UNIQUE(chat_id, message_id)` with `ON CONFLICT DO NOTHING`, so only the very first ephemeral
-`/summary` reply ever landed in `message_log` for a given chat, process-lifetime — every
-subsequent one silently no-opped: no exception, no log line, just a missing row (confirmed by
-querying `message_log` directly after a real-test run and finding exactly one `message_id = 0`
-row despite multiple `/summary` calls). Fixed by `BotHelpers.loggableMessageId`, which logs
-`EphemeralMessageId` instead of the `0` `MessageId` whenever that's what Telegram actually
-returned. Any future caller of `trySendEphemeralOrReply` that logs the sent message to
-`message_log` must go through `loggableMessageId`, not `sent.MessageId` directly.
+No action needed — nothing left to track; this entry exists only so the history isn't lost.
 
 ## `Req.SendRichMessage` >4096-char escalation is unverified against real Telegram (Slice 6)
 

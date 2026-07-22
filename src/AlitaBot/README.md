@@ -175,14 +175,45 @@ reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
 | Command | Aliases | Description |
 |---|---|---|
 | `/img <prompt>` | — | Generate an image (see "Image generation" above); reply-to-photo → img2img. Routed to Azure or Gemini by `IMAGE_PROVIDER`. |
-| `/model [name]` | — | No arg: show the current `LLM_DEPLOYMENT` + the `MODEL_ALLOWLIST`. With an allowlisted arg: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
-| `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below (as of the admin re-probe, "accepts" is confirmed but genuine delivery to the requester is not). |
+| `/model [name]` | — | No arg: show the current model + the model catalog, as real model names (never Azure deployment ids) — see "`/model` and the LLM_MODELS catalog" below. With a catalog model name: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
+| `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. A normal, whole-chat-visible reply — previously sent ephemerally, retired after staging feedback found ephemeral replies invisible in practice, see "Ephemeral message probe [RETIRED]" below. |
 | `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
 | `/ask <question>` | — | Semantic search over this chat's message history (see "Memory" below): answers grounded in the nearest matching quotes, cited by author and date. Empty question → RU usage hint. |
 | `/say [voice] <text>` | — | Synthesize `text` as a voice note (see "`/say`, `/sql`, cost footer" below); reply-to-message with no text of its own → voices ITS text. |
 | `/song [(style)] <lyrics or description>` | — | Generate music via Gemini's Lyria (see "Gemini provider" below), delivered as an audio attachment with a title. Optional leading `(style hint)`, e.g. `/song (рок-баллада) текст`. Cooldown `SONG_COOLDOWN_SECONDS` per user. |
 | `/sql <question>` | — | Admin-gated (`ADMIN_USER_IDS`) natural-language SQL over Alita's own database, rendered as a table (see "`/say`, `/sql`, cost footer" below). |
 | `/help` | `/start` | Auto-generated list of the above, from the registry. |
+
+### `/model` and the `LLM_MODELS` catalog
+
+Staging feedback: `/model` used to display the Azure AI Foundry *deployment id* directly
+(e.g. `alita-gpt-5-mini`) — "we don't have our own models". Deployment ids are wire-call
+plumbing, not model identity: `AZURE_FOUNDRY_ENDPOINT` (`szer-foundry.cognitiveservices.azure.com`)
+is a Foundry resource **shared with other bots in this repo** (CouponHubBot's project/product
+agents use the same endpoint — see `src/CouponHubBot/docs/PROJECT-AGENT.md`), so every
+AlitaBot deployment is named with an `alita-` prefix purely to avoid collisions in that shared
+account's flat deployment list — an operator namespacing convention, not something Azure
+requires or something a user should ever see.
+
+`LLM_MODELS` (bot_setting, `JSON_BLOB`) is the model catalog `/model` reads and writes:
+
+```json
+[{"model": "gpt-5-mini", "deployment": "alita-gpt-5-mini"}]
+```
+
+- **No arg**: looks up the current `LLM_DEPLOYMENT` in the catalog and shows its `model` name,
+  plus every `model` name in the catalog. An `LLM_DEPLOYMENT` with no matching catalog entry
+  (stale/incomplete `LLM_MODELS`) is shown **verbatim** — no guessing, no partial transformation.
+- **With an arg**: matched against catalog `model` names **exactly** — zero string
+  transformation (no prefix stripping, no substring matching). A match upserts `LLM_DEPLOYMENT`
+  to that entry's `deployment` and reloads live (`BotInfra.ISettingsReloader`, the
+  `/reload-settings` path) so the switch takes effect on the very next LLM call. The raw
+  `deployment` id is **never** an accepted arg and **never** appears in any `/model` output —
+  only `model` names are user-facing, in either direction.
+
+Replaces the earlier `MODEL_ALLOWLIST` (a bare JSON array of deployment ids, which is exactly
+what made `/model` show deployment ids in the first place — there was no model-name field to
+show instead). See `BotService.handleModelCommand`/`parseLlmModels`/`LlmModelEntry`.
 
 ### Usage accounting (`llm_usage`, V2 migration)
 
@@ -200,7 +231,18 @@ nullable: STT's wire response carries no usage block at all, and cost is `NULL` 
 `LLM_PRICING` has no matching entry for that model/deployment (same "no matching entry" case the
 existing metrics already tolerate).
 
-### Ephemeral message probe (`/summary`, Bot API 10.2)
+### Ephemeral message probe (`/summary`, Bot API 10.2) [RETIRED]
+
+**Status: retired.** `/summary` no longer uses ephemeral delivery — every command reply,
+`/summary` included, is now a plain, whole-chat-visible `sendMessage`
+(`BotHelpers.sendTextReply`). Decided after staging feedback ("ephemeral messages are not
+useful"): they were confirmed accepted by Telegram but never observably delivered (see the
+round-2 findings below), so `/summary`'s replies were effectively invisible in practice —
+exactly the caveat this section already flagged as unresolved. `BotHelpers
+.trySendEphemeralOrReply`/`loggableMessageId` and the standalone `EphemeralProbe.fs`/`make
+probe-ephemeral` repro tool have been removed from the codebase; this section is kept
+verbatim below as the empirical record of what was tried and found, not as current
+behavior.
 
 Bot API 10.2 added ephemeral messages — visible only to one user in a group. Decompiling
 `Funogram.Telegram.dll` 10.2.0 (`ilspycmd -t Funogram.Telegram.Req`) confirms the surface exists:
@@ -288,21 +330,24 @@ direction (live push or history pull).
    separately asserts the reply never shows up in `Messages_GetHistory` — see the test for the
    exact assertions.
 
-**Decision: `/usage` and `/help` were NOT switched to ephemeral delivery.** The task motivating
-this probe was "does ephemeral now work, so more chat-spam-reducing commands can use it" — given
-the accepted-but-unobservable-delivery finding above, defaulting `/usage`/`/help` to a delivery
-mechanism this harness cannot confirm reaches anyone would risk turning "always get an answer,
-visible to the chat" into "sometimes get nothing at all", for commands used far more casually
-than `/summary`. `/summary` itself is left as-is (already shipped, already falls back on any
-Telegram-side rejection) rather than rolled back, but is not a model to extend from until real
-delivery is confirmed — see `docs/TECH-DEBT.md`.
+**Decision, round 2: `/usage` and `/help` were NOT switched to ephemeral delivery.** The task
+motivating this probe was "does ephemeral now work, so more chat-spam-reducing commands can use
+it" — given the accepted-but-unobservable-delivery finding above, defaulting `/usage`/`/help` to
+a delivery mechanism this harness cannot confirm reaches anyone would risk turning "always get an
+answer, visible to the chat" into "sometimes get nothing at all", for commands used far more
+casually than `/summary`. `/summary` itself was initially left as-is (already shipped, already
+falls back on any Telegram-side rejection) rather than rolled back — see
+`docs/TECH-DEBT.md` for that reasoning at the time.
 
-**Action, still open:** confirming genuine delivery needs either a second, independent Telegram
-account watching the same chat live (this harness only has one MTProto identity), or manually
-watching an official Telegram client (mobile/desktop) receive a `/summary` reply in a chat where
-the bot is admin — neither is available from this environment. `make probe-ephemeral`
-(`EphemeralProbe.fs`) is the from-scratch repro for whoever picks this up next; DM/private-chat
-`receiver_user_id` behavior also remains unprobed.
+**Final decision (staging feedback): retired, not extended.** The "action, still open" below was
+never resolved — nobody confirmed genuine delivery — and staging surfaced exactly the predicted
+failure mode: `/summary`'s replies were invisible to users. Rather than keep chasing delivery
+confirmation, ephemeral sending was removed entirely; see the "[RETIRED]" note at the top of this
+section. The unresolved confirmation question (a second Telegram account watching live, or an
+official client observing a reply in an admin-bot chat) is moot now that nothing in this repo
+sends ephemeral messages — `EphemeralProbe.fs`/`make probe-ephemeral`, the from-scratch repro
+tool, was removed along with the feature. DM/private-chat `receiver_user_id` behavior remains
+(and will now stay) unprobed.
 
 ## Memory: per-message embeddings + `/ask` (Phase-1 Slice 5a)
 
@@ -967,7 +1012,6 @@ Makefile targets (repo root):
 | `make alita-build` | `dotnet build src/AlitaBot -c Release`. |
 | `make selfcheck` | Plumbing-only check (no MTProto): db → build → ngrok tunnel → bot process → webhook → public `/healthz` → teardown. |
 | `make probe-draft` | The M5 empirical probe — standalone, no tunnel/webhook/bot process needed; calls the Bot API directly and logs everything the MTProto user client observes. |
-| `make probe-ephemeral` | The ephemeral-message re-probe (admin-bot round) — same shape as `probe-draft`; calls `sendMessage` with `receiver_user_id` directly and watches for both live updates and `Messages_GetHistory` changes. |
 | `make real-test` | **The agent loop.** `alita-db` + `alita-build` + `dotnet test tests/AlitaBot.RealTests -c Release` — full real-Telegram smoke suite (`SmokeTests.fs`). |
 | `make alita-logs` | Tails `bot.log`/`ngrok.log` from the last `real-test`/`selfcheck` run. |
 | `make alita-clean` | `docker compose down -v` + `deleteWebhook?drop_pending_updates=true`. Run when done for the session. |

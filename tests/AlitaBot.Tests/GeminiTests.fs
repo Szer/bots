@@ -93,6 +93,81 @@ ORDER BY message_id
                 fixture.ReloadSettings() |> ignore
         }
 
+    // ── Error visibility (item 2: "read errors before retrying") + transient fallback
+    // (item 4: staging evidence — /img failed with Gemini 503 UNAVAILABLE "high demand"
+    // and the user only saw the generic RU shrug) ──────────────────────────────────────
+
+    [<Fact>]
+    let ``img scripted Gemini 500 logs the full error body and replies with the generic RU shrug`` () =
+        task {
+            try
+                do! fixture.SetBotSetting("IMAGE_PROVIDER", "gemini")
+                do! fixture.ReloadSettings()
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do!
+                    fixture.SetGeminiImageScript
+                        [| LlmTestHelpers.scripted
+                               500
+                               """{"error":{"code":500,"status":"INTERNAL","message":"boom from gemini fake"}}""" |]
+
+                let user = Tg.user(id = 9303L, username = "gemini_erin", firstName = "Erin")
+                let update = Tg.groupMessage("/img нарисуй что-нибудь сломанное", user, fixture.TargetChatId)
+
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                // The generic RU shrug, not the transient-flavored reply — a plain 500 isn't
+                // classified as transient (see LlmTypes.LlmError.isTransient's doc comment).
+                let! edits = fixture.GetFakeCalls("editMessageText")
+                let editsToChat = edits |> Array.filter (isToChat fixture.TargetChatId)
+                Assert.Contains(editsToChat, fun c -> (jsonString c "text") = "Не получилось нарисовать 🙁")
+                Assert.DoesNotContain(editsToChat, fun c -> (jsonString c "text").Contains "перегружена")
+
+                // The full scripted error body — model name + status + the exact message —
+                // must be logged at Warning BEFORE that fallback reply, not swallowed.
+                let! logs = fixture.GetBotLogs()
+                Assert.Contains("gemini-test-image", logs)
+                Assert.Contains("boom from gemini fake", logs)
+                Assert.Contains("500", logs)
+            finally
+                fixture.SetBotSetting("IMAGE_PROVIDER", "azure") |> ignore
+                fixture.SetGeminiImageScript [||] |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
+    [<Fact>]
+    let ``img scripted Gemini 503 UNAVAILABLE replies with the transient RU fallback`` () =
+        task {
+            try
+                do! fixture.SetBotSetting("IMAGE_PROVIDER", "gemini")
+                do! fixture.ReloadSettings()
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do!
+                    fixture.SetGeminiImageScript
+                        [| LlmTestHelpers.scripted
+                               503
+                               """{"error":{"code":503,"status":"UNAVAILABLE","message":"The model is overloaded. Please try again later."}}""" |]
+
+                let user = Tg.user(id = 9304L, username = "gemini_frank", firstName = "Frank")
+                let update = Tg.groupMessage("/img нарисуй перегруженную модель", user, fixture.TargetChatId)
+
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! edits = fixture.GetFakeCalls("editMessageText")
+                let editsToChat = edits |> Array.filter (isToChat fixture.TargetChatId)
+                Assert.Contains(
+                    editsToChat,
+                    fun c -> (jsonString c "text") = "Модель перегружена, попробуй ещё раз через минутку 🙏")
+                Assert.DoesNotContain(editsToChat, fun c -> (jsonString c "text") = "Не получилось нарисовать 🙁")
+            finally
+                fixture.SetBotSetting("IMAGE_PROVIDER", "azure") |> ignore
+                fixture.SetGeminiImageScript [||] |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
     interface IAsyncLifetime with
         member _.InitializeAsync() =
             ValueTask(task {

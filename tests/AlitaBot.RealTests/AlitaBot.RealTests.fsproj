@@ -12,13 +12,13 @@
   <ItemGroup>
     <Compile Include="RealEnv.fs" />
     <Compile Include="GeminiProbe.fs" />
+    <Compile Include="GeminiTransientDetection.fs" />
     <Compile Include="NgrokTunnel.fs" />
     <Compile Include="DevDb.fs" />
     <Compile Include="BotProcess.fs" />
     <Compile Include="Webhook.fs" />
     <Compile Include="TgUserClient.fs" />
     <Compile Include="DraftProbe.fs" />
-    <Compile Include="EphemeralProbe.fs" />
     <Compile Include="SelfCheck.fs" />
     <Compile Include="RealAssemblyFixture.fs" />
     <Compile Include="TestRetry.fs" />

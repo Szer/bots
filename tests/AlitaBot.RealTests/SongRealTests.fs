@@ -96,23 +96,46 @@ ORDER BY message_id LIMIT 1;
             let lyrics = $"(тестовый рок) короткая тестовая песня {marker}"
 
             let! msgId = fx.UserClient.SendText(env.TestChatId, $"/song {lyrics}")
-            let! duration, byteSize = fx.UserClient.AwaitAudioReplyTo(env.TestChatId, msgId, SongRealTimeouts.songReply)
+            // The "сочиняю..." placeholder is the first reply to msgId — captured so a
+            // later failure (edited in place, never a new message) can be told apart
+            // from "still generating"; see AwaitMediaOrPlaceholderEdit's doc comment.
+            let! placeholderReply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
 
-            // Fuzzy on purpose (mirrors StretchRealTests' /say check) — what matters is
-            // that SOMETHING playable came back.
-            Assert.True(duration >= 0, $"expected a non-negative audio duration, got {duration}")
-            Assert.True(byteSize > 0L, $"expected non-empty audio bytes, got {byteSize}")
+            match!
+                fx.UserClient.AwaitMediaOrPlaceholderEdit
+                    (fun t -> fx.UserClient.TryAwaitAudioReplyTo(env.TestChatId, msgId, t))
+                    env.TestChatId
+                    placeholderReply.id
+                    placeholderReply.message
+                    SongRealTimeouts.songReply
+            with
+            | Choice2Of2 editedText ->
+                // Item 4/5 (staging feedback): a Gemini 503 "high demand" failure gets a
+                // distinct RU reply and is skipped, not retried/failed — see
+                // GeminiTransientDetection's doc comment ("not waste money" on a second
+                // paid attempt against an upstream capacity blip outside this repo's control).
+                match GeminiTransientDetection.classify placeholderReply.message editedText with
+                | GeminiTransientDetection.ReplyOutcome.Transient ->
+                    Assert.Skip
+                        $"Gemini 503 high-demand — transient upstream capacity, skipped to not waste money (bot replied: {editedText})"
+                | _ ->
+                    Assert.Fail $"/song failed with a non-transient error — bot replied: {editedText}"
+            | Choice1Of2(duration, byteSize) ->
+                // Fuzzy on purpose (mirrors StretchRealTests' /say check) — what matters is
+                // that SOMETHING playable came back.
+                Assert.True(duration >= 0, $"expected a non-negative audio duration, got {duration}")
+                Assert.True(byteSize > 0L, $"expected non-empty audio bytes, got {byteSize}")
 
-            match! awaitUserCmdRow marker with
-            | None -> Assert.Fail $"'[song-cmd]' row (marker {marker}) never landed in message_log"
-            | Some userRow ->
-                Assert.False userRow.is_bot
+                match! awaitUserCmdRow marker with
+                | None -> Assert.Fail $"'[song-cmd]' row (marker {marker}) never landed in message_log"
+                | Some userRow ->
+                    Assert.False userRow.is_bot
 
-                match! awaitSongReplyRow userRow.message_id with
-                | None ->
-                    Assert.Fail
-                        $"no '[song] ...' bot reply row (reply_to_message_id={userRow.message_id}) in message_log"
-                | Some botRow ->
-                    Assert.True botRow.is_bot
-                    Assert.Equal(env.BotUserId, botRow.user_id)
+                    match! awaitSongReplyRow userRow.message_id with
+                    | None ->
+                        Assert.Fail
+                            $"no '[song] ...' bot reply row (reply_to_message_id={userRow.message_id}) in message_log"
+                    | Some botRow ->
+                        Assert.True botRow.is_bot
+                        Assert.Equal(env.BotUserId, botRow.user_id)
         })

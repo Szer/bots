@@ -66,6 +66,28 @@ type LlmError =
     | ApiError of status: int * body: string
     | NetworkError of message: string
 
+/// Companion module (RequireQualifiedAccess on the type itself already forces
+/// `LlmError.RateLimited`-style access to its cases, so `LlmError.isTransient` matches
+/// that same qualified convention for callers).
+module LlmError =
+    /// Whether an `LlmError` is likely transient — worth telling the user "try again
+    /// shortly" instead of the generic failure shrug (prod evidence: /img failing on a
+    /// Gemini `503 UNAVAILABLE` "high demand" response with no indication to the user
+    /// that retrying might just work). `RateLimited` (429-class, either provider) always
+    /// counts; `ApiError` only counts when the status/body carry Gemini's
+    /// `503`/`"UNAVAILABLE"` shape — Azure's 5xx bodies don't share that vocabulary, and
+    /// a bare "5xx" alone isn't a reliable enough transient signal to promise a retry
+    /// will help. `ContentFiltered`/`NetworkError` are never transient in this sense:
+    /// retrying won't un-block a filtered prompt, and a network error already reads as
+    /// "something's wrong", not "try again".
+    let isTransient (err: LlmError) : bool =
+        match err with
+        | LlmError.RateLimited _ -> true
+        | LlmError.ApiError(status, body) ->
+            status = 503 || body.Contains("UNAVAILABLE", StringComparison.OrdinalIgnoreCase)
+        | LlmError.ContentFiltered _ -> false
+        | LlmError.NetworkError _ -> false
+
 /// Chat/user attribution threaded through every provider call (Complete/CompleteStream/
 /// Embed/Transcribe/Synthesize/Generate) so the persisted `llm_usage` row (Phase-1 Slice 4)
 /// can be attributed — None fields become NULL columns (e.g. a call with no natural chat/user

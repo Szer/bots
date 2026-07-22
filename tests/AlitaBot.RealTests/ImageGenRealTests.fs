@@ -103,24 +103,47 @@ ORDER BY message_id LIMIT 1;
             let prompt = $"нарисуй красный квадрат {marker}"
 
             let! msgId = fx.UserClient.SendText(env.TestChatId, $"/img {prompt}")
-            let! photoReply = fx.UserClient.AwaitPhotoReplyTo(env.TestChatId, msgId, ImageGenRealTimeouts.imageReply)
+            // The "рисую..." placeholder is the first reply to msgId — captured so a
+            // later failure (edited in place, never a new message) can be told apart
+            // from "still generating"; see AwaitMediaOrPlaceholderEdit's doc comment.
+            let! placeholderReply = fx.UserClient.AwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
 
-            Assert.False(String.IsNullOrWhiteSpace photoReply.message)
-            let caption = photoReply.message
-            Assert.True(
-                caption.Contains "красный" || caption.Contains marker,
-                $"expected the photo caption to reference the prompt, got: {caption}")
+            match!
+                fx.UserClient.AwaitMediaOrPlaceholderEdit
+                    (fun t -> fx.UserClient.TryAwaitPhotoReplyTo(env.TestChatId, msgId, t))
+                    env.TestChatId
+                    placeholderReply.id
+                    placeholderReply.message
+                    ImageGenRealTimeouts.imageReply
+            with
+            | Choice2Of2 editedText ->
+                // Item 4/5 (staging feedback): a Gemini 503 "high demand" failure gets a
+                // distinct RU reply and is skipped, not retried/failed — see
+                // GeminiTransientDetection's doc comment ("not waste money" on a second
+                // paid attempt against an upstream capacity blip outside this repo's control).
+                match GeminiTransientDetection.classify placeholderReply.message editedText with
+                | GeminiTransientDetection.ReplyOutcome.Transient ->
+                    Assert.Skip
+                        $"Gemini 503 high-demand — transient upstream capacity, skipped to not waste money (bot replied: {editedText})"
+                | _ ->
+                    Assert.Fail $"/img failed with a non-transient error — bot replied: {editedText}"
+            | Choice1Of2 photoReply ->
+                Assert.False(String.IsNullOrWhiteSpace photoReply.message)
+                let caption = photoReply.message
+                Assert.True(
+                    caption.Contains "красный" || caption.Contains marker,
+                    $"expected the photo caption to reference the prompt, got: {caption}")
 
-            match! awaitUserCmdRow marker with
-            | None -> Assert.Fail $"'[img-cmd]' row (marker {marker}) never landed in message_log"
-            | Some userRow ->
-                Assert.False userRow.is_bot
+                match! awaitUserCmdRow marker with
+                | None -> Assert.Fail $"'[img-cmd]' row (marker {marker}) never landed in message_log"
+                | Some userRow ->
+                    Assert.False userRow.is_bot
 
-                match! awaitImageReplyRow userRow.message_id with
-                | None ->
-                    Assert.Fail
-                        $"no '[image] ...' bot reply row (reply_to_message_id={userRow.message_id}) in message_log"
-                | Some botRow ->
-                    Assert.True botRow.is_bot
-                    Assert.Equal(env.BotUserId, botRow.user_id)
+                    match! awaitImageReplyRow userRow.message_id with
+                    | None ->
+                        Assert.Fail
+                            $"no '[image] ...' bot reply row (reply_to_message_id={userRow.message_id}) in message_log"
+                    | Some botRow ->
+                        Assert.True botRow.is_bot
+                        Assert.Equal(env.BotUserId, botRow.user_id)
         })
