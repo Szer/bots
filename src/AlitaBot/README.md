@@ -176,7 +176,7 @@ reach `ResponderService`/the LLM responder, same guarantee `/img` already had.
 |---|---|---|
 | `/img <prompt>` | — | Generate an image (see "Image generation" above); reply-to-photo → img2img. Routed to Azure or Gemini by `IMAGE_PROVIDER`. |
 | `/model [name]` | — | No arg: show the current `LLM_DEPLOYMENT` + the `MODEL_ALLOWLIST`. With an allowlisted arg: switch `LLM_DEPLOYMENT` immediately (in-process, via `BotInfra.ISettingsReloader` — the same path `/reload-settings` uses) and persist it. |
-| `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below. |
+| `/summary [count]` | `/tldr` | Speaker-attributed digest of the last `count` (default 200, capped 500) `message_log` rows for the chat, via a non-stream LLM call with the `SUMMARY_PROMPT` bot_setting. Sent ephemerally when Telegram accepts it for the chat, otherwise a normal reply — see "Ephemeral message probe" below (as of the admin re-probe, "accepts" is confirmed but genuine delivery to the requester is not). |
 | `/usage` | — | Today + last-7-days call counts and USD cost from `llm_usage`, broken out by model and by top-5 user. |
 | `/ask <question>` | — | Semantic search over this chat's message history (see "Memory" below): answers grounded in the nearest matching quotes, cited by author and date. Empty question → RU usage hint. |
 | `/say [voice] <text>` | — | Synthesize `text` as a voice note (see "`/say`, `/sql`, cost footer" below); reply-to-message with no text of its own → voices ITS text. |
@@ -214,24 +214,20 @@ it's a normal `sendMessage` call with one extra field.
 Warning, falls back to a normal (whole-chat-visible) reply, and **remembers the chat**
 (an in-process `ConcurrentDictionary<int64, byte>`, process-lifetime — mirrors `DraftRenderer`'s
 per-chat fallback memo, see `docs/TECH-DEBT.md`) so later `/summary` calls in that chat skip the
-ephemeral attempt entirely instead of re-probing it every time.
+ephemeral attempt entirely instead of re-probing it every time. **Caveat confirmed below: even
+when Telegram accepts the ephemeral call, this harness could not confirm the requester's own
+Telegram client actually receives the message** — `/summary` still degrades gracefully (a
+non-2xx from Telegram is the only trigger for the fallback), but "ephemeral" should currently be
+read as "best-effort, unverified delivery" rather than a guaranteed answer.
 
-**Empirical findings** (`tests/AlitaBot.RealTests/CommandRealTests.fs`, run against the basic-
-group test chat — this repo's only real test chat, same caveat as the draft-semantics probe
-above; the bot account is a plain member of the chat, not an admin):
+**Empirical findings, round 1** (`tests/AlitaBot.RealTests/CommandRealTests.fs`, bot a plain
+member of the basic-group test chat):
 
 | Chat type | `receiver_user_id` on `sendMessage` | Result |
 |---|---|---|
-| Basic group (this repo's test chat, bot is a plain member) | `400 Bad Request: BOT_NOT_ADMIN` — rejected outright, same call shape as `TEXTDRAFT_PEER_INVALID` for drafts (both fail before Telegram fans anything out) | `trySendEphemeralOrReply` falls back to a normal reply automatically; the requester still gets an answer, just visible to the whole chat |
-| Basic/supergroup, bot **promoted to admin** | Not probed — the test bot in this repo's chat is deliberately a plain member (matches production: AlitaBot doesn't need admin rights for anything else it does) | Genuinely unknown; `BOT_NOT_ADMIN` reads as "needs the bot to be an admin", not "rejected in this chat type" the way `TEXTDRAFT_PEER_INVALID` does — worth re-probing if/when a chat with an admin bot is available |
-| Private chat (DM) | Not probed | — |
+| Basic group, bot a plain member | `400 Bad Request: BOT_NOT_ADMIN` — rejected outright, same call shape as `TEXTDRAFT_PEER_INVALID` for drafts (both fail before Telegram fans anything out) | `trySendEphemeralOrReply` falls back to a normal reply automatically; the requester still gets an answer, just visible to the whole chat |
 
-`BOT_NOT_ADMIN` is a genuinely different rejection shape than the draft probe's
-`TEXTDRAFT_PEER_INVALID` — it reads as a *permission* requirement (Telegram wants the bot to be
-able to moderate/manage the chat before it will scope a message to one member), not a *chat-type*
-restriction. That's an inference from the error string, not a probed fact — confirmed behavior
-in an admin-bot chat is still open. Real log line from the probe run
-(`test-artifacts/AlitaBot.RealTests/bot.log`):
+Real log line from that run (`test-artifacts/AlitaBot.RealTests/bot.log`):
 
 ```
 Ephemeral send rejected for chat -5236484897 — falling back to a normal reply and
@@ -239,44 +235,74 @@ remembering for the rest of this process
 BotInfra.TelegramApiException: Telegram API error 400: Bad Request: BOT_NOT_ADMIN
 ```
 
-**Action:** if/when AlitaBot is promoted to admin in a real deployment chat (or a second test
-chat with an admin bot becomes available), re-run `RESPONDER_MODE=llm make real-test` and update
-this table with what an admin-bot `sendMessage(receiver_user_id=...)` actually does — including
-whether the response `Message.EphemeralMessageId` gets populated and whether the message is
-genuinely invisible to other chat members (needs a second real user account to observe from,
-which this harness doesn't have yet — see `TgUserClient`'s single-account limitation).
+**Empirical findings, round 2 — bot promoted to GROUP ADMIN** (`make probe-ephemeral` /
+`EphemeralProbe.fs`, plus a re-run of `CommandRealTests`'s `/summary` test):
 
-**UPDATE (2026-07-22, re-probed while chasing a real-test hang):** the table above is now
-STALE for this repo's test chat — `receiver_user_id` on `sendMessage` succeeds there (`200 OK`,
-confirmed both via the app and a bare `curl` against the real Bot API), not `400
-BOT_NOT_ADMIN` as originally found. Whether that's Telegram loosening `BOT_NOT_ADMIN`'s
-requirement, a chat-permission change, or something else about this specific chat drifting
-since the original probe is unknown — the point is this table can silently go stale, so
-treat it as "last verified on the date above," not a permanent fact.
+**Side-finding first, because it broke every real test until accounted for:** promoting the test
+bots to admin in both test chats caused Telegram to silently migrate both from basic groups to
+supergroups — the dialog list now shows the SAME chat title twice, once under the old
+basic-group id and once under a new `-100…` supergroup id (`ALITA_TEST_CHAT_ID`/
+`ALITA_CI_CHAT_ID` had to be updated to the new ids; the old ids now 400 with `PEER_ID_INVALID`
+on send). Not something this slice set out to test, but a real consequence of the admin
+promotion worth recording — a future re-probe starting from a basic group should expect the same
+migration.
 
-That drift surfaced a real bug, now fixed: a successful ephemeral `sendMessage` reports
-`message_id: 0` on the wire (`ephemeral_message_id` carries the real, Telegram-side id
-instead — see the JSON above). `message_id: 0` is not a real, addressable Bot API message id
-(those start at 1), which broke two things `trySendEphemeralOrReply`'s callers used to assume
-every reply has:
-  - `handleSummaryCommand`'s `reply` used to log EVERY successful send into `message_log`
-    keyed by `sent.MessageId` — logging `0` would violate `message_log`'s
-    `UNIQUE(chat_id, message_id)` on this chat's SECOND-and-later ephemeral send (silently
-    dropped by the webhook-redelivery `ON CONFLICT DO NOTHING` dedup path, masking every
-    ephemeral reply after the first one ever sent to a chat). Fixed: a reply is only logged
-    when `sent.MessageId > 0` — an ephemeral send is, by definition, not part of the shared
-    chat log every other chat member can see, so it's correct for it to never appear in
-    later `/summary` transcripts or `/ask` semantic search either.
-  - `tests/AlitaBot.RealTests/CommandRealTests.fs`'s `/summary` test used to `AwaitReplyTo`
-    (this harness's MTProto client polling for a message whose reply-to matches the command)
-    for the digest itself — with `message_id: 0` there is no real message to correlate as a
-    "reply" over MTProto, so that wait never resolved and the test hung until its timeout
-    (previously "fixed" by giving it a longer timeout, which couldn't work since the target
-    genuinely never arrives that way, at any duration). Fixed: the test now proves
-    summarization succeeded via `message_log` (when Telegram fell back to a normal reply) OR
-    a fresh `llm_usage` row of `kind='chat'` (when the ephemeral send succeeded) — both
-    reliable server-side signals that don't depend on MTProto being able to see a Bot-API-only
-    ephemeral message.
+With that fixed, the ephemeral call itself:
+
+| Chat type | `receiver_user_id` on `sendMessage` | Result |
+|---|---|---|
+| Supergroup, bot **admin** (post-migration test chat) | `200 OK` — accepted. `result.message_id` is always `0`; the real per-send id is `result.ephemeral_message_id` (e.g. `13947911`, `93205090`, `95764773` — a large, non-sequential id space, nothing like the chat's own small sequential message ids) | Accepted server-side, but **never observed by the receiving account's own MTProto client** — no `UpdateNewMessage`/`UpdateEditMessage`/any other update arrived within 20s of the accepted call, and the message never appeared in `Messages_GetHistory` before or after (a plain control `sendMessage` sent moments later, no `receiver_user_id`, arrived via push in well under a second and appeared in history immediately — so the update pump and peer resolution are not the problem) |
+
+Raw HTTP response from `probe-ephemeral` (verbatim):
+
+```
+HTTP sendMessage {"chat_id":-1004443216370,"receiver_user_id":8818233083,"text":"ephemeral reply to <marker>"}
+-> {"ok":true,"result":{"message_id":0,"ephemeral_message_id":13947911,
+   "from":{"id":8864978376,"is_bot":true,"first_name":"Alita Test","username":"alita_llm_chat_test_bot"},
+   "chat":{"id":-1004443216370,"title":"Alita Test Chat","type":"supergroup"},
+   "date":1784705614,
+   "receiver_user":{"id":8818233083,"is_bot":false,"first_name":"Ayrat","last_name":"Ru","language_code":"en"},
+   "text":"ephemeral reply to <marker>"}}
+```
+
+The receiving account here is the SAME MTProto account that sent `/summary` (this harness's
+single-account limitation — see `TgUserClient`'s doc comments), which if anything should make
+delivery *easier* to observe than a genuine third party would; it still saw nothing, in either
+direction (live push or history pull).
+
+**Two concrete bugs this surfaced, both fixed in this slice:**
+
+1. **`message_log` silently dropped every ephemeral reply after the first one per chat.**
+   `handleSummaryCommand` logged `sent.MessageId` (Bot-API field) verbatim; since that's always
+   `0` for an accepted ephemeral send, and `message_log` has `UNIQUE(chat_id, message_id)` with
+   `ON CONFLICT DO NOTHING`, only the very first ephemeral `/summary` reply in a chat's
+   process-lifetime ever got persisted — every later one silently no-opped, no exception, no log
+   line, just a missing row (found by directly querying `message_log` after a real-test run: one
+   row with `message_id = 0` per chat, no matter how many `/summary` calls had actually run).
+   Fixed by `BotHelpers.loggableMessageId`: logs `EphemeralMessageId` instead of `0` when that's
+   what an accepted ephemeral send actually returned.
+2. Real test's `/summary` case previously used `AwaitReplyTo` (a live-update wait) to observe the
+   reply — now proven to hang forever once the bot is admin, since the message never arrives that
+   way. `CommandRealTests` now confirms the ephemeral send purely from `message_log` (via
+   `BotHelpers.loggableMessageId`'s value being EphemeralMessageId-shaped, i.e. large) and
+   separately asserts the reply never shows up in `Messages_GetHistory` — see the test for the
+   exact assertions.
+
+**Decision: `/usage` and `/help` were NOT switched to ephemeral delivery.** The task motivating
+this probe was "does ephemeral now work, so more chat-spam-reducing commands can use it" — given
+the accepted-but-unobservable-delivery finding above, defaulting `/usage`/`/help` to a delivery
+mechanism this harness cannot confirm reaches anyone would risk turning "always get an answer,
+visible to the chat" into "sometimes get nothing at all", for commands used far more casually
+than `/summary`. `/summary` itself is left as-is (already shipped, already falls back on any
+Telegram-side rejection) rather than rolled back, but is not a model to extend from until real
+delivery is confirmed — see `docs/TECH-DEBT.md`.
+
+**Action, still open:** confirming genuine delivery needs either a second, independent Telegram
+account watching the same chat live (this harness only has one MTProto identity), or manually
+watching an official Telegram client (mobile/desktop) receive a `/summary` reply in a chat where
+the bot is admin — neither is available from this environment. `make probe-ephemeral`
+(`EphemeralProbe.fs`) is the from-scratch repro for whoever picks this up next; DM/private-chat
+`receiver_user_id` behavior also remains unprobed.
 
 ## Memory: per-message embeddings + `/ask` (Phase-1 Slice 5a)
 
@@ -941,6 +967,7 @@ Makefile targets (repo root):
 | `make alita-build` | `dotnet build src/AlitaBot -c Release`. |
 | `make selfcheck` | Plumbing-only check (no MTProto): db → build → ngrok tunnel → bot process → webhook → public `/healthz` → teardown. |
 | `make probe-draft` | The M5 empirical probe — standalone, no tunnel/webhook/bot process needed; calls the Bot API directly and logs everything the MTProto user client observes. |
+| `make probe-ephemeral` | The ephemeral-message re-probe (admin-bot round) — same shape as `probe-draft`; calls `sendMessage` with `receiver_user_id` directly and watches for both live updates and `Messages_GetHistory` changes. |
 | `make real-test` | **The agent loop.** `alita-db` + `alita-build` + `dotnet test tests/AlitaBot.RealTests -c Release` — full real-Telegram smoke suite (`SmokeTests.fs`). |
 | `make alita-logs` | Tails `bot.log`/`ngrok.log` from the last `real-test`/`selfcheck` run. |
 | `make alita-clean` | `docker compose down -v` + `deleteWebhook?drop_pending_updates=true`. Run when done for the session. |

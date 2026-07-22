@@ -193,6 +193,46 @@ extra failed `sendMessage` call per chat per restart, immediately caught and deg
 normal reply, not a user-visible failure. No action needed unless restart frequency ever gets
 high enough for the repeated probe calls to matter (unlikely).
 
+## Ephemeral `sendMessage` delivery to the receiver is unconfirmed, even as admin
+
+Re-probed with the test bot promoted to group admin (see `src/AlitaBot/README.md`'s "Ephemeral
+message probe", round 2): the `BOT_NOT_ADMIN` rejection is gone — Telegram now accepts
+`sendMessage(receiver_user_id=...)` (`200 OK`, `ephemeral_message_id` populated) — but the
+accepted message was never observed by the receiving account's own MTProto client, neither as a
+live update (`UpdateNewMessage`/anything else, 20s watch) nor via `Messages_GetHistory` before or
+after, even though that account IS the exact `receiver_user_id`. A control `sendMessage` in the
+same chat (no `receiver_user_id`) arrived and appeared in history normally in under a second, so
+this isn't a harness/update-pump problem.
+
+This is NOT necessarily proof the feature is broken for real users — an official Telegram client
+might render ephemeral messages through some mechanism outside the public MTProto schema this
+harness's third-party client (WTelegramClient) can observe, the way inline-mode results and some
+other bot-only surfaces work. But from this repo's testing/observability standpoint, it means:
+**a `200 OK` from `sendMessage(receiver_user_id=...)` is not proof anyone actually saw the
+reply.** `/summary` was left as-is (it already only falls back on an actual Telegram-side
+rejection, and shipped before this finding), but `/usage`/`/help` were deliberately NOT switched
+to prefer ephemeral delivery for this reason — see README.
+
+**Action:** the only way to confirm real delivery is either a second, independent Telegram
+account watching the same chat live, or manually checking an official Telegram client (mobile/
+desktop) receives a `/summary` reply in an admin-bot chat — neither is available in this
+environment. Until confirmed, treat ephemeral delivery as unverified rather than working; don't
+extend it to more commands, and consider whether `/summary` itself should stop preferring it.
+
+## `message_log` silently dropped ephemeral replies after the first one per chat (fixed)
+
+Found alongside the above: `handleSummaryCommand` used to log the Bot-API `Message.MessageId`
+verbatim for the sent reply — but an ACCEPTED ephemeral send always reports `MessageId = 0` (the
+real id is `EphemeralMessageId`, a different field). `message_log` has
+`UNIQUE(chat_id, message_id)` with `ON CONFLICT DO NOTHING`, so only the very first ephemeral
+`/summary` reply ever landed in `message_log` for a given chat, process-lifetime — every
+subsequent one silently no-opped: no exception, no log line, just a missing row (confirmed by
+querying `message_log` directly after a real-test run and finding exactly one `message_id = 0`
+row despite multiple `/summary` calls). Fixed by `BotHelpers.loggableMessageId`, which logs
+`EphemeralMessageId` instead of the `0` `MessageId` whenever that's what Telegram actually
+returned. Any future caller of `trySendEphemeralOrReply` that logs the sent message to
+`message_log` must go through `loggableMessageId`, not `sent.MessageId` directly.
+
 ## `Req.SendRichMessage` >4096-char escalation is unverified against real Telegram (Slice 6)
 
 `Mdv2Delivery.sendFinal` (`Services/ReplyRenderer.fs`) escalates to `Req.SendRichMessage`

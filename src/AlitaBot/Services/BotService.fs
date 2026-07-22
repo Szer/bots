@@ -980,22 +980,10 @@ type BotService(
             let reply (text: string) (outcome: string) =
                 task {
                     let! sent = BotHelpers.trySendEphemeralOrReply tg logger msg.Chat.Id from.Id text msg.MessageId
-                    // A successful ephemeral send (Telegram accepted `receiver_user_id`) reports
-                    // `message_id = 0` on the wire — never a real, addressable Bot API message id
-                    // (those start at 1). Logging it into message_log under that id would violate
-                    // the table's UNIQUE(chat_id, message_id) on this chat's SECOND-and-later
-                    // ephemeral send (silently dropped by the webhook-redelivery ON CONFLICT DO
-                    // NOTHING dedup path, masking every ephemeral reply after the first one ever
-                    // sent to a chat) — and would wrongly feed text nobody else in the chat saw
-                    // into later /summary transcripts and /ask semantic search. So an ephemeral
-                    // reply is simply never logged; only a real (message_id > 0) reply — i.e. the
-                    // normal-reply fallback path — gets a message_log row, same as every other
-                    // command's reply.
-                    if sent.MessageId > 0L then
-                        do! logAndEmbed conf (
-                                logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                    (Some msg.MessageId) text)
-                            |> taskIgnore
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id (BotHelpers.loggableMessageId sent) (botUserId conf) conf.BotUsername
+                                conf.BotUsername true (Some msg.MessageId) text)
+                        |> taskIgnore
                     %a.SetTag("outcome", outcome)
                     countOutcome outcome
                 }

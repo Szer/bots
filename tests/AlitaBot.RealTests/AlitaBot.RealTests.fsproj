@@ -18,6 +18,7 @@
     <Compile Include="Webhook.fs" />
     <Compile Include="TgUserClient.fs" />
     <Compile Include="DraftProbe.fs" />
+    <Compile Include="EphemeralProbe.fs" />
     <Compile Include="SelfCheck.fs" />
     <Compile Include="RealAssemblyFixture.fs" />
     <Compile Include="SmokeTests.fs" />

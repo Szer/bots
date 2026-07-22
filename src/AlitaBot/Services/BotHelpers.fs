@@ -106,8 +106,16 @@ let sendTextReplyWithEntities
 // sees it. Confirmed by decompiling Funogram.Telegram.dll (ilspycmd -t Funogram.Telegram.Req):
 // SendMessage's constructor/Make both carry `FSharpOption<long> receiverUserId`, and the
 // response Message carries a matching `FSharpOption<long> EphemeralMessageId`. Whether
-// Telegram actually accepts it varies by chat type — see the empirical findings in
-// src/AlitaBot/README.md ("Ephemeral message probe").
+// Telegram actually accepts it varies by chat type/bot-admin-status — see the empirical
+// findings in src/AlitaBot/README.md ("Ephemeral message probe").
+//
+// Re-probed with the test bot promoted to admin (see README): Telegram now ACCEPTS the
+// call, but the returned `Message.MessageId` is always `0` — the real per-send identifier
+// lives in `EphemeralMessageId` instead, a totally different (much larger) id space than
+// the chat's normal sequential message ids. Callers that log the sent message to
+// `message_log` (`UNIQUE(chat_id, message_id)`) must use `loggableMessageId`, NOT
+// `sent.MessageId` directly — every ephemeral send after the first one in a chat would
+// otherwise collide on `(chatId, 0)` and get silently dropped by `ON CONFLICT DO NOTHING`.
 
 /// Chats where an ephemeral send has already failed once — permanently (process-lifetime)
 /// falls back to a normal reply for the rest of the process, mirroring DraftRenderer's
@@ -135,9 +143,16 @@ let trySendEphemeralOrReply
             return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
         else
             try
-                return!
+                let! sent =
                     tg.CallExn(
                         Req.SendMessage.Make(chatId, text, receiverUserId = receiverUserId, replyParameters = replyParams))
+                logger.LogInformation(
+                    "Ephemeral send accepted for chat {ChatId}, receiver {ReceiverUserId} — MessageId={MessageId} EphemeralMessageId={EphemeralMessageId}",
+                    chatId,
+                    receiverUserId,
+                    sent.MessageId,
+                    (sent.EphemeralMessageId |> Option.map string |> Option.defaultValue "<none>"))
+                return sent
             with ex ->
                 logger.LogWarning(
                     ex,
@@ -146,6 +161,17 @@ let trySendEphemeralOrReply
                 ephemeralUnsupportedChats[chatId] <- 0uy
                 return! tg.CallExn(Req.SendMessage.Make(chatId, text, replyParameters = replyParams))
     }
+
+/// The id to log to `message_log` for a `Message` returned by `trySendEphemeralOrReply`
+/// (or any other send): normally just `MessageId`, but an ACCEPTED ephemeral send always
+/// reports `MessageId = 0` (see the comment above `trySendEphemeralOrReply`) — using that
+/// verbatim would collide with every other ephemeral reply ever logged for the same chat
+/// (`UNIQUE(chat_id, message_id)`) after the first one, silently dropped by `ON CONFLICT DO
+/// NOTHING`. Falls back to `EphemeralMessageId` in that case, which is unique per send.
+let loggableMessageId (sent: Message) : int64 =
+    match sent.MessageId, sent.EphemeralMessageId with
+    | 0L, Some ephemeralId -> ephemeralId
+    | messageId, _ -> messageId
 
 /// Largest PhotoSize of a message's Photo array (Telegram orders smallest -> largest),
 /// or None for a message with no photo. Shared by BotService (detecting a photo message)

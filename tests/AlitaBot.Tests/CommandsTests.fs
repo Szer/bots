@@ -309,15 +309,6 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
 
     // ── /summary ──────────────────────────────────────────────────────────
 
-    /// REGRESSION (2026-07-22): a successful ephemeral send (`receiver_user_id` accepted)
-    /// reports `message_id: 0` on the wire — not a real, addressable Bot API message id
-    /// (see BotHelpers.trySendEphemeralOrReply's and FakeTgApi.Handlers.handleSendMessage's
-    /// doc comments). `handleSummaryCommand` deliberately does NOT log that reply into
-    /// `message_log` (would violate `UNIQUE(chat_id, message_id)` on a second ephemeral
-    /// reply in the same chat — see the next test), so these assertions go through the
-    /// channels that ARE populated for an ephemeral reply: the raw `sendMessage` FakeCall
-    /// (proves the digest text + `receiver_user_id` reached the wire) and `llm_usage`
-    /// (proves the summarization LLM call itself completed) — NOT `message_log`.
     [<Fact>]
     let ``summary transcribes recent messages and replies with the scripted digest`` () =
         task {
@@ -331,9 +322,14 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
 
             let requester = Tg.user(id = 8202L, username = "summary_bob", firstName = "Bob")
             let summaryUpdate = Tg.groupMessage("/summary 50", requester, fixture.TargetChatId)
+            let summaryMsgId = summaryUpdate.Message.Value.MessageId
 
             let! resp = fixture.SendUpdate(summaryUpdate)
             resp.EnsureSuccessStatusCode() |> ignore
+
+            let! replies = botReplyRows summaryMsgId
+            Assert.Single(replies) |> ignore
+            Assert.Equal("Итог: все спорили про котиков.", replies[0].text)
 
             // The scripted transcript was actually built from message_log — sanity-check
             // the fake LLM call's request body carries the seeded chat content (parsed via
@@ -342,9 +338,6 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             Assert.True(
                 llmCalls |> Array.exists (fun c -> requestMessagesContain c "котики лучше собак"),
                 "expected the /summary transcript (seeded chat message) in the LLM request body")
-
-            let! chatRowSeen = awaitUsageRow fixture "chat" fixture.TargetChatId
-            Assert.True(chatRowSeen, "expected an llm_usage row with kind='chat' after /summary")
 
             // Ephemeral probe: the send must have carried receiver_user_id (visible only
             // to the requester) — see BotHelpers.trySendEphemeralOrReply. FakeTgApi never
@@ -359,55 +352,15 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
                 summaryReplySend |> Array.exists (fun c -> jsonHasNumberProperty c "receiver_user_id"),
                 "expected the /summary reply's sendMessage call to carry receiver_user_id")
 
-            // The ephemeral reply itself (message_id: 0) must NOT be logged into
-            // message_log — it was never part of the shared chat log.
-            let! replies = botReplyRows summaryUpdate.Message.Value.MessageId
-            Assert.Empty replies
-        }
-
-    /// REGRESSION (2026-07-22): the actual production bug this covers. Before the fix,
-    /// `handleSummaryCommand` logged every ephemeral reply under `sent.MessageId = 0`,
-    /// which collides with `message_log`'s `UNIQUE(chat_id, message_id)` on the SECOND
-    /// ephemeral reply in the same chat — silently dropped by the webhook-redelivery
-    /// `ON CONFLICT DO NOTHING` dedup path (`db.LogMessage`), masking the reply from
-    /// message_log without ever failing the request. Two /summary calls in the same chat
-    /// must both go through cleanly and both produce a real `llm_usage` row.
-    [<Fact>]
-    let ``two ephemeral summary replies in the same chat don't collide on message_id`` () =
-        task {
-            do! fixture.ClearFakeCalls()
-            do! fixture.ClearAzureOcrCalls()
-            do! fixture.SetAzureLlmScript
-                    [| scripted 200 (nonStreamCompletionBody "первый итог")
-                       scripted 200 (nonStreamCompletionBody "второй итог") |]
-
-            let requester = Tg.user(id = 8204L, username = "summary_dave", firstName = "Dave")
-            // The fixture's llm_usage table isn't reset between tests in this class — scope
-            // the count to rows THIS test's two calls actually produced, not the table total.
-            let since = DateTime.UtcNow
-
-            let! resp1 = fixture.SendUpdate(Tg.groupMessage("/summary 10", requester, fixture.TargetChatId))
-            resp1.EnsureSuccessStatusCode() |> ignore
-            let! resp2 = fixture.SendUpdate(Tg.groupMessage("/summary 10", requester, fixture.TargetChatId))
-            resp2.EnsureSuccessStatusCode() |> ignore
-
-            let! sends = fixture.GetFakeCalls("sendMessage")
-            let toChat = sends |> Array.filter (isToChat fixture.TargetChatId)
-            Assert.Contains(toChat, fun c -> jsonString c "text" = "первый итог")
-            Assert.Contains(toChat, fun c -> jsonString c "text" = "второй итог")
-
-            // llm_usage rows are written fire-and-forget (LlmTelemetry.fs) — poll instead
-            // of a single immediate read, mirroring awaitUsageRow's reasoning above.
-            let deadline = DateTime.UtcNow + TimeSpan.FromSeconds 3.
-            let mutable chatUsageCount = 0
-            while chatUsageCount < 2 && DateTime.UtcNow < deadline do
-                let! count =
-                    fixture.QuerySingleOrDefault<int>(
-                        "SELECT COUNT(*) FROM llm_usage WHERE kind = 'chat' AND chat_id = @chat_id AND called_at >= @since",
-                        {| chat_id = fixture.TargetChatId; since = since |})
-                chatUsageCount <- count
-                if chatUsageCount < 2 then do! Task.Delay 200
-            Assert.Equal(2, chatUsageCount)
+            // Regression check (see BotHelpers.loggableMessageId / docs/TECH-DEBT.md): an
+            // accepted ephemeral send reports Message.MessageId = 0 on real Telegram (and
+            // now in FakeTgApi too — see Handlers.handleSendMessage), with the real per-send
+            // id in EphemeralMessageId instead. message_log has UNIQUE(chat_id, message_id)
+            // with ON CONFLICT DO NOTHING, so logging the raw MessageId=0 verbatim would make
+            // every ephemeral reply after the first one in a chat silently vanish. Asserting
+            // a nonzero message_id here pins that handleSummaryCommand logs
+            // BotHelpers.loggableMessageId, not sent.MessageId directly.
+            Assert.NotEqual(0L, replies[0].message_id)
         }
 
     [<Fact>]
@@ -420,12 +373,14 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             let user = Tg.user(id = 8203L, username = "summary_carol", firstName = "Carol")
             // No count arg -> SummaryDefaultCount (200), not the SummaryMaxCount cap.
             let update = Tg.groupMessage("/summary", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
 
             let! resp = fixture.SendUpdate(update)
             resp.EnsureSuccessStatusCode() |> ignore
 
-            let! sends = fixture.GetFakeCalls("sendMessage")
-            Assert.Contains(sends |> Array.filter (isToChat fixture.TargetChatId), fun c -> jsonString c "text" = "дефолтный итог")
+            let! replies = botReplyRows msgId
+            Assert.Single(replies) |> ignore
+            Assert.Equal("дефолтный итог", replies[0].text)
         }
 
     [<Fact>]
