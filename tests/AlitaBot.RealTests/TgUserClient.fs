@@ -266,6 +266,56 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
                     failwith $"No photo reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
         }
 
+    /// First incoming message in `chatId` that replies to `repliedMsgId` AND carries a
+    /// genuine voice note (TL.MessageMediaDocument whose document has a
+    /// DocumentAttributeAudio with the `voice` flag set) — used by StretchRealTests to
+    /// detect `/say`'s voice-note reply, the same way TryAwaitPhotoReplyTo detects /img's
+    /// photo reply. Returns (durationSeconds, byteSize) on the matched message.
+    member _.TryAwaitVoiceReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) : Task<(int * int64) option> =
+        task {
+            let deadline = DateTime.UtcNow + timeout
+            let mutable result = None
+
+            while result.IsNone && DateTime.UtcNow < deadline do
+                result <-
+                    snapshot ()
+                    |> Array.tryPick (fun m ->
+                        if
+                            peerMatches chatId m.peer_id
+                            && (match m.ReplyTo with
+                                | :? MessageReplyHeader as h -> h.reply_to_msg_id = repliedMsgId
+                                | _ -> false)
+                        then
+                            match m.media with
+                            | :? MessageMediaDocument as md ->
+                                match md.document with
+                                | :? TL.Document as doc ->
+                                    doc.attributes
+                                    |> Array.tryPick (fun a ->
+                                        match a with
+                                        | :? DocumentAttributeAudio as aa when aa.flags.HasFlag(DocumentAttributeAudio.Flags.voice) ->
+                                            Some(aa.duration, doc.size)
+                                        | _ -> None)
+                                | _ -> None
+                            | _ -> None
+                        else
+                            None)
+
+                if result.IsNone then
+                    do! Task.Delay pollInterval
+
+            return result
+        }
+
+    member this.AwaitVoiceReplyTo(chatId: int64, repliedMsgId: int, timeout: TimeSpan) =
+        task {
+            match! this.TryAwaitVoiceReplyTo(chatId, repliedMsgId, timeout) with
+            | Some r -> return r
+            | None ->
+                return
+                    failwith $"No voice-note reply to message {repliedMsgId} in chat {chatId} within {timeout.TotalSeconds}s"
+        }
+
     /// First incoming message from someone else in `chatId` whose text contains `marker`.
     member _.AwaitContaining(chatId: int64, marker: string, timeout: TimeSpan) =
         task {

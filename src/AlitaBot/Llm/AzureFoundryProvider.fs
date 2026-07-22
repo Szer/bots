@@ -35,8 +35,17 @@ module internal AzureWire =
     let transcriptionsUri (endpoint: string) (deployment: string) =
         $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/transcriptions?api-version={ApiVersion}"
 
+    /// audio/speech (TTS) 404s against the real Azure resource on the shared `ApiVersion`
+    /// above — confirmed empirically (Slice 9 stretch, `/say` real-test) — while chat/
+    /// embeddings/transcriptions all work fine on it. "2024-08-01-preview" is the version
+    /// S1's own hand-rolled curl verification used (VoiceRealTests.fs's synthesizeToFile,
+    /// predating this file's ISpeech.Synthesize ever actually being called end-to-end
+    /// against real Azure) and is confirmed working.
+    [<Literal>]
+    let SpeechApiVersion = "2024-08-01-preview"
+
     let speechUri (endpoint: string) (deployment: string) =
-        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/speech?api-version={ApiVersion}"
+        $"{endpoint.TrimEnd('/')}/openai/deployments/{deployment}/audio/speech?api-version={SpeechApiVersion}"
 
     /// gpt-image-1 (images/generations, images/edits) needs a newer api-version than the
     /// chat/embeddings/audio routes above. NOTE: unverified against a real deployment —

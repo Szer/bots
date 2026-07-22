@@ -4,6 +4,7 @@ open System
 open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
+open System.IO
 open System.Text.Json
 open System.Text.RegularExpressions
 open System.Threading
@@ -48,6 +49,18 @@ type QuoteEntry =
 /// `BotService.parseMemeJson`. Missing `emoji`/`text` fields default to "" (only `action`
 /// is required to parse at all, since only one of the two ever matters per action).
 type MemeAction = { Action: string; Emoji: string; Text: string }
+
+/// `/say`'s optional leading voice-name token, resolved against `validTtsVoices` (Slice 9
+/// stretch) — module-level for the same reason as RoastTarget/MemeAction above.
+[<RequireQualifiedAccess>]
+type SayVoiceArg =
+    /// No voice token present — use TTS_DEFAULT_VOICE.
+    | NoVoice
+    /// A recognized voice name.
+    | Valid of string
+    /// A single leftover token that isn't a recognized voice name — only reported when
+    /// there's no other plausible reading (see BotService.parseSayArgs).
+    | Invalid of string
 
 type BotService(
     options: IOptions<BotConfiguration>,
@@ -1546,6 +1559,306 @@ type BotService(
                         return renderKarma count titles, "karma_shown"
             })
 
+    // ── /say (Slice 9 stretch: TTS voice replies) ───────────────────────────────
+
+    /// The OpenAI/Azure TTS voice roster (gpt-4o-mini-tts family) — `/say`'s only valid
+    /// explicit voice names, matched case-insensitively.
+    let validTtsVoices =
+        [ "alloy"; "ash"; "ballad"; "coral"; "echo"; "fable"; "nova"; "onyx"; "sage"; "shimmer"; "verse" ]
+
+    let validTtsVoicesText = String.concat ", " validTtsVoices
+
+    /// Splits `/say`'s args into (voice selector, explicit spoken text). The first
+    /// whitespace-separated token is treated as an explicit voice selector in two cases:
+    /// (1) it's followed by more text ("/say nova привет" -> Valid "nova", Some "привет"),
+    /// or (2) it's the ONLY token AND the command replies to another message (that
+    /// message's text supplies the spoken content — "/say nova" replying to "привет" ->
+    /// Valid "nova", None). A first token that matches no known voice is left as ordinary
+    /// text in case (1) ("/say мама мыла раму" is just spoken with the default voice, no
+    /// error) but reported as SayVoiceArg.Invalid in case (2), where a lone leftover word
+    /// has no other plausible reading once the reply already supplies the message. Outside
+    /// a reply, a lone single token — matching a voice or not — is ambiguous between "just
+    /// the message" and "voice with no text", so it's always read as plain text.
+    let parseSayArgs (hasReplyText: bool) (args: string) : SayVoiceArg * string option =
+        let trimmed = args.Trim()
+        if trimmed = "" then
+            SayVoiceArg.NoVoice, None
+        else
+            let spaceIdx = trimmed.IndexOfAny([| ' '; '\t'; '\n' |])
+            if spaceIdx < 0 then
+                let lower = trimmed.ToLowerInvariant()
+                if List.contains lower validTtsVoices then
+                    if hasReplyText then SayVoiceArg.Valid lower, None else SayVoiceArg.NoVoice, Some trimmed
+                elif hasReplyText then
+                    SayVoiceArg.Invalid lower, None
+                else
+                    SayVoiceArg.NoVoice, Some trimmed
+            else
+                let first = trimmed.Substring(0, spaceIdx)
+                let rest = trimmed.Substring(spaceIdx + 1).Trim()
+                let lower = first.ToLowerInvariant()
+                if List.contains lower validTtsVoices then
+                    SayVoiceArg.Valid lower, Some rest
+                else
+                    SayVoiceArg.NoVoice, Some trimmed
+
+    /// True when `bytes` starts with the Ogg container magic ("OggS") — Azure's
+    /// audio/speech `response_format=opus` normally already yields one (see
+    /// AzureFoundryProvider's buildSpeechBody and VoiceRealTests' curl verification); this
+    /// only ever returns false for the rare voice/model combination that doesn't.
+    let isOggContainer (bytes: byte[]) =
+        bytes.Length >= 4 && bytes[0] = 0x4Fuy && bytes[1] = 0x67uy && bytes[2] = 0x67uy && bytes[3] = 0x53uy
+
+    /// Best-effort re-encode of non-Ogg TTS output into ogg/opus via `ffmpeg`, if it's on
+    /// PATH. Returns None when ffmpeg is missing or the conversion itself fails — the
+    /// caller falls back to sending the raw bytes as a regular audio attachment
+    /// (Req.SendAudio) instead of a voice note in that case.
+    let tryConvertToOggOpus (bytes: byte[]) : Task<byte[] option> =
+        task {
+            let inPath = IO.Path.GetTempFileName()
+            let outPath = IO.Path.ChangeExtension(IO.Path.GetTempFileName(), ".ogg")
+            try
+                try
+                    do! IO.File.WriteAllBytesAsync(inPath, bytes)
+                    let psi =
+                        ProcessStartInfo(
+                            FileName = "ffmpeg",
+                            Arguments = $"-y -i \"{inPath}\" -c:a libopus -b:a 32k \"{outPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true)
+                    use proc = new Process(StartInfo = psi)
+                    if not (proc.Start()) then
+                        return None
+                    else
+                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
+                        let! _stderr = proc.StandardError.ReadToEndAsync()
+                        do! proc.WaitForExitAsync()
+                        if proc.ExitCode = 0 && IO.File.Exists outPath then
+                            let! converted = IO.File.ReadAllBytesAsync(outPath)
+                            return Some converted
+                        else
+                            return None
+                with ex ->
+                    logger.LogWarning(ex, "/say: ffmpeg conversion to ogg/opus failed — falling back to sendAudio")
+                    return None
+            finally
+                (try IO.File.Delete inPath with _ -> ())
+                (try IO.File.Delete outPath with _ -> ())
+        }
+
+    /// `/say [voice] <text>` (or, replying to a message with no text of its own, voices
+    /// ITS text) — ISpeech.Synthesize -> sent as a voice note (Req.SendVoice) when the TTS
+    /// bytes are (or become, via tryConvertToOggOpus) a proper Ogg/Opus container, else as
+    /// a plain audio attachment (Req.SendAudio). Voice defaults to TTS_DEFAULT_VOICE; text
+    /// is capped at SAY_MAX_CHARS with a RU refusal beyond it. The bot's own message_log
+    /// row is tagged "[voice] {text}" — the same convention S1's voice-transcription reply
+    /// uses — so /say's output reads identically to a transcribed voice message in later
+    /// LLM context.
+    let handleSayCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
+        task {
+            use a = botActivity.StartActivity("handleSayCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if args = "" then "[say-cmd]" else $"[say-cmd] {args}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = BotHelpers.sendTextReply tg msg.Chat.Id text msg.MessageId
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            else
+                let replyText = msg.ReplyToMessage |> Option.bind (fun r -> r.Text |> Option.orElse r.Caption)
+                let voiceArg, textArg = parseSayArgs replyText.IsSome args
+                let text = (textArg |> Option.orElse replyText |> Option.defaultValue "").Trim()
+
+                match voiceArg with
+                | SayVoiceArg.Invalid bad ->
+                    do! reply $"Не знаю такой голос: «{bad}». Доступные: {validTtsVoicesText}." "say_invalid_voice"
+                | _ when String.IsNullOrWhiteSpace text ->
+                    do!
+                        reply
+                            "Скажи, что озвучить: `/say привет`. Или ответь этой командой на сообщение — озвучу его текст."
+                            "say_empty_text"
+                | _ when text.Length > conf.SayMaxChars ->
+                    do! reply $"Слишком длинный текст — максимум {conf.SayMaxChars} символов." "say_too_long"
+                | _ ->
+                    let voice = match voiceArg with SayVoiceArg.Valid v -> v | _ -> conf.TtsDefaultVoice
+                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                    match! speech.Synthesize(text, Some voice, usageCtx, CancellationToken.None) with
+                    | Error err ->
+                        logger.LogWarning("/say: TTS synthesis failed: {Error}", string err)
+                        do! reply "Не получилось озвучить 🙁" "say_failed"
+                    | Ok bytes when bytes.Length = 0 ->
+                        logger.LogWarning("/say: TTS synthesis returned no audio")
+                        do! reply "Не получилось озвучить 🙁" "say_failed"
+                    | Ok bytes ->
+                        let! oggBytes =
+                            if isOggContainer bytes then Task.FromResult(Some bytes) else tryConvertToOggOpus bytes
+                        let logText = $"[voice] {text}"
+
+                        let! sent, outcome =
+                            task {
+                                match oggBytes with
+                                | Some ogg ->
+                                    let! sent = BotHelpers.sendVoiceReply tg msg.Chat.Id ogg msg.MessageId
+                                    return sent, "say_delivered"
+                                | None ->
+                                    let! sent = BotHelpers.sendAudioReply tg msg.Chat.Id bytes msg.MessageId
+                                    return sent, "say_delivered_as_audio"
+                            }
+
+                        do! logAndEmbed conf (
+                                logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                    (Some msg.MessageId) logText)
+                            |> taskIgnore
+                        %a.SetTag("outcome", outcome)
+                        countOutcome outcome
+        }
+
+    // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
+
+    /// Parses the ADMIN_USER_IDS bot_setting (JSON_BLOB array of ints) — lenient like
+    /// parseModelAllowlist/parseAwardsJson: malformed JSON or a non-array value -> []
+    /// (nobody is admin until the setting is fixed, never "everybody").
+    let parseAdminUserIds (json: string) : int64 list =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Array then
+                []
+            else
+                [ for el in doc.RootElement.EnumerateArray() do
+                    if el.ValueKind = JsonValueKind.Number then el.GetInt64() ]
+        with _ -> []
+
+    /// S3-style troll refusal, Алита-styled — a non-admin gets exactly this, no LLM call.
+    [<Literal>]
+    let SqlNonAdminRefusal = "Куда лезёшь? SQL-консоль не для тебя."
+
+    /// The `/sql` LLM's JSON contract: {"sql": "..."}.
+    let parseSqlJson (json: string) : string option =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Object then
+                None
+            else
+                match doc.RootElement.TryGetProperty "sql" with
+                | true, v when v.ValueKind = JsonValueKind.String && not (String.IsNullOrWhiteSpace(v.GetString())) ->
+                    Some(v.GetString())
+                | _ -> None
+        with _ -> None
+
+    let sqlRequest (conf: BotConfiguration) (question: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.SqlPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text question ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    [<Literal>]
+    let SqlRowLimit = 50
+
+    [<Literal>]
+    let SqlCellMaxLen = 30
+
+    /// MDV2 code-block rendering of an /sql result set — one row per line, columns joined
+    /// by " | ", each cell capped at SqlCellMaxLen (a Telegram monospace code block has no
+    /// column alignment of its own, so this just keeps any one row from dominating the
+    /// message rather than attempting real table formatting).
+    let renderSqlTable (columns: string list) (rows: string[] list) : string =
+        let capCell (s: string) = if s.Length > SqlCellMaxLen then s.Substring(0, SqlCellMaxLen - 1) + "…" else s
+        let header = columns |> List.map capCell |> String.concat " | "
+        let sep = columns |> List.map (fun _ -> "---") |> String.concat " | "
+        if rows.IsEmpty then
+            "```\n" + header + "\n" + sep + "\n(нет строк)\n```"
+        else
+            let bodyLines = rows |> List.map (fun r -> r |> Array.map capCell |> String.concat " | ")
+            "```\n" + header + "\n" + sep + "\n" + String.concat "\n" bodyLines + "\n```"
+
+    let renderSqlRejected (sql: string) (reason: string) = $"```\n{sql}\n```\nОтклонено: {reason}"
+
+    let renderSqlExecError (sql: string) (err: string) =
+        let short = if err.Length > 200 then err.Substring(0, 200) + "…" else err
+        $"```\n{sql}\n```\nОшибка: {short}"
+
+    /// `/sql <question>` — ADMIN-GATED (ADMIN_USER_IDS): a non-admin gets a flat refusal,
+    /// no LLM call at all. For an admin, SQL_PROMPT (inlining a compact schema description)
+    /// asks the model for a single JSON {"sql": "..."} SELECT/WITH statement (one retry on
+    /// malformed JSON — completeJsonWithRetry, same as /awards/ /quote), validated by
+    /// SqlGuard.validate (must start SELECT/WITH, single statement, none of INSERT/UPDATE/
+    /// DELETE/DROP/ALTER/CREATE/GRANT outside quoted strings) and — belt and braces —
+    /// executed over a FRESH read-only connection (`SET default_transaction_read_only =
+    /// on`, 5s timeout), wrapped in an outer `SELECT ... LIMIT 50`. Errors (rejected or
+    /// failed) show the SQL plus a short RU reason; success renders as an MDV2 code-block
+    /// table.
+    let handleSqlCommand (conf: BotConfiguration) (msg: Message) (from: User) (question: string) =
+        task {
+            use a = botActivity.StartActivity("handleSqlCommand")
+            %a.SetTag("chatId", msg.Chat.Id)
+            %a.SetTag("fromId", from.Id)
+
+            let! inserted =
+                logAndEmbed conf (
+                    logRow msg.Chat.Id msg.MessageId from.Id (Option.toObj from.Username) (displayNameOf from) from.IsBot
+                        (match msg.ReplyToMessage with Some r -> Some r.MessageId | None -> None)
+                        (if question = "" then "[sql-cmd]" else $"[sql-cmd] {question}"))
+
+            let reply (text: string) (outcome: string) =
+                task {
+                    let! sent = Mdv2Delivery.sendFinal tg logger msg.Chat.Id msg.MessageId text
+                    do! logAndEmbed conf (
+                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                (Some msg.MessageId) text)
+                        |> taskIgnore
+                    %a.SetTag("outcome", outcome)
+                    countOutcome outcome
+                }
+
+            if not inserted then
+                %a.SetTag("outcome", "duplicate_update")
+                countOutcome "duplicate_update"
+            elif not (parseAdminUserIds conf.AdminUserIdsJson |> List.contains from.Id) then
+                do! reply SqlNonAdminRefusal "sql_refused_non_admin"
+            elif String.IsNullOrWhiteSpace question then
+                do! reply "Спроси что-нибудь про базу: `/sql сколько сообщений за сегодня?`" "sql_empty_question"
+            else
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                match! completeJsonWithRetry usageCtx (sqlRequest conf question) parseSqlJson with
+                | None -> do! reply "Не получилось составить запрос 🙁" "sql_generation_failed"
+                | Some rawSql ->
+                    match SqlGuard.validate rawSql with
+                    | Error reason -> do! reply (renderSqlRejected rawSql reason) "sql_rejected"
+                    | Ok validatedSql ->
+                        let wrapped = $"SELECT * FROM ({validatedSql}) AS sql_limited LIMIT {SqlRowLimit}"
+                        match! db.ExecuteReadOnlySelect(wrapped) with
+                        | Error err -> do! reply (renderSqlExecError rawSql err) "sql_exec_failed"
+                        | Ok(columns, rows) -> do! reply (renderSqlTable columns rows) "sql_delivered"
+        }
+
     let commandsWithoutHelp: CommandDef list =
         [ { Name = "img"
             Aliases = []
@@ -1591,7 +1904,15 @@ type BotService(
           { Name = "karma"
             Aliases = []
             Description = "карма: своя (без аргумента) или чужая — /karma @username"
-            Handler = handleKarmaCommand } ]
+            Handler = handleKarmaCommand }
+          { Name = "say"
+            Aliases = []
+            Description = "озвучить текст голосом: /say [голос] текст, или ответом на сообщение"
+            Handler = handleSayCommand }
+          { Name = "sql"
+            Aliases = []
+            Description = "аналитика по базе на естественном языке, только для админов: /sql <вопрос>"
+            Handler = handleSqlCommand } ]
 
     /// `/help` (and `/start`, for a newcomer's first message) — auto-generated from the
     /// registry (Commands.helpText), so it can never list a command that doesn't exist

@@ -99,6 +99,69 @@ module private DbServiceHelpers =
     let vectorLiteral (v: float32[]) : string =
         "[" + (v |> Array.map (fun f -> f.ToString("G9", Globalization.CultureInfo.InvariantCulture)) |> String.concat ",") + "]"
 
+/// Safety guard for `/sql`'s LLM-generated SQL (Slice 9 stretch) — a simple, deliberately
+/// conservative text-level check applied BEFORE the query ever reaches Postgres. This is
+/// belt-and-braces on top of the real safety net (DbService.ExecuteReadOnlySelect opens a
+/// connection with `SET default_transaction_read_only = on` and wraps every query in an
+/// outer `SELECT ... LIMIT 50`) — even a query that somehow slipped past this guard could
+/// still only SELECT, and only up to 50 rows.
+module SqlGuard =
+    /// Keywords that would attempt a write/DDL operation — checked as whole words, case-
+    /// insensitively, against the SQL text with any single-quoted string literals blanked
+    /// out first (so a keyword appearing only inside a quoted string, e.g. a WHERE clause
+    /// literal, is never mistaken for an attempted statement).
+    let private dangerousKeywords = [ "INSERT"; "UPDATE"; "DELETE"; "DROP"; "ALTER"; "CREATE"; "GRANT" ]
+
+    /// Blanks out the contents of every single-quoted string literal (handling ''-escaped
+    /// quotes) so keyword/semicolon checks never fire on quoted text — e.g. a query whose
+    /// WHERE clause legitimately contains the word "update" as a literal string value.
+    let private stripStringLiterals (sql: string) : string =
+        let sb = Text.StringBuilder(sql.Length)
+        let mutable i = 0
+        let mutable inStr = false
+        while i < sql.Length do
+            let c = sql[i]
+            if inStr then
+                if c = '\'' then
+                    if i + 1 < sql.Length && sql[i + 1] = '\'' then
+                        i <- i + 1 // escaped '' — consume both, emit nothing
+                    else
+                        inStr <- false
+            elif c = '\'' then
+                inStr <- true
+            else
+                %sb.Append(c)
+            i <- i + 1
+        sb.ToString()
+
+    /// Validates a model-generated SQL string: must be a single SELECT/WITH statement (at
+    /// most one trailing semicolon, none elsewhere) with none of `dangerousKeywords`
+    /// appearing outside a quoted string literal. On success returns the statement with
+    /// its trailing semicolon (if any) stripped — ready to be wrapped in an outer
+    /// `SELECT ... LIMIT`. On failure returns a short RU reason suitable for the reply.
+    let validate (sql: string) : Result<string, string> =
+        let trimmed = sql.Trim()
+        if trimmed = "" then
+            Error "пустой запрос"
+        else
+            let withoutTrailingSemi =
+                if trimmed.EndsWith(";") then trimmed.Substring(0, trimmed.Length - 1).TrimEnd() else trimmed
+            let stripped = stripStringLiterals withoutTrailingSemi
+            let upper = stripped.TrimStart().ToUpperInvariant()
+            if not (upper.StartsWith "SELECT" || upper.StartsWith "WITH") then
+                Error "запрос должен начинаться с SELECT или WITH"
+            elif stripped.Contains ";" then
+                Error "разрешён только один SQL-оператор"
+            else
+                let upperStripped = stripped.ToUpperInvariant()
+                let hits =
+                    dangerousKeywords
+                    |> List.filter (fun kw -> Text.RegularExpressions.Regex.IsMatch(upperStripped, $@"\b{kw}\b"))
+                if not hits.IsEmpty then
+                    Error $"""запрещённые операции: {String.concat ", " hits}"""
+                else
+                    Ok withoutTrailingSemi
+
 type DbService(connString: string) =
     let openConn() = task {
         let conn = new NpgsqlConnection(connString)
@@ -696,6 +759,46 @@ WHERE chat_id = @chat_id AND is_bot = FALSE AND sent_at >= @since;
             //language=postgresql
             let sql = "SELECT EXISTS(SELECT 1 FROM message_log WHERE chat_id = @chat_id AND is_bot = TRUE AND sent_at >= @since);"
             return! conn.QuerySingleAsync<bool>(sql, {| chat_id = chatId; since = since |})
+        }
+
+    // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
+
+    /// Executes an already-`SqlGuard.validate`d, already-`LIMIT`-wrapped SELECT/WITH
+    /// statement over a FRESH connection with `SET default_transaction_read_only = on`
+    /// (belt-and-braces alongside SqlGuard's text-level check — even a query that somehow
+    /// slipped past the guard could only ever SELECT in this session) and a 5-second
+    /// command timeout. Returns column names + rows-of-strings (every value rendered via
+    /// `.ToString()`, `NULL` for a null cell — `/sql`'s reply is a plain rendered table,
+    /// not a typed result set) on success, or the exception message on failure (a bad
+    /// query, e.g. an unknown column, still reaches here — the caller renders it as a
+    /// short RU error alongside the offending SQL).
+    member _.ExecuteReadOnlySelect(sql: string) : Task<Result<string list * string[] list, string>> =
+        task {
+            try
+                use conn = new NpgsqlConnection(connString)
+                do! conn.OpenAsync()
+                use roCmd = conn.CreateCommand()
+                roCmd.CommandText <- "SET default_transaction_read_only = on;"
+                let! _ = roCmd.ExecuteNonQueryAsync()
+
+                use cmd = conn.CreateCommand()
+                cmd.CommandText <- sql
+                cmd.CommandTimeout <- 5
+                use! reader = cmd.ExecuteReaderAsync()
+                let columns = [ for i in 0 .. reader.FieldCount - 1 -> reader.GetName(i) ]
+                let rows = ResizeArray<string[]>()
+                let mutable go = true
+                while go do
+                    let! has = reader.ReadAsync()
+                    if not has then
+                        go <- false
+                    else
+                        rows.Add(
+                            [| for i in 0 .. reader.FieldCount - 1 ->
+                                   if reader.IsDBNull(i) then "NULL" else string (reader.GetValue(i)) |])
+                return Ok(columns, rows |> List.ofSeq)
+            with ex ->
+                return Error ex.Message
         }
 
     interface IUsageRecorder with

@@ -20,6 +20,7 @@
     <Compile Include="PersonaTests.fs" />
     <Compile Include="SocialTests.fs" />
     <Compile Include="ProactiveTests.fs" />
+    <Compile Include="StretchTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

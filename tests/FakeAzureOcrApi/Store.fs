@@ -40,6 +40,19 @@ module Store =
     let tinyPngBase64 =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
+    /// Scripted responses for the Azure OpenAI audio/speech (TTS) endpoint (AlitaBot /say,
+    /// Slice 9 stretch). Kept separate from the other queues. If non-empty, dequeue one per
+    /// call; after it empties, respond with `defaultTtsBytes` — a tiny "OggS"-prefixed
+    /// payload so callers that don't bother scripting a response still exercise the
+    /// Ogg-container fast path (BotService.isOggContainer) rather than falling through to
+    /// the ffmpeg-conversion branch.
+    let ttsResponseScript = ConcurrentQueue<ScriptedResponse>()
+
+    /// "OggS" magic + a few filler bytes — not a real Ogg/Opus stream, just enough to pass
+    /// BotService.isOggContainer's 4-byte magic check so /say's fake-suite tests exercise
+    /// the sendVoice path by default.
+    let defaultTtsBytes: byte[] = [| 0x4Fuy; 0x67uy; 0x67uy; 0x53uy; 0uy; 0uy; 0uy; 0uy |]
+
     let defaultImageResponse =
         $"""{{"created":1774736361,"data":[{{"b64_json":"{tinyPngBase64}"}}],"usage":{{"input_tokens":10,"output_tokens":1000,"total_tokens":1010}}}}"""
 
@@ -93,6 +106,11 @@ module Store =
     let clearSttScript () =
         let mutable item = Unchecked.defaultof<ScriptedResponse>
         while sttResponseScript.TryDequeue(&item) do
+            ()
+
+    let clearTtsScript () =
+        let mutable item = Unchecked.defaultof<ScriptedResponse>
+        while ttsResponseScript.TryDequeue(&item) do
             ()
 
     let clearImageScript () =

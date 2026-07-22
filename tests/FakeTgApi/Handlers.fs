@@ -134,6 +134,28 @@ module Handlers =
             $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"caption":"ok"}}"""
         respondJson ctx 200 (okResult resultJson)
 
+    /// AlitaBot /say (Slice 9 stretch): `voice` (not `true`) is required so Funogram's
+    /// `Req.SendVoice` response parser (`Types.Message`) can deserialize the result —
+    /// falling through to the generic `handleSimpleOk`'s bare `true` result would fail
+    /// client-side JSON parsing.
+    let private handleSendVoice ctx body =
+        let chatId = parseChatId body
+        let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        let msgId = Store.allocMessageId()
+        let resultJson =
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"voice":{{"file_id":"voice-{msgId}","file_unique_id":"voice-{msgId}-uid","duration":1}}}}"""
+        respondJson ctx 200 (okResult resultJson)
+
+    /// `/say`'s fallback when the TTS bytes weren't a proper Ogg container and no ffmpeg
+    /// was available to convert them — see `BotService.tryConvertToOggOpus`.
+    let private handleSendAudio ctx body =
+        let chatId = parseChatId body
+        let now = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+        let msgId = Store.allocMessageId()
+        let resultJson =
+            $"""{{"message_id":{msgId},"date":{now},"chat":{{"id":{chatId},"type":"private"}},"audio":{{"file_id":"audio-{msgId}","file_unique_id":"audio-{msgId}-uid","duration":1}}}}"""
+        respondJson ctx 200 (okResult resultJson)
+
     let private handleSendMediaGroup ctx body =
         let chatId = parseChatId body
         let count =
@@ -246,6 +268,8 @@ module Handlers =
             do! handleSimulatedError ctx
         | "sendMessage"      -> do! handleSendMessage ctx body
         | "sendPhoto"        -> do! handleSendPhoto ctx body
+        | "sendVoice"        -> do! handleSendVoice ctx body
+        | "sendAudio"        -> do! handleSendAudio ctx body
         | "sendMediaGroup"   -> do! handleSendMediaGroup ctx body
         | "forwardMessage"   -> do! handleForwardMessage ctx body
         | "answerCallbackQuery" | "deleteMessage"

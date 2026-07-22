@@ -152,4 +152,23 @@ type BotConfiguration =
       /// emoji from the same Telegram-allowed reaction set the S6 outcome router uses.
       /// Default "".
       MemeReactPrompt: string
+      /// TTS_DEFAULT_VOICE bot_setting: default `/say` voice when no explicit voice arg
+      /// is given. Default "alloy" — matches ISpeech.Synthesize's own `voice=None` default.
+      TtsDefaultVoice: string
+      /// SAY_MAX_CHARS bot_setting: `/say` refuses (RU) text longer than this instead of
+      /// synthesizing it. Default 500.
+      SayMaxChars: int
+      /// ADMIN_USER_IDS bot_setting (JSON_BLOB): user ids allowed to run `/sql`. Default
+      /// "[]" — nobody is admin until this is hand-seeded (see AGENTS.md's "Settings
+      /// seeds, not migrations").
+      AdminUserIdsJson: string
+      /// SQL_PROMPT bot_setting: system prompt for `/sql` — must instruct the model to
+      /// answer with a strict JSON object {"sql": "..."} containing a single read-only
+      /// SELECT/WITH statement against Alita's own schema. Default "".
+      SqlPrompt: string
+      /// FEATURE_FLAG COST_FOOTER_ENABLED — appends a "⛽ $0.0021" cost line to LLM
+      /// responder replies (not command replies), visible in Telegram but stripped before
+      /// the message_log insert (so the model never sees its own cost in later context).
+      /// Default false.
+      CostFooterEnabled: bool
       TestMode: bool }
