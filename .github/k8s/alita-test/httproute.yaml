@@ -17,7 +17,18 @@ spec:
   hostnames:
   - "alita-test.szer.dev"
   rules:
-  - matches:
+  # Explicit request timeout (Gateway API v1's HTTPRouteRule.timeouts — "Extended" support,
+  # ignored rather than rejected by a controller that doesn't implement it): the gateway's
+  # implementation default (Envoy's usual 15s route timeout, matching the "upstream request
+  # timeout" 504 body format) is too short for Slice 5b's `POST /test/run-job?name=
+  # dossier_nightly_update` (DossierRealTests) — that handler runs two sequential real Azure
+  # AI Foundry chat-completion calls (extract, then merge) synchronously before responding,
+  # which can comfortably exceed 15s. Scoped to this transient, CI-only route — no effect on
+  # the persistent `main-gateway`'s other listeners/routes.
+  - timeouts:
+      request: 120s
+      backendRequest: 120s
+    matches:
     - path:
         type: PathPrefix
         value: /
