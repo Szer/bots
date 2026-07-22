@@ -19,6 +19,13 @@ open CommandsTestHelpers
 /// hash-of-text vectors (`FakeAzureOcrApi.Embedding.embed`) give real cosine-similarity
 /// behavior for dedup and recall without a real embedding model — texts sharing
 /// vocabulary land close together, texts with disjoint vocabulary land near-orthogonal.
+///
+/// `/test/run-job` is fire-and-forget on the bot side (ScheduledJobs.fs's
+/// SchedulerHostedService.RunJobNow — the HTTP response returns before the job's LLM
+/// calls/DB writes actually land, so a synchronous await inline in the handler can't hold
+/// a slow request open past a gateway timeout, see the CI hotfix this was added for).
+/// Every test below therefore polls for the job's observable effect (a DB row, or a new
+/// fake chat-completions call) instead of asserting immediately after `runJob()` returns.
 type DossierTests(fixture: AlitaTestContainers) =
 
     let botReplyRows (replyToMessageId: int64) =
@@ -36,6 +43,8 @@ ORDER BY message_id
 
     /// Triggers the nightly job immediately (TEST_MODE-only endpoint, bypasses the
     /// lease/schedule check entirely — see ScheduledJobs.fs's SchedulerHostedService).
+    /// Fire-and-forget on the bot side: this returns as soon as the job is kicked off,
+    /// not once it's finished — see the type doc comment.
     let runJob () =
         task {
             let! resp = fixture.Bot.PostAsync("/test/run-job?name=dossier_nightly_update", null)
@@ -55,6 +64,39 @@ ORDER BY message_id
             "SELECT summary, user_id FROM person_dossier WHERE user_id = @uid",
             {| uid = userId |})
 
+    /// Polls `activeFacts userId` until it has at least `minCount` rows, or `timeoutMs`
+    /// elapses (returns whatever it last saw either way — callers assert on the result).
+    let awaitActiveFactCount (userId: int64) (minCount: int) (timeoutMs: int) =
+        task {
+            let deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(float timeoutMs)
+            let mutable facts = [||]
+            let mutable settled = false
+            while not settled && DateTime.UtcNow < deadline do
+                let! f = activeFacts userId
+                facts <- f
+                if f.Length >= minCount then
+                    settled <- true
+                else
+                    do! Task.Delay 150
+            return facts
+        }
+
+    /// Polls `dossierRow userId` until it exists, or `timeoutMs` elapses.
+    let awaitDossierRow (userId: int64) (timeoutMs: int) =
+        task {
+            let deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(float timeoutMs)
+            let mutable row = Unchecked.defaultof<_>
+            let mutable found = false
+            while not found && DateTime.UtcNow < deadline do
+                let! r = dossierRow userId
+                row <- r
+                if box r <> null then
+                    found <- true
+                else
+                    do! Task.Delay 150
+            return row
+        }
+
     // ── Nightly extraction + dossier creation ───────────────────────────────
 
     [<Fact>]
@@ -73,11 +115,11 @@ ORDER BY message_id
 
             do! runJob ()
 
-            let! facts = activeFacts user.Id
+            let! facts = awaitActiveFactCount user.Id 1 5000
             Assert.Single(facts) |> ignore
             Assert.Equal("Любит программировать на F#", facts[0].content)
 
-            let! dossier = dossierRow user.Id
+            let! dossier = awaitDossierRow user.Id 5000
             Assert.NotNull(box dossier)
             Assert.Contains("F#", dossier.summary)
 
@@ -95,6 +137,10 @@ ORDER BY message_id
             do! fixture.SetAzureLlmScript [||]
 
             do! runJob ()
+            // Prove absence: wait out a generous window rather than checking immediately —
+            // the job is fire-and-forget, so an immediate check would trivially pass
+            // whether or not it was actually going to (wrongly) call the LLM.
+            do! Task.Delay 2500
 
             let! llmCalls = fixture.GetAzureLlmCalls()
             Assert.Empty llmCalls
@@ -119,7 +165,7 @@ ORDER BY message_id
                        scripted 200 (nonStreamCompletionBody "Боб на дух не переносит YAML.") |]
             do! runJob ()
 
-            let! facts1 = activeFacts user.Id
+            let! facts1 = awaitActiveFactCount user.Id 1 5000
             Assert.Single(facts1) |> ignore
 
             // Second run: user active again, extraction scripts the SAME fact text again —
@@ -129,8 +175,21 @@ ORDER BY message_id
             let! seed2 = fixture.SendUpdate(Tg.groupMessage("да, действительно ненавижу этот формат", user, fixture.TargetChatId))
             seed2.EnsureSuccessStatusCode() |> ignore
 
+            do! fixture.ClearFakeCalls()
             do! fixture.SetAzureLlmScript [| scripted 200 (nonStreamCompletionBody (factsJson [ fact ])) |]
             do! runJob ()
+
+            // The extraction call landing is proof the second run actually processed this
+            // user; dedup means no merge call follows (no new fact), so waiting for exactly
+            // one new chat-completions call plus a short settle window is the right signal
+            // that the (skipped) insert has had its chance to run.
+            let deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds 5000.
+            let mutable extracted = false
+            while not extracted && DateTime.UtcNow < deadline do
+                let! calls = fixture.GetAzureLlmCalls()
+                if calls.Length >= 1 then extracted <- true else do! Task.Delay 150
+            Assert.True(extracted, "expected the second run's extraction call to land within 5s")
+            do! Task.Delay 300
 
             let! facts2 = activeFacts user.Id
             Assert.Single(facts2) |> ignore
@@ -155,7 +214,7 @@ ORDER BY message_id
                        scripted 200 (nonStreamCompletionBody "Кэрол — большая любительница утреннего кофе.") |]
             do! runJob ()
 
-            let! dossier = dossierRow author.Id
+            let! dossier = awaitDossierRow author.Id 5000
             Assert.NotNull(box dossier)
 
             try
@@ -219,6 +278,9 @@ ORDER BY message_id
                            scripted 200 (nonStreamCompletionBody "Эрин бегает по утрам.") |]
                 do! runJob ()
 
+                let! dossier = awaitDossierRow author.Id 5000
+                Assert.NotNull(box dossier)
+
                 do! fixture.SetBotSetting("RESPONDER_MODE", "llm")
                 do! fixture.SetBotSetting("DOSSIER_ENABLED", "false")
                 do! fixture.ReloadSettings()
@@ -277,6 +339,9 @@ ORDER BY message_id
                        scripted 200 (nonStreamCompletionBody "Грейс увлекается велоспортом по выходным.") |]
             do! runJob ()
 
+            let! dossier = awaitDossierRow user.Id 5000
+            Assert.NotNull(box dossier)
+
             let requester = Tg.user(id = 9603L, username = "dossier_henry", firstName = "Henry")
             let update = Tg.groupMessage("/dossier @dossier_grace", requester, fixture.TargetChatId)
             let msgId = update.Message.Value.MessageId
@@ -325,9 +390,9 @@ ORDER BY message_id
                        scripted 200 (nonStreamCompletionBody "Джуди увлекается акварельной живописью.") |]
             do! runJob ()
 
-            let! factsBefore = activeFacts user.Id
+            let! factsBefore = awaitActiveFactCount user.Id 1 5000
             Assert.NotEmpty factsBefore
-            let! dossierBefore = dossierRow user.Id
+            let! dossierBefore = awaitDossierRow user.Id 5000
             Assert.NotNull(box dossierBefore)
 
             do! fixture.ClearFakeCalls()
@@ -359,6 +424,7 @@ ORDER BY message_id
             do! fixture.ClearFakeCalls()
             do! fixture.SetAzureLlmScript [||]
             do! runJob ()
+            do! Task.Delay 2500
             let! factsStill = activeFacts user.Id
             Assert.Empty factsStill
         }

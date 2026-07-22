@@ -8,6 +8,7 @@ open Npgsql
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open AlitaBot.Telemetry
+open BotInfra
 
 /// Distributed scheduled-job locking (Slice 5b) — local adaptation of the old (pre-
 /// Funogram) `feature/alita-bot` branch's `src/BotInfra/ScheduledJobs.fs` (see
@@ -73,6 +74,33 @@ WHERE job_name = @jobName;
             return ()
         }
 
+    /// Records completion for a TEST_MODE-triggered run (`RunJobNow`), using the real
+    /// system clock (`DateTime.UtcNow`) rather than the injected `TimeProvider` — Program.fs
+    /// overwrites the DI `TimeProvider` with a **frozen** `FakeTimeProvider` whenever
+    /// TEST_MODE is on (see `Program.fs`'s TestMode block), and that clock is never advanced
+    /// across a whole fake-suite assembly run or a real-test pod's lifetime (see
+    /// `ContainerTestBase.fs`'s `TruncateMemoryTables` doc comment). Writing `complete`'s
+    /// `timeProvider.GetUtcNow()` there would make every TEST_MODE-triggered completion land
+    /// on the exact same timestamp, so a caller polling for "`last_completed_at` advanced
+    /// past a pre-request snapshot" could hang forever on any run after the first one. Only
+    /// `last_completed_at` is touched — `locked_until`/`locked_by` are left alone because
+    /// `RunJobNow` never goes through `tryAcquire` in the first place, so there's no lease to
+    /// release.
+    let completeTestTriggered (connString: string) (jobName: string) : Task =
+        task {
+            use conn = new NpgsqlConnection(connString)
+            let now = DateTime.UtcNow
+            //language=postgresql
+            let sql =
+                """
+UPDATE scheduled_job
+SET last_completed_at = @now
+WHERE job_name = @jobName;
+"""
+            let! _ = conn.ExecuteAsync(sql, {| jobName = jobName; now = now |})
+            return ()
+        }
+
 /// Hosted background service driving the nightly dossier job, plus a TEST_MODE hook
 /// (`RunJobNow`, wired to `/test/run-job?name=` in Program.fs) that runs it immediately,
 /// bypassing the lease/schedule check entirely — mirrors the old `SchedulerService`'s
@@ -121,12 +149,34 @@ type SchedulerHostedService
         }
         :> Task
 
-    /// TEST_MODE hook (`/test/run-job?name=`): runs a named job immediately, regardless of
-    /// the lease/schedule — never touches `scheduled_job`'s lease columns at all, so it
-    /// can't collide with (or advance) the real nightly schedule.
+    /// TEST_MODE hook (`/test/run-job?name=`): starts a named job immediately, regardless
+    /// of the lease/schedule (never acquires the lease or touches `locked_until`/
+    /// `locked_by`, so it can't collide with a real pod's in-progress run), and returns as
+    /// soon as it's kicked off rather than waiting for it to finish (`BotInfra.Utils.
+    /// fireAndForget`). The job itself can run for tens of seconds (two sequential real
+    /// LLM calls against Azure AI Foundry) — awaiting it inline here would hold the HTTP
+    /// response open for that whole time, which exceeded the CI real-test AKS gateway's
+    /// request timeout ("504: upstream request timeout", DossierRealTests). Once the
+    /// fire-and-forget work finishes, it does stamp `last_completed_at` (via
+    /// `completeTestTriggered`) so a caller has something to poll for — see that function's
+    /// doc comment for why it can't just reuse `complete`. Callers otherwise poll the
+    /// database for the job's effects (both DossierTests.fs and DossierRealTests.fs do —
+    /// the nightly job's own result was always only observable that way, via
+    /// `person_dossier`/`interaction_memory`, never via the HTTP response body).
     member _.RunJobNow(jobName: string) : Task =
         task {
             match jobName with
-            | n when n = DossierJobName -> do! dossier.RunNightlyUpdate ()
+            | n when n = DossierJobName ->
+                fireAndForget logger "scheduled_jobs.run_now" (fun () ->
+                    task {
+                        do! dossier.RunNightlyUpdate ()
+                        do! ScheduledJobs.completeTestTriggered connString DossierJobName
+                    }
+                    :> Task)
             | other -> logger.LogWarning("ScheduledJobs: unknown job {Job}", other)
         }
+
+    /// Whether `jobName` is one `RunJobNow` recognizes — `/test/run-job` uses this to 404
+    /// unknown names up front rather than accepting the request and then just logging a
+    /// warning from inside the fire-and-forget task.
+    member _.IsKnownJob(jobName: string) : bool = jobName = DossierJobName
