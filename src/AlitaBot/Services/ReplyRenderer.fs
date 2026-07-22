@@ -85,6 +85,17 @@ module Mdv2Delivery =
             return last
         }
 
+    /// Same chunking as `sendPlainMultipart`, but as fresh (non-reply) messages —
+    /// `sendFinalToChat`'s over-length/rejected-rich-message fallback.
+    let private sendPlainMultipartToChat (tg: ITelegramApi) (chatId: int64) (fullText: string) : Task<Message> =
+        task {
+            let mutable last = Unchecked.defaultof<Message>
+            for chunk in splitPlain fullText do
+                let! sent = BotHelpers.sendMessage tg chatId chunk
+                last <- sent
+            return last
+        }
+
     /// Sends the FINAL reply for a response that hasn't sent anything yet (`PlainRenderer`,
     /// and the streaming renderers' edge cases that skip straight to one send). MDV2-
     /// formats `fullText`; on a Telegram 400 (bad entities) falls back to a plain-text
@@ -125,6 +136,34 @@ module Mdv2Delivery =
                         "SendRichMessage rejected by Telegram — falling back to plain multipart sends for chat {ChatId}",
                         chatId)
                     return! sendPlainMultipart tg chatId replyToMessageId fullText
+        }
+
+    /// Slice 8: sends `fullText` as a fresh (non-reply) message to `chatId` — the morning
+    /// digest has no triggering message to reply to. Same MDV2-with-fallback policy as
+    /// `sendFinal`, just without `replyParameters` anywhere on the wire.
+    let sendFinalToChat (tg: ITelegramApi) (logger: ILogger) (chatId: int64) (fullText: string) : Task<Message> =
+        task {
+            let mdv2 = MarkdownRenderer.toMarkdownV2 fullText
+            if mdv2.Length <= TelegramMaxLen then
+                try
+                    return! tg.CallExn(Req.SendMessage.Make(chatId, mdv2, parseMode = ParseMode.MarkdownV2))
+                with ex ->
+                    Metrics.mdv2FallbackTotal.Add(1L)
+                    logger.LogWarning(ex, "MDV2 sendMessage rejected by Telegram — falling back to plain text")
+                    return! BotHelpers.sendMessage tg chatId fullText
+            elif richMessageUnsupportedChats.ContainsKey chatId then
+                return! sendPlainMultipartToChat tg chatId fullText
+            else
+                try
+                    let rich = InputRichMessage.Create(markdown = mdv2)
+                    return! tg.CallExn(Req.SendRichMessage.Make(chatId, rich))
+                with ex ->
+                    richMessageUnsupportedChats[chatId] <- ()
+                    logger.LogWarning(
+                        ex,
+                        "SendRichMessage rejected by Telegram — falling back to plain multipart sends for chat {ChatId}",
+                        chatId)
+                    return! sendPlainMultipartToChat tg chatId fullText
         }
 
     /// Finalizes a streaming renderer's already-sent message with MDV2 formatting — the

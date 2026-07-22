@@ -55,6 +55,18 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   MarkdownV2`), the rewriter pass (`REWRITER_ENABLED=true` -> two chat-completions calls,
   `message_log`'s bot reply is the SECOND script's text), and reply-context enrichment (a
   reply-to-message's author + text show up in the LLM request body).
+- `ProactiveTests.fs` — Slice 8: the morning digest (`POST /test/run-job?name=digest_daily`
+  — a chat above `DIGEST_MIN_MESSAGES` gets a scripted digest as a fresh, non-reply
+  `sendMessage`; a chat below the threshold gets nothing), willingness-gated interjections
+  (`INTERJECT_PROBABILITY=1.0` + a seeded burst — `BURST_MSGS`/`BURST_SPEAKERS` lowered for
+  test speed — sends a scripted plain (non-reply) message; a scripted `PASS` stays silent
+  though the LLM call still lands; an active cooldown or `p=0.0` skip the LLM call
+  entirely), and meme reactions (a scripted `{"action":"react",...}` sets a message
+  reaction; `{"action":"pass"}` and malformed JSON both do nothing, the malformed case also
+  proving the bot stays responsive afterward). Interjection tests each use a **dedicated
+  chat id** (never `fixture.TargetChatId`) — the cooldown check looks at every bot message
+  ever logged for a chat, and the frozen `FakeTimeProvider` means any earlier test's bot
+  reply to the shared target chat would otherwise "recently" cool it down forever.
 
 Container logs land in `test-artifacts/AlitaBot.Tests/AlitaTestContainers/` (`bot.log`,
 `postgres.log`, `flyway.log`, `fake-tg-api.log`, `fake-azure-ocr.log`) on pass or fail.
@@ -88,6 +100,19 @@ make real-test    # dev DB + Release build + full real-Telegram smoke suite
 make alita-logs   # tail bot.log / ngrok.log from the last run
 make alita-clean  # tear down containers + deleteWebhook (run when done for the session)
 ```
+
+`ProactiveRealTests.fs` (Slice 8, both require `RESPONDER_MODE=llm`): enables
+`DIGEST_ENABLED`, seeds a few topical messages, triggers `digest_daily` the same
+`/test/run-job` way `DossierRealTests.fs` triggers the nightly job, and awaits a bot
+message referencing one of a few "generous fuzzy" topic needles (F#/YAML/кофе — a real
+digest paraphrases, so no literal GUID marker is expected to survive); and sets
+`INTERJECT_PROBABILITY=1.0`, `BURST_MSGS=3`, `BURST_SPEAKERS=1`,
+`INTERJECT_COOLDOWN_MINUTES=0`, and an `INTERJECT_PROMPT` overridden to a deterministic
+"ответь ровно: INTERJECT-OK" instruction, sends 3 quick messages, and awaits that exact
+marker. Both restore every setting they touched afterward via `try/with` + re-raise +
+an unconditional restore call, not a plain `finally` (F#'s `task` CE doesn't allow `do!`
+inside `finally`, and an un-awaited fire-and-forget restore risks the same async-restore
+race PersonaRealTests' emoji test already had to work around).
 
 `SmokeTests.fs` is the core conversational suite; `VoiceRealTests.fs`, `VisionRealTests.fs`,
 `ImageGenRealTests.fs`, `AskRealTests.fs`, `DossierRealTests.fs`, `PersonaRealTests.fs` cover

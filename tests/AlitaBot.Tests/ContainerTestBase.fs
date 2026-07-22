@@ -87,6 +87,20 @@ type AlitaTestContainers() =
                 "ROAST_COOLDOWN_SECONDS", "300",                                   "FREE_FORM", "llm"
                 "AWARDS_PROMPT",          """Below are this chat's messages from the last 7 days, each tagged [handle]: text. Pick 3-5 members and invent a witty title for each based on what they wrote. Reply with ONLY a strict JSON array of {"title": "...", "user": "...", "evidence_quote": "..."} objects — user must be ONLY the handle itself, WITHOUT the surrounding [] brackets, evidence_quote a short verbatim quote backing the title. No text outside the JSON.""", "FREE_FORM", "llm"
                 "QUOTE_PROMPT",           """Below are this chat's messages from the last 24 hours, each tagged with its author. Pick the ONE most absurd or quotable line. Reply with ONLY a strict JSON object {"author": "...", "quote": "...", "comment": "..."} — quote verbatim, comment a short wry remark. No text outside the JSON.""", "FREE_FORM", "llm"
+                // Slice 8: proactive behavior — every default OFF/0.0, same posture as
+                // dev-bot-settings.sql; ProactiveTests.fs flips these per-test.
+                "DIGEST_ENABLED",         "false",                             "FEATURE_FLAG", "proactive"
+                "DIGEST_UTC_HOUR",        "7",                                 "FREE_FORM", "proactive"
+                "DIGEST_MIN_MESSAGES",    "30",                                "FREE_FORM", "proactive"
+                "DIGEST_PROMPT",          "Write a short morning digest of yesterday's chat, by topic, with light sarcasm about who said what. 6-10 lines, no fluff.", "FREE_FORM", "proactive"
+                "INTERJECT_PROBABILITY",  "0.0",                               "FREE_FORM", "proactive"
+                "BURST_MSGS",             "8",                                 "FREE_FORM", "proactive"
+                "BURST_SPEAKERS",         "3",                                 "FREE_FORM", "proactive"
+                "BURST_WINDOW_MINUTES",   "5",                                 "FREE_FORM", "proactive"
+                "INTERJECT_COOLDOWN_MINUTES", "30",                            "FREE_FORM", "proactive"
+                "INTERJECT_PROMPT",       "You may drop ONE sharp one-liner into this conversation, or reply with exactly PASS if you have nothing worth adding.", "FREE_FORM", "proactive"
+                "MEME_REACT_PROBABILITY", "0.0",                               "FREE_FORM", "proactive"
+                "MEME_REACT_PROMPT",      """Rate this photo. Reply with ONLY strict JSON {"action":"react|comment|pass","emoji":"...","text":"..."} — react: one fitting emoji reaction; comment: one short witty reply; pass: if the photo doesn't deserve a reaction. No text outside the JSON.""", "FREE_FORM", "proactive"
             ]
             for (key, value, typ, group) in settings do
                 do! conn.ExecuteAsync(

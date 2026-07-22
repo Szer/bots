@@ -107,4 +107,49 @@ type BotConfiguration =
       /// the model to answer with a strict JSON object {author,quote,comment}.
       /// Default "".
       QuotePrompt: string
+      /// FEATURE_FLAG DIGEST_ENABLED (Slice 8) — the daily morning-digest scheduled job
+      /// (`digest_daily`). Default false — the job runs (lease-acquired, stamped
+      /// complete) but sends nothing until this is flipped on.
+      DigestEnabled: bool
+      /// DIGEST_UTC_HOUR bot_setting: UTC hour the digest job is scheduled to run at
+      /// daily (same lease-acquire pattern as `dossier_nightly_update`). Default 7.
+      DigestUtcHour: int
+      /// DIGEST_MIN_MESSAGES bot_setting: minimum human, non-command `message_log` rows
+      /// in the last 24h for a target chat to get a digest (`DbService.HumanMessagesSince`
+      /// — same query `/awards`/`/quote` use). Default 30.
+      DigestMinMessages: int
+      /// DIGEST_PROMPT bot_setting: system prompt for the morning-digest LLM call.
+      /// Default "".
+      DigestPrompt: string
+      /// INTERJECT_PROBABILITY bot_setting: roll in [0,1) gating a willingness-gated
+      /// interjection on a non-triggered, non-command text message in a target chat —
+      /// checked first (cheapest), before the burst/cooldown DB queries. Default 0.0 (off).
+      InterjectProbability: float
+      /// BURST_MSGS bot_setting: minimum non-bot `message_log` rows in the burst window
+      /// for an interjection to be eligible (`DbService.BurstStats`). Default 8.
+      BurstMsgs: int
+      /// BURST_SPEAKERS bot_setting: minimum distinct authors in the burst window.
+      /// Default 3.
+      BurstSpeakers: int
+      /// BURST_WINDOW_MINUTES bot_setting: lookback window (minutes) for the burst check.
+      /// Default 5.
+      BurstWindowMinutes: int
+      /// INTERJECT_COOLDOWN_MINUTES bot_setting: an interjection never fires while the
+      /// bot has sent ANY message (reply or a previous interjection — both are logged as
+      /// `is_bot=TRUE` message_log rows) in this chat within this many minutes
+      /// (`DbService.HasBotMessageSince`). Default 30.
+      InterjectCooldownMinutes: int
+      /// INTERJECT_PROMPT bot_setting: system prompt for the interjection LLM call —
+      /// must instruct the model to answer with exactly "PASS" (trimmed, case-
+      /// insensitive) when it has nothing worth adding. Default "".
+      InterjectPrompt: string
+      /// MEME_REACT_PROBABILITY bot_setting: roll in [0,1) gating a meme reaction on a
+      /// non-triggered photo message in a target chat. Default 0.0 (off).
+      MemeReactProbability: float
+      /// MEME_REACT_PROMPT bot_setting: system prompt for the meme-reaction vision LLM
+      /// call — must instruct the model to answer with strict JSON
+      /// {"action":"react|comment|pass","emoji":"...","text":"..."}; "react" picks ONE
+      /// emoji from the same Telegram-allowed reaction set the S6 outcome router uses.
+      /// Default "".
+      MemeReactPrompt: string
       TestMode: bool }

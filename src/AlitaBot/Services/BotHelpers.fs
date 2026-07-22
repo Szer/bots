@@ -1,12 +1,26 @@
 module AlitaBot.Services.BotHelpers
 
+open System
 open System.Collections.Concurrent
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
+open AlitaBot
 open BotInfra
 
 module Req = Funogram.Telegram.Req
+
+/// Bot user id is the numeric prefix of the bot token ("123456:ABC-..." -> 123456).
+/// Shared by every service that logs the bot's own `message_log` rows (BotService,
+/// DigestService/Slice 8) — a single source of truth instead of each service parsing
+/// `BotToken` itself.
+let botUserId (conf: BotConfiguration) =
+    match conf.BotToken.Split(':') with
+    | [||] -> 0L
+    | parts ->
+        match Int64.TryParse parts[0] with
+        | true, v -> v
+        | _ -> 0L
 
 // ── ITelegramApi call wrappers ──────────────────────────────────────────
 // All of these throw TelegramApiException on a Telegram API error (CallExn).

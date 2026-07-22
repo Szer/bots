@@ -7,6 +7,8 @@ open Dapper
 open Npgsql
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
+open Microsoft.Extensions.Options
+open AlitaBot
 open AlitaBot.Telemetry
 open BotInfra
 
@@ -101,16 +103,19 @@ WHERE job_name = @jobName;
             return ()
         }
 
-/// Hosted background service driving the nightly dossier job, plus a TEST_MODE hook
-/// (`RunJobNow`, wired to `/test/run-job?name=` in Program.fs) that runs it immediately,
-/// bypassing the lease/schedule check entirely — mirrors the old `SchedulerService`'s
-/// `RunJobNow`. Ticks every 10 minutes; `tryAcquire`'s own `scheduledTime` check is what
-/// actually gates whether today's run has become due, not the tick interval.
+/// Hosted background service driving the nightly dossier job and (Slice 8) the daily
+/// morning digest job, plus a TEST_MODE hook (`RunJobNow`, wired to `/test/run-job?name=`
+/// in Program.fs) that runs either immediately, bypassing the lease/schedule check
+/// entirely — mirrors the old `SchedulerService`'s `RunJobNow`. Ticks every 10 minutes;
+/// `tryAcquire`'s own `scheduledTime` check is what actually gates whether today's run has
+/// become due, not the tick interval.
 type SchedulerHostedService
     (
         connString: string,
         time: TimeProvider,
         dossier: DossierService,
+        digest: DigestService,
+        options: IOptions<BotConfiguration>,
         logger: ILogger<SchedulerHostedService>
     ) =
     inherit BackgroundService()
@@ -120,6 +125,9 @@ type SchedulerHostedService
 
     [<Literal>]
     let DossierScheduledHourUtc = 2
+
+    [<Literal>]
+    let DigestJobName = "digest_daily"
 
     let podId = Environment.MachineName
 
@@ -137,6 +145,24 @@ type SchedulerHostedService
                     logger.LogError(ex, "ScheduledJobs: {Job} failed", DossierJobName)
         }
 
+    /// `DIGEST_UTC_HOUR` is a hot-reloadable `bot_setting` (unlike the dossier job's
+    /// compile-time-fixed hour) — read fresh from `options.Value` on every tick so a
+    /// live change takes effect on the very next tick, no restart needed.
+    let runDigestJob () =
+        task {
+            let scheduledHour = options.Value.DigestUtcHour
+            let! acquired =
+                ScheduledJobs.tryAcquire connString time DigestJobName (TimeSpan.FromHours(float scheduledHour)) podId
+            if acquired then
+                logger.LogInformation("ScheduledJobs: acquired {Job}", DigestJobName)
+                try
+                    do! digest.RunDailyDigest()
+                    do! ScheduledJobs.complete connString time DigestJobName
+                    logger.LogInformation("ScheduledJobs: completed {Job}", DigestJobName)
+                with ex ->
+                    logger.LogError(ex, "ScheduledJobs: {Job} failed", DigestJobName)
+        }
+
     override _.ExecuteAsync(ct: CancellationToken) =
         task {
             use timer = new PeriodicTimer(TimeSpan.FromMinutes 10.0, time)
@@ -144,6 +170,10 @@ type SchedulerHostedService
                 if not ct.IsCancellationRequested then
                     try
                         do! runDossierJob ()
+                    with ex ->
+                        logger.LogError(ex, "ScheduledJobs: error during tick")
+                    try
+                        do! runDigestJob ()
                     with ex ->
                         logger.LogError(ex, "ScheduledJobs: error during tick")
         }
@@ -173,10 +203,17 @@ type SchedulerHostedService
                         do! ScheduledJobs.completeTestTriggered connString DossierJobName
                     }
                     :> Task)
+            | n when n = DigestJobName ->
+                fireAndForget logger "scheduled_jobs.run_now" (fun () ->
+                    task {
+                        do! digest.RunDailyDigest ()
+                        do! ScheduledJobs.completeTestTriggered connString DigestJobName
+                    }
+                    :> Task)
             | other -> logger.LogWarning("ScheduledJobs: unknown job {Job}", other)
         }
 
     /// Whether `jobName` is one `RunJobNow` recognizes — `/test/run-job` uses this to 404
     /// unknown names up front rather than accepting the request and then just logging a
     /// warning from inside the fire-and-forget task.
-    member _.IsKnownJob(jobName: string) : bool = jobName = DossierJobName
+    member _.IsKnownJob(jobName: string) : bool = jobName = DossierJobName || jobName = DigestJobName

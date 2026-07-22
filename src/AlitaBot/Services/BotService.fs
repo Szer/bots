@@ -44,6 +44,11 @@ type QuoteEntry =
       Quote: string
       Comment: string }
 
+/// The meme-react vision LLM's strict JSON contract (Slice 8) — see
+/// `BotService.parseMemeJson`. Missing `emoji`/`text` fields default to "" (only `action`
+/// is required to parse at all, since only one of the two ever matters per action).
+type MemeAction = { Action: string; Emoji: string; Text: string }
+
 type BotService(
     options: IOptions<BotConfiguration>,
     db: DbService,
@@ -95,14 +100,10 @@ type BotService(
         | Some last -> $"{u.FirstName} {last}"
         | None -> u.FirstName
 
-    /// Bot user id is the numeric prefix of the bot token ("123456:ABC-..." -> 123456).
-    let botUserId (conf: BotConfiguration) =
-        match conf.BotToken.Split(':') with
-        | [||] -> 0L
-        | parts ->
-            match Int64.TryParse parts[0] with
-            | true, v -> v
-            | _ -> 0L
+    /// Bot user id is the numeric prefix of the bot token — moved to `BotHelpers` (Slice 8:
+    /// `DigestService` needs it too) and aliased here so every existing `botUserId conf`
+    /// call site in this file is untouched.
+    let botUserId = BotHelpers.botUserId
 
     /// Checks a `@username` mention against whichever entity array corresponds to
     /// `text` — `Entities` for a text message, `CaptionEntities` for a photo's caption
@@ -298,11 +299,210 @@ type BotService(
                     logger.LogWarning(ex, "Outcome=emoji: SetMessageReaction failed for message {MessageId}", msg.MessageId)
         }
 
+    // ── Proactive behavior (Slice 8: interjections, meme reactions) ─────────
+    //
+    // Both hooks below fire from handleTriggerableMessage's "not triggered, first
+    // delivery" branch, fire-and-forget (BotInfra.Utils.fireAndForget) — never on the
+    // request path that just logged the message. Each takes withChatLock itself: since
+    // fireAndForget starts the task inline but the outer withChatLock callback (still
+    // executing synchronously up to that point) finishes and releases the semaphore
+    // before this task's own WaitAsync ever completes, there's no deadlock — the
+    // interjection/meme-react work simply queues behind whatever else touches this chat's
+    // lock next, same serialization guarantee normal triggered messages get.
+
+    let buildTranscript (rows: MessageLogRow[]) : string =
+        rows |> Array.map (fun r -> $"[{r.display_name}]: {r.text}") |> String.concat "\n"
+
+    let interjectRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.InterjectPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text transcript ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    /// Willingness-gated interjection (plan §2): INTERJECT_PROBABILITY roll, then a burst
+    /// check (>= BURST_MSGS messages from >= BURST_SPEAKERS distinct users in the last
+    /// BURST_WINDOW_MINUTES, DbService.BurstStats), then a cooldown check (no bot message
+    /// in this chat in the last INTERJECT_COOLDOWN_MINUTES, DbService.HasBotMessageSince)
+    /// — cheapest check first, no DB round trip at all when the roll itself fails. Only
+    /// once all three hold does the recent-context INTERJECT_PROMPT LLM call fire; a
+    /// "PASS" (trim/case-insensitive) response stays silent, anything else goes out as a
+    /// plain (non-reply) message and is logged like any other bot reply.
+    let tryInterject (conf: BotConfiguration) (msg: Message) (from: User) : Task<unit> =
+        withChatLock msg.Chat.Id (fun () ->
+            task {
+                if Random.Shared.NextDouble() >= conf.InterjectProbability then
+                    return ()
+                else
+                    let burstSince = time.GetUtcNow().UtcDateTime.AddMinutes(-float conf.BurstWindowMinutes)
+                    let! burst = db.BurstStats(msg.Chat.Id, burstSince)
+
+                    if burst.message_count < int64 conf.BurstMsgs || burst.distinct_users < int64 conf.BurstSpeakers then
+                        return ()
+                    else
+                        let cooldownSince = time.GetUtcNow().UtcDateTime.AddMinutes(-float conf.InterjectCooldownMinutes)
+                        let! onCooldown = db.HasBotMessageSince(msg.Chat.Id, cooldownSince)
+
+                        if onCooldown then
+                            return ()
+                        else
+                            let! rows = db.RecentContext(msg.Chat.Id, conf.ContextWindowMessages)
+                            let transcript = buildTranscript rows
+                            let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+
+                            match! chat.Complete(interjectRequest conf transcript, ctx, CancellationToken.None) with
+                            | Error err -> logger.LogWarning("Interject: LLM call failed: {Error}", string err)
+                            | Ok resp when String.IsNullOrWhiteSpace resp.Text ->
+                                logger.LogWarning("Interject: LLM returned empty text — staying silent")
+                            | Ok resp when resp.Text.Trim().Equals("PASS", StringComparison.OrdinalIgnoreCase) ->
+                                Metrics.proactiveTotal.Add(1L, KeyValuePair("kind", box "interject_pass"))
+                            | Ok resp ->
+                                let! sent = BotHelpers.sendMessage tg msg.Chat.Id resp.Text
+                                do! logAndEmbed conf (
+                                        logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                            None resp.Text)
+                                    |> taskIgnore
+                                Metrics.proactiveTotal.Add(1L, KeyValuePair("kind", box "interject"))
+            })
+
+    /// Parses the meme-react vision LLM's strict JSON contract (`MemeAction`, above) — a
+    /// missing/non-string `action`, or non-object/malformed JSON overall, is `None`; the
+    /// caller treats that the same as an explicit "pass" (plus a Warning log).
+    let parseMemeJson (json: string) : MemeAction option =
+        try
+            use doc = JsonDocument.Parse(json: string)
+            if doc.RootElement.ValueKind <> JsonValueKind.Object then
+                None
+            else
+                match doc.RootElement.TryGetProperty "action" with
+                | true, a when a.ValueKind = JsonValueKind.String ->
+                    let stringOr (prop: string) =
+                        match doc.RootElement.TryGetProperty prop with
+                        | true, v when v.ValueKind = JsonValueKind.String -> v.GetString()
+                        | _ -> ""
+                    Some { Action = a.GetString(); Emoji = stringOr "emoji"; Text = stringOr "text" }
+                | _ -> None
+        with _ ->
+            None
+
+    /// Downloads `msg`'s largest photo and re-encodes it as a base64 data: URL — same
+    /// shape as ResponderService's vision fetch, duplicated locally (not shared) since it's
+    /// a two-line wrapper and ResponderService's version is private to that type.
+    let tryFetchPhotoImagePart (conf: BotConfiguration) (msg: Message) : Task<ContentPart option> =
+        task {
+            match BotHelpers.largestPhoto msg with
+            | None -> return None
+            | Some photo ->
+                try
+                    let! file = tg.CallExn(Req.GetFile.Make(photo.FileId))
+                    match file.FilePath with
+                    | None -> return None
+                    | Some fp when String.IsNullOrWhiteSpace fp -> return None
+                    | Some fp ->
+                        let! bytes = tg.DownloadFile fp
+                        let url = $"data:image/jpeg;base64,{Convert.ToBase64String bytes}"
+                        return Some(ContentPart.ImageUrl(url, Some conf.VisionDetail))
+                with ex ->
+                    logger.LogWarning(ex, "Meme react: failed to fetch photo {FileId} — skipping", photo.FileId)
+                    return None
+        }
+
+    let memeReactRequest (conf: BotConfiguration) (imagePart: ContentPart) (caption: string) : ChatRequest =
+        let captionLine = if caption = "" then "" else $"\n\nПодпись к фото: {caption}"
+        { Deployment = conf.LlmDeployment
+          Messages =
+            [ { Role = ChatRole.System
+                Content = [ ContentPart.Text conf.MemeReactPrompt ]
+                ToolCalls = []
+                ToolCallId = None }
+              { Role = ChatRole.User
+                Content = [ ContentPart.Text $"Оцени это фото.{captionLine}"; imagePart ]
+                ToolCalls = []
+                ToolCallId = None } ]
+          Tools = []
+          Temperature = None
+          MaxTokens = None }
+
+    /// Meme reaction (plan §3): MEME_REACT_PROBABILITY roll, then a vision LLM call
+    /// (MEME_REACT_PROMPT) that must answer strict JSON {action,emoji,text}. "react" sets
+    /// a reaction (Req.SetMessageReaction) from the same S6 allowedReactionEmoji set — an
+    /// emoji outside that set is treated as a no-op (Warning-logged), never sent to
+    /// Telegram unchecked. "comment" sends a one-liner reply; blank text is a no-op.
+    /// "pass", an unrecognized action, a failed LLM call, or malformed JSON all count as
+    /// meme_pass — the spec's "malformed JSON -> treat as pass, log Warning".
+    let tryMemeReact (conf: BotConfiguration) (msg: Message) (from: User) : Task<unit> =
+        withChatLock msg.Chat.Id (fun () ->
+            task {
+                if Random.Shared.NextDouble() >= conf.MemeReactProbability then
+                    return ()
+                else
+                    match! tryFetchPhotoImagePart conf msg with
+                    | None -> return ()
+                    | Some imagePart ->
+                        let caption = msg.Caption |> Option.defaultValue ""
+                        let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                        let countMeme (kind: string) = Metrics.proactiveTotal.Add(1L, KeyValuePair("kind", box kind))
+
+                        match! chat.Complete(memeReactRequest conf imagePart caption, ctx, CancellationToken.None) with
+                        | Error err ->
+                            logger.LogWarning("Meme react: LLM call failed: {Error}", string err)
+                            countMeme "meme_pass"
+                        | Ok resp ->
+                            match parseMemeJson resp.Text with
+                            | None ->
+                                logger.LogWarning("Meme react: malformed JSON response — treating as pass: {Text}", resp.Text)
+                                countMeme "meme_pass"
+                            | Some m ->
+                                match m.Action.Trim().ToLowerInvariant() with
+                                | "react" when Array.contains m.Emoji allowedReactionEmoji ->
+                                    let reaction = [| ReactionType.Emoji(ReactionTypeEmoji.Create(``type`` = "emoji", emoji = m.Emoji)) |]
+                                    try
+                                        do! tg.CallExn(Req.SetMessageReaction.Make(msg.Chat.Id, msg.MessageId, reaction = reaction)) |> taskIgnore
+                                        countMeme "meme_react"
+                                    with ex ->
+                                        logger.LogWarning(ex, "Meme react: SetMessageReaction failed for message {MessageId}", msg.MessageId)
+                                        countMeme "meme_pass"
+                                | "react" ->
+                                    logger.LogWarning("Meme react: disallowed/empty emoji '{Emoji}' — skipping", m.Emoji)
+                                    countMeme "meme_pass"
+                                | "comment" when not (String.IsNullOrWhiteSpace m.Text) ->
+                                    let! sent = BotHelpers.sendTextReply tg msg.Chat.Id m.Text msg.MessageId
+                                    do! logAndEmbed conf (
+                                            logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
+                                                (Some msg.MessageId) m.Text)
+                                        |> taskIgnore
+                                    countMeme "meme_comment"
+                                | "comment" ->
+                                    logger.LogWarning("Meme react: comment action with empty text — skipping")
+                                    countMeme "meme_pass"
+                                | "pass" -> countMeme "meme_pass"
+                                | other ->
+                                    logger.LogWarning("Meme react: unknown action '{Action}' — treating as pass", other)
+                                    countMeme "meme_pass"
+            })
+
     /// Shared by plain text messages and photo messages: logs `logText` to message_log,
     /// checks `triggerText` (raw text/caption, matching whatever entity array the mention
     /// offsets are relative to) for a trigger, and — when triggered — rolls the outcome
-    /// router before dispatching to the responder.
-    let handleTriggerableMessage (conf: BotConfiguration) (msg: Message) (from: User) (logText: string) (triggerText: string) =
+    /// router before dispatching to the responder. When NOT triggered (first delivery
+    /// only, never on a duplicate), fires `onNotTriggered` fire-and-forget — Slice 8's
+    /// interjection/meme-react hooks — after logging, never delaying this response.
+    let handleTriggerableMessage
+        (conf: BotConfiguration)
+        (msg: Message)
+        (from: User)
+        (logText: string)
+        (triggerText: string)
+        (onNotTriggered: (unit -> Task<unit>) option)
+        =
         task {
             use a = botActivity.StartActivity("handleMessage")
             %a.SetTag("chatId", msg.Chat.Id)
@@ -346,10 +546,13 @@ type BotService(
             else
                 %a.SetTag("outcome", "logged")
                 countOutcome "logged"
+                match onNotTriggered with
+                | Some hook -> fireAndForget logger "proactive.hook" (fun () -> hook () :> Task)
+                | None -> ()
         }
 
     let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
-        handleTriggerableMessage conf msg from text text
+        handleTriggerableMessage conf msg from text text (Some(fun () -> tryInterject conf msg from))
 
     /// Photo message flow: logs as `[photo] {caption}` (bare `[photo]` for no caption,
     /// mirroring S1's `[voice]` convention) and checks the RAW caption — not the logged
@@ -360,7 +563,7 @@ type BotService(
     let handlePhotoMessage (conf: BotConfiguration) (msg: Message) (from: User) =
         let caption = msg.Caption |> Option.defaultValue ""
         let logText = if caption = "" then "[photo]" else $"[photo] {caption}"
-        handleTriggerableMessage conf msg from logText caption
+        handleTriggerableMessage conf msg from logText caption (Some(fun () -> tryMemeReact conf msg from))
 
     /// Voice/VideoNote/Audio flow: download -> transcribe -> reply as an expandable
     /// blockquote (+ TL;DR when long) -> log both the sender's transcript and the bot's
@@ -728,8 +931,9 @@ type BotService(
           Temperature = None
           MaxTokens = None }
 
-    let buildTranscript (rows: MessageLogRow[]) : string =
-        rows |> Array.map (fun r -> $"[{r.display_name}]: {r.text}") |> String.concat "\n"
+    // buildTranscript (rows |> [{display_name}]: text, joined) moved up next to the
+    // Slice 8 proactive-behavior section — it's shared by /summary here and
+    // tryInterject's recent-context LLM call.
 
     /// `/summary [count]` — speaker-attributed transcript of the last `count` (default
     /// SummaryDefaultCount, capped SummaryMaxCount) message_log rows for this chat, fed

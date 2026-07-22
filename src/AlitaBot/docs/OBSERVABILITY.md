@@ -27,6 +27,10 @@ This file only documents what's specific to AlitaBot.
   extract` (tagged `userId`, `candidateFacts`, `insertedFacts`, `outcome` on failure) and
   `dossier.merge` (tagged `userId`, `newFacts`, `outcome` ∈ `merged`/`empty_response`/
   `merge_failed` — only started when at least one fact was actually new).
+- Digest job span (Slice 8, `src/AlitaBot/Services/DigestService.fs`, one per target chat
+  per daily run — also not parented under `postUpdate`, same scheduler-driven reasoning as
+  the dossier spans above): `digest.generate`, tagged `chatId`, `messageCount`, `outcome` ∈
+  `below_min_messages` / `sent` / `empty_response` / `failed`.
 
 ## Logging
 
@@ -59,6 +63,7 @@ Meter: `AlitaBot.Metrics` (`src/AlitaBot/Telemetry.fs`, `src/AlitaBot/Llm/LlmTel
 | `alitabot_llm_latency_ms` | Histogram | — | Latency of every LLM/STT/TTS/image-gen call (span-scoped: for streamed chat, first byte to `[DONE]`). Not broken out by call type via a tag — use the span name (`llm.chat`/`llm.stt`/etc.) in Tempo to filter by operation. |
 | `alitabot_embedding_failures_total` | Counter | — | Embedding-pipeline failures (Slice 5a) — an `LlmError` from `IEmbeddings.Embed` or an exception inserting the `message_embedding` row. Always Warning-logged alongside this counter; never affects the reply path (`BotService`'s `tryEmbed`, fire-and-forget). Should stay near zero — a sustained nonzero rate means embeddings are silently failing to build `/ask`'s memory. |
 | `alitabot_mdv2_fallback_total` | Counter | — | MarkdownV2-formatted final-message deliveries Telegram rejected (400 bad entities) — Slice 6, `Mdv2Delivery` (`Services/ReplyRenderer.fs`). Always Warning-logged alongside this counter; the renderer always falls back to a plain-text resend/edit, so this never turns into a lost reply. Should stay near zero — a sustained nonzero rate means `MarkdownRenderer.toMarkdownV2` is producing entities Telegram doesn't accept. |
+| `alitabot_proactive_total` | Counter | `kind` | Slice 8 proactive-behavior actions. `kind` ∈ `digest` (a morning digest actually sent), `interject` (a willingness-gated interjection sent), `interject_pass` (the interjection LLM call answered PASS), `meme_react`/`meme_comment`/`meme_pass` (the meme-reaction vision call's outcome). Every underlying feature defaults OFF/0.0 in seeds (`DIGEST_ENABLED=false`, `INTERJECT_PROBABILITY=0.0`, `MEME_REACT_PROBABILITY=0.0`) — this stays at 0 in prod until hand-enabled live via `bot_setting`. |
 
 ## Persistent usage accounting (`llm_usage`, Phase-1 Slice 4)
 
@@ -80,6 +85,7 @@ accounting" section for the exact write path and nullability rules.
 - Embedding failure rate (should be ~0): `sum(rate(alitabot_embedding_failures_total[1h]))`
 - MDV2 fallback rate (should be ~0): `sum(rate(alitabot_mdv2_fallback_total[1h]))`
 - Outcome-router mix (24h): `sum by (outcome)(increase(alitabot_messages_total{outcome=~"replied|logged|silence|emoji"}[24h]))`
+- Proactive-behavior mix (24h, Slice 8 — 0 until enabled): `sum by (kind)(increase(alitabot_proactive_total[24h]))`
 
 ## Webhook idempotency and per-chat serialization
 
