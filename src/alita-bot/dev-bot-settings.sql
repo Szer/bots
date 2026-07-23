@@ -58,6 +58,14 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('REWRITER_ENABLED',        'false',                                                  'FEATURE_FLAG', 'llm',        'Second, cheap non-stream LLM call rewrites the final reply text before rendering ("перепиши как живой человек в чате")'),
     ('REWRITER_PROMPT',         'Перепиши следующий ответ так, как будто его написал живой человек в чате: убери ассистентские обороты и канцелярит, сократи, где можно, сохрани смысл и все факты. Ответь только переписанным текстом, без пояснений.', 'FREE_FORM', 'llm', 'System prompt for the rewriter pass (only used when REWRITER_ENABLED=true)'),
     ('OUTCOME_WEIGHTS',         '{"reply":100,"silence":0,"emoji":0}',                    'JSON_BLOB',    'llm',        'Weighted roll for a TRIGGERED non-command message: reply (normal path) | silence (say nothing) | emoji (react instead of replying) — see Services/OutcomeRouter.fs'),
+    -- Emoji-reaction expansion: the palette both the S6 emoji outcome and the S8 meme-react
+    -- "react" action pick from — hot-reloadable so the set/mode can be tuned live without a
+    -- redeploy. A generous but every-entry-valid set (verified against Telegram's documented
+    -- setMessageReaction allowed list — the classics 😁🔥👍💩🤡🥱 plus "❤" WITHOUT the
+    -- trailing variation selector: "❤️" (with VS16) is NOT on Telegram's list and would be
+    -- silently dropped with a Warning at parse time, see OutcomeRouter.parsePalette).
+    ('REACTION_PALETTE',        '["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱","👏","🥰","😍","💯","🤣","😎","🙏","👌"]', 'JSON_BLOB', 'llm', 'Emoji pool for the S6 emoji outcome and S8 meme-react "react" action — validated against Telegram''s allowed reaction-emoji set, see OutcomeRouter.parsePalette'),
+    ('REACTION_CHOICE_MODE',    'llm',                                                    'FREE_FORM',    'llm',        'random | llm — how the S6 emoji outcome picks from REACTION_PALETTE; "llm" makes a cheap gpt-5-mini call to pick the best-fitting emoji, falling back to random on failure'),
     -- Slice 7: social engine (/roast, /awards, /quote, /karma). Zero-censorship, dark-humor-
     -- normal ~30-person IT chat — prompts are deliberately sharp, not corporate-soft; the bot
     -- only roasts on explicit command.
