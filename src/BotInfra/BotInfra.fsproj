@@ -17,6 +17,7 @@
     <Compile Include="JsonLogging.fs" />
     <Compile Include="Observability.fs" />
     <Compile Include="TelegramApi.fs" />
+    <Compile Include="ScheduledJobs.fs" />
     <Compile Include="WebhookHost.fs" />
   </ItemGroup>
 
