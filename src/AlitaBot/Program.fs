@@ -217,10 +217,10 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<IToolExecutor, ToolExecutorService>()
     .AddSingleton<AgentToolLoop>()
     // Slice 5b: nightly per-person dossier fact extraction (Services/DossierService.fs,
-    // Services/ScheduledJobs.fs). SchedulerHostedService needs `connString` directly (the
-    // lease functions in ScheduledJobs.fs are plain functions over a connection string,
-    // like DbService itself) rather than through DbService, so it's constructed via a
-    // factory closure here instead of relying on constructor-parameter DI.
+    // Services/ScheduledJobs.fs). BotInfra.SchedulerHostedService needs `connString`
+    // directly (the lease functions in BotInfra.ScheduledJobs are plain functions over a
+    // connection string, like DbService itself) rather than through DbService, so it's
+    // constructed via a factory closure here instead of relying on constructor-parameter DI.
     .AddSingleton<DossierService>()
     // Slice 8: daily morning digest (Services/DigestService.fs) — same lease-driven
     // scheduling as DossierService, both owned by SchedulerHostedService below.
@@ -229,9 +229,11 @@ if botConfOptions.Value.TestMode then
         new SchedulerHostedService(
             connString,
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<DossierService>(),
-            sp.GetRequiredService<DigestService>(),
-            sp.GetRequiredService<IOptions<BotConfiguration>>(),
+            AlitaScheduledJobs.jobDefinitions
+                (sp.GetRequiredService<DossierService>())
+                (sp.GetRequiredService<DigestService>())
+                (sp.GetRequiredService<IOptions<BotConfiguration>>()),
+            TimeSpan.FromMinutes 10.0,
             sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
     .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
 
