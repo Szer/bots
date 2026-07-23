@@ -955,6 +955,62 @@ fragment per call, not split char-by-char). The fixture's baseline `NL_TOOLS_ENA
 keeps its pre-S10 request/response shape undisturbed — `NlToolLoopTests.fs` flips it on
 per-test.
 
+## Natural-language tool-calling: the full catalog (S10 PR2)
+
+PR2 rounds out the tool catalog to 14 tools, reusing PR1's loop/registry/executor plumbing
+unchanged:
+
+- **`generate_song`/`speak_text`** — `MediaActions.generateSong`/`speakText` (new, alongside
+  PR1's `generateImage`), shared by `/song`/`/say` and their NL tool counterparts, mirroring
+  `generateImage`'s "guardrail -> generate -> send" shape. `generateSong` also calls
+  `composeCaption` (kind="песню") — the delivered audio's `sendAudio` title is now the
+  composed persona reaction, not a (truncated) echo of the lyrics/description prompt (same
+  OQ3 fix PR1 applied to `/img`; `message_log`'s `/song` bot row is now `[song] {caption}`).
+  `speak_text` does NOT call `composeCaption` — the spoken text already IS the content (there's
+  nothing to react to that isn't already itself), so its "caption" (for the duplicate-final-
+  reply guard and `message_log`) is the spoken text verbatim, same as `/say`'s existing
+  `[voice] {text}` convention. `tryConvertToOggOpus`/`tryConvertToMp3`/`isOggContainer`/
+  `SongTitleMaxLen` moved into `MediaActions.fs` (the ffmpeg re-encode + title-building now
+  happens where the send itself happens); `parseSongArgs`/`parseSayArgs`/`validTtsVoices` stay
+  in `BotService.fs` — pure command-syntax parsing the NL tools don't need (the model supplies
+  structured `style`/`voice`/`text` arguments directly instead of sniffing the first token).
+- **`sql_query`** (`AdminOnly = true`) — wraps the exact same `SqlGuard`/read-only-connection
+  core `/sql` uses (`CommandCores.sqlCore`); `ToolRegistry.availableToolDefs` filters it out of
+  a non-admin caller's tools array entirely (the model never even sees it exists), and the
+  executor re-checks `ctx.IsAdmin` belt-and-braces, mirroring `/sql`'s own `Admin.isAdmin` gate.
+- **Read-only tools** — `ask_chat_history`, `summarize_chat`, `show_dossier`, `roast_user`,
+  `show_awards`, `show_quote`, `show_karma`, `switch_model`, `show_usage`: thin wrappers over
+  the exact same DB-read/LLM-call "cores" the matching commands use. Neither `/model` nor
+  `/usage` has ever been admin-gated, so `switch_model`/`show_usage` aren't either.
+
+**`Services/CommandCores.fs`** (new, compiled right after `Admin.fs`) is the PR2-equivalent of
+PR1's `MediaActions.fs` extraction: every command handler's "core" (target resolution, DB
+reads, the JSON-contract LLM calls, rendering) that previously lived inline inside
+`BotService.fs`'s `let`-bound closures moved here as free functions taking explicit
+parameters, so both a command handler's `reply` wrapper AND `ToolExecutorService`'s dispatch
+call the literal same function. `BotService.fs` rebinds them locally (`let askCore =
+CommandCores.askCore db embeddings chat logger`, etc.) exactly like it already does for
+`MessageLog.logRow`/`Admin.isAdmin` — every existing command handler's outer "shell" (log the
+command row, send the reply, log the bot's row, `alitabot_command_total`/outcome tagging) is
+untouched; only the "what do we actually answer" logic moved.
+
+`ToolExecContext` gained `UserDisplayName` — `roast_user`'s self-target resolution needs a
+display name the way the command path derives one from `msg.From`, but a tool call has no
+`User` object of its own; `ResponderService.Respond` populates it from the triggering
+message's author.
+
+`ToolExecResult.Outcome`'s small controlled vocabulary (`"ok"` / `"denied_cooldown"` / etc.)
+is preserved for the read-only tools via `ToolExecutor.ToolOutcome.classify`, a keyword-based
+mapping from `CommandCores`' granular per-branch outcome strings (`"dossier_shown"`,
+`"roast_cooldown"`, `"sql_refused_non_admin"`, ...) — the same strings `BotService`'s
+`countOutcome` telemetry already uses — down to the metric-cardinality-bounded set
+`alitabot_tool_call_total` expects, without making every read-only core aware of the tool
+layer's vocabulary.
+
+`rateLimitedKinds` in `ToolExecutorService` grows `"music"` (generate_song shares
+generate_image/web_search's existing per-user hourly bucket); `speak_text` and every read-only
+tool are NOT rate-limited, mirroring their command paths (no cooldown beyond a length cap).
+
 ## Empirical draft-semantics findings (M5)
 
 Bot API 10.x's `sendMessageDraft` / `sendRichMessageDraft` are undocumented in our codebase

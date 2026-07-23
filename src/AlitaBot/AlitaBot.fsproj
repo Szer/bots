@@ -13,6 +13,7 @@
     <Compile Include="Services/BotHelpers.fs" />
     <Compile Include="Services/MessageLog.fs" />
     <Compile Include="Services/Admin.fs" />
+    <Compile Include="Services/CommandCores.fs" />
     <Compile Include="Services/MediaActions.fs" />
     <Compile Include="Services/MarkdownRenderer.fs" />
     <Compile Include="Services/OutcomeRouter.fs" />

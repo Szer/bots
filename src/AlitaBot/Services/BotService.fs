@@ -4,7 +4,6 @@ open System
 open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
-open System.IO
 open System.Text.Json
 open System.Text.RegularExpressions
 open System.Threading
@@ -19,31 +18,13 @@ open BotInfra
 
 module Req = Funogram.Telegram.Req
 
-// ── Social engine (Slice 7) request/response shapes ─────────────────────────
+// ── Module-level shapes still local to BotService ────────────────────────────
 //
 // Module-level (not nested in BotService) — F# doesn't support type declarations inside
 // a class's `let`-bound implementation section, only at module/namespace scope.
-
-/// `/roast`'s resolved target: a user_id plus the display name shown in the LLM prompt.
-type RoastTarget = { UserId: int64; DisplayName: string }
-
-/// `/roast`'s gathered ammunition — see `BotService.gatherRoastAmmo`.
-type RoastAmmo =
-    { DossierSummary: string option
-      Facts: string list
-      Messages: string list }
-
-/// One entry of the `/awards` LLM's JSON array — see `BotService.parseAwardsJson`.
-type AwardEntry =
-    { Title: string
-      User: string
-      EvidenceQuote: string }
-
-/// The `/quote` LLM's JSON object — see `BotService.parseQuoteJson`.
-type QuoteEntry =
-    { Author: string
-      Quote: string
-      Comment: string }
+// RoastTarget/RoastAmmo/AwardEntry/QuoteEntry/LlmModelEntry moved to CommandCores.fs (S10
+// PR2 prerequisite, mirroring PR1's MessageLog/Admin/MediaActions extraction) — their
+// cores are now shared with the read-only NL tools; see CommandCores.fs's header comment.
 
 /// The meme-react vision LLM's strict JSON contract (Slice 8) — see
 /// `BotService.parseMemeJson`. Missing `emoji`/`text` fields default to "" (only `action`
@@ -51,7 +32,9 @@ type QuoteEntry =
 type MemeAction = { Action: string; Emoji: string; Text: string }
 
 /// `/say`'s optional leading voice-name token, resolved against `validTtsVoices` (Slice 9
-/// stretch) — module-level for the same reason as RoastTarget/MemeAction above.
+/// stretch) — module-level for the same reason as MemeAction above. Command-syntax
+/// parsing only (S10 PR2: the `speak_text` NL tool takes an explicit `voice` argument
+/// instead of this ambiguous first-token sniffing), so it stays here, not CommandCores.
 [<RequireQualifiedAccess>]
 type SayVoiceArg =
     /// No voice token present — use TTS_DEFAULT_VOICE.
@@ -61,13 +44,6 @@ type SayVoiceArg =
     /// A single leftover token that isn't a recognized voice name — only reported when
     /// there's no other plausible reading (see BotService.parseSayArgs).
     | Invalid of string
-
-/// One entry of the LLM_MODELS bot_setting (`/model`'s catalog) — module-level for the
-/// same reason as RoastTarget/MemeAction above. A real, user-facing model name paired
-/// with the Azure AI Foundry deployment id that actually serves it. `Deployment` is
-/// wire-call plumbing ONLY — see BotService.handleModelCommand's doc comment for why it
-/// must never reach a user-facing string.
-type LlmModelEntry = { Model: string; Deployment: string }
 
 type BotService(
     options: IOptions<BotConfiguration>,
@@ -172,6 +148,24 @@ type BotService(
     let logRow = MessageLog.logRow time
     let logAndEmbed = MessageLog.logAndEmbed logger embeddings db
 
+    /// Command "cores" — extracted to Services/CommandCores.fs (S10 PR2 prerequisite) so
+    /// the read-only NL tools (ask_chat_history, summarize_chat, show_dossier, roast_user,
+    /// show_awards, show_quote, show_karma, switch_model, show_usage) share the EXACT SAME
+    /// DB-read + LLM-call logic every command handler below uses — rebound locally with
+    /// this file's own `db`/`chat`/`logger`/`time`/`embeddings` so every call site below
+    /// reads like a direct call, same convention as logRow/logAndEmbed above.
+    let askCore = CommandCores.askCore db embeddings chat logger
+    let summaryCore = CommandCores.summaryCore db chat logger
+    let dossierCore = CommandCores.dossierCore db
+    let roastCommandCore = CommandCores.roastCommandCore db chat logger time
+    let awardsCore = CommandCores.awardsCore db chat logger time
+    let quoteCore = CommandCores.quoteCore db chat logger time
+    let karmaCore = CommandCores.karmaCore db
+    let modelCore = CommandCores.modelCore db settingsReloader
+    let usageCore = CommandCores.usageCore db time
+    let sqlCore = CommandCores.sqlCore db chat logger
+    let buildTranscript = CommandCores.buildTranscript
+
     let tldrRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
         { Deployment = conf.LlmDeployment
           Messages =
@@ -270,8 +264,7 @@ type BotService(
     // interjection/meme-react work simply queues behind whatever else touches this chat's
     // lock next, same serialization guarantee normal triggered messages get.
 
-    let buildTranscript (rows: MessageLogRow[]) : string =
-        rows |> Array.map (fun r -> $"[{r.display_name}]: {r.text}") |> String.concat "\n"
+    // buildTranscript aliased above (CommandCores.buildTranscript) — shared with /summary.
 
     let interjectRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
         { Deployment = conf.LlmDeployment
@@ -773,158 +766,22 @@ type BotService(
     /// entry missing either field (or with an empty one) is skipped — /model's switchable
     /// list is whatever parses cleanly, same lenient posture the old MODEL_ALLOWLIST parse
     /// had.
-    let parseLlmModels (json: string) : LlmModelEntry list =
-        try
-            use doc = JsonDocument.Parse(json: string)
-            if doc.RootElement.ValueKind <> JsonValueKind.Array then
-                []
-            else
-                [ for el in doc.RootElement.EnumerateArray() do
-                    if el.ValueKind = JsonValueKind.Object then
-                        let str (name: string) =
-                            match el.TryGetProperty name with
-                            | true, v when v.ValueKind = JsonValueKind.String -> Some(v.GetString())
-                            | _ -> None
-                        match str "model", str "deployment" with
-                        | Some model, Some deployment when model <> "" && deployment <> "" ->
-                            { Model = model; Deployment = deployment }
-                        | _ -> () ]
-        with _ -> []
-
-    /// `/model` — no arg: shows the current model + every model in the LLM_MODELS
-    /// catalog (bot_setting, JSON_BLOB array of {"model","deployment"} — see
-    /// `LlmModelEntry`/`parseLlmModels`). With an arg: if it matches an entry's `Model`
-    /// EXACTLY (zero string transformation — no prefix stripping, no substring
-    /// matching), upserts LLM_DEPLOYMENT to that entry's `Deployment` and reloads the
-    /// live BotConfiguration in-process (ISettingsReloader — the same path
-    /// `/reload-settings` uses) so the switch takes effect on the very next LLM call, not
-    /// just after a restart; otherwise a RU refusal + the model list.
-    ///
-    /// `Deployment` (the Azure AI Foundry deployment id, e.g. "alita-gpt-5-mini" — this
-    /// bot's namespacing convention on a Foundry account shared with other bots, see
-    /// dev-bot-settings.sql) is wire-call plumbing ONLY: it is never displayed, and users
-    /// never type it — staging feedback was explicit that deployment ids read as fake
-    /// model names ("we don't have our own models"). The current LLM_DEPLOYMENT is looked
-    /// up in the catalog to find its display name; if nothing matches (a deployment not
-    /// in LLM_MODELS, e.g. the setting is stale or empty), it's shown VERBATIM — no
-    /// cleverness, just whatever's actually configured.
+    /// `/model` — core logic (parse LLM_MODELS, show or switch) moved to
+    /// `CommandCores.modelCore` (S10 PR2) — shared with the `switch_model` NL tool, which
+    /// is NOT admin-gated either, mirroring this command.
     let handleModelCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
-        handleSimpleCommand "model" conf msg from args (fun () ->
-            task {
-                let models = parseLlmModels conf.LlmModelsJson
-                let modelList = if models.IsEmpty then "(пусто)" else models |> List.map (fun m -> m.Model) |> String.concat ", "
-                let currentModel =
-                    models
-                    |> List.tryFind (fun m -> m.Deployment = conf.LlmDeployment)
-                    |> Option.map (fun m -> m.Model)
-                    |> Option.defaultValue conf.LlmDeployment
+        handleSimpleCommand "model" conf msg from args (fun () -> modelCore conf args)
 
-                if String.IsNullOrWhiteSpace args then
-                    return $"Текущая модель: {currentModel}\nДоступные модели: {modelList}", "model_shown"
-                else
-                    match models |> List.tryFind (fun m -> m.Model = args) with
-                    | Some entry ->
-                        do! db.UpsertBotSetting("LLM_DEPLOYMENT", entry.Deployment, "FREE_FORM", "llm")
-                        do! settingsReloader.Reload()
-                        return $"Модель переключена на {entry.Model} ✅", "model_switched"
-                    | None ->
-                        return
-                            $"Такую модель не знаю и выдумывать не буду: «{args}». Выбирай из списка: {modelList}",
-                            "model_refused"
-            })
-
-    /// $-USD with 4 decimal places, invariant culture (never locale-dependent commas).
-    let formatUsd (v: decimal) =
-        "$" + v.ToString("F4", System.Globalization.CultureInfo.InvariantCulture)
-
-    /// Compact monospace-ish RU rendering of /usage's totals — no Markdown/parse_mode
-    /// (avoids escaping model/display-name text), alignment via plain padding instead.
-    let renderUsage
-        (today: UsageTotalsRow)
-        (week: UsageTotalsRow)
-        (byModel: UsageByModelRow[])
-        (byUser: UsageByUserRow[])
-        : string =
-        let header =
-            [ "📊 Usage"
-              ""
-              $"Сегодня:  {today.calls,4} выз.  {formatUsd today.cost_usd}"
-              $"7 дней:   {week.calls,4} выз.  {formatUsd week.cost_usd}" ]
-        let modelLines =
-            if byModel.Length = 0 then
-                []
-            else
-                ""
-                :: "По моделям (7 дней):"
-                :: [ for m in byModel -> $"  {m.model,-24} {m.calls,4} выз.  {formatUsd m.cost_usd}" ]
-        let userLines =
-            if byUser.Length = 0 then
-                []
-            else
-                ""
-                :: "Топ пользователей (7 дней):"
-                :: [ for u in byUser ->
-                        let name = u.display_name |> Option.ofObj |> Option.defaultValue $"id{u.user_id}"
-                        $"  {name,-24} {u.calls,4} выз.  {formatUsd u.cost_usd}" ]
-        let footer = [ ""; $"Итого за 7 дней: {formatUsd week.cost_usd}" ]
-        header @ modelLines @ userLines @ footer |> String.concat "\n"
-
-    /// `/usage` — today + last 7 days totals, by-model and top-5-by-user breakdowns
-    /// (7-day window), all read straight from `llm_usage` (see DbService).
+    /// `/usage` — core logic moved to `CommandCores.usageCore` (S10 PR2) — shared with the
+    /// `show_usage` NL tool, which is NOT admin-gated either, mirroring this command.
     let handleUsageCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
-        handleSimpleCommand "usage" conf msg from args (fun () ->
-            task {
-                let now = time.GetUtcNow().UtcDateTime
-                let todayStart = DateTime(now.Year, now.Month, now.Day, 0, 0, 0, DateTimeKind.Utc)
-                let weekStart = now.AddDays(-7.0)
-                let! today = db.UsageTotals(todayStart)
-                let! week = db.UsageTotals(weekStart)
-                let! byModel = db.UsageByModel(weekStart)
-                let! byUser = db.UsageByUser(weekStart, 5)
-                return renderUsage today week byModel byUser, "usage_shown"
-            })
+        handleSimpleCommand "usage" conf msg from args (fun () -> usageCore conf)
 
-    [<Literal>]
-    let SummaryDefaultCount = 200
-
-    [<Literal>]
-    let SummaryMaxCount = 500
-
-    /// `/summary [count]` arg parsing: a positive integer arg is capped at
-    /// SummaryMaxCount; anything else (missing, non-numeric, <= 0) falls back to
-    /// SummaryDefaultCount.
-    let parseSummaryCount (args: string) =
-        match Int32.TryParse(args.Trim()) with
-        | true, v when v > 0 -> min v SummaryMaxCount
-        | _ -> SummaryDefaultCount
-
-    let summaryRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.SummaryPrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text transcript ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    // buildTranscript (rows |> [{display_name}]: text, joined) moved up next to the
-    // Slice 8 proactive-behavior section — it's shared by /summary here and
-    // tryInterject's recent-context LLM call.
-
-    /// `/summary [count]` — speaker-attributed transcript of the last `count` (default
-    /// SummaryDefaultCount, capped SummaryMaxCount) message_log rows for this chat, fed
-    /// to a non-stream LLM call with the SUMMARY_PROMPT bot_setting, replied back as a
-    /// normal, whole-chat-visible reply. (Previously sent via Bot API 10.2's ephemeral
-    /// `sendMessage`, visible only to the requester — retired after staging feedback
-    /// found those replies invisible in practice; see the "Ephemeral message probe
-    /// [RETIRED]" section of src/AlitaBot/README.md and docs/TECH-DEBT.md for the
+    /// `/summary [count]` — core logic moved to `CommandCores.summaryCore` (S10 PR2) —
+    /// shared with the `summarize_chat` NL tool. (Previously sent via Bot API 10.2's
+    /// ephemeral `sendMessage`, visible only to the requester — retired after staging
+    /// feedback found those replies invisible in practice; see the "Ephemeral message
+    /// probe [RETIRED]" section of src/AlitaBot/README.md and docs/TECH-DEBT.md for the
     /// empirical writeup.)
     let handleSummaryCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
@@ -953,54 +810,18 @@ type BotService(
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
             else
-                let count = parseSummaryCount args
-                let! rows = db.RecentContext(msg.Chat.Id, count)
-
-                if rows.Length = 0 then
-                    do! reply "Пока обсуждать нечего — история этого чата пуста." "summary_empty_history"
-                else
-                    let transcript = buildTranscript rows
-                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-
-                    match! chat.Complete(summaryRequest conf transcript, usageCtx, CancellationToken.None) with
-                    | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> do! reply resp.Text "summary_generated"
-                    | Ok _ -> do! reply "Модель промолчала — не смогла подвести итоги." "summary_empty_response"
-                    | Error err ->
-                        logger.LogWarning("Summary generation failed: {Error}", string err)
-                        do! reply "Не получилось подвести итоги 🙁" "summary_failed"
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                let! text, outcome = summaryCore conf msg.Chat.Id usageCtx args
+                do! reply text outcome
         }
 
     // ── /ask (Slice 5a: semantic search over this chat's message_embedding) ────
+    //
+    // Core logic (embed question -> SemanticSearch -> grounded LLM answer) moved to
+    // `CommandCores.askCore` (S10 PR2) — shared with the `ask_chat_history` NL tool.
 
-    /// Context block fed to the LLM: one line per matched message, oldest first
-    /// (matches DbService.SemanticSearch's ordering) — author, date, quoted text.
-    let buildAskContext (rows: AskMatchRow[]) : string =
-        rows
-        |> Array.map (fun r -> $"""[{r.display_name}, {r.sent_at.ToString("yyyy-MM-dd")}]: {r.text}""")
-        |> String.concat "\n"
-
-    let askRequest (conf: BotConfiguration) (question: string) (context: string) : ChatRequest =
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.AskPrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text $"Вопрос: {question}\n\nСообщения из истории чата:\n{context}" ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    /// `/ask <question>` — embeds the question, pulls the ASK_TOP_K nearest
-    /// message_embedding rows for this chat above ASK_SIM_FLOOR cosine similarity
-    /// (DbService.SemanticSearch), and answers via a non-stream LLM call grounded in
-    /// that context (ASK_PROMPT). No candidates above the floor short-circuits to a
-    /// fixed RU "nothing relevant" reply — deterministic, no LLM call needed to say
-    /// there's nothing to say. Empty question -> RU usage hint, no embedding/LLM call.
+    /// `/ask <question>` — see `CommandCores.askCore`'s doc comment for the guardrails
+    /// (empty question, embed failure, no matches above the similarity floor).
     let handleAskCommand (conf: BotConfiguration) (msg: Message) (from: User) (question: string) =
         task {
             use a = botActivity.StartActivity("handleAskCommand")
@@ -1027,75 +848,21 @@ type BotService(
             if not inserted then
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
-            elif String.IsNullOrWhiteSpace question then
-                do! reply "Спроси что-нибудь про этот чат: `/ask когда договорились встретиться`." "ask_empty_question"
             else
                 let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-
-                match! embeddings.Embed(conf.EmbeddingDeployment, [ question ], usageCtx, CancellationToken.None) with
-                | Error err ->
-                    logger.LogWarning("/ask: failed to embed the question: {Error}", string err)
-                    do! reply "Не получилось разобрать вопрос 🙁" "ask_embed_failed"
-                | Ok vectors when vectors.Length = 0 || vectors[0].Length = 0 ->
-                    logger.LogWarning("/ask: embedding returned no vectors for the question")
-                    do! reply "Не получилось разобрать вопрос 🙁" "ask_embed_failed"
-                | Ok vectors ->
-                    let! matches = db.SemanticSearch(msg.Chat.Id, vectors[0], conf.AskTopK, conf.AskSimFloor)
-
-                    if matches.Length = 0 then
-                        do! reply "Ничего подходящего в истории этого чата не нашла." "ask_no_matches"
-                    else
-                        let context = buildAskContext matches
-
-                        match! chat.Complete(askRequest conf question context, usageCtx, CancellationToken.None) with
-                        | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) -> do! reply resp.Text "ask_answered"
-                        | Ok _ -> do! reply "Модель промолчала." "ask_empty_response"
-                        | Error err ->
-                            logger.LogWarning("/ask: LLM call failed: {Error}", string err)
-                            do! reply "Не получилось ответить 🙁" "ask_failed"
+                let! text, outcome = askCore conf msg.Chat.Id usageCtx question
+                do! reply text outcome
         }
 
     // ── /dossier, /forget-me (Slice 5b: per-person dossiers) ───────────────────
-
-    /// Fixed RU reply for "no dossier yet" — used both for a resolved user with no
-    /// person_dossier row, and for an unresolvable `@username`. Deliberately the same
-    /// message for both: distinguishing "never mentioned" from "unknown username" would
-    /// leak whether a given username has ever posted in the chat.
-    [<Literal>]
-    let NoDossierText = "пусто, я тебя ещё не изучила"
-
-    /// Renders a dossier's summary plus its newest `/dossier`-visible facts (already
-    /// fetched — DbService.NewestActiveFacts), newest first.
-    let renderDossier (summary: string) (facts: ActiveFactRow[]) : string =
-        if facts.Length = 0 then
-            summary
-        else
-            let factsText = facts |> Array.map (fun f -> $"- {f.content}") |> String.concat "\n"
-            $"{summary}\n\nФакты:\n{factsText}"
-
-    [<Literal>]
-    let DossierFactsShown = 5
+    //
+    // /dossier's core (resolve target -> render summary+facts, or CommandCores.NoDossierText)
+    // moved to `CommandCores.dossierCore` (S10 PR2) — shared with the `show_dossier` NL tool.
 
     /// `/dossier` (self, no arg) or `/dossier @username` (another chat member, `@`
-    /// optional) — renders the person's cumulative summary plus their newest
-    /// DossierFactsShown active facts, or NoDossierText when there's nothing yet (unknown
-    /// username, or a known user with no dossier row).
+    /// optional) — see `CommandCores.dossierCore`'s doc comment.
     let handleDossierCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
-        handleSimpleCommand "dossier" conf msg from args (fun () ->
-            task {
-                let trimmedArg = args.Trim().TrimStart('@')
-                let! targetIdOpt =
-                    if trimmedArg = "" then Task.FromResult(Some from.Id) else db.ResolveUserIdByUsername(trimmedArg)
-
-                match targetIdOpt with
-                | None -> return NoDossierText, "dossier_unknown_user"
-                | Some targetId ->
-                    match! db.GetPersonDossier(targetId) with
-                    | None -> return NoDossierText, "dossier_empty"
-                    | Some dossier ->
-                        let! facts = db.NewestActiveFacts(targetId, DossierFactsShown)
-                        return renderDossier dossier.summary facts, "dossier_shown"
-            })
+        handleSimpleCommand "dossier" conf msg from args (fun () -> dossierCore from.Id args)
 
     /// `/forget-me` — opts the requester out of memory (memory_opt_out), hard-deletes
     /// their interaction_memory/person_dossier/message_embedding rows (DbService.
@@ -1120,143 +887,13 @@ type BotService(
     // the LLM responder's own renderers use) — the LLM output is free text that may
     // legitimately contain markdown; /quote and /karma render fixed/templated RU text
     // with no markdown-sensitive content, so they stay on handleSimpleCommand's plain
-    // sendTextReply like /usage, /dossier, /forget-me.
+    // sendTextReply like /usage, /dossier, /forget-me. All four cores (target resolution,
+    // ammo gathering, the JSON-contract LLM calls, rendering) moved to CommandCores.fs
+    // (S10 PR2) — shared with roast_user/show_awards/show_quote/show_karma NL tools.
 
-    /// Calls `chat.Complete(request, ...)` and applies `tryParse` to the raw response
-    /// text; on an LLM failure OR a malformed/unparseable response, retries ONCE with the
-    /// exact same request before giving up. `/awards`/`/quote` both need a strict JSON
-    /// shape out of a free-text-capable model — this is the one retry the plan asks for,
-    /// shared so both commands get identical behavior. Returns `None` only after both
-    /// attempts fail — callers render a fixed RU failure reply in that case, never crash
-    /// or leave a half-written state (no karma rows / no quote) behind.
-    let completeJsonWithRetry (usageCtx: UsageContext) (request: ChatRequest) (tryParse: string -> 'a option) : Task<'a option> =
-        task {
-            let attempt () =
-                task {
-                    match! chat.Complete(request, usageCtx, CancellationToken.None) with
-                    | Ok resp -> return tryParse resp.Text
-                    | Error err ->
-                        logger.LogWarning("Social JSON LLM call failed: {Error}", string err)
-                        return None
-                }
-            match! attempt () with
-            | Some v -> return Some v
-            | None ->
-                logger.LogWarning("Social JSON LLM response malformed or the call failed — retrying once")
-                return! attempt ()
-        }
-
-    /// The handle a `/awards`/`/quote` transcript line attributes a message to: `@username`
-    /// when the sender has one, their `display_name` otherwise (not everyone sets a
-    /// Telegram username) — also what `/awards` asks the LLM to echo back verbatim in its
-    /// "user" field, so `handleAwardsCommand` can try to resolve it against
-    /// `message_log.username` afterwards.
-    let socialHandleOf (r: MessageLogRow) =
-        if String.IsNullOrWhiteSpace(r.username: string) then r.display_name else $"@{r.username}"
-
-    let buildHandleTranscript (rows: MessageLogRow[]) : string =
-        rows |> Array.map (fun r -> $"[{socialHandleOf r}]: {r.text}") |> String.concat "\n"
-
-    /// Defensive cleanup for a `/awards` "user" field: despite the prompt explicitly
-    /// asking for the handle WITHOUT its surrounding `[...]`, a real model (confirmed
-    /// against Azure AI Foundry in `SocialRealTests.fs`) sometimes echoes the bracketed
-    /// form verbatim from the transcript line (e.g. `"[Ayrat Ru]"` instead of `"Ayrat Ru"`)
-    /// — stripped here so both the `@username` resolution check and the rendered
-    /// announcement/stored `karma.username` are never left with stray brackets.
-    let stripUserHandleBrackets (s: string) =
-        let t = s.Trim()
-        if t.Length >= 2 && t.StartsWith "[" && t.EndsWith "]" then t.Substring(1, t.Length - 2).Trim() else t
-
-    // ── /roast ───────────────────────────────────────────────────────────────
-
-    [<Literal>]
-    let RoastMessagesLimit = 50
-
-    [<Literal>]
-    let RoastFactsK = 8
-
-    [<Literal>]
-    let NoRoastDataText = "этого кадра я ещё не изучила"
-
-    [<Literal>]
-    let RoastCooldownText = "этого уже жарили, дай остыть"
-
-    /// Resolves `/roast`'s target: an explicit `@username`/`username` arg (message_log
-    /// lookup for user_id + display_name — `None` when nobody with that username has ever
-    /// been logged, treated the same as "no data" by the caller); otherwise the message
-    /// being replied to's author; otherwise the invoker themselves.
-    let resolveRoastTarget (msg: Message) (from: User) (args: string) : Task<RoastTarget option> =
-        task {
-            let trimmed = args.Trim().TrimStart('@')
-            if trimmed <> "" then
-                match! db.ResolveUserByUsername(trimmed) with
-                | Some(uid, name) -> return Some { UserId = uid; DisplayName = name }
-                | None -> return None
-            else
-                match msg.ReplyToMessage |> Option.bind (fun r -> r.From) with
-                | Some u -> return Some { UserId = u.Id; DisplayName = displayNameOf u }
-                | None -> return Some { UserId = from.Id; DisplayName = displayNameOf from }
-        }
-
-    let roastAmmoIsEmpty (ammo: RoastAmmo) =
-        ammo.DossierSummary.IsNone && ammo.Facts.IsEmpty && ammo.Messages.IsEmpty
-
-    /// Gathers `/roast`'s ammunition for `target`: dossier summary + up to RoastFactsK
-    /// newest active interaction_memory facts (no similarity filter — same "just take the
-    /// newest" posture as `/dossier`'s NewestActiveFacts, unlike ResponderService's
-    /// similarity-scored recall) + up to RoastMessagesLimit of the target's own recent
-    /// message_log texts. An opted-out (`memory_opt_out`) target gets roasted ONLY from
-    /// their recent messages — dossier/facts are never read for them, respecting the same
-    /// boundary `/forget-me` established elsewhere in the bot.
-    let gatherRoastAmmo (target: RoastTarget) : Task<RoastAmmo> =
-        task {
-            let! optedOut = db.IsOptedOut(target.UserId)
-            let! recentRows = db.UserRecentMessages(target.UserId, RoastMessagesLimit)
-            let messages = recentRows |> Array.map (fun r -> r.text) |> Array.toList
-            if optedOut then
-                return { DossierSummary = None; Facts = []; Messages = messages }
-            else
-                let! dossierOpt = db.GetPersonDossier(target.UserId)
-                let! facts = db.NewestActiveFacts(target.UserId, RoastFactsK)
-                return
-                    { DossierSummary = dossierOpt |> Option.map (fun d -> d.summary)
-                      Facts = facts |> Array.map (fun f -> f.content) |> Array.toList
-                      Messages = messages }
-        }
-
-    let roastRequest (conf: BotConfiguration) (targetName: string) (ammo: RoastAmmo) : ChatRequest =
-        let parts =
-            [ ammo.DossierSummary |> Option.map (fun s -> $"Досье:\n{s}")
-              (if ammo.Facts.IsEmpty then
-                   None
-               else
-                   Some("Факты:\n" + (ammo.Facts |> List.map (fun f -> $"- {f}") |> String.concat "\n")))
-              (if ammo.Messages.IsEmpty then
-                   None
-               else
-                   Some("Сообщения:\n" + (ammo.Messages |> List.map (fun m -> $"- {m}") |> String.concat "\n"))) ]
-            |> List.choose id
-        let body = String.concat "\n\n" parts
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.RoastPrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text $"Цель: {targetName}\n\n{body}" ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    /// `/roast [@username | reply-to-target]` — see `resolveRoastTarget`/`gatherRoastAmmo`
-    /// for target resolution and ammunition gathering. Delivered via `Mdv2Delivery.sendFinal`
-    /// (non-stream LLM call -> MDV2 render -> reply), `ROAST_COOLDOWN_SECONDS` (default 300)
-    /// per target — a fresh roast only stamps `roast_cooldown` on an actual successful
-    /// delivery, never on a cooldown/no-data/failed attempt.
+    /// `/roast [@username | reply-to-target]` — see `CommandCores.roastCommandCore`'s doc
+    /// comment for target resolution + ammunition gathering. Delivered via
+    /// `Mdv2Delivery.sendFinal` (non-stream LLM call -> MDV2 render -> reply).
     let handleRoastCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
             use a = botActivity.StartActivity("handleRoastCommand")
@@ -1284,105 +921,12 @@ type BotService(
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
             else
-                match! resolveRoastTarget msg from args with
-                | None -> do! reply NoRoastDataText "roast_unknown_target"
-                | Some target ->
-                    let now = time.GetUtcNow().UtcDateTime
-                    let! lastRoasted = db.LastRoastedAt(target.UserId)
-                    match lastRoasted with
-                    | Some last when (now - last).TotalSeconds < float conf.RoastCooldownSeconds ->
-                        do! reply RoastCooldownText "roast_cooldown"
-                    | _ ->
-                        let! ammo = gatherRoastAmmo target
-                        if roastAmmoIsEmpty ammo then
-                            do! reply NoRoastDataText "roast_no_data"
-                        else
-                            let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-                            match! chat.Complete(roastRequest conf target.DisplayName ammo, usageCtx, CancellationToken.None) with
-                            | Ok resp when not (String.IsNullOrWhiteSpace resp.Text) ->
-                                do! db.RecordRoast(target.UserId, now)
-                                do! reply resp.Text "roast_delivered"
-                            | Ok _ -> do! reply "Слов не нашлось — то ещё достижение." "roast_empty_response"
-                            | Error err ->
-                                logger.LogWarning("Roast generation failed: {Error}", string err)
-                                do! reply "Не получилось прожарить 🙁" "roast_failed"
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                let! text, outcome = roastCommandCore conf msg from usageCtx args
+                do! reply text outcome
         }
 
-    // ── /awards ──────────────────────────────────────────────────────────────
-
-    [<Literal>]
-    let AwardsWindowDays = 7.0
-
-    [<Literal>]
-    let AwardsTranscriptCap = 800
-
-    /// Lenient-but-strict parse of the awards LLM's JSON contract: an array of
-    /// `{title, user, evidence_quote}` objects, all three string fields required and
-    /// non-blank for title/user. Unlike `DossierService.parseFactsJson` (which silently
-    /// drops malformed elements), a single malformed entry fails the WHOLE parse — the
-    /// plan's "malformed JSON after 1 retry -> graceful failure" applies to the response
-    /// as a whole, not per-entry, so `completeJsonWithRetry` retries the entire call
-    /// rather than shipping a partially-understood awards list.
-    let parseAwardsJson (json: string) : AwardEntry list option =
-        try
-            use doc = JsonDocument.Parse(json: string)
-            if doc.RootElement.ValueKind <> JsonValueKind.Array then
-                None
-            else
-                let elements = doc.RootElement.EnumerateArray() |> Seq.toList
-                if elements.IsEmpty then
-                    None
-                else
-                    let parsed =
-                        elements
-                        |> List.map (fun el ->
-                            if el.ValueKind <> JsonValueKind.Object then
-                                None
-                            else
-                                match el.TryGetProperty "title", el.TryGetProperty "user", el.TryGetProperty "evidence_quote" with
-                                | (true, t), (true, u), (true, e) when
-                                    t.ValueKind = JsonValueKind.String
-                                    && u.ValueKind = JsonValueKind.String
-                                    && e.ValueKind = JsonValueKind.String
-                                    && not (String.IsNullOrWhiteSpace(t.GetString()))
-                                    && not (String.IsNullOrWhiteSpace(u.GetString())) ->
-                                    Some
-                                        { Title = t.GetString()
-                                          User = stripUserHandleBrackets (u.GetString())
-                                          EvidenceQuote = e.GetString() }
-                                | _ -> None)
-                    if parsed |> List.exists Option.isNone then None else Some(parsed |> List.choose id)
-        with _ ->
-            None
-
-    let awardsRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.AwardsPrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text transcript ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    let renderAwards (awards: AwardEntry list) : string =
-        let lines = awards |> List.map (fun a -> $"🏆 {a.Title} — {a.User}: „{a.EvidenceQuote}\"")
-        "Награды недели:\n" + String.concat "\n" lines
-
-    /// `/awards` — over the last AwardsWindowDays (7) of this chat's message_log (capped
-    /// AwardsTranscriptCap (~800) rows, human messages only — see `HumanMessagesSince`),
-    /// the AWARDS_PROMPT LLM call returns a strict JSON array of 3-5 witty
-    /// {title, user, evidence_quote} awards, rendered as one line each and written to
-    /// `karma` (user_id resolved from message_log.username when the LLM's "user" field is
-    /// a "@handle" it can match — see `socialHandleOf`; kept unresolved otherwise rather
-    /// than dropped). Malformed JSON after one retry -> a fixed RU failure reply, no karma
-    /// rows written, never a crash.
+    /// `/awards` — see `CommandCores.awardsCore`'s doc comment.
     let handleAwardsCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
             use a = botActivity.StartActivity("handleAwardsCommand")
@@ -1410,130 +954,28 @@ type BotService(
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
             else
-                let since = time.GetUtcNow().UtcDateTime.AddDays(-AwardsWindowDays)
-                let! rows = db.HumanMessagesSince(msg.Chat.Id, since, AwardsTranscriptCap)
-
-                if rows.Length = 0 then
-                    do! reply "Не за что вручать — эта неделя прошла на редкость тихо." "awards_empty"
-                else
-                    let transcript = buildHandleTranscript rows
-                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-
-                    match! completeJsonWithRetry usageCtx (awardsRequest conf transcript) parseAwardsJson with
-                    | None -> do! reply "Не получилось раздать награды 🙁" "awards_failed"
-                    | Some awards when awards.IsEmpty -> do! reply "Не получилось раздать награды 🙁" "awards_failed"
-                    | Some awards ->
-                        for aw in awards do
-                            let! resolvedId =
-                                if aw.User.StartsWith "@" then db.ResolveUserIdByUsername(aw.User.TrimStart '@')
-                                else Task.FromResult None
-                            do! db.InsertKarmaAward(resolvedId, aw.User, aw.Title, aw.EvidenceQuote)
-                        do! reply (renderAwards awards) "awards_delivered"
+                let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                let! text, outcome = awardsCore conf msg.Chat.Id usageCtx
+                do! reply text outcome
         }
 
-    // ── /quote ───────────────────────────────────────────────────────────────
-
-    [<Literal>]
-    let QuoteWindowHours = 24.0
-
-    [<Literal>]
-    let QuoteTranscriptCap = 500
-
-    let parseQuoteJson (json: string) : QuoteEntry option =
-        try
-            use doc = JsonDocument.Parse(json: string)
-            if doc.RootElement.ValueKind <> JsonValueKind.Object then
-                None
-            else
-                match
-                    doc.RootElement.TryGetProperty "author", doc.RootElement.TryGetProperty "quote", doc.RootElement.TryGetProperty "comment"
-                with
-                | (true, a), (true, q), (true, c) when
-                    a.ValueKind = JsonValueKind.String
-                    && q.ValueKind = JsonValueKind.String
-                    && c.ValueKind = JsonValueKind.String
-                    && not (String.IsNullOrWhiteSpace(q.GetString())) ->
-                    Some { Author = a.GetString(); Quote = q.GetString(); Comment = c.GetString() }
-                | _ -> None
-        with _ ->
-            None
-
-    let quoteRequest (conf: BotConfiguration) (transcript: string) : ChatRequest =
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.QuotePrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text transcript ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    let renderQuote (q: QuoteEntry) : string =
-        $"💬 Цитата дня: „{q.Quote}\" — {q.Author}. {q.Comment}"
-
-    /// `/quote` — the last QuoteWindowHours (24) of this chat's human, non-command
-    /// message_log rows (capped QuoteTranscriptCap (~500) — see `HumanMessagesSince`)
-    /// feed the QUOTE_PROMPT LLM call, which must answer with a strict JSON
-    /// `{author, quote, comment}` picking the single most absurd/quotable line. No
-    /// messages in the window -> a fixed RU "nothing to quote" reply, no LLM call.
+    /// `/quote` — see `CommandCores.quoteCore`'s doc comment.
     let handleQuoteCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         handleSimpleCommand "quote" conf msg from args (fun () ->
-            task {
-                let since = time.GetUtcNow().UtcDateTime.AddHours(-QuoteWindowHours)
-                let! rows = db.HumanMessagesSince(msg.Chat.Id, since, QuoteTranscriptCap)
+            let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+            quoteCore conf msg.Chat.Id usageCtx)
 
-                if rows.Length = 0 then
-                    return "За последние сутки цитировать особо некого.", "quote_empty"
-                else
-                    let transcript = buildHandleTranscript rows
-                    let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-
-                    match! completeJsonWithRetry usageCtx (quoteRequest conf transcript) parseQuoteJson with
-                    | Some q -> return renderQuote q, "quote_generated"
-                    | None -> return "Не получилось выбрать цитату дня 🙁", "quote_failed"
-            })
-
-    // ── /karma ───────────────────────────────────────────────────────────────
-
-    [<Literal>]
-    let KarmaRecentTitles = 3
-
-    [<Literal>]
-    let NoKarmaText = "пока без наград"
-
-    let renderKarma (count: int64) (titles: string[]) : string =
-        let titlesText = titles |> Array.map (fun t -> $"- {t}") |> String.concat "\n"
-        $"Наград: {count}\nПоследние:\n{titlesText}"
-
-    /// `/karma [@user]` — self (no arg) or another chat member's totals from `karma`: a
-    /// count plus the newest KarmaRecentTitles (3) titles. An unresolvable `@username` or
-    /// a known user with zero karma rows both render the same fixed "no awards yet" reply
-    /// (same "don't leak who's ever been seen" posture as `/dossier`'s NoDossierText).
+    /// `/karma [@user]` — see `CommandCores.karmaCore`'s doc comment.
     let handleKarmaCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
-        handleSimpleCommand "karma" conf msg from args (fun () ->
-            task {
-                let trimmedArg = args.Trim().TrimStart('@')
-                let! targetIdOpt =
-                    if trimmedArg = "" then Task.FromResult(Some from.Id) else db.ResolveUserIdByUsername(trimmedArg)
-
-                match targetIdOpt with
-                | None -> return NoKarmaText, "karma_unknown_user"
-                | Some targetId ->
-                    let! count = db.KarmaCount(targetId)
-                    if count = 0L then
-                        return NoKarmaText, "karma_empty"
-                    else
-                        let! titles = db.KarmaNewestTitles(targetId, KarmaRecentTitles)
-                        return renderKarma count titles, "karma_shown"
-            })
+        handleSimpleCommand "karma" conf msg from args (fun () -> karmaCore from.Id args)
 
     // ── /say (Slice 9 stretch: TTS voice replies) ───────────────────────────────
+    //
+    // The generate+synthesize+send core moved to MediaActions.speakText (S10 PR2, mirroring
+    // PR1's MediaActions.generateImage refactor) — shared with the `speak_text` NL tool.
+    // parseSayArgs/validTtsVoices stay here: pure command-syntax parsing (the ambiguous
+    // "is the first token a voice name or the message itself" sniffing), not needed by the
+    // tool (which gets an explicit `voice` argument from the model).
 
     /// The OpenAI/Azure TTS voice roster (gpt-4o-mini-tts family) — `/say`'s only valid
     /// explicit voice names, matched case-insensitively.
@@ -1576,59 +1018,12 @@ type BotService(
                 else
                     SayVoiceArg.NoVoice, Some trimmed
 
-    /// True when `bytes` starts with the Ogg container magic ("OggS") — Azure's
-    /// audio/speech `response_format=opus` normally already yields one (see
-    /// AzureFoundryProvider's buildSpeechBody and VoiceRealTests' curl verification); this
-    /// only ever returns false for the rare voice/model combination that doesn't.
-    let isOggContainer (bytes: byte[]) =
-        bytes.Length >= 4 && bytes[0] = 0x4Fuy && bytes[1] = 0x67uy && bytes[2] = 0x67uy && bytes[3] = 0x53uy
-
-    /// Best-effort re-encode of non-Ogg TTS output into ogg/opus via `ffmpeg`, if it's on
-    /// PATH. Returns None when ffmpeg is missing or the conversion itself fails — the
-    /// caller falls back to sending the raw bytes as a regular audio attachment
-    /// (Req.SendAudio) instead of a voice note in that case.
-    let tryConvertToOggOpus (bytes: byte[]) : Task<byte[] option> =
-        task {
-            let inPath = IO.Path.GetTempFileName()
-            let outPath = IO.Path.ChangeExtension(IO.Path.GetTempFileName(), ".ogg")
-            try
-                try
-                    do! IO.File.WriteAllBytesAsync(inPath, bytes)
-                    let psi =
-                        ProcessStartInfo(
-                            FileName = "ffmpeg",
-                            Arguments = $"-y -i \"{inPath}\" -c:a libopus -b:a 32k \"{outPath}\"",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true)
-                    use proc = new Process(StartInfo = psi)
-                    if not (proc.Start()) then
-                        return None
-                    else
-                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
-                        let! _stderr = proc.StandardError.ReadToEndAsync()
-                        do! proc.WaitForExitAsync()
-                        if proc.ExitCode = 0 && IO.File.Exists outPath then
-                            let! converted = IO.File.ReadAllBytesAsync(outPath)
-                            return Some converted
-                        else
-                            return None
-                with ex ->
-                    logger.LogWarning(ex, "/say: ffmpeg conversion to ogg/opus failed — falling back to sendAudio")
-                    return None
-            finally
-                (try IO.File.Delete inPath with _ -> ())
-                (try IO.File.Delete outPath with _ -> ())
-        }
-
     /// `/say [voice] <text>` (or, replying to a message with no text of its own, voices
-    /// ITS text) — ISpeech.Synthesize -> sent as a voice note (Req.SendVoice) when the TTS
-    /// bytes are (or become, via tryConvertToOggOpus) a proper Ogg/Opus container, else as
-    /// a plain audio attachment (Req.SendAudio). Voice defaults to TTS_DEFAULT_VOICE; text
-    /// is capped at SAY_MAX_CHARS with a RU refusal beyond it. The bot's own message_log
-    /// row is tagged "[voice] {text}" — the same convention S1's voice-transcription reply
-    /// uses — so /say's output reads identically to a transcribed voice message in later
-    /// LLM context.
+    /// ITS text) — delegates the middle (synthesize -> re-encode -> send) to
+    /// `MediaActions.speakText`. Command-only guards (invalid voice name, empty text, over
+    /// SAY_MAX_CHARS) run BEFORE calling it, same "avoid a doomed call" pattern
+    /// `handleImageCommand` uses for IMAGE_GEN_ENABLED — `speakText`'s own internal guards
+    /// are defensive-only here, and the ones that actually fire for the `speak_text` tool.
     let handleSayCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
             use a = botActivity.StartActivity("handleSayCommand")
@@ -1671,45 +1066,30 @@ type BotService(
                 | _ when text.Length > conf.SayMaxChars ->
                     do! reply $"Слишком длинный текст — максимум {conf.SayMaxChars} символов." "say_too_long"
                 | _ ->
-                    let voice = match voiceArg with SayVoiceArg.Valid v -> v | _ -> conf.TtsDefaultVoice
+                    let voice = match voiceArg with SayVoiceArg.Valid v -> Some v | _ -> None
                     let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
 
-                    match! speech.Synthesize(text, Some voice, usageCtx, CancellationToken.None) with
-                    | Error err ->
-                        logger.LogWarning("/say: TTS synthesis failed: {Error}", string err)
-                        do! reply "Не получилось озвучить 🙁" "say_failed"
-                    | Ok bytes when bytes.Length = 0 ->
-                        logger.LogWarning("/say: TTS synthesis returned no audio")
-                        do! reply "Не получилось озвучить 🙁" "say_failed"
-                    | Ok bytes ->
-                        let! oggBytes =
-                            if isOggContainer bytes then Task.FromResult(Some bytes) else tryConvertToOggOpus bytes
-                        let logText = $"[voice] {text}"
-
-                        let! sent, outcome =
-                            task {
-                                match oggBytes with
-                                | Some ogg ->
-                                    let! sent = BotHelpers.sendVoiceReply tg msg.Chat.Id ogg msg.MessageId
-                                    return sent, "say_delivered"
-                                | None ->
-                                    let! sent = BotHelpers.sendAudioReply tg msg.Chat.Id bytes msg.MessageId
-                                    return sent, "say_delivered_as_audio"
-                            }
-
+                    match! MediaActions.speakText logger speech tg conf msg.Chat.Id msg.MessageId voice text usageCtx with
+                    | MediaOutcome.Sent(sent, spokenText) ->
                         do! logAndEmbed conf (
                                 logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                    (Some msg.MessageId) logText)
+                                    (Some msg.MessageId) $"[voice] {spokenText}")
                             |> taskIgnore
-                        %a.SetTag("outcome", outcome)
-                        countOutcome outcome
+                        %a.SetTag("outcome", "say_delivered")
+                        countOutcome "say_delivered"
+                    | MediaOutcome.GenFailed reason -> do! reply reason "say_failed"
+                    | MediaOutcome.Refused reason ->
+                        // Defensive only — the guards above already rule these cases out
+                        // before speakText is ever called from the command path.
+                        do! reply reason "say_refused"
         }
 
     // ── /song (Gemini/Lyria music generation) ───────────────────────────────────
-
-    /// Truncation length for the `/song` audio's title (Bot API `sendAudio` `title` field).
-    [<Literal>]
-    let SongTitleMaxLen = 60
+    //
+    // The generate+caption+send core moved to MediaActions.generateSong (S10 PR2, mirroring
+    // PR1's MediaActions.generateImage refactor) — shared with the `generate_song` NL tool.
+    // parseSongArgs stays here: pure command-syntax parsing (the `(style)` inline-flag
+    // convention), not needed by the tool (which gets an explicit `style` argument).
 
     /// Splits `/song`'s args into an optional leading `(style hint)` and the rest (lyrics /
     /// description) — Matie-style inline flags, e.g. `(рок-баллада) текст песни...` ->
@@ -1728,55 +1108,15 @@ type BotService(
         else
             None, trimmed
 
-    /// Best-effort re-encode of Lyria's (unverified — see GeminiProvider.fs's doc comment)
-    /// audio bytes into mp3 via `ffmpeg`, mirroring `tryConvertToOggOpus`'s pattern:
-    /// mp3 (not ogg/opus) because `/song` delivers via `sendAudio` with a `title` — a
-    /// regular audio-player attachment, not a voice-note bubble. Returns `None` when
-    /// `ffmpeg` is missing or the conversion itself fails — the caller falls back to
-    /// sending the raw bytes as-is.
-    let tryConvertToMp3 (bytes: byte[]) : Task<byte[] option> =
-        task {
-            let inPath = IO.Path.GetTempFileName()
-            let outPath = IO.Path.ChangeExtension(IO.Path.GetTempFileName(), ".mp3")
-            try
-                try
-                    do! IO.File.WriteAllBytesAsync(inPath, bytes)
-                    let psi =
-                        ProcessStartInfo(
-                            FileName = "ffmpeg",
-                            Arguments = $"-y -i \"{inPath}\" -c:a libmp3lame -b:a 128k \"{outPath}\"",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true)
-                    use proc = new Process(StartInfo = psi)
-                    if not (proc.Start()) then
-                        return None
-                    else
-                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
-                        let! _stderr = proc.StandardError.ReadToEndAsync()
-                        do! proc.WaitForExitAsync()
-                        if proc.ExitCode = 0 && IO.File.Exists outPath then
-                            let! converted = IO.File.ReadAllBytesAsync(outPath)
-                            return Some converted
-                        else
-                            return None
-                with ex ->
-                    logger.LogWarning(ex, "/song: ffmpeg conversion to mp3 failed — sending raw bytes as-is")
-                    return None
-            finally
-                (try IO.File.Delete inPath with _ -> ())
-                (try IO.File.Delete outPath with _ -> ())
-        }
-
-    /// `/song [(style)] <lyrics or description>` — Gemini's Lyria music generation
-    /// (GEMINI_MUSIC_MODEL). Logs `[song-cmd] {args}` first (webhook-redelivery dedup guard,
-    /// same convention as every other command), then: empty prompt -> RU usage hint; over
-    /// `SONG_MAX_CHARS` -> RU refusal; on cooldown (`SONG_COOLDOWN_SECONDS`, per-invoker —
-    /// see `DbService.LastSongAt`'s doc comment) -> RU cooldown reply; otherwise sends a
-    /// "сочиняю..." placeholder, generates, re-encodes to mp3 when possible (best-effort,
-    /// `tryConvertToMp3`), delivers via `sendAudio` with a title, and logs the bot's own
-    /// reply row as `[song] {prompt}`. The cooldown is only stamped on an actual successful
-    /// delivery, mirroring `/roast`'s `RecordRoast` convention.
+    /// `/song [(style)] <lyrics or description>` — Gemini's Lyria music generation,
+    /// delegating the middle (generate -> composeCaption -> re-encode -> send) to
+    /// `MediaActions.generateSong`. Logs `[song-cmd] {args}` first (webhook-redelivery
+    /// dedup guard, same convention as every other command), then: empty prompt -> RU usage
+    /// hint; over `SONG_MAX_CHARS` -> RU refusal; on cooldown (`SONG_COOLDOWN_SECONDS`,
+    /// per-invoker) -> RU cooldown reply, all checked BEFORE sending a "сочиняю..."
+    /// placeholder (same "avoid a doomed call" pattern `handleImageCommand` uses) — the
+    /// message_log reply row is now `[song] {caption}` (S10 PR2 fix: no more prompt-echo
+    /// titles/log text — matches the `/img` OQ3 convention).
     let handleSongCommand (conf: BotConfiguration) (msg: Message) (from: User) (args: string) =
         task {
             use a = botActivity.StartActivity("handleSongCommand")
@@ -1819,124 +1159,48 @@ type BotService(
                     | Some last when (now - last).TotalSeconds < float conf.SongCooldownSeconds ->
                         do! reply "рано, дай отдышаться — попробуй чуть позже" "song_cooldown"
                     | _ ->
-                        let prompt =
-                            match styleHint with
-                            | Some style -> $"Style: {style}\n\n{lyricsOrDesc}"
-                            | None -> lyricsOrDesc
                         let! placeholder = BotHelpers.sendTextReply tg msg.Chat.Id "сочиняю..." msg.MessageId
                         let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
 
-                        match! musicGen.Generate(prompt, usageCtx, CancellationToken.None) with
-                        | Error err ->
-                            logger.LogWarning("Music generation failed: {Error}", string err)
-                            // Same transient-vs-generic split as handleImageCommand — see
-                            // LlmTypes.LlmError.isTransient's doc comment.
-                            let failText =
-                                if LlmError.isTransient err then
-                                    "Модель перегружена, попробуй сочинить чуть позже 🙏"
-                                else
-                                    "Не получилось сочинить 🙁"
-                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId failText
-                            let outcome = if LlmError.isTransient err then "song_failed_transient" else "song_failed"
-                            %a.SetTag("outcome", outcome)
-                            countOutcome outcome
-                        | Ok(bytes, _usage) when bytes.Length = 0 ->
-                            logger.LogWarning("Music generation returned no audio")
-                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId "Не получилось сочинить 🙁"
-                            %a.SetTag("outcome", "song_failed")
-                            countOutcome "song_failed"
-                        | Ok(bytes, _usage) ->
-                            let! mp3Bytes = tryConvertToMp3 bytes
-                            let deliverBytes = mp3Bytes |> Option.defaultValue bytes
-                            let title =
-                                if lyricsOrDesc.Length > SongTitleMaxLen then lyricsOrDesc.Substring(0, SongTitleMaxLen)
-                                else lyricsOrDesc
-                            let! sent = BotHelpers.sendAudioReplyWithTitle tg msg.Chat.Id deliverBytes title msg.MessageId
+                        match!
+                            MediaActions.generateSong
+                                logger musicGen chat tg db time conf msg.Chat.Id msg.MessageId from.Id styleHint lyricsOrDesc usageCtx
+                        with
+                        | MediaOutcome.Sent(sent, caption) ->
                             do! logAndEmbed conf (
                                     logRow msg.Chat.Id sent.MessageId (botUserId conf) conf.BotUsername conf.BotUsername true
-                                        (Some msg.MessageId) $"[song] {prompt}")
+                                        (Some msg.MessageId) $"[song] {caption}")
                                 |> taskIgnore
                             do! BotHelpers.deleteMessage tg msg.Chat.Id placeholder.MessageId
-                            do! db.RecordSong(from.Id, now)
                             %a.SetTag("outcome", "song_delivered")
                             countOutcome "song_delivered"
+                        | MediaOutcome.GenFailed reason ->
+                            logger.LogWarning("Music generation failed: {Reason}", reason)
+                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId reason
+                            let outcome =
+                                if reason.Contains("перегружена", StringComparison.Ordinal) then
+                                    "song_failed_transient"
+                                else
+                                    "song_failed"
+                            %a.SetTag("outcome", outcome)
+                            countOutcome outcome
+                        | MediaOutcome.Refused reason ->
+                            // Defensive only — the guards above already rule these cases out
+                            // before generateSong is ever called from the command path.
+                            do! BotHelpers.editMessageText tg msg.Chat.Id placeholder.MessageId reason
+                            %a.SetTag("outcome", "song_refused")
+                            countOutcome "song_refused"
         }
 
     // ── /sql (Slice 9 stretch: admin-gated natural-language SQL analytics) ─────────────
     //
     // ADMIN_USER_IDS parsing + isAdmin moved to Services/Admin.fs (S10 PR1 prerequisite) so
-    // ToolRegistry/ResponderService can gate AdminOnly NL tools (PR2's sql_query) the same
-    // way — handleSqlCommand below now calls Admin.isAdmin directly.
-
-    /// S3-style troll refusal, Алита-styled — a non-admin gets exactly this, no LLM call.
-    [<Literal>]
-    let SqlNonAdminRefusal = "Куда лезёшь? SQL-консоль не для тебя."
-
-    /// The `/sql` LLM's JSON contract: {"sql": "..."}.
-    let parseSqlJson (json: string) : string option =
-        try
-            use doc = JsonDocument.Parse(json: string)
-            if doc.RootElement.ValueKind <> JsonValueKind.Object then
-                None
-            else
-                match doc.RootElement.TryGetProperty "sql" with
-                | true, v when v.ValueKind = JsonValueKind.String && not (String.IsNullOrWhiteSpace(v.GetString())) ->
-                    Some(v.GetString())
-                | _ -> None
-        with _ -> None
-
-    let sqlRequest (conf: BotConfiguration) (question: string) : ChatRequest =
-        { Deployment = conf.LlmDeployment
-          Messages =
-            [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.SqlPrompt ]
-                ToolCalls = []
-                ToolCallId = None }
-              { Role = ChatRole.User
-                Content = [ ContentPart.Text question ]
-                ToolCalls = []
-                ToolCallId = None } ]
-          Tools = []
-          Temperature = None
-          MaxTokens = None
-          ReasoningEffort = None }
-
-    [<Literal>]
-    let SqlRowLimit = 50
-
-    [<Literal>]
-    let SqlCellMaxLen = 30
-
-    /// MDV2 code-block rendering of an /sql result set — one row per line, columns joined
-    /// by " | ", each cell capped at SqlCellMaxLen (a Telegram monospace code block has no
-    /// column alignment of its own, so this just keeps any one row from dominating the
-    /// message rather than attempting real table formatting).
-    let renderSqlTable (columns: string list) (rows: string[] list) : string =
-        let capCell (s: string) = if s.Length > SqlCellMaxLen then s.Substring(0, SqlCellMaxLen - 1) + "…" else s
-        let header = columns |> List.map capCell |> String.concat " | "
-        let sep = columns |> List.map (fun _ -> "---") |> String.concat " | "
-        if rows.IsEmpty then
-            "```\n" + header + "\n" + sep + "\n(нет строк)\n```"
-        else
-            let bodyLines = rows |> List.map (fun r -> r |> Array.map capCell |> String.concat " | ")
-            "```\n" + header + "\n" + sep + "\n" + String.concat "\n" bodyLines + "\n```"
-
-    let renderSqlRejected (sql: string) (reason: string) = $"```\n{sql}\n```\nОтклонено: {reason}"
-
-    let renderSqlExecError (sql: string) (err: string) =
-        let short = if err.Length > 200 then err.Substring(0, 200) + "…" else err
-        $"```\n{sql}\n```\nОшибка: {short}"
+    // ToolRegistry/ResponderService can gate AdminOnly NL tools (sql_query) the same way.
+    // The rest of the core (LLM call -> SqlGuard -> execute -> render) moved to
+    // `CommandCores.sqlCore` (S10 PR2) — shared with the `sql_query` NL tool.
 
     /// `/sql <question>` — ADMIN-GATED (ADMIN_USER_IDS): a non-admin gets a flat refusal,
-    /// no LLM call at all. For an admin, SQL_PROMPT (inlining a compact schema description)
-    /// asks the model for a single JSON {"sql": "..."} SELECT/WITH statement (one retry on
-    /// malformed JSON — completeJsonWithRetry, same as /awards/ /quote), validated by
-    /// SqlGuard.validate (must start SELECT/WITH, single statement, none of INSERT/UPDATE/
-    /// DELETE/DROP/ALTER/CREATE/GRANT outside quoted strings) and — belt and braces —
-    /// executed over a FRESH read-only connection (`SET default_transaction_read_only =
-    /// on`, 5s timeout), wrapped in an outer `SELECT ... LIMIT 50`. Errors (rejected or
-    /// failed) show the SQL plus a short RU reason; success renders as an MDV2 code-block
-    /// table.
+    /// no LLM call at all. See `CommandCores.sqlCore`'s doc comment for the rest.
     let handleSqlCommand (conf: BotConfiguration) (msg: Message) (from: User) (question: string) =
         task {
             use a = botActivity.StartActivity("handleSqlCommand")
@@ -1963,23 +1227,10 @@ type BotService(
             if not inserted then
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
-            elif not (Admin.isAdmin conf from.Id) then
-                do! reply SqlNonAdminRefusal "sql_refused_non_admin"
-            elif String.IsNullOrWhiteSpace question then
-                do! reply "Спроси что-нибудь про базу: `/sql сколько сообщений за сегодня?`" "sql_empty_question"
             else
                 let usageCtx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-
-                match! completeJsonWithRetry usageCtx (sqlRequest conf question) parseSqlJson with
-                | None -> do! reply "Не получилось составить запрос 🙁" "sql_generation_failed"
-                | Some rawSql ->
-                    match SqlGuard.validate rawSql with
-                    | Error reason -> do! reply (renderSqlRejected rawSql reason) "sql_rejected"
-                    | Ok validatedSql ->
-                        let wrapped = $"SELECT * FROM ({validatedSql}) AS sql_limited LIMIT {SqlRowLimit}"
-                        match! db.ExecuteReadOnlySelect(wrapped) with
-                        | Error err -> do! reply (renderSqlExecError rawSql err) "sql_exec_failed"
-                        | Ok(columns, rows) -> do! reply (renderSqlTable columns rows) "sql_delivered"
+                let! text, outcome = sqlCore conf (Admin.isAdmin conf from.Id) usageCtx question
+                do! reply text outcome
         }
 
     let commandsWithoutHelp: CommandDef list =
@@ -1994,7 +1245,7 @@ type BotService(
           { Name = "summary"
             Aliases = [ "tldr" ]
             Description =
-              $"итоги последних N сообщений чата (по умолчанию {SummaryDefaultCount}, максимум {SummaryMaxCount}): /summary [N]"
+              $"итоги последних N сообщений чата (по умолчанию {CommandCores.SummaryDefaultCount}, максимум {CommandCores.SummaryMaxCount}): /summary [N]"
             Handler = handleSummaryCommand }
           { Name = "usage"
             Aliases = []

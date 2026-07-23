@@ -24,6 +24,7 @@
     <Compile Include="GeminiTests.fs" />
     <Compile Include="SongTests.fs" />
     <Compile Include="NlToolLoopTests.fs" />
+    <Compile Include="NlToolLoopPr2Tests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

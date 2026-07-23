@@ -33,11 +33,13 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             {| cid = chatId; mid = messageId |})
 
     [<Fact>]
-    let ``song generates audio, sends it, logs the bot reply, and records llm_usage kind=music`` () =
+    let ``song generates audio, sends it captioned with the composed persona reaction (not the raw prompt), logs the bot reply, and records llm_usage kind=music`` () =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.ClearAzureOcrCalls()
             do! fixture.SetGeminiMusicScript [||]
+            let scriptedCaption = "готово, слушай"
+            do! fixture.SetAzureLlmScript [| scripted 200 (nonStreamCompletionBody scriptedCaption) |]
 
             let user = Tg.user(id = 9401L, username = "song_alice", firstName = "Alice")
             let update = Tg.groupMessage("/song (рок-баллада) про баги в проде", user, fixture.TargetChatId)
@@ -47,7 +49,12 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
             resp.EnsureSuccessStatusCode() |> ignore
 
             let! audioSends = fixture.GetFakeCalls("sendAudio")
-            Assert.NotEmpty(audioSends |> Array.filter (isToChat fixture.TargetChatId))
+            let toChat = audioSends |> Array.filter (isToChat fixture.TargetChatId)
+            Assert.NotEmpty toChat
+            // The title is MediaActions.composeCaption's SCRIPTED output (S10 PR2, mirrors
+            // /img's OQ3 caption-parity fix) — never a (truncated) echo of the raw prompt.
+            Assert.Contains(toChat, fun c -> (jsonString c "title") = scriptedCaption)
+            Assert.DoesNotContain(toChat, fun c -> (jsonString c "title").Contains "про баги в проде")
 
             let! geminiCalls = fixture.GetGeminiCalls()
             Assert.Contains(geminiCalls, fun (c: FakeCall) -> c.Url.Contains "generateContent")
@@ -58,7 +65,7 @@ FROM message_log WHERE chat_id = @cid AND message_id = @mid
 
             let! replyRows = botReplyRows msgId
             Assert.NotEmpty replyRows
-            Assert.Contains(replyRows, fun (r: MessageLogRow) -> r.text.StartsWith "[song] " && r.text.Contains "про баги в проде")
+            Assert.Contains(replyRows, fun (r: MessageLogRow) -> r.text = $"[song] {scriptedCaption}")
 
             let! sawMusicUsage = awaitUsageRow fixture "music" fixture.TargetChatId
             Assert.True(sawMusicUsage, "expected an llm_usage row with kind='music' after /song")
