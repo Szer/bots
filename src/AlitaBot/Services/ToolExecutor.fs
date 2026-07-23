@@ -161,7 +161,7 @@ type ToolExecutorService
                     | MediaOutcome.Sent(sent, caption) ->
                         do! logMediaReply conf ctx sent.MessageId $"[image] {caption}"
                         return
-                            { ResultText = $"Изображение отправлено. Подпись: «{caption}»"
+                            { ResultText = $"Изображение уже отправлено пользователю с подписью «{caption}» — она уже видна пользователю. НИЧЕГО больше не пиши в ответ (верни пустой ответ), если тебе нечего добавить по существу."
                               Outcome = "ok"
                               CaptionSent = Some caption }
                     | MediaOutcome.Refused reason ->
@@ -224,7 +224,7 @@ type ToolExecutorService
                     | MediaOutcome.Sent(sent, caption) ->
                         do! logMediaReply conf ctx sent.MessageId $"[song] {caption}"
                         return
-                            { ResultText = $"Песня отправлена. Реакция: «{caption}»"
+                            { ResultText = $"Песня уже отправлена пользователю с подписью «{caption}» — она уже видна пользователю. НИЧЕГО больше не пиши в ответ (верни пустой ответ), если тебе нечего добавить по существу."
                               Outcome = "ok"
                               CaptionSent = Some caption }
                     | MediaOutcome.Refused reason ->
@@ -247,7 +247,10 @@ type ToolExecutorService
                 match! MediaActions.speakText logger speech tg conf ctx.ChatId ctx.ReplyToMessageId voice text ctx.UsageCtx with
                 | MediaOutcome.Sent(sent, spokenText) ->
                     do! logMediaReply conf ctx sent.MessageId $"[voice] {spokenText}"
-                    return { ResultText = "Голосовое сообщение отправлено."; Outcome = "ok"; CaptionSent = Some spokenText }
+                    return
+                        { ResultText = "Голосовое сообщение уже отправлено пользователю. НИЧЕГО больше не пиши в ответ (верни пустой ответ), если тебе нечего добавить по существу."
+                          Outcome = "ok"
+                          CaptionSent = Some spokenText }
                 | MediaOutcome.Refused reason ->
                     return { ResultText = reason; Outcome = "denied_disabled"; CaptionSent = None }
                 | MediaOutcome.GenFailed reason ->

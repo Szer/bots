@@ -312,6 +312,145 @@ ORDER BY message_id
             Assert.Empty deletes
         }
 
+    /// Staging evidence (2026-07-23, prod screenshots): a NL image ask delivered a photo
+    /// with a good LLM caption («Окей, повесила в зал…»), then the model's final round
+    /// emitted a SEPARATE contentless ack («Готово.») that matches nothing the duplicate-
+    /// caption guard above compares against (it isn't a rewording of the caption at all) —
+    /// it shipped as a second, pointless message. The broader guard: once a media tool has
+    /// already succeeded this turn, a final reply that normalizes to a stoplisted ack is
+    /// suppressed the same way a duplicate caption is (message deleted, no second
+    /// message_log row).
+    [<Fact>]
+    let ``final round contentless ack "Готово." after a successful media tool is suppressed: message deleted, no second message_log row`` () =
+        task {
+            let scriptedCaption = "окей, повесила в зал"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_ack", "generate_image", """{"prompt":"картина для зала"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "Готово.") |]
+
+            let user = Tg.user(id = 9530L, username = "nl_nadia", firstName = "Nadia")
+            let update = Tg.groupMessage("алита, нарисуй картину для зала", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! photoSends = fixture.GetFakeCalls("sendPhoto")
+            let toChat = photoSends |> Array.filter (isToChat fixture.TargetChatId)
+            Assert.Contains(toChat, fun c -> (jsonString c "caption") = scriptedCaption)
+
+            let! replies = botReplyRows msgId
+            Assert.Single(replies) |> ignore
+            Assert.Equal($"[image] {scriptedCaption}", replies[0].text)
+
+            let! deletes = fixture.GetFakeCalls("deleteMessage")
+            Assert.NotEmpty deletes
+        }
+
+    /// Negative case for the contentless-ack guard: a question mark is a hard exemption
+    /// even though "готово" normalizes to a stoplisted word — a genuine follow-up question
+    /// must never be swallowed.
+    [<Fact>]
+    let ``final round "Готово?" after a media tool still ships — a question mark exempts it from the contentless-ack guard`` () =
+        task {
+            let scriptedCaption = "вот, специально для тебя"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_q", "generate_image", """{"prompt":"вопрос"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "Готово?") |]
+
+            let user = Tg.user(id = 9531L, username = "nl_oleg", firstName = "Oleg")
+            let update = Tg.groupMessage("алита, нарисуй вопрос", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! replies = botReplyRows msgId
+            Assert.Equal(2, replies.Length)
+            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = "Готово?")
+
+            let! deletes = fixture.GetFakeCalls("deleteMessage")
+            Assert.Empty deletes
+        }
+
+    /// Negative case for the contentless-ack guard: text longer than 25 characters ships
+    /// even when it starts with a stoplisted word — the length exemption keeps genuinely
+    /// substantive follow-ups from being swallowed.
+    [<Fact>]
+    let ``final round longer than 25 characters ships even if it starts with a stoplisted word`` () =
+        task {
+            let scriptedCaption = "вот, специально для тебя"
+            let longFollowUp = "Готово, но хочу сказать ещё кое-что важное"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_long", "generate_image", """{"prompt":"длинное"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody longFollowUp) |]
+
+            let user = Tg.user(id = 9534L, username = "nl_rita", firstName = "Rita")
+            let update = Tg.groupMessage("алита, нарисуй длинное", user, fixture.TargetChatId)
+            let msgId = update.Message.Value.MessageId
+            let! resp = fixture.SendUpdate(update)
+            resp.EnsureSuccessStatusCode() |> ignore
+
+            let! replies = botReplyRows msgId
+            Assert.Equal(2, replies.Length)
+            Assert.Contains(replies, fun (r: MessageLogRow) -> r.text = longFollowUp)
+        }
+
+    /// Stoplist normalization: case and trailing punctuation must not matter — "ГОТОВО"
+    /// (case) and "сделала!" (punctuation) both normalize to a stoplisted ack and get
+    /// suppressed exactly like "Готово." does.
+    [<Fact>]
+    let ``contentless-ack guard normalizes case and punctuation: "ГОТОВО" and "сделала!" are both suppressed`` () =
+        task {
+            let scriptedCaption1 = "вот, специально для тебя"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_case", "generate_image", """{"prompt":"первое"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption1)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "ГОТОВО") |]
+
+            let user1 = Tg.user(id = 9532L, username = "nl_petra", firstName = "Petra")
+            let update1 = Tg.groupMessage("алита, нарисуй первое", user1, fixture.TargetChatId)
+            let msgId1 = update1.Message.Value.MessageId
+            let! resp1 = fixture.SendUpdate(update1)
+            resp1.EnsureSuccessStatusCode() |> ignore
+
+            let! replies1 = botReplyRows msgId1
+            Assert.Single(replies1) |> ignore
+            Assert.Equal($"[image] {scriptedCaption1}", replies1[0].text)
+
+            let scriptedCaption2 = "как тебе такое"
+            do! fixture.SetAzureLlmScript
+                    [| LlmTestHelpers.scripted
+                           200
+                           (NlToolLoopTestHelpers.toolCallsCompletionBody
+                               [ "call_punct", "generate_image", """{"prompt":"второе"}""" ])
+                       LlmTestHelpers.scripted 200 (nonStreamCompletionBody scriptedCaption2)
+                       LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "сделала!") |]
+
+            let user2 = Tg.user(id = 9533L, username = "nl_quinn", firstName = "Quinn")
+            let update2 = Tg.groupMessage("алита, нарисуй второе", user2, fixture.TargetChatId)
+            let msgId2 = update2.Message.Value.MessageId
+            let! resp2 = fixture.SendUpdate(update2)
+            resp2.EnsureSuccessStatusCode() |> ignore
+
+            let! replies2 = botReplyRows msgId2
+            Assert.Single(replies2) |> ignore
+            Assert.Equal($"[image] {scriptedCaption2}", replies2[0].text)
+        }
+
     /// S10 staging Bug 3: a single SendChatAction call goes stale (~5s Telegram lifetime)
     /// long before a 10-15s+ image generation finishes. Asserts the periodic refresher
     /// fired `upload_photo` (not just `typing`) at least once during a generate_image
