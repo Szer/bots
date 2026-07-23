@@ -30,6 +30,25 @@ ORDER BY message_id
         let entities = [| MessageEntity.Create(``type`` = "mention", offset = 0L, length = int64 mention.Length) |]
         Tg.quickMsg(text = text, chat = Tg.chat(id = fixture.TargetChatId), from = user, entities = entities)
 
+    /// Polls (up to `timeoutMs`) for at least one `setMessageReaction` call — same idiom as
+    /// ProactiveTests.awaitReactions, duplicated locally rather than shared (both files
+    /// already duplicate small polling helpers this way, see e.g. awaitSendsToChat).
+    let awaitReactions (timeoutMs: int) =
+        task {
+            let deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(float timeoutMs)
+            let mutable reactions = [||]
+            while reactions.Length = 0 && DateTime.UtcNow < deadline do
+                let! r = fixture.GetFakeCalls("setMessageReaction")
+                reactions <- r
+                if reactions.Length = 0 then do! Task.Delay 150
+            return reactions
+        }
+
+    let reactedEmoji (reactions: FakeCall[]) =
+        use doc = JsonDocument.Parse(reactions[0].Body: string)
+        let reactionArr = doc.RootElement.GetProperty("reaction")
+        reactionArr[0].GetProperty("emoji").GetString()
+
     // ── Outcome router ───────────────────────────────────────────────────────
 
     [<Fact>]
@@ -111,6 +130,136 @@ ORDER BY message_id
             let reactionArr = doc.RootElement.GetProperty("reaction")
             Assert.Equal(1, reactionArr.GetArrayLength())
             Assert.Equal("🔥", reactionArr[0].GetProperty("emoji").GetString())
+        }
+
+    // ── Reaction palette / choice mode ───────────────────────────────────────
+
+    [<Fact>]
+    let ``REACTION_CHOICE_MODE=random picks only from REACTION_PALETTE, never calls the LLM`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "random")
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉"]""")
+                do! fixture.ReloadSettings()
+                do! fixture.SetAzureLlmScript [||]
+
+                let update = mentionUpdate 6011L "outcome_palette_random" "здорово"
+                let msgId = update.Message.Value.MessageId
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! reactions = awaitReactions 5000
+                Assert.NotEmpty(reactions)
+                Assert.Equal("🎉", reactedEmoji reactions)
+
+                // random mode never touches the LLM at all.
+                let! llmCalls = fixture.GetAzureLlmCalls()
+                Assert.Empty(llmCalls)
+                ignore msgId
+            finally
+                fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
+                fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
+    [<Fact>]
+    let ``REACTION_CHOICE_MODE=llm picks the scripted emoji from REACTION_PALETTE`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉","💯"]""")
+                do! fixture.ReloadSettings()
+                do! fixture.SetAzureLlmScript [| scripted 200 (nonStreamCompletionBody "💯") |]
+
+                let update = mentionUpdate 6012L "outcome_palette_llm" "здорово"
+                let msgId = update.Message.Value.MessageId
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! reactions = awaitReactions 5000
+                Assert.NotEmpty(reactions)
+                Assert.Equal("💯", reactedEmoji reactions)
+
+                let! llmCalls = fixture.GetAzureLlmCalls()
+                Assert.NotEmpty(llmCalls)
+                ignore msgId
+            finally
+                fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
+                fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
+    [<Fact>]
+    let ``a failed emoji-pick LLM call falls back to a random pick from the palette`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
+                // A single-entry palette makes the random fallback's outcome deterministic —
+                // this test is about "did it fall back at all", not "is Random.Shared fair".
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉"]""")
+                do! fixture.ReloadSettings()
+                do! fixture.SetAzureLlmScript
+                        [| scripted 400 """{"error":{"code":"content_filter","message":"blocked"}}""" |]
+
+                let update = mentionUpdate 6013L "outcome_palette_fallback" "здорово"
+                let msgId = update.Message.Value.MessageId
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! reactions = awaitReactions 5000
+                Assert.NotEmpty(reactions)
+                Assert.Equal("🎉", reactedEmoji reactions)
+
+                let! logs = fixture.GetBotLogs()
+                Assert.Contains("falling back to a random pick", logs)
+                ignore msgId
+            finally
+                fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
+                fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
+                fixture.ReloadSettings() |> ignore
+        }
+
+    [<Fact>]
+    let ``REACTION_PALETTE entries outside Telegram's allowed set are dropped with a Warning`` () =
+        task {
+            try
+                do! fixture.ClearFakeCalls()
+                do! fixture.ClearAzureOcrCalls()
+                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "random")
+                // "🚀" is not on Telegram's documented setMessageReaction allowed-emoji list
+                // (OutcomeRouter.telegramAllowedReactionEmoji) — it must be filtered out,
+                // leaving "🎉" as the only (deterministic) pick.
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉","🚀"]""")
+                do! fixture.ReloadSettings()
+                do! fixture.SetAzureLlmScript [||]
+
+                let update = mentionUpdate 6014L "outcome_palette_invalid" "здорово"
+                let msgId = update.Message.Value.MessageId
+                let! resp = fixture.SendUpdate(update)
+                resp.EnsureSuccessStatusCode() |> ignore
+
+                let! reactions = awaitReactions 5000
+                Assert.NotEmpty(reactions)
+                Assert.Equal("🎉", reactedEmoji reactions)
+
+                let! logs = fixture.GetBotLogs()
+                Assert.Contains("REACTION_PALETTE", logs)
+                Assert.Contains("dropped", logs)
+                ignore msgId
+            finally
+                fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
+                fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
+                fixture.ReloadSettings() |> ignore
         }
 
     // ── MarkdownV2 final-message rendering ──────────────────────────────────
@@ -241,6 +390,8 @@ ORDER BY message_id
                 do! fixture.SetBotSetting("STREAM_MODE", "edit")
                 do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.SetBotSetting("REWRITER_ENABLED", "false")
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
                 do! fixture.ReloadSettings()
             } :> Task)
 
@@ -252,5 +403,7 @@ ORDER BY message_id
                 do! fixture.SetBotSetting("RESPONDER_MODE", "echo")
                 do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.SetBotSetting("REWRITER_ENABLED", "false")
+                do! fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""")
+                do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
                 do! fixture.ReloadSettings()
             } :> Task)

@@ -85,16 +85,31 @@ rolls a weighted outcome in `BotService.handleTriggerableMessage`:
 
 - **reply** — the normal path, unchanged (`ResponderService.Respond`).
 - **silence** — says nothing at all; no LLM call, `outcome=silence` (`alitabot_messages_total`).
-- **emoji** — a tiny non-stream LLM call picks ONE emoji from Telegram's allowed reaction set
-  (👍❤️🔥😁🤔🤯😱🤬😢🎉🤩💩🤡🥱 — the prompt lists exactly these and instructs "output only
-  it"), then `Req.SetMessageReaction` reacts to the triggering message — no text reply,
-  `outcome=emoji`. A malformed/unlisted model answer falls back to the set's first emoji rather
-  than refusing to react; a failed LLM call or a rejected `SetMessageReaction` is Warning-logged
-  and simply skipped.
+- **emoji** — picks ONE emoji from `REACTION_PALETTE` (bot_setting, JSON array — default
+  👍❤🔥😁🤔🤯😱🤬😢🎉🤩💩🤡🥱, validated against Telegram's documented allowed reaction-emoji
+  set, see below) and reacts to the triggering message via `Req.SetMessageReaction` — no text
+  reply, `outcome=emoji`. `REACTION_CHOICE_MODE` (`random` | `llm`, default `llm`) decides HOW:
+  `llm` makes a tiny non-stream gpt-5-mini call (`ReasoningEffort="minimal"`, same
+  cost-saving lever as `MediaActions.composeCaption`) asking the model to pick the
+  best-fitting emoji for the message text from the palette; `random` skips the LLM entirely.
+  A failed LLM call, or an answer outside the palette, falls back to a uniform random pick
+  (`OutcomeRouter.pickRandomEmoji`) rather than refusing to react; a rejected
+  `SetMessageReaction` call is Warning-logged and simply skipped.
 
 `OutcomeRouter.pick` is a pure, deterministic function over `(weights, roll: float in [0,1))` —
 the actual `Random.Shared.NextDouble()` draw lives at the call site. Non-positive/all-zero
 weights degrade to "reply" (a trigger is never silently dropped by a misconfigured setting).
+
+#### Reaction palette (`REACTION_PALETTE`, `REACTION_CHOICE_MODE`)
+
+Both the emoji outcome above and meme-react's "react" action (below) draw from — and
+validate against — the same `REACTION_PALETTE` bot_setting (`BotService.reactionPalette`),
+a hot-reloadable JSON array of emoji. Every entry is checked against
+`OutcomeRouter.telegramAllowedReactionEmoji`, the set Telegram's `setMessageReaction`
+actually accepts for a `ReactionTypeEmoji` — Telegram rejects the WHOLE call if even one
+entry is invalid, so anything outside that set is filtered out with a Warning log rather
+than reaching the wire. Malformed JSON, a non-array, or a palette that filters down to
+empty all fall back to `OutcomeRouter.defaultPalette` (the original hardcoded S6/S8 set).
 
 ### Persona (`SYSTEM_PROMPT`)
 
@@ -667,9 +682,11 @@ fire-and-forget/`withChatLock` shape as interjections): `MEME_REACT_PROBABILITY`
 "emoji":"...","text":"..."}`:
 
 - **`react`** — sets a message reaction (`Req.SetMessageReaction`) using ONE emoji from the
-  same Telegram-allowed set the S6 outcome router's emoji outcome uses
-  (`allowedReactionEmoji`). An emoji outside that set is treated as a no-op (Warning-logged),
-  never sent to Telegram unchecked.
+  same shared, hot-reloadable `REACTION_PALETTE` the S6 outcome router's emoji outcome picks
+  from (`BotService.reactionPalette` — see "Reaction palette" above). The palette is also
+  interpolated into `MEME_REACT_PROMPT` so the model is grounded in the exact allowed set,
+  not just checked after the fact. An emoji outside that set is treated as a no-op
+  (Warning-logged), never sent to Telegram unchecked.
 - **`comment`** — sends a one-liner reply (`BotHelpers.sendTextReply`, logged normally).
   Blank text is a no-op.
 - **`pass`** — does nothing.

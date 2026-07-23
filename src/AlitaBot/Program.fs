@@ -86,6 +86,9 @@ let buildBotConf () =
       RewriterEnabled = getSettingOr "REWRITER_ENABLED" "false" |> bool.Parse
       RewriterPrompt = getSettingOr "REWRITER_PROMPT" ""
       OutcomeWeightsJson = getSettingOr "OUTCOME_WEIGHTS" """{"reply":100,"silence":0,"emoji":0}"""
+      ReactionPaletteJson =
+        getSettingOr "REACTION_PALETTE" """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]"""
+      ReactionChoiceMode = getSettingOr "REACTION_CHOICE_MODE" "llm"
       RoastPrompt = getSettingOr "ROAST_PROMPT" ""
       RoastCooldownSeconds = getSettingOr "ROAST_COOLDOWN_SECONDS" "300" |> int
       AwardsPrompt = getSettingOr "AWARDS_PROMPT" ""

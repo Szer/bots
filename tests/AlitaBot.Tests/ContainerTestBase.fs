@@ -101,6 +101,13 @@ type AlitaTestContainers() =
                 "REWRITER_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
                 "REWRITER_PROMPT",        "Rewrite the following reply as if a real human chat member wrote it: strip assistant-isms, shorten where possible, keep the meaning and all facts. Reply with only the rewritten text.", "FREE_FORM", "llm"
                 "OUTCOME_WEIGHTS",        """{"reply":100,"silence":0,"emoji":0}""", "JSON_BLOB", "llm"
+                // Emoji-reaction expansion: default palette mirrors dev-bot-settings.sql
+                // (minus the extra classics — PersonaTests' scripted picks only ever need
+                // "🔥"/"🎉", kept small so custom-palette tests can tell the seeded default
+                // apart from a per-test override at a glance). REACTION_CHOICE_MODE defaults
+                // to "llm", same as prod/dev — PersonaTests flips to "random" per-test.
+                "REACTION_PALETTE",       """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""", "JSON_BLOB", "llm"
+                "REACTION_CHOICE_MODE",   "llm",                               "FREE_FORM", "llm"
                 // Slice 7: social engine (/roast, /awards, /quote, /karma).
                 "ROAST_PROMPT",           "Roast this person like a mean stand-up comedian — specific, grounded in their dossier facts and their own quotes, quote them verbatim where funniest, no disclaimers, no softening. 4-6 sentences.", "FREE_FORM", "llm"
                 "ROAST_COOLDOWN_SECONDS", "300",                                   "FREE_FORM", "llm"

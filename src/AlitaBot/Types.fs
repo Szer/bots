@@ -98,6 +98,25 @@ type BotConfiguration =
       /// non-command message — {"reply":100,"silence":0,"emoji":0}. Default keeps the
       /// pre-S6 behavior (always reply). See Services/OutcomeRouter.fs.
       OutcomeWeightsJson: string
+      /// REACTION_PALETTE bot_setting (JSON_BLOB): the pool of emoji the S6 emoji outcome
+      /// and S8 meme-react "react" action pick from — a JSON array of emoji strings, e.g.
+      /// `["👍","🔥","😁"]`. Every entry is validated against Telegram's documented
+      /// message-reaction allowed set (`OutcomeRouter.telegramAllowedReactionEmoji`) —
+      /// invalid entries are dropped with a Warning log rather than reaching
+      /// `Req.SetMessageReaction` unchecked (a single bad entry would reject the whole
+      /// call). Malformed JSON, a non-array, or a palette that filters down to empty all
+      /// fall back to `OutcomeRouter.defaultPalette`. Hot-reloadable — parsed fresh on
+      /// every pick, not just at startup.
+      ReactionPaletteJson: string
+      /// REACTION_CHOICE_MODE bot_setting: "random" | "llm" — how the S6 emoji outcome
+      /// picks ONE emoji from REACTION_PALETTE. "llm" (default) makes a cheap non-stream
+      /// gpt-5-mini call (ReasoningEffort="minimal", same cost-saving lever as
+      /// MediaActions.composeCaption) asking the model to pick the best-fitting emoji for
+      /// the triggering message; a failed call, or an answer outside the palette, falls
+      /// back to a uniform random pick — the reaction never blocks or refuses because of
+      /// an LLM hiccup. "random" skips the LLM call entirely (cheapest, dumbest). Any
+      /// other value is treated as "llm" (lenient parse, same posture as OUTCOME_WEIGHTS).
+      ReactionChoiceMode: string
       /// ROAST_PROMPT bot_setting: system prompt for the /roast command — must instruct
       /// the model to roast the target using their dossier/facts/quotes, no disclaimers.
       /// Default "".

@@ -206,14 +206,39 @@ type BotService(
     // "emoji" (react instead of replying) — see Services/OutcomeRouter.fs for the
     // weighted-pick itself. Defaults keep the pre-S6 behavior (always "reply").
 
-    /// Telegram restricts message-reaction emoji to a fixed allowed set; this is the
-    /// subset the emoji outcome picks from (plan §3's list) — chosen to cover a broad
-    /// range of reactions without listing Telegram's entire allowed-emoji table.
-    let allowedReactionEmoji =
-        [| "👍"; "❤️"; "🔥"; "😁"; "🤔"; "🤯"; "😱"; "🤬"; "😢"; "🎉"; "🤩"; "💩"; "🤡"; "🥱" |]
+    /// REACTION_PALETTE (bot_setting, hot-reloadable), validated against Telegram's
+    /// allowed reaction-emoji set (`OutcomeRouter.parsePalette`) — shared by the S6 emoji
+    /// outcome and the S8 meme-react "react" action so both draw from (and validate
+    /// against) the exact same tunable palette. Parsed fresh on every call (cheap: a
+    /// handful of emoji) so a `/reload-settings` change takes effect immediately, same as
+    /// every other bot_setting; entries dropped for not being on Telegram's list are
+    /// Warning-logged.
+    let reactionPalette (conf: BotConfiguration) : string[] =
+        let palette, invalid = OutcomeRouter.parsePalette conf.ReactionPaletteJson
+        if not invalid.IsEmpty then
+            logger.LogWarning(
+                "REACTION_PALETTE: entries not in Telegram's allowed reaction set were dropped: {Invalid}",
+                String.concat " " invalid)
+        palette
 
-    let emojiPickRequest (conf: BotConfiguration) (text: string) : ChatRequest =
-        let allowedText = String.concat "" allowedReactionEmoji
+    /// Shared by the S6 emoji outcome and the S8 meme-react "react" action:
+    /// `Req.SetMessageReaction` with a single emoji. Best-effort — a rejected call is
+    /// Warning-logged (tagged with `context`) and swallowed, never blocking/retrying the
+    /// triggering message. Returns whether the call succeeded so callers that count
+    /// outcomes (meme-react) can distinguish a real reaction from a failed one.
+    let setReaction (context: string) (msg: Message) (emoji: string) : Task<bool> =
+        task {
+            let reaction = [| ReactionType.Emoji(ReactionTypeEmoji.Create(``type`` = "emoji", emoji = emoji)) |]
+            try
+                do! tg.CallExn(Req.SetMessageReaction.Make(msg.Chat.Id, msg.MessageId, reaction = reaction)) |> taskIgnore
+                return true
+            with ex ->
+                logger.LogWarning(ex, "{Context}: SetMessageReaction failed for message {MessageId}", context, msg.MessageId)
+                return false
+        }
+
+    let emojiPickRequest (conf: BotConfiguration) (palette: string[]) (text: string) : ChatRequest =
+        let allowedText = String.concat "" palette
         { Deployment = conf.LlmDeployment
           Messages =
             [ { Role = ChatRole.System
@@ -229,28 +254,39 @@ type BotService(
           Tools = []
           Temperature = None
           MaxTokens = Some 10
-          ReasoningEffort = None }
+          // Same cheap-formulaic-ask lever MediaActions.composeCaption uses (S10 prod
+          // incident) — this system prompt is a single short line (never conf.SystemPrompt's
+          // full persona), so reasoning-token exhaustion was never observed here, but there's
+          // no reason to pay for reasoning on a single-emoji pick either.
+          ReasoningEffort = Some "minimal" }
 
-    /// "emoji" outcome: a tiny non-stream LLM call picks one emoji from
-    /// `allowedReactionEmoji`, then `Req.SetMessageReaction` reacts to the triggering
-    /// message — no text reply. Best-effort: a malformed/unlisted model answer falls back
-    /// to the set's first emoji rather than refusing to react at all; a failed LLM call or
-    /// a rejected SetMessageReaction call is Warning-logged and simply skipped (the
-    /// message stays logged either way — this never blocks or retries the trigger).
+    /// "emoji" outcome: picks ONE emoji from REACTION_PALETTE and `Req.SetMessageReaction`s
+    /// the triggering message — no text reply. REACTION_CHOICE_MODE gates HOW it's picked:
+    /// "random" (cheapest) skips the LLM entirely; "llm" (default) makes a tiny non-stream
+    /// LLM call asking the model to pick the best-fitting emoji for the message text. A
+    /// failed LLM call, or an answer outside the palette, falls back to a uniform random
+    /// pick — never a fixed emoji, and never a refusal to react. A rejected
+    /// `SetMessageReaction` call is Warning-logged and simply skipped (the message stays
+    /// logged either way — this never blocks or retries the trigger).
     let handleEmojiOutcome (conf: BotConfiguration) (msg: Message) (from: User) =
         task {
-            let text = msg.Text |> Option.orElse msg.Caption |> Option.defaultValue ""
-            let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
-            match! chat.Complete(emojiPickRequest conf text, ctx, CancellationToken.None) with
-            | Error err -> logger.LogWarning("Outcome=emoji: emoji-pick LLM call failed: {Error}", string err)
-            | Ok resp ->
-                let picked = resp.Text.Trim()
-                let emoji = if Array.contains picked allowedReactionEmoji then picked else allowedReactionEmoji[0]
-                let reaction = [| ReactionType.Emoji(ReactionTypeEmoji.Create(``type`` = "emoji", emoji = emoji)) |]
-                try
-                    do! tg.CallExn(Req.SetMessageReaction.Make(msg.Chat.Id, msg.MessageId, reaction = reaction)) |> taskIgnore
-                with ex ->
-                    logger.LogWarning(ex, "Outcome=emoji: SetMessageReaction failed for message {MessageId}", msg.MessageId)
+            let palette = reactionPalette conf
+            if conf.ReactionChoiceMode = OutcomeRouter.ModeRandom then
+                let emoji = OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
+                do! setReaction "Outcome=emoji" msg emoji |> taskIgnore
+            else
+                let text = msg.Text |> Option.orElse msg.Caption |> Option.defaultValue ""
+                let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
+                match! chat.Complete(emojiPickRequest conf palette text, ctx, CancellationToken.None) with
+                | Error err ->
+                    logger.LogWarning("Outcome=emoji: emoji-pick LLM call failed: {Error} — falling back to a random pick", string err)
+                    do! setReaction "Outcome=emoji" msg (OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())) |> taskIgnore
+                | Ok resp ->
+                    let picked = resp.Text.Trim()
+                    let emoji =
+                        if Array.contains picked palette then picked
+                        else OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
+                    do! setReaction "Outcome=emoji" msg emoji |> taskIgnore
         }
 
     // ── Proactive behavior (Slice 8: interjections, meme reactions) ─────────
@@ -369,12 +405,17 @@ type BotService(
                     return None
         }
 
-    let memeReactRequest (conf: BotConfiguration) (imagePart: ContentPart) (caption: string) : ChatRequest =
+    let memeReactRequest (conf: BotConfiguration) (palette: string[]) (imagePart: ContentPart) (caption: string) : ChatRequest =
         let captionLine = if caption = "" then "" else $"\n\nПодпись к фото: {caption}"
+        // Same shared, hot-reloadable REACTION_PALETTE the S6 emoji outcome picks from
+        // (BotService.reactionPalette) — grounds the model in the exact set it's allowed
+        // to answer with, instead of relying solely on post-hoc validation below.
+        let allowedText = String.concat "" palette
+        let systemPrompt = conf.MemeReactPrompt + $"\n\nEmoji-реакция (\"emoji\") ДОЛЖНА быть ровно одним символом из этого набора: {allowedText}."
         { Deployment = conf.LlmDeployment
           Messages =
             [ { Role = ChatRole.System
-                Content = [ ContentPart.Text conf.MemeReactPrompt ]
+                Content = [ ContentPart.Text systemPrompt ]
                 ToolCalls = []
                 ToolCallId = None }
               { Role = ChatRole.User
@@ -388,9 +429,10 @@ type BotService(
 
     /// Meme reaction (plan §3): MEME_REACT_PROBABILITY roll, then a vision LLM call
     /// (MEME_REACT_PROMPT) that must answer strict JSON {action,emoji,text}. "react" sets
-    /// a reaction (Req.SetMessageReaction) from the same S6 allowedReactionEmoji set — an
-    /// emoji outside that set is treated as a no-op (Warning-logged), never sent to
-    /// Telegram unchecked. "comment" sends a one-liner reply; blank text is a no-op.
+    /// a reaction (Req.SetMessageReaction) from the same shared REACTION_PALETTE the S6
+    /// emoji outcome picks from (BotService.reactionPalette) — an emoji outside that set is
+    /// treated as a no-op (Warning-logged), never sent to Telegram unchecked. "comment"
+    /// sends a one-liner reply; blank text is a no-op.
     /// "pass", an unrecognized action, a failed LLM call, or malformed JSON all count as
     /// meme_pass — the spec's "malformed JSON -> treat as pass, log Warning".
     let tryMemeReact (conf: BotConfiguration) (msg: Message) (from: User) : Task<unit> =
@@ -402,11 +444,12 @@ type BotService(
                     match! tryFetchPhotoImagePart conf msg with
                     | None -> return ()
                     | Some imagePart ->
+                        let palette = reactionPalette conf
                         let caption = msg.Caption |> Option.defaultValue ""
                         let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
                         let countMeme (kind: string) = Metrics.proactiveTotal.Add(1L, KeyValuePair("kind", box kind))
 
-                        match! chat.Complete(memeReactRequest conf imagePart caption, ctx, CancellationToken.None) with
+                        match! chat.Complete(memeReactRequest conf palette imagePart caption, ctx, CancellationToken.None) with
                         | Error err ->
                             logger.LogWarning("Meme react: LLM call failed: {Error}", string err)
                             countMeme "meme_pass"
@@ -417,14 +460,9 @@ type BotService(
                                 countMeme "meme_pass"
                             | Some m ->
                                 match m.Action.Trim().ToLowerInvariant() with
-                                | "react" when Array.contains m.Emoji allowedReactionEmoji ->
-                                    let reaction = [| ReactionType.Emoji(ReactionTypeEmoji.Create(``type`` = "emoji", emoji = m.Emoji)) |]
-                                    try
-                                        do! tg.CallExn(Req.SetMessageReaction.Make(msg.Chat.Id, msg.MessageId, reaction = reaction)) |> taskIgnore
-                                        countMeme "meme_react"
-                                    with ex ->
-                                        logger.LogWarning(ex, "Meme react: SetMessageReaction failed for message {MessageId}", msg.MessageId)
-                                        countMeme "meme_pass"
+                                | "react" when Array.contains m.Emoji palette ->
+                                    let! ok = setReaction "Meme react" msg m.Emoji
+                                    countMeme (if ok then "meme_react" else "meme_pass")
                                 | "react" ->
                                     logger.LogWarning("Meme react: disallowed/empty emoji '{Emoji}' — skipping", m.Emoji)
                                     countMeme "meme_pass"
