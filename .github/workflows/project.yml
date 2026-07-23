@@ -30,6 +30,10 @@ jobs:
   project:
     needs: cleanup
     runs-on: ubuntu-latest
+    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident).
+    concurrency:
+      group: aks-vpn
+      cancel-in-progress: false
 
     steps:
     - uses: actions/checkout@v4

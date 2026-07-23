@@ -34,6 +34,10 @@ jobs:
   real-test:
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 30
+    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident).
+    concurrency:
+      group: aks-vpn
+      cancel-in-progress: false
 
     steps:
     - name: Checkout
