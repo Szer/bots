@@ -50,6 +50,35 @@ type AgentToolLoop
     let normalizeForDuplicateCheck (s: string) =
         s.Trim().TrimEnd('.', '!', '?', '…', ',', ';', ':', ' ').ToLowerInvariant()
 
+    /// Contentless-acknowledgment stoplist for the guard below — echoes of "done" the model
+    /// tacks on after a media tool already delivered its own caption/reaction text. Kept
+    /// small and literal (no fuzzy matching) so it only ever catches the exact set of known
+    /// throwaway acks, never a real word that happens to be short.
+    let contentlessAckStoplist =
+        set [ "готово"; "сделано"; "сделала"; "отправила"; "отправлено"; "done"; "ok"; "ок" ]
+
+    /// Strips ALL punctuation (not just trailing, unlike `normalizeForDuplicateCheck`
+    /// above) after trimming + lowercasing — feeds the contentless-ack guard, which must
+    /// match "Готово." / "ГОТОВО" / "сделала!" alike.
+    let normalizeForContentlessCheck (s: string) =
+        let sb = System.Text.StringBuilder()
+        for c in s.Trim().ToLowerInvariant() do
+            if not (Char.IsPunctuation c) then
+                sb.Append(c) |> ignore
+        sb.ToString().Trim()
+
+    /// True when `text` is a contentless acknowledgment ("Готово.", "ОК", "сделала!") that
+    /// should be suppressed the same way a duplicate caption is — ONLY called when at least
+    /// one media tool already succeeded this turn (see `capturedCaptions` below). Guards
+    /// against over-triggering on legitimate short follow-ups: never suppresses text with a
+    /// question mark, an `@mention`, or longer than 25 characters.
+    let isContentlessAck (text: string) =
+        if text.Contains "?" || text.Contains "@" || text.Length > 25 then
+            false
+        else
+            let normalized = normalizeForContentlessCheck text
+            contentlessAckStoplist.Contains normalized || normalized.Length <= 3
+
     /// Runs the loop for one turn, starting from `baseRequest` (its `Tools` are the full
     /// offered set — [] when NL tools are off/unavailable for this caller). Returns the
     /// SAME `RenderResult` shape a non-tool `Respond` call would, with `Usage` summed across
@@ -175,6 +204,20 @@ type AgentToolLoop
                             capturedCaptions
                             |> List.tryFind (fun (_, caption) -> normalizeForDuplicateCheck caption = normalizedFinal)
 
+                    // Staging evidence (2026-07-23, real prod screenshots): a duplicate-
+                    // CAPTION match isn't the only shape this bug takes — the model can also
+                    // emit a short, contentless ack ("Готово.") that matches NOTHING it sent
+                    // (the caption was e.g. «Окей, повесила в зал…»), so `duplicateCaption`
+                    // above misses it entirely. Second, broader layer: once ANY media tool
+                    // has already succeeded this turn (`capturedCaptions` non-empty), also
+                    // suppress a final reply that's just a stoplisted/very-short ack — same
+                    // suppression handling as the duplicate-caption path.
+                    let contentlessAck =
+                        result.FullText <> ""
+                        && duplicateCaption.IsNone
+                        && not (List.isEmpty capturedCaptions)
+                        && isContentlessAck result.FullText
+
                     match duplicateCaption, result.FinalMessage with
                     | Some(toolName, _), Some sent ->
                         logger.LogDebug(
@@ -186,6 +229,18 @@ type AgentToolLoop
                             1L,
                             KeyValuePair("tool", box toolName),
                             KeyValuePair("outcome", box "duplicate_final_suppressed"))
+                        final <- Some { result with FinalMessage = None; FullText = ""; Usage = totalUsage }
+                    | None, Some sent when contentlessAck ->
+                        let toolName = capturedCaptions |> List.last |> fst
+                        logger.LogDebug(
+                            "Suppressing contentless final reply {Text} — a media tool ({Tool}) already delivered its own caption this turn",
+                            result.FullText,
+                            toolName)
+                        do! BotHelpers.deleteMessage tg execCtx.ChatId sent.MessageId
+                        Metrics.toolCallTotal.Add(
+                            1L,
+                            KeyValuePair("tool", box toolName),
+                            KeyValuePair("outcome", box "contentless_final_suppressed"))
                         final <- Some { result with FinalMessage = None; FullText = ""; Usage = totalUsage }
                     | _ -> final <- Some { result with Usage = totalUsage }
 
