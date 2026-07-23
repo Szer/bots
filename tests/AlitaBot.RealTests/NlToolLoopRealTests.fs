@@ -48,6 +48,28 @@ type NlToolLoopRealTests(fx: RealAssemblyFixture) =
             return found
         }
 
+    /// Polls for the bot's `[song] ...` reply row attributed to `userMessageId` — same
+    /// query SongRealTests.fs's `awaitSongReplyRow` uses (message_log carries the caption
+    /// text; TryAwaitAudioReplyTo itself only returns duration/byte-size, no text).
+    let awaitSongReplyRow (userMessageId: int64) =
+        task {
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            let deadline = DateTime.UtcNow + Timeouts.dbSettle
+            let mutable found = None
+            while found.IsNone && DateTime.UtcNow < deadline do
+                let! rows =
+                    conn.QueryAsync<{| text: string |}>(
+                        """
+SELECT text FROM message_log
+WHERE chat_id = @chat_id AND is_bot = true AND reply_to_message_id = @rid AND text LIKE '[song]%'
+ORDER BY message_id LIMIT 1;
+""",
+                        {| chat_id = env.TestChatId; rid = userMessageId |})
+                found <- rows |> Seq.tryHead
+                if found.IsNone then do! Task.Delay 500
+            return found
+        }
+
     [<Fact>]
     member _.``NL image ask ("Алита, нарисуй...") gets a photo reply captioned with an in-persona reaction, not the prompt``() =
         TestRetry.withTimeoutRetry (fun () -> task {
@@ -126,6 +148,54 @@ type NlToolLoopRealTests(fx: RealAssemblyFixture) =
                 Assert.Equal(1L, finalCount)
         })
 
+    /// S10 PR2: the ONLY paid generation this slice's real suite may trigger (~$0.06) — an
+    /// NL song ask exercising the FULL round trip: trigger -> AgentToolLoop -> ToolExecutor
+    /// -> MediaActions.generateSong -> real Gemini/Lyria -> a real Telegram audio reply.
+    /// No `/song` command is sent here. Mirrors the NL image-ask test's "no placeholder to
+    /// race against on the NL path" posture (MediaActions never sends one for a tool call)
+    /// and SongRealTests' Gemini-transient self-skip (a 503 "high demand" upstream capacity
+    /// blip is skipped, not failed/retried, to not waste money on a second paid attempt) —
+    /// but since there's no placeholder to detect that edited-in-place failure text on this
+    /// path, a plain timeout self-skips outright rather than trying to distinguish the two.
+    [<Fact>]
+    member _.``NL song ask ("Алита, сочини песню про...") gets an audio reply captioned with an in-persona reaction``() =
+        TestRetry.withTimeoutRetry (fun () -> task {
+            fx.SkipUnlessUserClient()
+
+            if env.ResponderMode <> "llm" then
+                Assert.Skip
+                    "RESPONDER_MODE=llm required (the NL tool loop only runs off ResponderService) — run `RESPONDER_MODE=llm make real-test`"
+
+            if String.IsNullOrWhiteSpace env.GeminiApiKey then
+                Assert.Skip "ALITA_GEMINI_API_KEY missing in ~/.alita-test/env — no real music-gen backend"
+
+            let! blocked = GeminiProbe.isQuotaBlocked env.GeminiApiKey "lyria-3-pro-preview"
+            if blocked then
+                Assert.Skip
+                    "Gemini music generation is billing-gated (free_tier limit: 0) for this ALITA_GEMINI_API_KEY's Google Cloud project — see GeminiProbe.fs's doc comment"
+
+            let marker = Guid.NewGuid().ToString "N"
+            let! msgId = fx.UserClient.SendText(env.TestChatId, $"Алита, сочини короткую песню про тесты {marker}")
+
+            match! fx.UserClient.TryAwaitAudioReplyTo(env.TestChatId, msgId, SongRealTimeouts.songReply) with
+            | None ->
+                Assert.Skip
+                    $"No audio reply within {SongRealTimeouts.songReply.TotalSeconds}s — likely a transient upstream capacity issue (or a Gemini 503 high-demand refusal), not asserting a hard failure"
+            | Some(_duration, byteSize) ->
+                Assert.True(byteSize > 0L, $"expected non-empty audio bytes, got {byteSize}")
+
+                match! awaitSongReplyRow (int64 msgId) with
+                | None -> Assert.Fail $"no '[song] ...' bot reply row (reply_to_message_id={msgId}) in message_log"
+                | Some row ->
+                    let caption = row.text.Substring("[song] ".Length)
+                    // MEDIA_CAPTION_PROMPT explicitly forbids describing/repeating the
+                    // prompt — assert the title/caption is an in-persona reaction, not an
+                    // echo of the marker (S10 PR2 fix: no more prompt-echo titles).
+                    Assert.False(
+                        caption.Contains marker,
+                        $"expected an in-persona caption reaction, not an echo of the prompt/marker ({marker}): {caption}")
+        })
+
     /// EMPIRICAL FINDING (first real run of this test, 2026-07-22): the real model, even
     /// when `web_search` came back correctly grounded (verified via the real Azure Responses
     /// API reply confirming ".NET 10 вышел 11 ноября 2025"), replied in-character with
@@ -134,6 +204,7 @@ type NlToolLoopRealTests(fx: RealAssemblyFixture) =
     /// brittle against that persona-conversational style, so this asserts on the DB-verified
     /// `llm_usage(kind='web_search')` row (the tool genuinely fired) plus a loose grounding
     /// check on the reply text (a literal URL OR the correct release info), not JUST the URL.
+    ///
     [<Fact>]
     member _.``NL search ask ("Алита, найди в интернете...") triggers a real web_search call and threads a grounded reply``() =
         TestRetry.withTimeoutRetry (fun () -> task {

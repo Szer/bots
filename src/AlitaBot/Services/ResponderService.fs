@@ -371,6 +371,10 @@ type ResponderService(
                         { ChatId = msg.Chat.Id
                           ReplyToMessageId = msg.MessageId
                           UserId = msg.From |> Option.map (fun u -> u.Id) |> Option.defaultValue 0L
+                          // S10 PR2: roast_user's self-target resolution needs a display
+                          // name (mirrors the command path's `displayNameOf from`) — a tool
+                          // call has no `User` object of its own to derive one from.
+                          UserDisplayName = msg.From |> Option.map displayNameOf |> Option.defaultValue "?"
                           IsAdmin = isAdmin
                           UsageCtx = ctx
                           SourceImage = sourceImage }

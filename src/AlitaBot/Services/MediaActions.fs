@@ -1,6 +1,8 @@
 namespace AlitaBot.Services
 
 open System
+open System.Diagnostics
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
@@ -138,4 +140,198 @@ module MediaActions =
                         else
                             "Не получилось нарисовать 🙁"
                     return MediaOutcome.GenFailed reason
+        }
+
+    /// Truncation length for `/song`'s delivered audio title (Bot API `sendAudio`
+    /// `title` field) — now built from `composeCaption`'s output (S10 PR2 fix: no more
+    /// prompt-echo titles), so this constant lives here next to where the title is
+    /// actually built rather than in BotService.
+    [<Literal>]
+    let SongTitleMaxLen = 60
+
+    /// True when `bytes` starts with the Ogg container magic ("OggS") — Azure's
+    /// audio/speech `response_format=opus` normally already yields one.
+    let isOggContainer (bytes: byte[]) =
+        bytes.Length >= 4 && bytes[0] = 0x4Fuy && bytes[1] = 0x67uy && bytes[2] = 0x67uy && bytes[3] = 0x53uy
+
+    /// Best-effort re-encode of non-Ogg TTS output into ogg/opus via `ffmpeg`, if it's on
+    /// PATH. Returns None when ffmpeg is missing or the conversion itself fails — the
+    /// caller falls back to sending the raw bytes as a regular audio attachment instead of
+    /// a voice note in that case.
+    let tryConvertToOggOpus (logger: ILogger) (bytes: byte[]) : Task<byte[] option> =
+        task {
+            let inPath = Path.GetTempFileName()
+            let outPath = Path.ChangeExtension(Path.GetTempFileName(), ".ogg")
+            try
+                try
+                    do! File.WriteAllBytesAsync(inPath, bytes)
+                    let psi =
+                        ProcessStartInfo(
+                            FileName = "ffmpeg",
+                            Arguments = $"-y -i \"{inPath}\" -c:a libopus -b:a 32k \"{outPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true)
+                    use proc = new Process(StartInfo = psi)
+                    if not (proc.Start()) then
+                        return None
+                    else
+                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
+                        let! _stderr = proc.StandardError.ReadToEndAsync()
+                        do! proc.WaitForExitAsync()
+                        if proc.ExitCode = 0 && File.Exists outPath then
+                            let! converted = File.ReadAllBytesAsync(outPath)
+                            return Some converted
+                        else
+                            return None
+                with ex ->
+                    logger.LogWarning(ex, "/say: ffmpeg conversion to ogg/opus failed — falling back to sendAudio")
+                    return None
+            finally
+                (try File.Delete inPath with _ -> ())
+                (try File.Delete outPath with _ -> ())
+        }
+
+    /// Best-effort re-encode of Lyria's audio bytes into mp3 via `ffmpeg`, mirroring
+    /// `tryConvertToOggOpus`'s pattern: mp3 (not ogg/opus) because `/song` delivers via
+    /// `sendAudio` with a `title` — a regular audio-player attachment, not a voice-note
+    /// bubble. Returns `None` when `ffmpeg` is missing or the conversion itself fails.
+    let tryConvertToMp3 (logger: ILogger) (bytes: byte[]) : Task<byte[] option> =
+        task {
+            let inPath = Path.GetTempFileName()
+            let outPath = Path.ChangeExtension(Path.GetTempFileName(), ".mp3")
+            try
+                try
+                    do! File.WriteAllBytesAsync(inPath, bytes)
+                    let psi =
+                        ProcessStartInfo(
+                            FileName = "ffmpeg",
+                            Arguments = $"-y -i \"{inPath}\" -c:a libmp3lame -b:a 128k \"{outPath}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true)
+                    use proc = new Process(StartInfo = psi)
+                    if not (proc.Start()) then
+                        return None
+                    else
+                        let! _stdout = proc.StandardOutput.ReadToEndAsync()
+                        let! _stderr = proc.StandardError.ReadToEndAsync()
+                        do! proc.WaitForExitAsync()
+                        if proc.ExitCode = 0 && File.Exists outPath then
+                            let! converted = File.ReadAllBytesAsync(outPath)
+                            return Some converted
+                        else
+                            return None
+                with ex ->
+                    logger.LogWarning(ex, "/song: ffmpeg conversion to mp3 failed — sending raw bytes as-is")
+                    return None
+            finally
+                (try File.Delete inPath with _ -> ())
+                (try File.Delete outPath with _ -> ())
+        }
+
+    /// Core of `/song` (command AND `generate_song` tool, S10 PR2): guardrails
+    /// (SONG_MAX_CHARS, SONG_COOLDOWN_SECONDS via `db.LastSongAt`/`db.RecordSong` — the SAME
+    /// DbService calls the `/song` command uses) -> `musicGen.Generate` -> `composeCaption`
+    /// (kind="песню") -> re-encode to mp3 (best-effort) -> `sendAudioReplyWithTitle`, title
+    /// built from the COMPOSED caption (S10 PR2 fix: no more prompt-echo titles — the old
+    /// `/song` title was `lyricsOrDesc` truncated verbatim). The cooldown is only stamped
+    /// (`db.RecordSong`) on an actual successful delivery, mirroring `/roast`'s
+    /// `RecordRoast` convention. The command path ALSO pre-checks length/cooldown itself
+    /// (same "defensive, avoid showing a placeholder for a doomed request" pattern
+    /// `generateImage`'s callers use for IMAGE_GEN_ENABLED) — these guards are the ones
+    /// that actually fire for the `generate_song` tool path, which has no placeholder and
+    /// never pre-checks.
+    let generateSong
+        (logger: ILogger)
+        (musicGen: IMusicGen)
+        (chat: IChatCompletion)
+        (tg: ITelegramApi)
+        (db: DbService)
+        (time: TimeProvider)
+        (conf: BotConfiguration)
+        (chatId: int64)
+        (replyToMessageId: int64)
+        (userId: int64)
+        (styleHint: string option)
+        (lyricsOrDesc: string)
+        (ctx: UsageContext)
+        : Task<MediaOutcome> =
+        task {
+            if String.IsNullOrWhiteSpace lyricsOrDesc then
+                return MediaOutcome.Refused "Напиши, что сочинить: `/song текст песни` или `/song (стиль) текст песни`."
+            elif lyricsOrDesc.Length > conf.SongMaxChars then
+                return MediaOutcome.Refused $"Слишком длинный текст — максимум {conf.SongMaxChars} символов."
+            else
+                let now = time.GetUtcNow().UtcDateTime
+                let! lastSong = db.LastSongAt(userId)
+                match lastSong with
+                | Some last when (now - last).TotalSeconds < float conf.SongCooldownSeconds ->
+                    return MediaOutcome.Refused "рано, дай отдышаться — попробуй чуть позже"
+                | _ ->
+                    let prompt =
+                        match styleHint with
+                        | Some style -> $"Style: {style}\n\n{lyricsOrDesc}"
+                        | None -> lyricsOrDesc
+                    match! musicGen.Generate(prompt, ctx, CancellationToken.None) with
+                    | Error err ->
+                        let reason =
+                            if LlmError.isTransient err then
+                                "Модель перегружена, попробуй сочинить чуть позже 🙏"
+                            else
+                                "Не получилось сочинить 🙁"
+                        return MediaOutcome.GenFailed reason
+                    | Ok(bytes, _usage) when bytes.Length = 0 ->
+                        logger.LogWarning("Music generation returned no audio")
+                        return MediaOutcome.GenFailed "Не получилось сочинить 🙁"
+                    | Ok(bytes, _usage) ->
+                        let! caption = composeCaption logger chat conf ctx "песню" lyricsOrDesc
+                        let! mp3Bytes = tryConvertToMp3 logger bytes
+                        let deliverBytes = mp3Bytes |> Option.defaultValue bytes
+                        let title = if caption.Length > SongTitleMaxLen then caption.Substring(0, SongTitleMaxLen) else caption
+                        let! sent = BotHelpers.sendAudioReplyWithTitle tg chatId deliverBytes title replyToMessageId
+                        do! db.RecordSong(userId, now)
+                        return MediaOutcome.Sent(sent, caption)
+        }
+
+    /// Core of `/say` (command AND `speak_text` tool, S10 PR2): guardrail (SAY_MAX_CHARS)
+    /// -> `speech.Synthesize` -> re-encode to ogg/opus (best-effort) -> `sendVoiceReply`,
+    /// falling back to `sendAudioReply` when neither the raw bytes nor a converted copy is
+    /// a proper Ogg container. Unlike `generateImage`/`generateSong`, this does NOT call
+    /// `composeCaption` — the spoken `text` IS the content (there is nothing to react to
+    /// that isn't already the text itself), so the returned "caption" is `text` verbatim,
+    /// matching the existing `[voice] {text}` message_log convention.
+    let speakText
+        (logger: ILogger)
+        (speech: ISpeech)
+        (tg: ITelegramApi)
+        (conf: BotConfiguration)
+        (chatId: int64)
+        (replyToMessageId: int64)
+        (voice: string option)
+        (text: string)
+        (ctx: UsageContext)
+        : Task<MediaOutcome> =
+        task {
+            if String.IsNullOrWhiteSpace text then
+                return MediaOutcome.Refused "Скажи, что озвучить: `/say привет`."
+            elif text.Length > conf.SayMaxChars then
+                return MediaOutcome.Refused $"Слишком длинный текст — максимум {conf.SayMaxChars} символов."
+            else
+                match! speech.Synthesize(text, voice, ctx, CancellationToken.None) with
+                | Error err ->
+                    logger.LogWarning("/say: TTS synthesis failed: {Error}", string err)
+                    return MediaOutcome.GenFailed "Не получилось озвучить 🙁"
+                | Ok bytes when bytes.Length = 0 ->
+                    logger.LogWarning("/say: TTS synthesis returned no audio")
+                    return MediaOutcome.GenFailed "Не получилось озвучить 🙁"
+                | Ok bytes ->
+                    let! oggBytes = if isOggContainer bytes then Task.FromResult(Some bytes) else tryConvertToOggOpus logger bytes
+                    match oggBytes with
+                    | Some ogg ->
+                        let! sent = BotHelpers.sendVoiceReply tg chatId ogg replyToMessageId
+                        return MediaOutcome.Sent(sent, text)
+                    | None ->
+                        let! sent = BotHelpers.sendAudioReply tg chatId bytes replyToMessageId
+                        return MediaOutcome.Sent(sent, text)
         }
