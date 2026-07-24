@@ -46,11 +46,12 @@ module private PersonaChecks =
 
     let hasNameHeadlineOpener (text: string) = nameHeadlinePattern.IsMatch text
 
-/// Slice 6 real-Telegram tests: outcome-router emoji reactions, MarkdownV2 entities on
-/// the settled final message, and a persona smoke check (no assistant-isms leak into a
-/// real LLM reply). All three need `RESPONDER_MODE=llm` — the outcome router and MDV2
-/// rendering only ever run for the "llm" ResponderService path, and the persona check is
-/// obviously meaningless against "echo" mode's `pong: ...` replies.
+/// Slice 6 real-Telegram tests: the reaction channel (redesign, PR #253 follow-up —
+/// `REACTION_PROBABILITY`, independent of replying), MarkdownV2 entities on the settled
+/// final message, and a persona smoke check (no assistant-isms leak into a real LLM
+/// reply). All need `RESPONDER_MODE=llm` — MDV2 rendering only ever runs for the "llm"
+/// ResponderService path, and the persona check is obviously meaningless against "echo"
+/// mode's `pong: ...` replies.
 type PersonaRealTests(fx: RealAssemblyFixture) =
     let env = fx.Env
 
@@ -59,8 +60,8 @@ type PersonaRealTests(fx: RealAssemblyFixture) =
             Assert.Skip "RESPONDER_MODE=llm required — run `RESPONDER_MODE=llm make real-test`"
 
     /// Upserts a `bot_setting` row directly (same shape as DevDb's own upsert) — used to
-    /// flip OUTCOME_WEIGHTS/etc. for the duration of one test, mirroring the fake suite's
-    /// `fixture.SetBotSetting` + `/reload-settings` idiom (ContainerTestBase.fs).
+    /// flip REACTION_PROBABILITY/etc. for the duration of one test, mirroring the fake
+    /// suite's `fixture.SetBotSetting` + `/reload-settings` idiom (ContainerTestBase.fs).
     let setBotSetting (key: string) (value: string) =
         task {
             use conn = new NpgsqlConnection(fx.DbConnectionString)
@@ -88,22 +89,28 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             resp.EnsureSuccessStatusCode() |> ignore
         }
 
+    /// Restores the reaction channel to its off-by-default posture — every test below
+    /// (not just the reaction-channel one) calls this defensively so it never depends on
+    /// declaration/execution order relative to whichever test last flipped it.
     let restoreDefaultWeights () =
         task {
-            do! setBotSetting "OUTCOME_WEIGHTS" """{"reply":100,"silence":0,"emoji":0}"""
+            do! setBotSetting "REACTION_PROBABILITY" "0.0"
             do! reloadSettings ()
         }
 
-    // ── (a) Outcome router: emoji reaction, no text reply ────────────────────
+    // ── (a) Reaction channel: BOTH a reaction AND a reply, independently ─────
 
     [<Fact>]
-    member _.``OUTCOME_WEIGHTS emoji=100 makes the bot react instead of replying``() =
+    member _.``REACTION_PROBABILITY=1.0 makes the bot react AND still reply — the two channels don't interfere``() =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             requireLlmMode ()
 
             try
-                do! setBotSetting "OUTCOME_WEIGHTS" """{"reply":0,"silence":0,"emoji":100}"""
+                // "random" so the reply's own LLM call is the only LLM call in play here —
+                // an "llm" emoji pick would be a second, independent call.
+                do! setBotSetting "REACTION_PROBABILITY" "1.0"
+                do! setBotSetting "REACTION_CHOICE_MODE" "random"
                 do! reloadSettings ()
 
                 let marker = Guid.NewGuid().ToString "N"
@@ -115,15 +122,17 @@ ON CONFLICT (key) DO UPDATE SET value = @value
                         "expected message_id to carry a reaction (via Messages_GetHistory polling — see TgUserClient.TryAwaitReactionOn's doc comment) within 30s"
                 | Some emojis -> Assert.NotEmpty emojis
 
-                // No text reply within 15s — the emoji outcome never calls ResponderService.
-                let! reply = fx.UserClient.TryAwaitReplyTo(env.TestChatId, msgId, TimeSpan.FromSeconds 15.)
-                Assert.True(reply.IsNone, "expected no text reply while OUTCOME_WEIGHTS routes to emoji")
+                // A TRIGGERED (mentioned) message always replies now — the reaction above
+                // is an independent channel, not a substitute for the reply path.
+                let! reply = fx.UserClient.TryAwaitReplyTo(env.TestChatId, msgId, Timeouts.reply)
+                Assert.True(reply.IsSome, "expected a text reply alongside the reaction — the two channels must not interfere")
             with ex ->
                 // MUST be awaited, not fire-and-forget: a later test in this class (or a
-                // re-run) can start before an un-awaited restore lands and itself gets
-                // routed to "emoji" by the stale weights — exactly what happened once
-                // while developing this test. Re-raises so the original failure (if any)
-                // is still what fails the test, not swallowed by the cleanup.
+                // re-run) can start before an un-awaited restore lands and itself gets an
+                // unwanted reaction from the stale probability — exactly what happened once
+                // while developing this test (back when this flipped OUTCOME_WEIGHTS).
+                // Re-raises so the original failure (if any) is still what fails the test,
+                // not swallowed by the cleanup.
                 do! restoreDefaultWeights ()
                 raise ex
 
@@ -138,7 +147,7 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             fx.SkipUnlessUserClient()
             requireLlmMode ()
             // Defensive: don't depend on declaration/execution order relative to the
-            // emoji-outcome test above — ensure "reply" is actually possible here too.
+            // reaction-channel test above — ensure "reply" is actually possible here too.
             do! restoreDefaultWeights ()
 
             let marker = Guid.NewGuid().ToString "N"
@@ -170,7 +179,7 @@ ON CONFLICT (key) DO UPDATE SET value = @value
             fx.SkipUnlessUserClient()
             requireLlmMode ()
             // Defensive: don't depend on declaration/execution order relative to the
-            // emoji-outcome test above — ensure "reply" is actually possible here too.
+            // reaction-channel test above — ensure "reply" is actually possible here too.
             do! restoreDefaultWeights ()
 
             let marker = Guid.NewGuid().ToString "N"

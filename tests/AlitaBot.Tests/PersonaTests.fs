@@ -9,9 +9,11 @@ open Xunit
 
 open CommandsTestHelpers
 
-/// Slice 6: outcome router (weighted reply/silence/emoji roll for TRIGGERED non-command
-/// messages), MarkdownV2 final-message rendering (+ plain-text fallback on a Telegram
-/// 400), rewriter pass, and reply-context enrichment.
+/// Slice 6: a TRIGGERED message always replies (the old OUTCOME_WEIGHTS reply/silence/
+/// emoji roll is gone, see ProactiveTests.fs's "── Reaction channel ──" section for the
+/// independent reaction-roll tests that replaced it), reaction-palette/choice-mode
+/// mechanics (REACTION_CHOICE_MODE/REACTION_PALETTE), MarkdownV2 final-message rendering
+/// (+ plain-text fallback on a Telegram 400), rewriter pass, and reply-context enrichment.
 type PersonaTests(fixture: AlitaTestContainers) =
 
     let botReplyRows (replyToMessageId: int64) =
@@ -29,6 +31,15 @@ ORDER BY message_id
         let text = $"{mention} {tail}"
         let entities = [| MessageEntity.Create(``type`` = "mention", offset = 0L, length = int64 mention.Length) |]
         Tg.quickMsg(text = text, chat = Tg.chat(id = fixture.TargetChatId), from = user, entities = entities)
+
+    /// A plain, NOT-triggered message (no mention/name/reply-to-bot) to a `chatId` — used
+    /// by the REACTION_CHOICE_MODE/REACTION_PALETTE mechanics tests below so the reaction
+    /// channel (`tryReact`) is the ONLY thing that can fire an LLM call/reaction; the reply
+    /// path never engages for an untriggered message, so there's no risk of the scripted
+    /// Azure response being consumed by the wrong caller.
+    let plainUpdate (userId: int64) (username: string) (chatId: int64) (text: string) =
+        let user = Tg.user(id = userId, username = username, firstName = username)
+        Tg.groupMessage(text, user, chatId)
 
     /// Polls (up to `timeoutMs`) for at least one `setMessageReaction` call — same idiom as
     /// ProactiveTests.awaitReactions, duplicated locally rather than shared (both files
@@ -49,14 +60,12 @@ ORDER BY message_id
         let reactionArr = doc.RootElement.GetProperty("reaction")
         reactionArr[0].GetProperty("emoji").GetString()
 
-    // ── Outcome router ───────────────────────────────────────────────────────
+    // ── Triggered messages always reply (no roll) ─────────────────────────────
 
     [<Fact>]
-    let ``OUTCOME_WEIGHTS 100/0/0 always replies normally`` () =
+    let ``a triggered (mentioned) message always replies — no silence/emoji roll`` () =
         task {
             do! fixture.ClearFakeCalls()
-            do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
-            do! fixture.ReloadSettings()
             do! fixture.SetAzureLlmScript [| LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "привет") |]
 
             let update = mentionUpdate 6001L "outcome_reply" "здорово"
@@ -67,87 +76,39 @@ ORDER BY message_id
             let! replies = botReplyRows msgId
             Assert.Single(replies) |> ignore
 
+            // REACTION_PROBABILITY defaults to 0.0 in the fixture — no reaction either.
             let! reactions = fixture.GetFakeCalls("setMessageReaction")
             Assert.Empty(reactions)
-        }
-
-    [<Fact>]
-    let ``OUTCOME_WEIGHTS 0/100/0 stays silent — no reply, no LLM call, no reaction`` () =
-        task {
-            do! fixture.ClearFakeCalls()
-            do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":100,"emoji":0}""")
-            do! fixture.ReloadSettings()
-            do! fixture.SetAzureLlmScript [||]
-
-            let update = mentionUpdate 6002L "outcome_silence" "здорово"
-            let msgId = update.Message.Value.MessageId
-            let! resp = fixture.SendUpdate(update)
-            resp.EnsureSuccessStatusCode() |> ignore
-
-            // Prove absence, not just "not yet": wait out a generous window.
-            do! Task.Delay 1500
-
-            let! replies = botReplyRows msgId
-            Assert.Empty(replies)
-            let! sends = fixture.GetFakeCalls("sendMessage")
-            Assert.Empty(sends |> Array.filter (isToChat fixture.TargetChatId))
-            let! reactions = fixture.GetFakeCalls("setMessageReaction")
-            Assert.Empty(reactions)
-            let! llmCalls = fixture.GetAzureLlmCalls()
-            Assert.Empty(llmCalls)
-        }
-
-    [<Fact>]
-    let ``OUTCOME_WEIGHTS 0/0/100 reacts with an emoji instead of replying`` () =
-        task {
-            do! fixture.ClearFakeCalls()
-            do! fixture.ClearAzureOcrCalls()
-            do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
-            do! fixture.ReloadSettings()
-            do! fixture.SetAzureLlmScript [| scripted 200 (nonStreamCompletionBody "🔥") |]
-
-            let update = mentionUpdate 6003L "outcome_emoji" "здорово"
-            let msgId = update.Message.Value.MessageId
-            let! resp = fixture.SendUpdate(update)
-            resp.EnsureSuccessStatusCode() |> ignore
-
-            let! replies = botReplyRows msgId
-            Assert.Empty(replies)
-
-            let deadline = DateTime.UtcNow + TimeSpan.FromSeconds 5.
-            let mutable reactions = [||]
-            while reactions.Length = 0 && DateTime.UtcNow < deadline do
-                let! r = fixture.GetFakeCalls("setMessageReaction")
-                reactions <- r
-                if reactions.Length = 0 then do! Task.Delay 150
-
-            Assert.NotEmpty(reactions)
-            // Parse, don't raw-substring — System.Text.Json escapes non-ASCII (incl. this
-            // emoji's surrogate pair) as \uXXXX by default (see AGENTS.md's "Russian text
-            // in tests" rule, same reasoning applies to any non-ASCII wire content).
-            use doc = JsonDocument.Parse(reactions[0].Body: string)
-            Assert.Equal(int64 msgId, doc.RootElement.GetProperty("message_id").GetInt64())
-            let reactionArr = doc.RootElement.GetProperty("reaction")
-            Assert.Equal(1, reactionArr.GetArrayLength())
-            Assert.Equal("🔥", reactionArr[0].GetProperty("emoji").GetString())
         }
 
     // ── Reaction palette / choice mode ───────────────────────────────────────
+    //
+    // These exercise ONLY the reaction channel's emoji-picking mechanics
+    // (REACTION_CHOICE_MODE/REACTION_PALETTE) — REACTION_PROBABILITY=1.0 on an
+    // UNADDRESSED plain message (plainUpdate), so the reply path never engages and the
+    // scripted Azure response can only ever be consumed by the emoji-pick call. Each test
+    // uses its own dedicated chat id: REACTION_COOLDOWN_SECONDS' claim is a per-chat,
+    // in-memory, process-lifetime timestamp (BotService.lastReactionAt) — reusing
+    // fixture.TargetChatId across tests would have every test after the first find the
+    // chat's reaction slot already claimed by an earlier test and never fire (same
+    // reasoning as ProactiveTests.fs's interjection tests, which use dedicated chat ids
+    // for exactly this reason).
 
     [<Fact>]
     let ``REACTION_CHOICE_MODE=random picks only from REACTION_PALETTE, never calls the LLM`` () =
         task {
+            let chatId = -6111L
             try
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", $"{fixture.TargetChatId},{chatId}")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "1.0")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "random")
                 do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉"]""")
                 do! fixture.ReloadSettings()
                 do! fixture.SetAzureLlmScript [||]
 
-                let update = mentionUpdate 6011L "outcome_palette_random" "здорово"
-                let msgId = update.Message.Value.MessageId
+                let update = plainUpdate 6011L "outcome_palette_random" chatId "просто сообщение в чате"
                 let! resp = fixture.SendUpdate(update)
                 resp.EnsureSuccessStatusCode() |> ignore
 
@@ -158,8 +119,9 @@ ORDER BY message_id
                 // random mode never touches the LLM at all.
                 let! llmCalls = fixture.GetAzureLlmCalls()
                 Assert.Empty(llmCalls)
-                ignore msgId
             finally
+                fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId) |> ignore
+                fixture.SetBotSetting("REACTION_PROBABILITY", "0.0") |> ignore
                 fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
                 fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
                 fixture.ReloadSettings() |> ignore
@@ -168,17 +130,18 @@ ORDER BY message_id
     [<Fact>]
     let ``REACTION_CHOICE_MODE=llm picks the scripted emoji from REACTION_PALETTE`` () =
         task {
+            let chatId = -6112L
             try
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", $"{fixture.TargetChatId},{chatId}")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "1.0")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
                 do! fixture.SetBotSetting("REACTION_PALETTE", """["🎉","💯"]""")
                 do! fixture.ReloadSettings()
                 do! fixture.SetAzureLlmScript [| scripted 200 (nonStreamCompletionBody "💯") |]
 
-                let update = mentionUpdate 6012L "outcome_palette_llm" "здорово"
-                let msgId = update.Message.Value.MessageId
+                let update = plainUpdate 6012L "outcome_palette_llm" chatId "просто сообщение в чате"
                 let! resp = fixture.SendUpdate(update)
                 resp.EnsureSuccessStatusCode() |> ignore
 
@@ -188,8 +151,9 @@ ORDER BY message_id
 
                 let! llmCalls = fixture.GetAzureLlmCalls()
                 Assert.NotEmpty(llmCalls)
-                ignore msgId
             finally
+                fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId) |> ignore
+                fixture.SetBotSetting("REACTION_PROBABILITY", "0.0") |> ignore
                 fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
                 fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
                 fixture.ReloadSettings() |> ignore
@@ -198,10 +162,12 @@ ORDER BY message_id
     [<Fact>]
     let ``a failed emoji-pick LLM call falls back to a random pick from the palette`` () =
         task {
+            let chatId = -6113L
             try
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", $"{fixture.TargetChatId},{chatId}")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "1.0")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
                 // A single-entry palette makes the random fallback's outcome deterministic —
                 // this test is about "did it fall back at all", not "is Random.Shared fair".
@@ -210,8 +176,7 @@ ORDER BY message_id
                 do! fixture.SetAzureLlmScript
                         [| scripted 400 """{"error":{"code":"content_filter","message":"blocked"}}""" |]
 
-                let update = mentionUpdate 6013L "outcome_palette_fallback" "здорово"
-                let msgId = update.Message.Value.MessageId
+                let update = plainUpdate 6013L "outcome_palette_fallback" chatId "просто сообщение в чате"
                 let! resp = fixture.SendUpdate(update)
                 resp.EnsureSuccessStatusCode() |> ignore
 
@@ -221,8 +186,9 @@ ORDER BY message_id
 
                 let! logs = fixture.GetBotLogs()
                 Assert.Contains("falling back to a random pick", logs)
-                ignore msgId
             finally
+                fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId) |> ignore
+                fixture.SetBotSetting("REACTION_PROBABILITY", "0.0") |> ignore
                 fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
                 fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
                 fixture.ReloadSettings() |> ignore
@@ -231,10 +197,12 @@ ORDER BY message_id
     [<Fact>]
     let ``REACTION_PALETTE entries outside Telegram's allowed set are dropped with a Warning`` () =
         task {
+            let chatId = -6114L
             try
                 do! fixture.ClearFakeCalls()
                 do! fixture.ClearAzureOcrCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":0,"silence":0,"emoji":100}""")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", $"{fixture.TargetChatId},{chatId}")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "1.0")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "random")
                 // "🚀" is not on Telegram's documented setMessageReaction allowed-emoji list
                 // (OutcomeRouter.telegramAllowedReactionEmoji) — it must be filtered out,
@@ -243,8 +211,7 @@ ORDER BY message_id
                 do! fixture.ReloadSettings()
                 do! fixture.SetAzureLlmScript [||]
 
-                let update = mentionUpdate 6014L "outcome_palette_invalid" "здорово"
-                let msgId = update.Message.Value.MessageId
+                let update = plainUpdate 6014L "outcome_palette_invalid" chatId "просто сообщение в чате"
                 let! resp = fixture.SendUpdate(update)
                 resp.EnsureSuccessStatusCode() |> ignore
 
@@ -255,8 +222,9 @@ ORDER BY message_id
                 let! logs = fixture.GetBotLogs()
                 Assert.Contains("REACTION_PALETTE", logs)
                 Assert.Contains("dropped", logs)
-                ignore msgId
             finally
+                fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId) |> ignore
+                fixture.SetBotSetting("REACTION_PROBABILITY", "0.0") |> ignore
                 fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm") |> ignore
                 fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""") |> ignore
                 fixture.ReloadSettings() |> ignore
@@ -268,7 +236,6 @@ ORDER BY message_id
     let ``final reply is delivered as MarkdownV2 with escaped payload`` () =
         task {
             do! fixture.ClearFakeCalls()
-            do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
             do! fixture.ReloadSettings()
             do! fixture.SetAzureLlmScript [| LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "**жирный** и `код`") |]
 
@@ -295,7 +262,6 @@ ORDER BY message_id
         task {
             try
                 do! fixture.ClearFakeCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.ReloadSettings()
                 do! fixture.SetMdv2Rejected(true)
                 do! fixture.SetAzureLlmScript [| LlmTestHelpers.scripted 200 (LlmTestHelpers.completionBody "**жирный** текст") |]
@@ -325,7 +291,6 @@ ORDER BY message_id
         task {
             try
                 do! fixture.ClearFakeCalls()
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.SetBotSetting("REWRITER_ENABLED", "true")
                 do! fixture.ReloadSettings()
                 do! fixture.SetAzureLlmScript
@@ -354,7 +319,6 @@ ORDER BY message_id
     let ``a reply-to-message is quoted (author + text) into the LLM request`` () =
         task {
             do! fixture.ClearFakeCalls()
-            do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
             do! fixture.ReloadSettings()
 
             let quotedAuthor = Tg.user(id = 6301L, username = "quoted_dave", firstName = "Dave")
@@ -388,10 +352,11 @@ ORDER BY message_id
                 do! fixture.SetMdv2Rejected(false)
                 do! fixture.SetBotSetting("RESPONDER_MODE", "llm")
                 do! fixture.SetBotSetting("STREAM_MODE", "edit")
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.SetBotSetting("REWRITER_ENABLED", "false")
                 do! fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "0.0")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId)
                 do! fixture.ReloadSettings()
             } :> Task)
 
@@ -401,9 +366,10 @@ ORDER BY message_id
                 do! fixture.SetAzureLlmScript [||]
                 do! fixture.SetMdv2Rejected(false)
                 do! fixture.SetBotSetting("RESPONDER_MODE", "echo")
-                do! fixture.SetBotSetting("OUTCOME_WEIGHTS", """{"reply":100,"silence":0,"emoji":0}""")
                 do! fixture.SetBotSetting("REWRITER_ENABLED", "false")
                 do! fixture.SetBotSetting("REACTION_PALETTE", """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""")
                 do! fixture.SetBotSetting("REACTION_CHOICE_MODE", "llm")
+                do! fixture.SetBotSetting("REACTION_PROBABILITY", "0.0")
+                do! fixture.SetBotSetting("TARGET_CHAT_IDS", string fixture.TargetChatId)
                 do! fixture.ReloadSettings()
             } :> Task)

@@ -97,10 +97,12 @@ type AlitaTestContainers() =
                 "DOSSIER_SIM_FLOOR",      "0.60",                              "FREE_FORM", "llm"
                 "EXTRACT_PROMPT",         "Extract new short facts about this person from their recent messages. Reply with ONLY a JSON array of short fact strings, e.g. [\"likes cats\"]. If nothing new, reply [].", "FREE_FORM", "llm"
                 "MERGE_PROMPT",           "Merge the new facts into the existing dossier summary. Reply with the updated summary text only, max 250 words.", "FREE_FORM", "llm"
-                // Slice 6: persona + rewriter + outcome router + MarkdownV2 rendering.
+                // Slice 6: persona + rewriter + MarkdownV2 rendering. NOTE: OUTCOME_WEIGHTS
+                // (the old weighted reply/silence/emoji roll for TRIGGERED messages) is
+                // GONE — a triggered message always replies now; see REACTION_PROBABILITY
+                // below for the independent reaction channel that replaced it.
                 "REWRITER_ENABLED",       "false",                             "FEATURE_FLAG", "llm"
                 "REWRITER_PROMPT",        "Rewrite the following reply as if a real human chat member wrote it: strip assistant-isms, shorten where possible, keep the meaning and all facts. Reply with only the rewritten text.", "FREE_FORM", "llm"
-                "OUTCOME_WEIGHTS",        """{"reply":100,"silence":0,"emoji":0}""", "JSON_BLOB", "llm"
                 // Emoji-reaction expansion: default palette mirrors dev-bot-settings.sql
                 // (minus the extra classics — PersonaTests' scripted picks only ever need
                 // "🔥"/"🎉", kept small so custom-palette tests can tell the seeded default
@@ -108,6 +110,11 @@ type AlitaTestContainers() =
                 // to "llm", same as prod/dev — PersonaTests flips to "random" per-test.
                 "REACTION_PALETTE",       """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]""", "JSON_BLOB", "llm"
                 "REACTION_CHOICE_MODE",   "llm",                               "FREE_FORM", "llm"
+                // Independent reaction channel — defaults OFF/0.0 like every other
+                // proactive-behavior probability in this fixture (INTERJECT_PROBABILITY,
+                // MEME_REACT_PROBABILITY below); PersonaTests/ReactionTests flip it per-test.
+                "REACTION_PROBABILITY",   "0.0",                               "FREE_FORM", "llm"
+                "REACTION_COOLDOWN_SECONDS", "90",                             "FREE_FORM", "llm"
                 // Slice 7: social engine (/roast, /awards, /quote, /karma).
                 "ROAST_PROMPT",           "Roast this person like a mean stand-up comedian — specific, grounded in their dossier facts and their own quotes, quote them verbatim where funniest, no disclaimers, no softening. 4-6 sentences.", "FREE_FORM", "llm"
                 "ROAST_COOLDOWN_SECONDS", "300",                                   "FREE_FORM", "llm"

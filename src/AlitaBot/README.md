@@ -77,32 +77,39 @@ etc.) — only `ResponderService.Respond`'s "llm" branch ever calls it. Failure 
 text on the main call → silence; a failed/empty **rewrite** falls back to sending the
 unrewritten text rather than dropping the reply.
 
-### Outcome router (`OUTCOME_WEIGHTS`, `Services/OutcomeRouter.fs`)
+### Reaction channel (`REACTION_PROBABILITY`, `Services/OutcomeRouter.fs`, redesign — PR #253 follow-up)
 
-A TRIGGERED non-command message doesn't always get a text reply — `OUTCOME_WEIGHTS` bot_setting
-(`{"reply":100,"silence":0,"emoji":0}` by default, keeping the pre-S6 always-reply behavior)
-rolls a weighted outcome in `BotService.handleTriggerableMessage`:
+**A TRIGGERED message (mention, reply-to-bot, name trigger) always replies now** —
+`BotService.handleTriggerableMessage` dispatches straight to `ResponderService.Respond`,
+no roll involved. The old Slice 6 `OUTCOME_WEIGHTS` reply/silence/emoji coin flip on
+triggered messages is gone: a person addressing the bot directly and getting only a
+reaction (or nothing) read as broken, not charming.
 
-- **reply** — the normal path, unchanged (`ResponderService.Respond`).
-- **silence** — says nothing at all; no LLM call, `outcome=silence` (`alitabot_messages_total`).
-- **emoji** — picks ONE emoji from `REACTION_PALETTE` (bot_setting, JSON array — default
-  👍❤🔥😁🤔🤯😱🤬😢🎉🤩💩🤡🥱, validated against Telegram's documented allowed reaction-emoji
-  set, see below) and reacts to the triggering message via `Req.SetMessageReaction` — no text
-  reply, `outcome=emoji`. `REACTION_CHOICE_MODE` (`random` | `llm`, default `llm`) decides HOW:
-  `llm` makes a tiny non-stream gpt-5-mini call (`ReasoningEffort="minimal"`, same
-  cost-saving lever as `MediaActions.composeCaption`) asking the model to pick the
-  best-fitting emoji for the message text from the palette; `random` skips the LLM entirely.
-  A failed LLM call, or an answer outside the palette, falls back to a uniform random pick
-  (`OutcomeRouter.pickRandomEmoji`) rather than refusing to react; a rejected
-  `SetMessageReaction` call is Warning-logged and simply skipped.
+Emoji reactions are their own **independent channel** instead: `REACTION_PROBABILITY`
+(bot_setting, roll in `[0,1)`, default `0.0`) fires on **every** first-delivery message in
+a target chat — addressed to the bot or not — completely decoupled from the reply path
+(`BotService.tryReact`, called fire-and-forget from `handleTriggerableMessage` right after
+logging). A message can get both a reaction and a reply; neither one holds up the other.
+`REACTION_COOLDOWN_SECONDS` (default `90`) is a simple in-memory, per-chat, process-lifetime
+cooldown (`BotService.lastReactionAt`/`tryClaimReactionSlot`) so a lively chat with a high
+roll probability isn't reacted to on every single message. A successful reaction is also
+logged into `message_log` as a synthetic `[reaction] {emoji}` row (`message_id =
+-(original message_id)`, guaranteed free since real Telegram message ids are always
+positive) so the LLM's own context window — and `/ask`-style recall — can see, and later
+explain, why she reacted to something.
 
-`OutcomeRouter.pick` is a pure, deterministic function over `(weights, roll: float in [0,1))` —
-the actual `Random.Shared.NextDouble()` draw lives at the call site. Non-positive/all-zero
-weights degrade to "reply" (a trigger is never silently dropped by a misconfigured setting).
+Emoji picking itself (`BotService.pickReactionEmoji`) is unchanged from the old emoji
+outcome: `REACTION_CHOICE_MODE` (`random` | `llm`, default `llm`) decides HOW. `llm` makes
+a tiny non-stream gpt-5-mini call (`ReasoningEffort="minimal"`, same cost-saving lever as
+`MediaActions.composeCaption`) asking the model to pick the best-fitting emoji for the
+message text from `REACTION_PALETTE`; `random` skips the LLM entirely. A failed LLM call,
+or an answer outside the palette, falls back to a uniform random pick
+(`OutcomeRouter.pickRandomEmoji`) rather than refusing to react; a rejected
+`SetMessageReaction` call is Warning-logged and simply skipped.
 
 #### Reaction palette (`REACTION_PALETTE`, `REACTION_CHOICE_MODE`)
 
-Both the emoji outcome above and meme-react's "react" action (below) draw from — and
+Both the reaction channel above and meme-react's "react" action (below) draw from — and
 validate against — the same `REACTION_PALETTE` bot_setting (`BotService.reactionPalette`),
 a hot-reloadable JSON array of emoji. Every entry is checked against
 `OutcomeRouter.telegramAllowedReactionEmoji`, the set Telegram's `setMessageReaction`
@@ -682,7 +689,7 @@ fire-and-forget/`withChatLock` shape as interjections): `MEME_REACT_PROBABILITY`
 "emoji":"...","text":"..."}`:
 
 - **`react`** — sets a message reaction (`Req.SetMessageReaction`) using ONE emoji from the
-  same shared, hot-reloadable `REACTION_PALETTE` the S6 outcome router's emoji outcome picks
+  same shared, hot-reloadable `REACTION_PALETTE` the reaction channel picks
   from (`BotService.reactionPalette` — see "Reaction palette" above). The palette is also
   interpolated into `MEME_REACT_PROMPT` so the model is grounded in the exact allowed set,
   not just checked after the fact. An emoji outside that set is treated as a no-op
