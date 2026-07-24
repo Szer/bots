@@ -71,8 +71,12 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   advanced across the whole assembly run (every seeded message across every test class shares
   one frozen `sent_at`), so without truncating, every user_id ever seeded by an earlier test
   class would show up as "active in the last 24h" too.
-- `PersonaTests.fs` — Slice 6: the outcome router (`OUTCOME_WEIGHTS` at 100/0/0, 0/100/0,
-  0/0/100 — reply/silence/emoji, each toggled via `fixture.SetBotSetting` + `ReloadSettings`),
+- `PersonaTests.fs` — Slice 6, redesigned (PR #253 follow-up): a TRIGGERED message always
+  replies now (no more `OUTCOME_WEIGHTS` reply/silence/emoji roll — that setting is gone),
+  reaction-palette/choice-mode mechanics (`REACTION_CHOICE_MODE`/`REACTION_PALETTE`, forced
+  via `REACTION_PROBABILITY=1.0` on an UNADDRESSED plain message so the reply path never
+  engages and shares no scripted LLM response with the emoji pick — see `ProactiveTests.fs`
+  below for the reaction channel's own probability/cooldown/both-channels tests),
   MarkdownV2 final-message rendering (a scripted `**bold** and `code`` reply lands as the
   final `editMessageText` with `parse_mode=MarkdownV2` and the correctly-escaped payload,
   `message_log` keeping the plain unescaped text), the plain-text fallback on a simulated
@@ -87,12 +91,23 @@ generations/edits), reusing the same container CouponHubBot's OCR tests use.
   (`INTERJECT_PROBABILITY=1.0` + a seeded burst — `BURST_MSGS`/`BURST_SPEAKERS` lowered for
   test speed — sends a scripted plain (non-reply) message; a scripted `PASS` stays silent
   though the LLM call still lands; an active cooldown or `p=0.0` skip the LLM call
-  entirely), and meme reactions (a scripted `{"action":"react",...}` sets a message
+  entirely), meme reactions (a scripted `{"action":"react",...}` sets a message
   reaction; `{"action":"pass"}` and malformed JSON both do nothing, the malformed case also
-  proving the bot stays responsive afterward). Interjection tests each use a **dedicated
-  chat id** (never `fixture.TargetChatId`) — the cooldown check looks at every bot message
-  ever logged for a chat, and the frozen `FakeTimeProvider` means any earlier test's bot
-  reply to the shared target chat would otherwise "recently" cool it down forever.
+  proving the bot stays responsive afterward), and (redesign, PR #253 follow-up) the
+  independent reaction channel (`REACTION_PROBABILITY`/`REACTION_COOLDOWN_SECONDS`,
+  `REACTION_CHOICE_MODE=random` throughout so these never share a scripted LLM response
+  with a reply's own call): an unaddressed plain message with `p=1.0` gets a reaction and
+  no reply; an addressed (mentioned) message with `p=1.0` gets BOTH a reaction and a reply
+  (the two channels proven independent); a large `REACTION_COOLDOWN_SECONDS` suppresses a
+  second reaction to a later message in the same chat; `p=0.0` never reacts; and a
+  successful reaction lands a synthetic `[reaction] {emoji}` `message_log` row (polled
+  for, since the log write is fire-and-forget) so later context/recall can see it.
+  Interjection AND reaction-channel tests each use a **dedicated chat id** (never
+  `fixture.TargetChatId`) — the interjection cooldown check looks at every bot message
+  ever logged for a chat, the reaction-channel cooldown is an in-memory per-chat
+  timestamp that lives for the whole test-assembly run, and the frozen `FakeTimeProvider`
+  means any earlier test's activity on the shared target chat would otherwise "recently"
+  cool either one down forever.
 
 Container logs land in `test-artifacts/AlitaBot.Tests/AlitaTestContainers/` (`bot.log`,
 `postgres.log`, `flyway.log`, `fake-tg-api.log`, `fake-azure-ocr.log`) on pass or fail.
@@ -144,7 +159,7 @@ digest paraphrases, so no literal GUID marker is expected to survive); and sets
 marker. Both restore every setting they touched afterward via `try/with` + re-raise +
 an unconditional restore call, not a plain `finally` (F#'s `task` CE doesn't allow `do!`
 inside `finally`, and an un-awaited fire-and-forget restore risks the same async-restore
-race PersonaRealTests' emoji test already had to work around).
+race PersonaRealTests' reaction-channel test already had to work around).
 
 `SmokeTests.fs` is the core conversational suite; `VoiceRealTests.fs`, `VisionRealTests.fs`,
 `ImageGenRealTests.fs`, `AskRealTests.fs`, `DossierRealTests.fs`, `PersonaRealTests.fs` cover
@@ -154,12 +169,14 @@ to Azure's `ALITA_IMAGE_DEPLOYMENT`), and `SongRealTests.fs` (Gemini/Lyria `/son
 gates on `ALITA_GEMINI_API_KEY` — both self-skip if Gemini's own billing gate blocks
 generation (`GeminiProbe.isQuotaBlocked`, one real HTTP probe before the Telegram round trip
 assertion), rather than hard-failing on an external blocker.
-`PersonaRealTests.fs` (Slice 6, all three require `RESPONDER_MODE=llm`): (a) flips
-`OUTCOME_WEIGHTS` to `emoji=100` (direct `bot_setting` upsert + `/reload-settings`, restored
-in a `finally`), mentions the bot, and awaits a `TL.UpdateMessageReactions` on the triggering
-message (`TgUserClient.TryAwaitReactionOn` — see its doc comment for why a plain MTProto
-client sees this update and not the bot-only `UpdateBotMessageReaction*` pair) plus 15s of
-silence on a text reply; (b) asks for a markdown-shaped reply and best-effort-asserts the
+`PersonaRealTests.fs` (Slice 6, all require `RESPONDER_MODE=llm`): (a) flips
+`REACTION_PROBABILITY` to `1.0` with `REACTION_CHOICE_MODE=random` (direct `bot_setting`
+upsert + `/reload-settings`, restored in a `finally`), mentions the bot, and awaits BOTH a
+`TL.UpdateMessageReactions` on the triggering message (`TgUserClient.TryAwaitReactionOn` —
+see its doc comment for why a plain MTProto client sees this update and not the bot-only
+`UpdateBotMessageReaction*` pair) AND a real text reply — proving the reaction channel
+(redesign, PR #253 follow-up) and the reply path don't interfere with each other; (b) asks
+for a markdown-shaped reply and best-effort-asserts the
 settled message carries real MTProto entities (`TgUserClient.LastEntitiesOf`) once MDV2 has
 round-tripped through Telegram's own parser; (c) asserts a real reply contains none of a
 short assistant-isms list ("как ИИ", "отличный вопрос"). `AskRealTests.fs` (Slice 5a) sends two

@@ -94,12 +94,9 @@ type BotConfiguration =
       RewriterEnabled: bool
       /// REWRITER_PROMPT bot_setting: system prompt for the rewrite pass. Default "".
       RewriterPrompt: string
-      /// OUTCOME_WEIGHTS bot_setting (JSON_BLOB): weighted outcome roll for a TRIGGERED
-      /// non-command message — {"reply":100,"silence":0,"emoji":0}. Default keeps the
-      /// pre-S6 behavior (always reply). See Services/OutcomeRouter.fs.
-      OutcomeWeightsJson: string
-      /// REACTION_PALETTE bot_setting (JSON_BLOB): the pool of emoji the S6 emoji outcome
-      /// and S8 meme-react "react" action pick from — a JSON array of emoji strings, e.g.
+      /// REACTION_PALETTE bot_setting (JSON_BLOB): the pool of emoji the message-level
+      /// reaction roll (ReactionProbability below) and S8 meme-react "react" action pick
+      /// from — a JSON array of emoji strings, e.g.
       /// `["👍","🔥","😁"]`. Every entry is validated against Telegram's documented
       /// message-reaction allowed set (`OutcomeRouter.telegramAllowedReactionEmoji`) —
       /// invalid entries are dropped with a Warning log rather than reaching
@@ -108,15 +105,31 @@ type BotConfiguration =
       /// fall back to `OutcomeRouter.defaultPalette`. Hot-reloadable — parsed fresh on
       /// every pick, not just at startup.
       ReactionPaletteJson: string
-      /// REACTION_CHOICE_MODE bot_setting: "random" | "llm" — how the S6 emoji outcome
-      /// picks ONE emoji from REACTION_PALETTE. "llm" (default) makes a cheap non-stream
-      /// gpt-5-mini call (ReasoningEffort="minimal", same cost-saving lever as
-      /// MediaActions.composeCaption) asking the model to pick the best-fitting emoji for
-      /// the triggering message; a failed call, or an answer outside the palette, falls
-      /// back to a uniform random pick — the reaction never blocks or refuses because of
-      /// an LLM hiccup. "random" skips the LLM call entirely (cheapest, dumbest). Any
-      /// other value is treated as "llm" (lenient parse, same posture as OUTCOME_WEIGHTS).
+      /// REACTION_CHOICE_MODE bot_setting: "random" | "llm" — how the reaction channel
+      /// (ReactionProbability below) picks ONE emoji from REACTION_PALETTE. "llm" (default)
+      /// makes a cheap non-stream gpt-5-mini call (ReasoningEffort="minimal", same
+      /// cost-saving lever as MediaActions.composeCaption) asking the model to pick the
+      /// best-fitting emoji for the message text; a failed call, or an answer outside the
+      /// palette, falls back to a uniform random pick — the reaction never blocks or
+      /// refuses because of an LLM hiccup. "random" skips the LLM call entirely (cheapest,
+      /// dumbest). Any other value is treated as "llm" (lenient parse).
       ReactionChoiceMode: string
+      /// REACTION_PROBABILITY bot_setting: roll in [0,1) gating an independent, reply-
+      /// agnostic emoji reaction on EVERY first-delivery message in a target chat —
+      /// triggered (addressed to the bot) or not. Fully decoupled from the reply path: a
+      /// triggered message always replies AND may separately get a reaction; an
+      /// unaddressed message may get a reaction with no reply at all. Redesign that
+      /// replaces the old OUTCOME_WEIGHTS reply/silence/emoji roll for triggered messages
+      /// (which is gone — a triggered message never rolls dice on whether to reply
+      /// anymore). Default 0.0 (off) — same defensive posture as INTERJECT_PROBABILITY /
+      /// MEME_REACT_PROBABILITY, hand-enabled live via bot_setting. See
+      /// Services/BotService.tryReact.
+      ReactionProbability: float
+      /// REACTION_COOLDOWN_SECONDS bot_setting: minimum seconds between two reactions in
+      /// the same chat (simple in-memory per-chat last-reaction timestamp, not persisted —
+      /// a pod restart just resets the cooldown clock, same tradeoff chatLocks already
+      /// makes). Default 90.
+      ReactionCooldownSeconds: int
       /// ROAST_PROMPT bot_setting: system prompt for the /roast command — must instruct
       /// the model to roast the target using their dossier/facts/quotes, no disclaimers.
       /// Default "".

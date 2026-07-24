@@ -52,20 +52,30 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('DOSSIER_SIM_FLOOR',       '0.60',                                                   'FREE_FORM',    'llm',        'Minimum cosine similarity for a recalled fact'),
     ('EXTRACT_PROMPT',          'Ты анализируешь недавние сообщения одного человека в чате и выделяешь новые факты о нём, которых ещё нет в текущем досье: черты характера, мнения, симпатии/антипатии, увлечения, повторяющиеся темы, заметные цитаты. Ответь ТОЛЬКО JSON-массивом коротких строк-фактов на русском языке, каждая — отдельный новый факт. Если новых фактов нет — верни []. Пример: ["любит кофе по утрам", "не любит YAML", "пишет на F#"]', 'FREE_FORM', 'llm', 'System prompt for the nightly fact-extraction LLM call (DossierService) — must yield a JSON array of short fact strings'),
     ('MERGE_PROMPT',            'Ты ведёшь растущее личное досье участника приватного Telegram-чата. Объедини текущее досье с новыми фактами в единый связный абзац на русском языке. Не удаляй и не противоречь существующей информации, если она явно не устарела. Кратко — не более 250 слов. Ответь только текстом обновлённого досье, без вступлений и пояснений.', 'FREE_FORM', 'llm', 'System prompt for the nightly summary-merge LLM call (DossierService) — must answer in RU, max 250 words'),
-    -- Slice 6: rewriter pass (OFF by default — see AlitaBot/README.md "Rewriter pass"),
-    -- outcome router (default weights keep the pre-S6 always-reply behavior; prod tuning
-    -- happens live via bot_setting, same posture as SYSTEM_PROMPT above).
+    -- Slice 6: rewriter pass (OFF by default — see AlitaBot/README.md "Rewriter pass").
+    -- NOTE: OUTCOME_WEIGHTS (the old weighted reply/silence/emoji roll for TRIGGERED
+    -- messages) is GONE — a triggered message always replies now, no dice. Reactions are
+    -- their own independent channel, see REACTION_PROBABILITY below.
     ('REWRITER_ENABLED',        'false',                                                  'FEATURE_FLAG', 'llm',        'Second, cheap non-stream LLM call rewrites the final reply text before rendering ("перепиши как живой человек в чате")'),
     ('REWRITER_PROMPT',         'Перепиши следующий ответ так, как будто его написал живой человек в чате: убери ассистентские обороты и канцелярит, сократи, где можно, сохрани смысл и все факты. Ответь только переписанным текстом, без пояснений.', 'FREE_FORM', 'llm', 'System prompt for the rewriter pass (only used when REWRITER_ENABLED=true)'),
-    ('OUTCOME_WEIGHTS',         '{"reply":100,"silence":0,"emoji":0}',                    'JSON_BLOB',    'llm',        'Weighted roll for a TRIGGERED non-command message: reply (normal path) | silence (say nothing) | emoji (react instead of replying) — see Services/OutcomeRouter.fs'),
-    -- Emoji-reaction expansion: the palette both the S6 emoji outcome and the S8 meme-react
-    -- "react" action pick from — hot-reloadable so the set/mode can be tuned live without a
-    -- redeploy. A generous but every-entry-valid set (verified against Telegram's documented
-    -- setMessageReaction allowed list — the classics 😁🔥👍💩🤡🥱 plus "❤" WITHOUT the
-    -- trailing variation selector: "❤️" (with VS16) is NOT on Telegram's list and would be
-    -- silently dropped with a Warning at parse time, see OutcomeRouter.parsePalette).
-    ('REACTION_PALETTE',        '["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱","👏","🥰","😍","💯","🤣","😎","🙏","👌"]', 'JSON_BLOB', 'llm', 'Emoji pool for the S6 emoji outcome and S8 meme-react "react" action — validated against Telegram''s allowed reaction-emoji set, see OutcomeRouter.parsePalette'),
-    ('REACTION_CHOICE_MODE',    'llm',                                                    'FREE_FORM',    'llm',        'random | llm — how the S6 emoji outcome picks from REACTION_PALETTE; "llm" makes a cheap gpt-5-mini call to pick the best-fitting emoji, falling back to random on failure'),
+    -- Emoji-reaction expansion: the palette both the message-level reaction roll and the
+    -- S8 meme-react "react" action pick from — hot-reloadable so the set/mode can be tuned
+    -- live without a redeploy. A generous but every-entry-valid set (verified against
+    -- Telegram's documented setMessageReaction allowed list — the classics 😁🔥👍💩🤡🥱
+    -- plus "❤" WITHOUT the trailing variation selector: "❤️" (with VS16) is NOT on
+    -- Telegram's list and would be silently dropped with a Warning at parse time, see
+    -- OutcomeRouter.parsePalette).
+    ('REACTION_PALETTE',        '["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱","👏","🥰","😍","💯","🤣","😎","🙏","👌"]', 'JSON_BLOB', 'llm', 'Emoji pool for the message-level reaction roll and S8 meme-react "react" action — validated against Telegram''s allowed reaction-emoji set, see OutcomeRouter.parsePalette'),
+    ('REACTION_CHOICE_MODE',    'llm',                                                    'FREE_FORM',    'llm',        'random | llm — how the message-level reaction roll picks from REACTION_PALETTE; "llm" makes a cheap gpt-5-mini call to pick the best-fitting emoji, falling back to random on failure'),
+    -- Independent reaction channel (redesign, PR #253 follow-up): rolls on EVERY
+    -- first-delivery message in a target chat — addressed to the bot or not — completely
+    -- decoupled from the reply path. Nonzero here (unlike INTERJECT_PROBABILITY/
+    -- MEME_REACT_PROBABILITY, which stay 0.0 even in dev) so local testing exercises the
+    -- new channel by default; the deployed PROD value is seeded 0.0 (off) via hand-run SQL
+    -- (AGENTS.md's "Settings seeds, not migrations") and flipped live only after staging
+    -- validation, same posture as NL_TOOLS_ENABLED.
+    ('REACTION_PROBABILITY',    '0.08',                                                   'FREE_FORM',    'llm',        'Roll (0..1) gating an independent, reply-agnostic emoji reaction on every first-delivery message in a target chat — 0.0 disables the reaction channel entirely'),
+    ('REACTION_COOLDOWN_SECONDS', '90',                                                   'FREE_FORM',    'llm',        'Minimum seconds between two reactions in the same chat (simple in-memory per-chat cooldown, not persisted across restarts)'),
     -- Slice 7: social engine (/roast, /awards, /quote, /karma). Zero-censorship, dark-humor-
     -- normal ~30-person IT chat — prompts are deliberately sharp, not corporate-soft; the bot
     -- only roasts on explicit command.

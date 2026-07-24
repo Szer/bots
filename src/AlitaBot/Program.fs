@@ -85,10 +85,11 @@ let buildBotConf () =
       MergePrompt = getSettingOr "MERGE_PROMPT" ""
       RewriterEnabled = getSettingOr "REWRITER_ENABLED" "false" |> bool.Parse
       RewriterPrompt = getSettingOr "REWRITER_PROMPT" ""
-      OutcomeWeightsJson = getSettingOr "OUTCOME_WEIGHTS" """{"reply":100,"silence":0,"emoji":0}"""
       ReactionPaletteJson =
         getSettingOr "REACTION_PALETTE" """["👍","❤","🔥","😁","🤔","🤯","😱","🤬","😢","🎉","🤩","💩","🤡","🥱"]"""
       ReactionChoiceMode = getSettingOr "REACTION_CHOICE_MODE" "llm"
+      ReactionProbability = getSettingOr "REACTION_PROBABILITY" "0.0" |> float
+      ReactionCooldownSeconds = getSettingOr "REACTION_COOLDOWN_SECONDS" "90" |> int
       RoastPrompt = getSettingOr "ROAST_PROMPT" ""
       RoastCooldownSeconds = getSettingOr "ROAST_COOLDOWN_SECONDS" "300" |> int
       AwardsPrompt = getSettingOr "AWARDS_PROMPT" ""

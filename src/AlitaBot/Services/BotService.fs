@@ -199,20 +199,23 @@ type BotService(
                     return None
         }
 
-    // ── Outcome router (Slice 6) ─────────────────────────────────────────────
+    // ── Reaction channel (redesign, PR #253 follow-up) ───────────────────────
     //
-    // A TRIGGERED non-command message doesn't always get a text reply: OUTCOME_WEIGHTS
-    // (bot_setting) rolls "reply" (normal path, unchanged) | "silence" (say nothing) |
-    // "emoji" (react instead of replying) — see Services/OutcomeRouter.fs for the
-    // weighted-pick itself. Defaults keep the pre-S6 behavior (always "reply").
+    // Emoji reactions are now an INDEPENDENT channel, not a coin-flip competing with
+    // replying. A TRIGGERED message (mention, reply-to-bot, name trigger) always gets the
+    // reply path — see `isTriggered`/`handleTriggerableMessage` below; the old
+    // OUTCOME_WEIGHTS reply/silence/emoji roll is gone. Separately, REACTION_PROBABILITY
+    // rolls on EVERY first-delivery message in a target chat (triggered or not),
+    // REACTION_COOLDOWN_SECONDS-gated per chat — see `tryReact` further down. A message
+    // can get both a reaction AND a reply; the two never interfere with each other.
 
     /// REACTION_PALETTE (bot_setting, hot-reloadable), validated against Telegram's
-    /// allowed reaction-emoji set (`OutcomeRouter.parsePalette`) — shared by the S6 emoji
-    /// outcome and the S8 meme-react "react" action so both draw from (and validate
-    /// against) the exact same tunable palette. Parsed fresh on every call (cheap: a
-    /// handful of emoji) so a `/reload-settings` change takes effect immediately, same as
-    /// every other bot_setting; entries dropped for not being on Telegram's list are
-    /// Warning-logged.
+    /// allowed reaction-emoji set (`OutcomeRouter.parsePalette`) — shared by the
+    /// message-level reaction roll (`tryReact`) and the S8 meme-react "react" action so
+    /// both draw from (and validate against) the exact same tunable palette. Parsed fresh
+    /// on every call (cheap: a handful of emoji) so a `/reload-settings` change takes
+    /// effect immediately, same as every other bot_setting; entries dropped for not being
+    /// on Telegram's list are Warning-logged.
     let reactionPalette (conf: BotConfiguration) : string[] =
         let palette, invalid = OutcomeRouter.parsePalette conf.ReactionPaletteJson
         if not invalid.IsEmpty then
@@ -260,34 +263,86 @@ type BotService(
           // no reason to pay for reasoning on a single-emoji pick either.
           ReasoningEffort = Some "minimal" }
 
-    /// "emoji" outcome: picks ONE emoji from REACTION_PALETTE and `Req.SetMessageReaction`s
-    /// the triggering message — no text reply. REACTION_CHOICE_MODE gates HOW it's picked:
+    /// Picks ONE emoji from `palette` for a reaction. REACTION_CHOICE_MODE gates HOW:
     /// "random" (cheapest) skips the LLM entirely; "llm" (default) makes a tiny non-stream
     /// LLM call asking the model to pick the best-fitting emoji for the message text. A
     /// failed LLM call, or an answer outside the palette, falls back to a uniform random
-    /// pick — never a fixed emoji, and never a refusal to react. A rejected
-    /// `SetMessageReaction` call is Warning-logged and simply skipped (the message stays
-    /// logged either way — this never blocks or retries the trigger).
-    let handleEmojiOutcome (conf: BotConfiguration) (msg: Message) (from: User) =
+    /// pick — never a fixed emoji, and never a refusal to react. Shared by `tryReact`
+    /// (message-level reaction roll) — kept separate from `setReaction` (the actual wire
+    /// call) so both `tryReact` and a future caller can pick without necessarily sending.
+    let pickReactionEmoji (conf: BotConfiguration) (palette: string[]) (msg: Message) (from: User) : Task<string> =
         task {
-            let palette = reactionPalette conf
             if conf.ReactionChoiceMode = OutcomeRouter.ModeRandom then
-                let emoji = OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
-                do! setReaction "Outcome=emoji" msg emoji |> taskIgnore
+                return OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
             else
                 let text = msg.Text |> Option.orElse msg.Caption |> Option.defaultValue ""
                 let ctx: UsageContext = { ChatId = Some msg.Chat.Id; UserId = Some from.Id }
                 match! chat.Complete(emojiPickRequest conf palette text, ctx, CancellationToken.None) with
                 | Error err ->
-                    logger.LogWarning("Outcome=emoji: emoji-pick LLM call failed: {Error} — falling back to a random pick", string err)
-                    do! setReaction "Outcome=emoji" msg (OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())) |> taskIgnore
+                    logger.LogWarning("Reaction: emoji-pick LLM call failed: {Error} — falling back to a random pick", string err)
+                    return OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
                 | Ok resp ->
                     let picked = resp.Text.Trim()
-                    let emoji =
-                        if Array.contains picked palette then picked
-                        else OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
-                    do! setReaction "Outcome=emoji" msg emoji |> taskIgnore
+                    if Array.contains picked palette then
+                        return picked
+                    else
+                        return OutcomeRouter.pickRandomEmoji palette (Random.Shared.NextDouble())
         }
+
+    /// Simple in-memory per-chat cooldown for the reaction channel (`REACTION_COOLDOWN_SECONDS`)
+    /// — not persisted, same "a pod restart just resets it" tradeoff `chatLocks` already
+    /// makes. Bounded the same way: only chats the bot actually listens to ever get an
+    /// entry.
+    let lastReactionAt = ConcurrentDictionary<int64, DateTimeOffset>()
+
+    /// Atomically claims chat `chatId`'s reaction slot: true only if no reaction has been
+    /// sent to this chat within REACTION_COOLDOWN_SECONDS (or ever) — and if so, the claim
+    /// itself immediately stamps `now`, so two concurrent messages racing this check can't
+    /// both slip through before the first claim becomes visible to the second.
+    let tryClaimReactionSlot (conf: BotConfiguration) (chatId: int64) (now: DateTimeOffset) : bool =
+        let cooldown = TimeSpan.FromSeconds(float conf.ReactionCooldownSeconds)
+        let mutable claimed = false
+        lastReactionAt.AddOrUpdate(
+            chatId,
+            (fun _ -> claimed <- true; now),
+            (fun _ last -> if now - last >= cooldown then (claimed <- true; now) else last))
+        |> ignore
+        claimed
+
+    /// The reaction channel (redesign, PR #253 follow-up): REACTION_PROBABILITY rolls on
+    /// EVERY first-delivery message `handleTriggerableMessage` sees — triggered
+    /// (addressed to the bot) or not — completely independent of whether that message
+    /// also gets a text reply. REACTION_COOLDOWN_SECONDS (`tryClaimReactionSlot`) keeps a
+    /// lively chat from being reacted to on every single message even at a high roll
+    /// probability. A successful reaction is logged into `message_log` as a synthetic
+    /// `[reaction] {emoji}` row — `message_id = -(original message_id)`, guaranteed free
+    /// since real Telegram message ids are always positive — so later `/ask`-style recall
+    /// and the LLM's own context window can see (and explain) why she reacted. Runs
+    /// inside `withChatLock` (same convention as `tryInterject`/`tryMemeReact`) so it
+    /// never races the main reply stream's own LLM call for the same chat. Best-effort: a
+    /// rejected `SetMessageReaction` call is Warning-logged (inside `setReaction`) and
+    /// simply skipped — this never blocks or retries the triggering message.
+    let tryReact (conf: BotConfiguration) (msg: Message) (from: User) : Task<unit> =
+        withChatLock msg.Chat.Id (fun () ->
+            task {
+                let countReact (kind: string) = Metrics.proactiveTotal.Add(1L, KeyValuePair("kind", box kind))
+                if Random.Shared.NextDouble() >= conf.ReactionProbability then
+                    return ()
+                elif not (tryClaimReactionSlot conf msg.Chat.Id (time.GetUtcNow())) then
+                    countReact "reaction_cooldown"
+                else
+                    let palette = reactionPalette conf
+                    let! emoji = pickReactionEmoji conf palette msg from
+                    let! ok = setReaction "Reaction" msg emoji
+                    if ok then
+                        do! logAndEmbed conf (
+                                logRow msg.Chat.Id (-msg.MessageId) (botUserId conf) conf.BotUsername conf.BotUsername true
+                                    (Some msg.MessageId) $"[reaction] {emoji}")
+                            |> taskIgnore
+                        countReact "reaction"
+                    else
+                        countReact "reaction_failed"
+            })
 
     // ── Proactive behavior (Slice 8: interjections, meme reactions) ─────────
     //
@@ -483,11 +538,15 @@ type BotService(
             })
 
     /// Shared by plain text messages and photo messages: logs `logText` to message_log,
-    /// checks `triggerText` (raw text/caption, matching whatever entity array the mention
-    /// offsets are relative to) for a trigger, and — when triggered — rolls the outcome
-    /// router before dispatching to the responder. When NOT triggered (first delivery
-    /// only, never on a duplicate), fires `onNotTriggered` fire-and-forget — Slice 8's
-    /// interjection/meme-react hooks — after logging, never delaying this response.
+    /// fires the independent reaction-channel roll (`tryReact`, fire-and-forget — see its
+    /// own doc comment) on every first-delivery message regardless of whether it's
+    /// triggered, then checks `triggerText` (raw text/caption, matching whatever entity
+    /// array the mention offsets are relative to) for a trigger: a TRIGGERED message
+    /// ALWAYS dispatches to the responder now (the old OUTCOME_WEIGHTS silence/emoji roll
+    /// for triggered messages is gone — redesign, PR #253 follow-up). When NOT triggered
+    /// (first delivery only, never on a duplicate), fires `onNotTriggered` fire-and-forget
+    /// — Slice 8's interjection/meme-react hooks — after logging, never delaying this
+    /// response.
     let handleTriggerableMessage
         (conf: BotConfiguration)
         (msg: Message)
@@ -514,17 +573,14 @@ type BotService(
                 // distinct reply on top of the one already sent.
                 %a.SetTag("outcome", "duplicate_update")
                 countOutcome "duplicate_update"
-            elif isTriggered conf triggerText msg then
-                let weights = OutcomeRouter.parseWeights conf.OutcomeWeightsJson
-                match OutcomeRouter.pick weights (Random.Shared.NextDouble()) with
-                | OutcomeRouter.Silence ->
-                    %a.SetTag("outcome", "silence")
-                    countOutcome "silence"
-                | OutcomeRouter.Emoji ->
-                    do! handleEmojiOutcome conf msg from
-                    %a.SetTag("outcome", "emoji")
-                    countOutcome "emoji"
-                | _ ->
+            else
+                // Independent reaction channel: rolls on this first-delivery message
+                // whether or not it's triggered, fire-and-forget so it never delays the
+                // reply path below (`tryReact` takes its own `withChatLock`, same
+                // convention as `tryInterject`/`tryMemeReact`).
+                fireAndForget logger "reaction.roll" (fun () -> tryReact conf msg from :> Task)
+
+                if isTriggered conf triggerText msg then
                     match! responder.Respond(msg) with
                     | Some(sent, replyText) ->
                         do! logAndEmbed conf (
@@ -536,12 +592,12 @@ type BotService(
                     | None ->
                         %a.SetTag("outcome", "logged")
                         countOutcome "logged"
-            else
-                %a.SetTag("outcome", "logged")
-                countOutcome "logged"
-                match onNotTriggered with
-                | Some hook -> fireAndForget logger "proactive.hook" (fun () -> hook () :> Task)
-                | None -> ()
+                else
+                    %a.SetTag("outcome", "logged")
+                    countOutcome "logged"
+                    match onNotTriggered with
+                    | Some hook -> fireAndForget logger "proactive.hook" (fun () -> hook () :> Task)
+                    | None -> ()
         }
 
     let handleMessage (conf: BotConfiguration) (msg: Message) (from: User) (text: string) =
