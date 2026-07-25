@@ -13,6 +13,13 @@
 #   CONTAINER_NAME        container label (default: coupon-bot)
 #
 # Output: structured markdown report to stdout
+#
+# Failure behavior: a failed Prometheus/psql/gh query is fatal — the script
+# prints the real error and exits non-zero rather than substituting an empty
+# result (a genuinely empty result set from a *successful* query is not an
+# error and is reported as-is). Loki is documented-optional: its failure
+# prints a WARNING and degrades the relevant report cell instead of failing
+# the run.
 
 set -euo pipefail
 
@@ -25,6 +32,9 @@ REPO="${GITHUB_REPOSITORY:-Szer/bots}"
 log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
 
 # Helper: query Prometheus instant endpoint
+# Stderr is left unredirected so curl's exact error text reaches the workflow
+# log. A failed query (after retries) is fatal — a successful query with an
+# empty result vector is not, and is returned as-is.
 prom_query() {
     local query="$1"
     local attempt
@@ -33,26 +43,41 @@ prom_query() {
             --connect-timeout 5 \
             --max-time 20 \
             "${PROMETHEUS_URL}/api/v1/query" \
-            --data-urlencode "query=${query}" 2>/dev/null); then
+            --data-urlencode "query=${query}"); then
             echo "$result"
             return 0
         fi
         log "Prometheus query failed (attempt ${attempt}/3), retrying..."
         sleep 1
     done
-    log "Prometheus query failed after 3 attempts, returning empty result."
-    echo '{"data":{"result":[]}}'
+    log "ERROR: Prometheus query failed after 3 attempts (see curl error above): ${query}"
+    exit 1
 }
 
 # Helper: query PostgreSQL via psql
-# Stderr is preserved so permission errors are visible in workflow logs.
+# Stderr is left unredirected so psql's exact error text reaches the workflow
+# log. A failed query is fatal — a successful query with zero rows is not,
+# and is returned as-is (empty stdout).
 db_query() {
-    PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-5}" \
-        psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -t -A -F $'\t' -c "$1" || {
-        log "ERROR: psql query failed: $1"
-        echo ""
+    local out
+    out=$(PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-5}" \
+        psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -t -A -F $'\t' -c "$1") || {
+        log "ERROR: psql query failed (see error above): $1"
+        exit 1
     }
+    echo "$out"
 }
+
+# ─── Preflight connectivity check ────────────────────────────────────────────
+# One trivial query per data source so a broken DB or Prometheus path fails
+# in one second with one clear error, instead of after six identical
+# multi-second timeouts scattered through the report below.
+
+log "Checking database connectivity..."
+db_query "SELECT 1;" >/dev/null
+
+log "Checking Prometheus connectivity..."
+prom_query "vector(1)" >/dev/null
 
 # ─── Bot usage metrics (Prometheus) ──────────────────────────────────────────
 
@@ -282,12 +307,17 @@ fi
 if [ -n "${LOKI_URL:-}" ]; then
     log "Querying Loki for user-facing errors..."
 
-    ERROR_COUNT_JSON=$(curl -sf -G \
+    # Loki is documented-optional (see header) — a failed query degrades this
+    # one report cell with a loud WARNING instead of failing the run.
+    if ERROR_COUNT_JSON=$(curl -sf -G \
         --connect-timeout 5 --max-time 20 \
         "${LOKI_URL}/loki/api/v1/query" \
-        --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"[7d]))" \
-        2>/dev/null || echo '{"data":{"result":[]}}')
-    ERROR_COUNT_7D=$(echo "$ERROR_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+        --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"[7d]))"); then
+        ERROR_COUNT_7D=$(echo "$ERROR_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+    else
+        log "WARNING: Loki unavailable (see curl error above) — error count omitted."
+        ERROR_COUNT_7D="N/A (Loki query failed — see workflow logs)"
+    fi
 else
     ERROR_COUNT_7D="N/A (Loki not configured)"
 fi
@@ -297,13 +327,22 @@ fi
 log "Querying GitHub issues..."
 
 OPEN_FEEDBACK=$(gh issue list --repo "$REPO" --label "user-feedback" --state open -L 1000 --json number,title,createdAt \
-    --jq 'length' 2>/dev/null || echo "0")
+    --jq 'length') || {
+    log "ERROR: gh issue list failed (label=user-feedback, see error above)"
+    exit 1
+}
 
 OPEN_FEATURES=$(gh issue list --repo "$REPO" --label "feature-request" --state open -L 1000 --json number,title \
-    --jq 'length' 2>/dev/null || echo "0")
+    --jq 'length') || {
+    log "ERROR: gh issue list failed (label=feature-request, see error above)"
+    exit 1
+}
 
 OPEN_BUGS=$(gh issue list --repo "$REPO" --label "bug" --state open -L 1000 --json number,title \
-    --jq 'length' 2>/dev/null || echo "0")
+    --jq 'length') || {
+    log "ERROR: gh issue list failed (label=bug, see error above)"
+    exit 1
+}
 
 # ─── Output markdown report ──────────────────────────────────────────────────
 
