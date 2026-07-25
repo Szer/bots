@@ -28,7 +28,6 @@ type VoidCouponResult =
     | NotFoundOrNotAllowed
 
 /// Result of a holder reporting a coupon as already used externally (taken -> reported).
-/// See docs/PLAN-report-used-coupon.md §1-2.
 [<RequireQualifiedAccess>]
 type ReportCouponResult =
     | Reported of coupon: Coupon
@@ -122,7 +121,7 @@ type CouponOutcomes =
       total_count: int64 }
 
 /// A coupon the caller currently holds ('taken'), enriched with the adder's identity
-/// so /my can render "· добавил @username" (see docs/PLAN-report-used-coupon.md §5).
+/// so /my can render "· добавил @username".
 [<CLIMutable>]
 type TakenCoupon =
     { id: int
@@ -686,9 +685,10 @@ ORDER BY count DESC, e.user_id;
 
     /// Per-owner count of reports RECEIVED, for the §8a community leaderboard's social-pressure
     /// marker. Deliberately keyed on the coupon's owner_id, NOT coupon_event.user_id (the
-    /// 'reported' event's user_id is the REPORTER) — see docs/PLAN-report-used-coupon.md §8a for
-    /// why reusing GetUserEventCounts("reported") here would invert the accountability signal.
-    /// Nets out reported_reverted the same way GetUserEventCounts nets "<type>_reverted".
+    /// 'reported' event's user_id is the REPORTER) — reusing GetUserEventCounts("reported") here
+    /// would credit the shame to the reporter and exonerate the adder who forgot to void.
+    /// ReportFlowTests test 13 guards this. Nets out reported_reverted the same way
+    /// GetUserEventCounts nets "<type>_reverted".
     member _.GetReportedCountsByOwner(sinceUtc: DateTime option, untilUtc: DateTime) =
         task {
             use! conn = openConn()
@@ -921,7 +921,6 @@ WHERE id = @coupon_id;
 
     /// Holder reports a coupon as already used externally: taken -> reported, clearing
     /// taken_by/taken_at (mirrors VoidCoupon). Only the current holder may report.
-    /// See docs/PLAN-report-used-coupon.md §1-2.
     member _.TryReportCoupon(couponId: int, reporterId: int64) =
         task {
             use! conn = openConn()
@@ -964,20 +963,24 @@ WHERE id = @coupon_id;
     member _.GetReportedCouponsByOwner(ownerId: int64) =
         task {
             use! conn = openConn()
+            // Deliberately no expires_at filter: an expired reported coupon must stay visible
+            // so the adder can still retroactively mark it "Использован", same call already
+            // made for expired taken coupons in GetCouponsTakenBy.
             //language=postgresql
             let sql =
                 """
 SELECT *
 FROM coupon
 WHERE owner_id = @owner_id
-  AND status = 'reported';
+  AND status = 'reported'
+ORDER BY expires_at, id;
 """
             let! coupons = conn.QueryAsync<Coupon>(sql, {| owner_id = ownerId |})
             return coupons |> Seq.toArray
         }
 
     /// Owner-only path from 'reported' -> 'used' (distinct from MarkUsed, which is taker-only
-    /// from 'taken'). See docs/PLAN-report-used-coupon.md §4.
+    /// from 'taken').
     member _.MarkReportedUsed(couponId: int, ownerId: int64) =
         task {
             use! conn = openConn()

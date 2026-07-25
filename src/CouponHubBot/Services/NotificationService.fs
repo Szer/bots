@@ -31,7 +31,7 @@ type TelegramNotificationService(
 
     /// Unsolicited DM to the adder when a holder reports their coupon as already used
     /// externally. Same single-retry-and-report-failure shape as NotifyTakerCouponVoided —
-    /// failure here must not fail the report itself (docs/PLAN-report-used-coupon.md §6).
+    /// failure here must not fail the report itself.
     member _.NotifyAdderCouponReported(ownerUserId: int64, coupon: Coupon, reporterHandle: string) : Task<bool> =
         task {
             let msg =

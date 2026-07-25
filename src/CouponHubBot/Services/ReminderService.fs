@@ -27,9 +27,9 @@ type ReminderService(
             string userId
 
     // reportedRows carries reports RECEIVED (keyed on the coupon's owner_id, via
-    // GetReportedCountsByOwner) — see docs/PLAN-report-used-coupon.md §8a. The marker is shown
-    // only for users who already have a leaderboard line from used/added activity; a user with
-    // reports but no used/added history has no line to attach the marker to.
+    // GetReportedCountsByOwner). The marker is shown only for users who already have a
+    // leaderboard line from used/added activity; a user with reports but no used/added
+    // history has no line to attach the marker to.
     let formatCombinedStats (usedRows: UserEventCount array) (addedRows: UserEventCount array) (reportedRows: ReportedCountRow array) =
         let usedMap = usedRows |> Array.map (fun r -> r.user_id, r.count) |> Map.ofArray
         let addedMap = addedRows |> Array.map (fun r -> r.user_id, r.count) |> Map.ofArray

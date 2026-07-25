@@ -299,7 +299,7 @@ let reportSelectKeyboard (heldCouponIds: int array) =
     inlineKb (Array.append rows [| [| btn "Отмена" "reportCancel" |] |])
 
 /// Confirmation step before a report is filed — deliberately requires an extra tap since a
-/// report accuses another member (docs/PLAN-report-used-coupon.md §3).
+/// report accuses another member.
 let reportConfirmKeyboard (couponId: int) =
     inlineKb [|
         [| btn "Подтвердить" $"report:{couponId}:confirm" |]
