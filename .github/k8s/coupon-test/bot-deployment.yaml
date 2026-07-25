@@ -1,0 +1,79 @@
+---
+# Transient CouponHubBot deployment for the CI real-Telegram test suite.
+# Applied/torn down every run by .github/workflows/coupon-real-test.yml.
+#
+# `image: IMAGE_PLACEHOLDER` is replaced in-place by the workflow (sed) with
+# the just-built/pushed ghcr.io/szer/coupon-bot:test-<sha> tag before apply —
+# a tag that can never collide with prod's `:<sha>`/`:latest` tags from
+# _bot-deploy.yml.
+#
+# Env comes entirely from the `coupon-bot-env` Secret the workflow creates
+# from GH secrets (DATABASE_URL points at the in-cluster coupon-test-postgres
+# service; BOT_TELEGRAM_TOKEN/BOT_AUTH_TOKEN/AZURE_OCR_* etc.) — nothing here
+# is a value, only the key name of what the Secret must provide.
+#
+# GITHUB_TOKEN is deliberately NOT one of those keys: GitHubService.IsConfigured
+# requires a non-empty GITHUB_TOKEN, and the seeded GITHUB_REPO bot_setting
+# fallback is the real `Szer/coupon-bot` repo — with a token present, a
+# `/feedback` real test would open a REAL GitHub issue and assign a real
+# Copilot agent. Do not "fix" this by adding a token; the real suite covers
+# `/feedback` only up to the admin-forward step (see the contract's
+# "Containment of external side effects" section).
+#
+# `coupon-ci: transient` (never `app.kubernetes.io/instance`) is the only
+# label CI teardown keys off — see postgres.yaml for why.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coupon-bot
+  namespace: coupon-test
+  labels:
+    coupon-ci: transient
+    app: coupon-bot
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coupon-bot
+  template:
+    metadata:
+      labels:
+        coupon-ci: transient
+        app: coupon-bot
+    spec:
+      containers:
+      - name: coupon-bot
+        image: IMAGE_PLACEHOLDER
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 5000
+          name: http
+        envFrom:
+        - secretRef:
+            name: coupon-bot-env
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 5000
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        # Explicit + minimal, matching alita-test/bot-deployment.yaml's
+        # rationale: the cluster is a single ARM node with tight headroom —
+        # CPU request matches what production bots actually use on this node
+        # (20m); the 500m limit is just a safety cap — limits don't count
+        # against scheduling quota, only requests do.
+        resources:
+          requests:
+            memory: "192Mi"
+            cpu: "20m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"

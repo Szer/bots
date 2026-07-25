@@ -54,3 +54,31 @@ alita-clean:
 	# network it pins in use) survives a plain `down` if `make smoke` ran earlier.
 	$(COMPOSE) --profile smoke down -v
 	. $(ALITA_ENV) && curl -s "https://api.telegram.org/bot$$ALITA_TEST_BOT_TOKEN/deleteWebhook?drop_pending_updates=true" > /dev/null && echo "webhook deleted"
+
+# CouponHubBot real-Telegram test loop — tests/CouponHubBot.RealTests. Credentials:
+# ~/.coupon-test/env. Unlike the AlitaBot loop above, this harness never spawns the bot
+# itself: point COUPON_BOT_BASE_URL at an already-running bot (either the CI AKS pod —
+# which self-registers its webhook at startup when WEBHOOK_URL is set, see
+# src/CouponHubBot/Services/WebhookRegistration.fs — or your own local
+# `docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile smoke up -d
+# --build` + ngrok + manual setWebhook per src/CouponHubBot/README.dev.md) before
+# running any of these. Scope with FILTER, e.g.:
+#   make coupon-real-test FILTER="FullyQualifiedName~AddFlowRealTests"
+COUPON_REAL_FILTER = $(FILTER)
+
+.PHONY: coupon-real-test coupon-tg-login coupon-tg-chats
+
+coupon-real-test:
+	dotnet test tests/CouponHubBot.RealTests -c Release $(if $(COUPON_REAL_FILTER),--filter "$(COUPON_REAL_FILTER)",)
+
+# Local dev loop only — CI does NOT run this. The coupon real-test workflow reuses
+# Alita's already-logged-in MTProto session (same real Telegram account; the two
+# workflows share the aks-vpn concurrency group with cancel-in-progress: false, so a
+# coupon run and an Alita run never execute concurrently and never fight over the
+# session file) and writes it to COUPON_TG_SESSION_PATH itself — no login step needed
+# in CI. Use this only to create your OWN local session for the dev loop above.
+coupon-tg-login:
+	dotnet run --project tests/CouponHubBot.RealTests -c Release -- login
+
+coupon-tg-chats:
+	dotnet run --project tests/CouponHubBot.RealTests -c Release -- list-dialogs

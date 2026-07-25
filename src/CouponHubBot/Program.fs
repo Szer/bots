@@ -65,6 +65,7 @@ let buildBotConf () =
       FeedbackAdminIds = getSettingOr "FEEDBACK_ADMINS" (getEnvOr "FEEDBACK_ADMINS" "") |> parseAdmins
       GitHubToken = getEnvOr "GITHUB_TOKEN" ""
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/coupon-bot")
+      WebhookUrl = getSettingOr "WEBHOOK_URL" (getEnvOr "WEBHOOK_URL" "")
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
       BatchDebounceMs = getSettingOr "BATCH_DEBOUNCE_MS" "5000" |> int }
@@ -147,6 +148,7 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
     .AddHostedService<BotCommandsSetupService>()
+    .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
@@ -200,6 +202,21 @@ let app = builder.Build()
             let! sent = runner.RunOnce(nowUtc)
             return Results.Json({| ok = true; sent = sent |})
     }))
+
+// Test-only hook to clear TelegramMembershipService's in-memory cache immediately.
+// Without this, IsMember(userId) keeps returning a stale cached verdict for up to a
+// day after COMMUNITY_CHAT_ID changes underneath it (MembershipService.fs's 1-day
+// `expiry`), which made the membership-gate real test unable to observe a fresh
+// verdict without a full pod restart. 404 outside TestMode.
+%app.MapPost("/test/membership/invalidate", Func<HttpContext, IResult>(fun ctx ->
+    let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+    if not opts.Value.TestMode then
+        Results.NotFound()
+    else
+        let membership = ctx.RequestServices.GetRequiredService<TelegramMembershipService>()
+        membership.InvalidateCache()
+        Results.Json({| ok = true |})
+))
 
 // Reload settings endpoint
 %app.MapPost("/reload-settings", Func<HttpContext, IResult>(fun ctx ->
