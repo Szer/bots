@@ -170,21 +170,20 @@ jobs:
       # membership/isolation check the CI run depends on.
       env:
         CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
-        # NOT in the contract's binding secret list (coupon-real-test-contract.md
-        # only says "the test MTProto user's own id", names no secret) — see
-        # this workflow's PR description / the delivering agent's report for
-        # why this name was introduced and needs a human decision before
-        # first real run. Left unset, FEEDBACK_ADMINS seeds as an empty
-        # string, which BotConfiguration.parseAdmins tolerates (no admin
-        # forward, not a boot failure) — non-fatal degradation, not a hard
-        # blocker.
-        FEEDBACK_ADMIN_ID: ${{ secrets.COUPON_CI_FEEDBACK_ADMIN_ID }}
       run: |
         cat > "$RUNNER_TEMP/coupon-test-bot-settings.sql" <<SQL
         INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
             ('TEST_MODE',              'true',                 'FEATURE_FLAG', 'diagnostics', 'Unlocks /test/clock/advance + /test/run-reminder for the real-Telegram CI suite'),
             ('COMMUNITY_CHAT_ID',      '${CHAT_ID}',           'FREE_FORM',    'telegram',    'Dedicated CI group — the single highest-leverage isolation control'),
-            ('FEEDBACK_ADMINS',        '${FEEDBACK_ADMIN_ID}', 'FREE_FORM',    'feedback',    'Test MTProto user''s own id, so /feedback forwards land in an observable DM'),
+            -- Deliberately empty, not a placeholder awaiting a secret: there is no
+            -- FEEDBACK_ADMINS secret and none will be added. The real-Telegram suite
+            -- discovers the test MTProto account's own numeric id at runtime (from the
+            -- logged-in client, not from CI config), writes it into this row directly
+            -- in the transient DB (COUPON_TEST_DB_URL), and calls POST /reload-settings
+            -- on the bot to pick it up before exercising /feedback's admin-forward step.
+            -- This keeps real Telegram user ids out of CI configuration entirely — do
+            -- not "fix" this by adding a secret back.
+            ('FEEDBACK_ADMINS',        '',                     'FREE_FORM',    'feedback',    'Empty on purpose — the real-test suite sets this at runtime via COUPON_TEST_DB_URL + /reload-settings, see comment above'),
             ('OCR_ENABLED',            'true',                 'FEATURE_FLAG', 'ocr',         'OCR cost is negligible; endpoint/key come from env (AZURE_OCR_ENDPOINT/KEY via the coupon-bot-env Secret), not this table'),
             ('MAX_TAKEN_COUPONS',      '6',                    'FREE_FORM',    'coupons',     'Match prod'),
             ('REMINDER_RUN_ON_START',  'false',                'FEATURE_FLAG', 'reminders',   'Reminders are driven on demand via /test/run-reminder instead'),
@@ -254,9 +253,20 @@ jobs:
         exit 1
 
     - name: Reconstruct MTProto session
+      # Reuses Alita's session (ALITA_CI_TG_SESSION_B64) rather than a
+      # dedicated coupon session. Safe because both real-test workflows
+      # share the aks-vpn concurrency group with cancel-in-progress: false
+      # (see this job's concurrency block above and alita-real-test.yml's) —
+      # an Alita run and a coupon run can never execute concurrently, so
+      # they can never fight over the same session file. The ALITA_ prefix
+      # here is a misnomer: it's an account-level MTProto credential (the
+      # same real Telegram account), not an Alita-specific one — same
+      # reasoning as the already-reused ALITA_TG_API_ID/HASH/PHONE triple
+      # below. Written to the same path as before so the test project's
+      # documented default (~/.coupon-test/tg.session) still applies.
       run: |
         mkdir -p "$HOME/.coupon-test"
-        echo "${{ secrets.COUPON_CI_TG_SESSION_B64 }}" \
+        echo "${{ secrets.ALITA_CI_TG_SESSION_B64 }}" \
           | base64 -d | gunzip > "$HOME/.coupon-test/tg.session"
 
     - name: Run real-Telegram suite
@@ -266,9 +276,9 @@ jobs:
         COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
         # ALITA_-prefixed names are a misnomer per the contract: these are
         # account/application-level MTProto credentials for the same real
-        # Telegram account, reused as-is to avoid three redundant manual
-        # secret creations. The session itself is NOT reused — see
-        # COUPON_CI_TG_SESSION_B64 above.
+        # Telegram account, reused as-is to avoid redundant manual secret
+        # creations. The session (ALITA_CI_TG_SESSION_B64, see "Reconstruct
+        # MTProto session" above) is reused too, for the same reason.
         COUPON_TG_API_ID: ${{ secrets.ALITA_TG_API_ID }}
         COUPON_TG_API_HASH: ${{ secrets.ALITA_TG_API_HASH }}
         COUPON_TG_API_PHONE: ${{ secrets.ALITA_TG_API_PHONE }}
