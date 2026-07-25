@@ -122,8 +122,11 @@ jobs:
         OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "null")
         TYPE=$(jq -r '.result.type // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
         TITLE=$(jq -r '.result.title // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
-        RESULT_ID=$(jq -r '.result.id // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
-        echo "getChat: http_code=$HTTP_CODE ok=$OK type=$TYPE title=$TITLE id=$RESULT_ID"
+        # Deliberately NOT printing .result.id here — for a group/supergroup
+        # getChat's returned id is the same secret value as COUPON_CI_CHAT_ID
+        # (or its supergroup-migrated form), so echoing it would leak the
+        # secret into the run log.
+        echo "getChat: http_code=$HTTP_CODE ok=$OK type=$TYPE title=$TITLE"
 
         if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
           echo "::error::getChat failed for COUPON_CI_CHAT_ID (http_code=$HTTP_CODE ok=$OK) — the chat id is wrong or the bot is not a member of that chat. Most likely cause: the group was upgraded from a basic group to a supergroup, which changes its id (Telegram assigns a new -100... id on upgrade — dev-bot-settings.sql's stale COMMUNITY_CHAT_ID is a precedent for this exact drift). Remediation: send any message in the group, call https://api.telegram.org/bot<token>/getUpdates and read the CURRENT chat.id off a recent update (or migrate_to_chat_id on the old chat's entry), then re-set the secret with: printf '%s' '<id>' | gh secret set COUPON_CI_CHAT_ID --repo Szer/bots (printf, not echo)."
@@ -131,7 +134,7 @@ jobs:
         fi
 
         if [ "$TYPE" = "group" ]; then
-          echo "::warning::COUPON_CI_CHAT_ID resolves to a basic 'group' (id=$RESULT_ID, title=$TITLE), not a 'supergroup'. Basic-group ids are UNSTABLE — Telegram silently upgrades a group to a supergroup and its id changes shape when it does, breaking getChatMember-based membership checks until the secret is manually re-set. This is a standing risk, not a one-time fix."
+          echo "::warning::COUPON_CI_CHAT_ID resolves to a basic 'group' (title=$TITLE), not a 'supergroup'. Basic-group ids are UNSTABLE — Telegram silently upgrades a group to a supergroup and its id changes shape when it does, breaking getChatMember-based membership checks until the secret is manually re-set. This is a standing risk, not a one-time fix."
         fi
 
         COUNT_HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getchatmembercount.json" -w "%{http_code}" \
@@ -282,7 +285,18 @@ jobs:
             ('REMINDER_RUN_ON_START',  'false',                'FEATURE_FLAG', 'reminders',   'Reminders are driven on demand via /test/run-reminder instead'),
             ('REMINDER_HOUR_DUBLIN',   '10',                   'FREE_FORM',    'reminders',   'Irrelevant given REMINDER_RUN_ON_START=false; set for parity with prod'),
             ('BATCH_DEBOUNCE_MS',      '1000',                 'FREE_FORM',    'coupons',     'Short, so album/batch tests do not idle 5s each')
-        ON CONFLICT (key) DO NOTHING;
+        -- DO UPDATE, not DO NOTHING: migration V16__pending_add_batch.sql
+        -- already seeds BATCH_DEBOUNCE_MS='5000' with its own ON CONFLICT DO
+        -- NOTHING, so a fresh DB (via Flyway migrate above) already has that
+        -- row when this INSERT runs. DO NOTHING here would silently keep the
+        -- migration's 5000ms default instead of this step's CI-authoritative
+        -- 1000ms override — exactly the album/batch idling this row's own
+        -- description says it exists to avoid. DO UPDATE makes every value in
+        -- this list authoritative for the CI run regardless of what any
+        -- migration pre-seeds, matching every other row's existing intent
+        -- (see e.g. TEST_MODE's "must already be true at FIRST boot" comment
+        -- above).
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
         SQL
 
         docker run --rm --network host \
