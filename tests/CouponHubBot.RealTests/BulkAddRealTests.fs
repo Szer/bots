@@ -1,6 +1,7 @@
 namespace CouponHubBot.RealTests
 
 open System
+open System.Globalization
 open System.IO
 open System.Threading.Tasks
 open Dapper
@@ -11,14 +12,27 @@ open Xunit
 /// path in the bot."
 ///
 /// Uses 3 of the shared EXPIRED-coupon fixtures (same barcode-uniqueness/public-repo
-/// constraint as AddFlowRealTests — see its doc comment). Unlike the single-photo /add
-/// test, an album has no per-photo caption to override OCR's own (past) printed expiry
-/// with — CouponFlowHandler.fs's OcrItem/FinalizeBatch batch path has no expiry
-/// validation at all (only "did OCR find a barcode + value + min-check + date" gates
-/// 'ok' vs 'needs_input'; see CouponFlowHandler.fs:496-509), so this deliberately does
-/// NOT assert the resulting coupons are still available/unexpired — only that the
-/// stateful album -> debounce -> awaiting_user -> bulk-confirm -> DB pipeline completes
-/// for real, which is what "most stateful path in the bot" means to exercise.
+/// constraint as AddFlowRealTests — see its doc comment); their OCR-decoded barcodes
+/// (2706688198821 / …838 / …845) are distinct, verified both by reading the fixtures'
+/// raw Azure-OCR text and by the passing CouponHubBot.Ocr.Tests theory cases for these
+/// exact filenames, so no barcode-uniqueness collision is in play here.
+///
+/// Unlike the single-photo /add test, an album has no per-photo caption to override
+/// OCR's own (past) printed expiry with. CouponFlowHandler.fs's OcrItem gate (does OCR
+/// find a barcode + value + min-check + date; see CouponFlowHandler.fs:532-537) has no
+/// expiry check, but DbService.TryAddCoupon — called per-item from BulkBatchConfirm —
+/// DOES reject `expires_at < todayUtc()` (DbService.fs:198-200), same as the manual /add
+/// path. Since every fixture in Images/ is deliberately dated in the past (repo-public
+/// constraint above) and the album flow has no caption to carry an override, OCR's own
+/// printed expiry would always get every item silently skipped as "Expired" (0 net
+/// coupons added — this bit the suite for real: see git blame near this comment).
+/// `bumpItemsToFutureExpiry` below overrides just the batch items' `expires_at` via
+/// direct SQL after OCR lands (same "direct SQL, real-test-only" pattern
+/// ReminderRealTests.fs and AddFlowRealTests' caption both already use to get a
+/// real-but-photographed-expired fixture past TryAddCoupon's expiry gate) so the
+/// pipeline being exercised — album -> debounce -> awaiting_user -> bulk-confirm -> DB
+/// insert — completes for real and actually lands 3 coupons, which is what "most
+/// stateful path in the bot" and this test's own name both claim.
 ///
 /// BATCH_DEBOUNCE_MS is seeded to 1000ms (contract's bot_setting table) specifically so
 /// this test doesn't idle on the production 5s default — but it's still scheduled
@@ -96,6 +110,22 @@ type BulkAddRealTests(fx: RealAssemblyFixture) =
             return! conn.QuerySingleAsync<int64>("SELECT COUNT(*)::bigint FROM coupon WHERE owner_id=@u", {| u = ownerId |})
         }
 
+    /// The album flow has no caption to carry an expiry override, so — mirroring
+    /// AddFlowRealTests' explicit-future-caption trick via direct SQL instead — bump the
+    /// OCR-landed 'ok' items' expires_at past DbService.TryAddCoupon's `expires_at <
+    /// todayUtc()` gate (DbService.fs:198-200) before the batch is confirmed. Leaves
+    /// value/min_check/barcode_text (the actually-under-test OCR output) untouched.
+    let bumpItemsToFutureExpiry (batchId: int64) =
+        task {
+            let futureExpiry = DateTime.UtcNow.AddDays(400.).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            let! _ =
+                conn.ExecuteAsync(
+                    "UPDATE pending_add_batch_item SET expires_at=@e::date WHERE batch_id=@b AND status='ok'",
+                    {| b = batchId; e = futureExpiry |})
+            return ()
+        }
+
     [<Fact>]
     member _.``album of 3 photos finalizes into a bulk-confirm; confirming adds 3 coupons``() =
         TestRetry.withTimeoutRetry (fun () -> task {
@@ -109,6 +139,7 @@ type BulkAddRealTests(fx: RealAssemblyFixture) =
 
             let! batchId = waitForBatchByOwner ownerId
             do! waitForAllItemsTerminal batchId
+            do! bumpItemsToFutureExpiry batchId
             do! fx.AdvanceClockAsync 2000 // BATCH_DEBOUNCE_MS=1000 (contract seed) + margin
             do! waitForBatchStatus batchId "awaiting_user"
 
