@@ -27,6 +27,17 @@ type VoidCouponResult =
     | Voided of coupon: Coupon * takenByUserId: int64 option
     | NotFoundOrNotAllowed
 
+/// Result of a holder reporting a coupon as already used externally (taken -> reported).
+/// See docs/PLAN-report-used-coupon.md §1-2.
+[<RequireQualifiedAccess>]
+type ReportCouponResult =
+    | Reported of coupon: Coupon
+    | NotFound
+    /// Coupon exists but is not currently 'taken' (e.g. available/used/voided/reported already).
+    | NotActive
+    /// Coupon is 'taken', but not by the reporting user.
+    | NotHolder
+
 [<RequireQualifiedAccess>]
 type UndoResult =
     /// The latest live action was reverted. `coupon` is the row after the undo,
@@ -107,7 +118,33 @@ type CouponOutcomes =
       expired_count: int64
       active_count: int64
       voided_count: int64
+      reported_count: int64
       total_count: int64 }
+
+/// A coupon the caller currently holds ('taken'), enriched with the adder's identity
+/// so /my can render "· добавил @username" (see docs/PLAN-report-used-coupon.md §5).
+[<CLIMutable>]
+type TakenCoupon =
+    { id: int
+      owner_id: int64
+      photo_file_id: string
+      value: decimal
+      min_check: decimal
+      expires_at: DateOnly
+      barcode_text: string | null
+      status: string
+      taken_by: Nullable<int64>
+      taken_at: Nullable<DateTime>
+      created_at: DateTime
+      valid_from: Nullable<DateOnly>
+      owner_username: string | null
+      owner_first_name: string | null }
+
+/// Per-owner count of live (not-yet-reverted) 'reported' events, for the §8a community leaderboard.
+[<CLIMutable>]
+type ReportedCountRow =
+    { user_id: int64
+      count: int64 }
 
 [<CLIMutable>]
 type ChatMessageRow =
@@ -254,13 +291,16 @@ RETURNING *;
                             // Race condition: another transaction inserted the same barcode concurrently.
                             // Look up the winning coupon by the exact constraint key to return its ID.
                             //language=postgresql
+                            // Status list must match coupon_barcode_active_uniq's predicate exactly
+                            // (V18__coupon_reported_status.sql) or this recovery path can return the
+                            // wrong coupon id under a concurrent insert race.
                             let dupBarcodeByKeySql =
                                 """
 SELECT id
 FROM coupon
 WHERE barcode_text = @barcode_text
   AND expires_at = @expires_at
-  AND status IN ('available', 'taken')
+  AND status IN ('available', 'taken', 'reported')
 ORDER BY id
 LIMIT 1;
 """
@@ -354,13 +394,14 @@ ORDER BY created_at DESC, id DESC;
             //language=postgresql
             let sql =
                 """
-SELECT *
-FROM coupon
-WHERE taken_by = @user_id
-  AND status = 'taken'
-ORDER BY taken_at DESC NULLS LAST, id DESC;
+SELECT c.*, u.username AS owner_username, u.first_name AS owner_first_name
+FROM coupon c
+LEFT JOIN "user" u ON u.id = c.owner_id
+WHERE c.taken_by = @user_id
+  AND c.status = 'taken'
+ORDER BY c.taken_at DESC NULLS LAST, c.id DESC;
 """
-            let! coupons = conn.QueryAsync<Coupon>(sql, {| user_id = userId |})
+            let! coupons = conn.QueryAsync<TakenCoupon>(sql, {| user_id = userId |})
             return coupons |> Seq.toArray
         }
 
@@ -388,7 +429,7 @@ GROUP BY event_type;
 
             // Net out admin /undo compensations so counts reflect reality.
             let net pos = max 0L (get pos - get (pos + "_reverted"))
-            return get "added", net "taken", net "returned", net "used", net "voided"
+            return get "added", net "taken", net "returned", net "used", net "voided", net "reported"
         }
 
     member _.GetPersonalCouponOutcomes(userId: int64) =
@@ -403,6 +444,7 @@ SELECT
     COUNT(*) FILTER (WHERE status IN ('available','taken') AND expires_at < @today)::bigint  AS expired_count,
     COUNT(*) FILTER (WHERE status IN ('available','taken') AND expires_at >= @today)::bigint AS active_count,
     COUNT(*) FILTER (WHERE status = 'voided')::bigint                                        AS voided_count,
+    COUNT(*) FILTER (WHERE status = 'reported')::bigint                                      AS reported_count,
     COUNT(*)::bigint                                                                         AS total_count
 FROM coupon
 WHERE owner_id = @user_id;
@@ -422,6 +464,7 @@ SELECT
     COUNT(*) FILTER (WHERE status IN ('available','taken') AND expires_at < @today)::bigint  AS expired_count,
     COUNT(*) FILTER (WHERE status IN ('available','taken') AND expires_at >= @today)::bigint AS active_count,
     COUNT(*) FILTER (WHERE status = 'voided')::bigint                                        AS voided_count,
+    COUNT(*) FILTER (WHERE status = 'reported')::bigint                                      AS reported_count,
     COUNT(*)::bigint                                                                         AS total_count
 FROM coupon;
 """
@@ -641,6 +684,39 @@ ORDER BY count DESC, e.user_id;
             return rows |> Seq.toArray
         }
 
+    /// Per-owner count of reports RECEIVED, for the §8a community leaderboard's social-pressure
+    /// marker. Deliberately keyed on the coupon's owner_id, NOT coupon_event.user_id (the
+    /// 'reported' event's user_id is the REPORTER) — see docs/PLAN-report-used-coupon.md §8a for
+    /// why reusing GetUserEventCounts("reported") here would invert the accountability signal.
+    /// Nets out reported_reverted the same way GetUserEventCounts nets "<type>_reverted".
+    member _.GetReportedCountsByOwner(sinceUtc: DateTime option, untilUtc: DateTime) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT c.owner_id AS user_id,
+       (COUNT(*) FILTER (WHERE e.event_type = 'reported')
+        - COUNT(*) FILTER (WHERE e.event_type = 'reported_reverted'))::bigint AS count
+FROM coupon_event e
+JOIN coupon c ON c.id = e.coupon_id
+WHERE e.event_type IN ('reported', 'reported_reverted')
+  AND (NOT @has_since OR e.created_at >= @since_utc)
+  AND e.created_at < @until_utc
+GROUP BY c.owner_id
+HAVING (COUNT(*) FILTER (WHERE e.event_type = 'reported')
+        - COUNT(*) FILTER (WHERE e.event_type = 'reported_reverted')) > 0;
+"""
+            let! rows =
+                conn.QueryAsync<ReportedCountRow>(
+                    sql,
+                    {| has_since = Option.isSome sinceUtc
+                       since_utc = (sinceUtc |> Option.defaultValue untilUtc)
+                       until_utc = untilUtc |}
+                )
+            return rows |> Seq.toArray
+        }
+
     member _.GetUsersWhoUsedButDidNotAddYesterday(nowUtc: DateTime) =
         task {
             use! conn = openConn()
@@ -801,7 +877,7 @@ RETURNING user_id;
 SELECT *
 FROM coupon
 WHERE id = @coupon_id
-  AND status IN ('available', 'taken')
+  AND status IN ('available', 'taken', 'reported')
   AND expires_at >= @today
   AND (@is_admin OR owner_id = @user_id)
 FOR UPDATE;
@@ -841,6 +917,89 @@ WHERE id = @coupon_id;
                 do! insertEvent conn tx couponId original.owner_id "voided"
                 do! tx.CommitAsync()
                 return VoidCouponResult.Voided ({ original with status = "voided"; taken_by = Nullable(); taken_at = Nullable() }, takenBy)
+        }
+
+    /// Holder reports a coupon as already used externally: taken -> reported, clearing
+    /// taken_by/taken_at (mirrors VoidCoupon). Only the current holder may report.
+    /// See docs/PLAN-report-used-coupon.md §1-2.
+    member _.TryReportCoupon(couponId: int, reporterId: int64) =
+        task {
+            use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+
+            // Lock the row first so a concurrent /void or /used can't race the report
+            // (same SELECT ... FOR UPDATE + validate-then-UPDATE-by-id pattern as VoidCoupon).
+            //language=postgresql
+            let selectSql = "SELECT * FROM coupon WHERE id = @coupon_id FOR UPDATE;"
+            let! rows = conn.QueryAsync<Coupon>(selectSql, {| coupon_id = couponId |}, tx)
+
+            match rows |> Seq.tryHead with
+            | None ->
+                do! tx.RollbackAsync()
+                return ReportCouponResult.NotFound
+            | Some original when original.status <> "taken" ->
+                do! tx.RollbackAsync()
+                return ReportCouponResult.NotActive
+            | Some original when not original.taken_by.HasValue || original.taken_by.Value <> reporterId ->
+                do! tx.RollbackAsync()
+                return ReportCouponResult.NotHolder
+            | Some _ ->
+                //language=postgresql
+                let updateSql =
+                    """
+UPDATE coupon
+SET status = 'reported',
+    taken_by = NULL,
+    taken_at = NULL
+WHERE id = @coupon_id;
+"""
+                let! _ = conn.ExecuteAsync(updateSql, {| coupon_id = couponId |}, tx)
+                do! insertEvent conn tx couponId reporterId "reported"
+                let! updated = conn.QueryAsync<Coupon>("SELECT * FROM coupon WHERE id = @coupon_id;", {| coupon_id = couponId |}, tx)
+                do! tx.CommitAsync()
+                return ReportCouponResult.Reported (updated |> Seq.head)
+        }
+
+    /// The adder's own coupons currently sitting in 'reported' status (§4).
+    member _.GetReportedCouponsByOwner(ownerId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT *
+FROM coupon
+WHERE owner_id = @owner_id
+  AND status = 'reported';
+"""
+            let! coupons = conn.QueryAsync<Coupon>(sql, {| owner_id = ownerId |})
+            return coupons |> Seq.toArray
+        }
+
+    /// Owner-only path from 'reported' -> 'used' (distinct from MarkUsed, which is taker-only
+    /// from 'taken'). See docs/PLAN-report-used-coupon.md §4.
+    member _.MarkReportedUsed(couponId: int, ownerId: int64) =
+        task {
+            use! conn = openConn()
+            use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
+
+            //language=postgresql
+            let sql =
+                """
+UPDATE coupon
+SET status = 'used'
+WHERE id = @coupon_id
+  AND status = 'reported'
+  AND owner_id = @owner_id;
+"""
+            let! rows = conn.ExecuteAsync(sql, {| coupon_id = couponId; owner_id = ownerId |}, tx)
+            if rows = 1 then
+                do! insertEvent conn tx couponId ownerId "used"
+                do! tx.CommitAsync()
+                return true
+            else
+                do! tx.RollbackAsync()
+                return false
         }
 
     /// Admin-only rewind: reverses the latest *live* (not-yet-reverted) action on a coupon
@@ -934,6 +1093,20 @@ WHERE id = @coupon_id AND status = 'available';
                         //language=postgresql
                         let sql = "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id AND status = 'voided';"
                         return! finish sql {| coupon_id = couponId |} None
+                    | "reported" ->
+                        // Restore the reporter's pocket; recover taken_at from the most recent prior take
+                        // (mirrors the "returned" case above). Reporter is recovered from the 'reported'
+                        // event's user_id — no separate column stores it (see plan §1).
+                        //language=postgresql
+                        let sql =
+                            """
+UPDATE coupon
+SET status = 'taken',
+    taken_by = @taken_by,
+    taken_at = COALESCE((SELECT MAX(created_at) FROM coupon_event WHERE coupon_id = @coupon_id AND event_type = 'taken'), @now)
+WHERE id = @coupon_id AND status = 'reported';
+"""
+                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (Some ev.user_id)
                     | other ->
                         // "added" (terminal — use /void) or anything unrecognised.
                         do! tx.RollbackAsync()
@@ -950,7 +1123,7 @@ WHERE id = @coupon_id AND status = 'available';
 SELECT *
 FROM coupon
 WHERE owner_id = @owner_id
-  AND status IN ('available', 'taken')
+  AND status IN ('available', 'taken', 'reported')
   AND expires_at >= @today
 ORDER BY expires_at, id;
 """

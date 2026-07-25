@@ -146,9 +146,9 @@ let tryParseDateOnly (time: TimeProvider) (s: string) =
         else
             None
 
-let formatCouponValue (c: Coupon) =
-    let v = c.value.ToString("0.##")
-    let mc = c.min_check.ToString("0.##")
+let formatCouponValue (value: decimal) (minCheck: decimal) =
+    let v = value.ToString("0.##")
+    let mc = minCheck.ToString("0.##")
     $"{v}€ из {mc}€"
 
 let formatUiDate (d: DateOnly) =
@@ -156,7 +156,14 @@ let formatUiDate (d: DateOnly) =
 
 let formatAvailableCouponLine (idx: int) (c: Coupon) =
     let d = formatUiDate c.expires_at
-    $"{idx}. ID:{c.id} — {formatCouponValue c}, {d}"
+    $"{idx}. ID:{c.id} — {formatCouponValue c.value c.min_check}, {d}"
+
+/// "@username", else first_name, else the raw numeric id. Matches the precedent in
+/// ReminderService's private formatUser, first introduced for the §8a leaderboard.
+let formatUserHandle (userId: int64) (username: string | null) (firstName: string | null) =
+    if not (String.IsNullOrWhiteSpace username) then "@" + username
+    elif not (String.IsNullOrWhiteSpace firstName) then firstName
+    else string userId
 
 let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
     let headers = [| "date"; "user"; "event_type" |]
@@ -284,6 +291,19 @@ let singleTakenKeyboard (c: Coupon) =
     inlineKb [|
         [| btn "Вернуть" $"return:{c.id}:del"
            btn "Использован" $"used:{c.id}:del" |]
+    |]
+
+/// "Какой купон уже использован?" step: one button per currently-held coupon plus «Отмена».
+let reportSelectKeyboard (heldCouponIds: int array) =
+    let rows = heldCouponIds |> Array.map (fun id -> [| btn $"ID:{id}" $"report:{id}" |])
+    inlineKb (Array.append rows [| [| btn "Отмена" "reportCancel" |] |])
+
+/// Confirmation step before a report is filed — deliberately requires an extra tap since a
+/// report accuses another member (docs/PLAN-report-used-coupon.md §3).
+let reportConfirmKeyboard (couponId: int) =
+    inlineKb [|
+        [| btn "Подтвердить" $"report:{couponId}:confirm" |]
+        [| btn "Отмена" "reportCancel" |]
     |]
 
 let getLargestPhotoFileId (msg: Message) =

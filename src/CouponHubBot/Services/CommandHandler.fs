@@ -78,11 +78,11 @@ type CommandHandler(
 
     let handleStart (chatId: int64) =
         sendText chatId
-            "Привет! Я бот для совместного управления купонами Dunnes.\n\nКоманды:\n/add (или /a) — добавить купон\n/list (или /l) — доступные купоны\n/my (или /m) — мои купоны\n/added (или /ad) — мои добавленные\n/stats (или /s) — моя статистика\n/feedback (или /f) — фидбэк авторам\n\nДополнительно (не в меню):\n/take <id>\n/used <id>\n/return <id>\n/void <id>\n/help"
+            "Привет! Я бот для совместного управления купонами Dunnes.\n\nКоманды:\n/add (или /a) — добавить купон\n/list (или /l) — доступные купоны\n/my (или /m) — мои купоны\n/added (или /ad) — мои добавленные\n/stats (или /s) — моя статистика\n/feedback (или /f) — фидбэк авторам\n\nДополнительно (не в меню):\n/take <id>\n/used <id>\n/return <id>\n/void <id>\n/report <id> — сообщить, что купон уже использован кем-то другим\n/help"
 
     let handleHelp (chatId: int64) =
         sendText chatId
-            "Команды (все в личке):\n/add (/a)\n/list (/l)\n/my (/m)\n/added (/ad)\n/stats (/s)\n/feedback (/f)\n\nДополнительно:\n/take <id> (или /take для списка)\n/used <id>\n/return <id>\n/void <id>\n/help"
+            "Команды (все в личке):\n/add (/a)\n/list (/l)\n/my (/m)\n/added (/ad)\n/stats (/s)\n/feedback (/f)\n\nДополнительно:\n/take <id> (или /take для списка)\n/used <id>\n/return <id>\n/void <id>\n/report <id>\n/help"
 
     let handleCoupons (chatId: int64) =
         task {
@@ -120,7 +120,7 @@ type CommandHandler(
             | Taken coupon ->
                 let d = BotHelpers.formatUiDate coupon.expires_at
                 do! BotHelpers.sendPhotoWithCaption tg chatId coupon.photo_file_id
-                        $"Купон ID:{couponId} теперь твой: {BotHelpers.formatCouponValue coupon}, истекает {d}"
+                        $"Купон ID:{couponId} теперь твой: {BotHelpers.formatCouponValue coupon.value coupon.min_check}, истекает {d}"
                         (BotHelpers.singleTakenKeyboard coupon)
         }
 
@@ -146,7 +146,7 @@ type CommandHandler(
 
     let handleStats (user: DbUser) (chatId: int64) =
         task {
-            let! added, taken, returned, used, voided = db.GetUserStats(user.id)
+            let! added, taken, returned, used, voided, reported = db.GetUserStats(user.id)
             let! personal = db.GetPersonalCouponOutcomes(user.id)
             let! globalStats = db.GetGlobalCouponStats()
 
@@ -160,18 +160,20 @@ type CommandHandler(
 
             do!
                 sendText chatId
-                    ($"Статистика:\nДобавлено: {added} · Взято: {taken} · Возвращено: {returned} · Использовано: {used} · Аннулировано: {voided}\n\n"
+                    ($"Статистика:\nДобавлено: {added} · Взято: {taken} · Возвращено: {returned} · Использовано: {used} · Аннулировано: {voided} · Пожаловался: {reported}\n\n"
                     + $"Судьба моих купонов:\n"
                     + $"Использовано: {personal.used_count}\n"
                     + $"Истекло неиспользованными: {personal.expired_count}\n"
                     + $"Сейчас активны: {personal.active_count}\n"
                     + $"Аннулировано: {personal.voided_count}\n"
+                    + $"Отмечено использованными вне бота: {personal.reported_count}\n"
                     + $"Утилизация: {personalRate}\n\n"
                     + $"Сообщество (всего):\n"
                     + $"Добавлено: {globalStats.total_count}\n"
                     + $"Использовано: {globalStats.used_count}\n"
                     + $"Истекло: {globalStats.expired_count}\n"
                     + $"Активных сейчас: {globalStats.active_count}\n"
+                    + $"Аннулировано: {globalStats.voided_count} · Отмечено использованными: {globalStats.reported_count}\n"
                     + $"Утилизация: {globalRate}\n\n"
                     + "ℹ️ «Аннулировано» — купон, использованный вне бота (в приложении или на сайте Dunnes). Аннулируй его в /added, чтобы он не висел в боте как доступный.")
         }
@@ -179,52 +181,84 @@ type CommandHandler(
     let handleMy (user: DbUser) (chatId: int64) =
         task {
             let! taken = db.GetCouponsTakenBy(user.id)
+            let! reported = db.GetReportedCouponsByOwner(user.id)
             let todayStr =
                 Utils.TimeZones.dublinToday time
                 |> BotHelpers.formatUiDate
-            if taken.Length = 0 then
-                let kb = InlineKeyboardMarkup.Create [| [| InlineKeyboardButton.Create("Мои добавленные", callbackData = "myAdded") |] |]
-                do! BotHelpers.sendTextMarkup tg chatId $"{todayStr}\n\nМои купоны:\n—" kb
-            else
-                // Clamp to Telegram's media group limit of 10; always show at least 1 coupon when there are taken coupons.
-                let maxShown = max 1 (min options.Value.MaxTakenCoupons 10)
-                let shown = taken |> Array.truncate maxShown
 
-                // 1) Photo(s) — SendPhoto for single item, SendMediaGroup for 2–10 (Telegram requires 2–10 items in a media group)
-                if shown.Length = 1 then
-                    do! BotHelpers.sendPhoto tg chatId shown[0].photo_file_id
+            // Clamp to Telegram's media group limit of 10; always show at least 1 coupon when there are taken coupons.
+            let maxShown = max 1 (min options.Value.MaxTakenCoupons 10)
+            let shown = taken |> Array.truncate maxShown
+
+            // 1) Photo(s) — SendPhoto for single item, SendMediaGroup for 2–10 (Telegram requires
+            // 2–10 items in a media group). Only for held (taken) coupons; reported coupons are
+            // text-only, same as /added.
+            if shown.Length = 1 then
+                do! BotHelpers.sendPhoto tg chatId shown[0].photo_file_id
+            elif shown.Length > 1 then
+                do! BotHelpers.sendMediaGroupPhotos tg chatId (shown |> Array.map (fun c -> c.photo_file_id))
+
+            // 2) Text + inline buttons
+            let truncationNote =
+                if taken.Length > shown.Length then
+                    $"\n(показаны первые {shown.Length} из {taken.Length})"
                 else
-                    do! BotHelpers.sendMediaGroupPhotos tg chatId (shown |> Array.map (fun c -> c.photo_file_id))
+                    ""
 
-                // 2) Text + inline buttons
-                let truncationNote =
-                    if taken.Length > shown.Length then
-                        $"\n(показаны первые {shown.Length} из {taken.Length})"
-                    else
-                        ""
-
-                let text =
-                    shown
-                    |> Array.indexed
-                    |> Array.map (fun (i, c) ->
-                        let n = i + 1
-                        let d = BotHelpers.formatUiDate c.expires_at
-                        $"{n}. Купон ID:{c.id} на {BotHelpers.formatCouponValue c}, до {d}")
-                    |> String.concat "\n"
-
-                let kb =
-                    let couponRows =
+            let takenSection =
+                if shown.Length = 0 then
+                    "Мои купоны:\n—"
+                else
+                    let lines =
                         shown
-                        |> Array.map (fun c ->
-                            [| InlineKeyboardButton.Create($"Вернуть ID:{c.id}", callbackData = $"return:{c.id}")
-                               InlineKeyboardButton.Create($"Использован ID:{c.id}", callbackData = $"used:{c.id}") |])
-                    let addedRow = [| [| InlineKeyboardButton.Create("Мои добавленные", callbackData = "myAdded") |] |]
-                    InlineKeyboardMarkup.Create(Array.append couponRows addedRow)
+                        |> Array.indexed
+                        |> Array.map (fun (i, c) ->
+                            let n = i + 1
+                            let d = BotHelpers.formatUiDate c.expires_at
+                            let who = BotHelpers.formatUserHandle c.owner_id c.owner_username c.owner_first_name
+                            $"{n}. Купон ID:{c.id} на {BotHelpers.formatCouponValue c.value c.min_check}, до {d} · добавил {who}")
+                        |> String.concat "\n"
+                    "Мои купоны:\n" + lines + truncationNote
 
-                do!
-                    BotHelpers.sendTextMarkup tg chatId
-                        $"{todayStr}\n\nМои купоны:\n{text}{truncationNote}"
-                        kb
+            // §4: coupons reported as used-elsewhere sit here, offering only «Использован» —
+            // never «Вернуть». Returning a known-dead coupon to the pool is the exact harm
+            // this feature exists to stop.
+            let reportedSection =
+                if reported.Length = 0 then
+                    ""
+                else
+                    let lines =
+                        reported
+                        |> Array.indexed
+                        |> Array.map (fun (i, c) ->
+                            let n = shown.Length + i + 1
+                            let d = BotHelpers.formatUiDate c.expires_at
+                            $"{n}. Купон ID:{c.id} на {BotHelpers.formatCouponValue c.value c.min_check}, до {d}")
+                        |> String.concat "\n"
+                    "\n\n⚠️ Отмечены как использованные вне бота:\n" + lines
+
+            let hint =
+                "\n\nℹ️ Встретил уже использованный купон? Нажми «Купон уже использован» или вызови /report ID — купон вернётся владельцу."
+
+            let kb =
+                let takenRows =
+                    shown
+                    |> Array.map (fun c ->
+                        [| InlineKeyboardButton.Create($"Вернуть ID:{c.id}", callbackData = $"return:{c.id}")
+                           InlineKeyboardButton.Create($"Использован ID:{c.id}", callbackData = $"used:{c.id}") |])
+                let reportedRows =
+                    reported
+                    |> Array.map (fun c ->
+                        [| InlineKeyboardButton.Create($"Использован ID:{c.id}", callbackData = $"reportedUsed:{c.id}") |])
+                let bottomRows =
+                    [| [| InlineKeyboardButton.Create("⚠️ Купон уже использован", callbackData = "report") |]
+                       [| InlineKeyboardButton.Create("Мои добавленные", callbackData = "myAdded") |] |]
+                InlineKeyboardMarkup.Create(Array.concat [ takenRows; reportedRows; bottomRows ])
+
+            do!
+                BotHelpers.sendTextMarkup tg chatId
+                    $"{todayStr}\n\n{takenSection}{reportedSection}{hint}"
+                    kb
         }
 
     let handleAdded (user: DbUser) (chatId: int64) =
@@ -249,8 +283,9 @@ type CommandHandler(
                             let statusText =
                                 match c.status with
                                 | "taken" -> " (взят)"
+                                | "reported" -> " (отмечен использованным)"
                                 | _ -> ""
-                            $"{n}. ID:{c.id} — {BotHelpers.formatCouponValue c}, {d}{barcodeSuffix}{statusText}")
+                            $"{n}. ID:{c.id} — {BotHelpers.formatCouponValue c.value c.min_check}, {d}{barcodeSuffix}{statusText}")
                         |> String.concat "\n"
                     if remaining > 0 then
                         lines + $"\n...и ещё {remaining} купонов"
@@ -293,6 +328,42 @@ type CommandHandler(
                     | None -> ()
         }
 
+    // Holder reports a coupon as already used externally (taken -> reported). Authorization,
+    // event bookkeeping and taken_by/taken_at clearing all live in DbService.TryReportCoupon;
+    // this just renders the three outcomes and fires the adder notification (§1, §2, §6).
+    let handleReport (user: DbUser) (chatId: int64) (couponId: int) =
+        task {
+            match! db.TryReportCoupon(couponId, user.id) with
+            | ReportCouponResult.NotFound ->
+                do! sendText chatId "Купон не найден."
+            | ReportCouponResult.NotActive ->
+                do! sendText chatId "Купон уже не активен."
+            | ReportCouponResult.NotHolder ->
+                do! sendText chatId "Этот купон не у тебя."
+            | ReportCouponResult.Reported coupon ->
+                logger.LogInformation("User {ReporterId} reported coupon {CouponId} owned by {OwnerId} as used externally", user.id, couponId, coupon.owner_id)
+                let! ownerOpt = db.GetUserById(coupon.owner_id)
+                let ownerHandle =
+                    match ownerOpt with
+                    | Some owner -> BotHelpers.formatUserHandle owner.id owner.username owner.first_name
+                    | None -> string coupon.owner_id
+                let reporterHandle = BotHelpers.formatUserHandle user.id user.username user.first_name
+                let! notified = notifications.NotifyAdderCouponReported(coupon.owner_id, coupon, reporterHandle)
+                let notifyWarning = if not notified then " (⚠️ Не удалось уведомить владельца купона)" else ""
+                do! sendText chatId $"Спасибо! Купон ID:{couponId} отправлен владельцу {ownerHandle}. Он больше не в общем пуле.{notifyWarning}"
+        }
+
+    // Adder's own path from 'reported' -> 'used' (§4), distinct from handleUsed (taker-only, 'taken' -> 'used').
+    let handleReportedUsed (user: DbUser) (chatId: int64) (couponId: int) =
+        task {
+            let! updated = db.MarkReportedUsed(couponId, user.id)
+            if updated then
+                do! sendText chatId $"Купон ID:{couponId} отмечен как использованный."
+            else
+                do! sendText chatId $"Не получилось отметить купон ID:{couponId}."
+            return updated
+        }
+
     let handleFeedback (user: DbUser) (chatId: int64) =
         task {
             if options.Value.FeedbackAdminIds.Length = 0 then
@@ -308,6 +379,8 @@ type CommandHandler(
     member _.HandleReturn (user: DbUser) (chatId: int64) (couponId: int) = handleReturn user chatId couponId
     member _.HandleUsed (user: DbUser) (chatId: int64) (couponId: int) = handleUsed user chatId couponId
     member _.HandleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgIdToDelete: int64 option) = handleVoid user chatId couponId isAdmin deleteMsg msgIdToDelete
+    member _.HandleReport (user: DbUser) (chatId: int64) (couponId: int) = handleReport user chatId couponId
+    member _.HandleReportedUsed (user: DbUser) (chatId: int64) (couponId: int) = handleReportedUsed user chatId couponId
     member _.HandleAdded (user: DbUser) (chatId: int64) = handleAdded user chatId
     member _.HandleUndo (adminId: int64) (chatId: int64) (couponId: int) = handleUndo adminId chatId couponId
 
@@ -396,6 +469,11 @@ type CommandHandler(
                     let isAdmin = options.Value.FeedbackAdminIds |> Array.contains user.id
                     do! handleVoid user msg.Chat.Id couponId isAdmin false None
                 | None -> do! sendText msg.Chat.Id "Формат: /void <id>"
+            | Some t when t.StartsWith("/report ") ->
+                recordCommand "report"
+                match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
+                | Some couponId -> do! handleReport user msg.Chat.Id couponId
+                | None -> do! sendText msg.Chat.Id "Формат: /report <id>"
             | Some t when t.StartsWith("/debug ") ->
                 recordCommand "debug"
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
