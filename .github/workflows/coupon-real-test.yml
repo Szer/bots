@@ -58,6 +58,48 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Validate COUPON_CI_BOT_TOKEN shape and identity
+      # Runs BEFORE the VPN/kubeconfig/image-build/deploy steps below so a
+      # bad token fails in seconds, not after a ~5-minute deploy. A 404/ok=false
+      # from getWebhookInfo or getMe means Telegram rejected the TOKEN — an
+      # unregistered webhook on a *valid* token returns http=200, ok=true,
+      # url="". This step never prints the token value, only its shape
+      # (length/whitespace) and the getMe result (username is not secret).
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+      run: |
+        LEN=${#BOT_TOKEN}
+        TRIMMED="$(printf '%s' "$BOT_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        TRIMMED_LEN=${#TRIMMED}
+        HAS_LEADING_TRAILING_WS="no"
+        if [ "$LEN" != "$TRIMMED_LEN" ]; then HAS_LEADING_TRAILING_WS="yes"; fi
+
+        # Embedded newline/CR check — a raw value with internal line breaks
+        # reports a non-zero line count here.
+        LINE_COUNT=$(printf '%s' "$BOT_TOKEN" | wc -l)
+        HAS_EMBEDDED_NEWLINE="no"
+        if [ "$LINE_COUNT" != "0" ]; then HAS_EMBEDDED_NEWLINE="yes"; fi
+
+        SHAPE_MATCH="no"
+        if printf '%s' "$BOT_TOKEN" | grep -Eq '^[0-9]+:[A-Za-z0-9_-]+$'; then
+          SHAPE_MATCH="yes"
+        fi
+
+        echo "COUPON_CI_BOT_TOKEN shape: len=$LEN trimmed_len=$TRIMMED_LEN leading_trailing_whitespace=$HAS_LEADING_TRAILING_WS embedded_newline_or_cr=$HAS_EMBEDDED_NEWLINE matches_pattern(^[0-9]+:[A-Za-z0-9_-]+\$)=$SHAPE_MATCH"
+
+        HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getme.json" -w "%{http_code}" "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+        OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getme.json" 2>/dev/null || echo "null")
+        USERNAME=$(jq -r '.result.username // ""' "$RUNNER_TEMP/getme.json" 2>/dev/null || echo "")
+        echo "getMe: http_code=$HTTP_CODE ok=$OK username=$USERNAME"
+
+        if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+          echo "::error::COUPON_CI_BOT_TOKEN was rejected by Telegram (getMe http_code=$HTTP_CODE ok=$OK). Ranked hypotheses: (1) trailing newline/whitespace in the secret — the classic 'echo x | gh secret set' trap; (2) the secret is empty/unset; (3) the REVOKED token was stored instead of its replacement. Remediation: have the repo owner re-set the secret with: printf '%s' '<token>' | gh secret set COUPON_CI_BOT_TOKEN --repo Szer/bots (printf, not echo — echo appends the newline that causes this)."
+          exit 1
+        fi
+        if [ "$USERNAME" != "coupon_test_bot" ]; then
+          echo "::warning::getMe succeeded but result.username='$USERNAME', expected 'coupon_test_bot' — token may belong to the wrong bot."
+        fi
+
     - uses: actions/setup-dotnet@v4
       with:
         global-json-file: global.json
@@ -291,8 +333,12 @@ jobs:
         INFO_LAST_ERROR=$(jq -r '.result.last_error_message // ""' "$RUNNER_TEMP/webhookinfo.json")
         echo "getWebhookInfo: http=$HTTP_CODE ok=$INFO_OK url=$INFO_URL last_error_message=$INFO_LAST_ERROR"
 
-        if [ "$HTTP_CODE" != "200" ] || [ "$INFO_OK" != "true" ] || [ "$INFO_URL" != "$EXPECTED_URL" ]; then
-          echo "::error::Webhook self-registration not confirmed — expected url '$EXPECTED_URL', got '$INFO_URL' (http=$HTTP_CODE ok=$INFO_OK). The bot likely did not self-register: verify WEBHOOK_URL reached the pod via the coupon-bot-env Secret and check the startup log with 'kubectl logs deployment/coupon-bot -n $NAMESPACE'."
+        if [ "$HTTP_CODE" != "200" ] || [ "$INFO_OK" != "true" ]; then
+          echo "::error::getWebhookInfo returned http=$HTTP_CODE ok=$INFO_OK — this shape (non-200 or ok=false) means Telegram rejected the BOT TOKEN itself, not that the webhook is unregistered (an unregistered webhook on a valid token returns http=200, ok=true, url=\"\"). See the 'Validate COUPON_CI_BOT_TOKEN shape and identity' step earlier in this run for the diagnosis (token shape/whitespace + getMe result)."
+          exit 1
+        fi
+        if [ "$INFO_URL" != "$EXPECTED_URL" ]; then
+          echo "::error::Webhook self-registration not confirmed — expected url '$EXPECTED_URL', got '$INFO_URL' (http=200, ok=true, so the token itself is valid). This means self-registration genuinely did not happen: verify WEBHOOK_URL reached the pod via the coupon-bot-env Secret and check the startup log with 'kubectl logs deployment/coupon-bot -n $NAMESPACE'."
           exit 1
         fi
         if [ -n "$INFO_LAST_ERROR" ]; then
@@ -352,6 +398,19 @@ jobs:
         name: real-test-artifacts
         path: test-artifacts/
         if-no-files-found: ignore
+
+    - name: Dump pod diagnostics on failure (before teardown deletes them)
+      # Teardown below runs with if: always() and deletes the deployment, so
+      # by the time a human reads the failed step's "run kubectl logs ..."
+      # advice, the pod is already gone. Capture it here first. Startup logs
+      # should not contain secrets (the webhook service only logs the URL),
+      # but redact-and-report rather than trust that blindly.
+      if: failure()
+      run: |
+        echo "--- kubectl -n $NAMESPACE get pods,deploy ---"
+        kubectl -n "$NAMESPACE" get pods,deploy || true
+        echo "--- kubectl -n $NAMESPACE logs deployment/coupon-bot --tail=200 ---"
+        kubectl -n "$NAMESPACE" logs deployment/coupon-bot --tail=200 || true
 
     - name: Teardown transient workload
       if: always()
