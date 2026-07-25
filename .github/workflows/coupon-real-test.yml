@@ -167,7 +167,13 @@ jobs:
       # Must run BEFORE the bot pod starts — loadDbSettings() runs at process
       # start and a missing/incomplete bot_setting table is not itself fatal,
       # but CommunityChatId falling back to "-1" would silently break every
-      # membership/isolation check the CI run depends on.
+      # membership/isolation check the CI run depends on. TEST_MODE=true
+      # specifically must already be true at that FIRST boot, not applied
+      # later: Program.fs only registers FakeTimeProvider once, at startup,
+      # when TestMode is true — POST /reload-settings refreshes BotConfiguration
+      # but cannot retroactively swap in FakeTimeProvider, so /test/clock/advance
+      # would silently 400 for the rest of the run. Do not reorder this step
+      # to after "Deploy bot".
       env:
         CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
       run: |
@@ -209,6 +215,13 @@ jobs:
         OCR_ENDPOINT: ${{ secrets.COUPON_AZURE_OCR_ENDPOINT }}
         OCR_KEY: ${{ secrets.COUPON_AZURE_OCR_KEY }}
       run: |
+        # WEBHOOK_URL drives the bot's own startup-time setWebhook call — see
+        # the "Verify webhook self-registration" step below for why CI no
+        # longer calls Telegram's setWebhook itself. Full URL including the
+        # /bot path (the path is fixed by the bot's route,
+        # README.dev.md:105-108). This is the contract with the bot-side
+        # startup-registration code (a separate change to
+        # src/CouponHubBot) — do not rename this key.
         kubectl create secret generic coupon-bot-env -n "$NAMESPACE" \
           --from-literal=DATABASE_URL="Server=coupon-test-postgres;Port=5432;Database=coupon_hub_bot;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;" \
           --from-literal=BOT_TELEGRAM_TOKEN="$BOT_TOKEN" \
@@ -216,6 +229,7 @@ jobs:
           --from-literal=ASPNETCORE_URLS="http://0.0.0.0:5000" \
           --from-literal=AZURE_OCR_ENDPOINT="$OCR_ENDPOINT" \
           --from-literal=AZURE_OCR_KEY="$OCR_KEY" \
+          --from-literal=WEBHOOK_URL="${{ env.PUBLIC_URL }}/bot" \
           --dry-run=client -o yaml \
         | kubectl label -f - coupon-ci=transient --local -o yaml \
         | kubectl apply -f -
@@ -251,6 +265,40 @@ jobs:
         echo "::error::$PUBLIC_URL/healthz never came up within 120s"
         kubectl logs deployment/coupon-bot -n "$NAMESPACE" --tail=200
         exit 1
+
+    - name: Verify webhook self-registration
+      # CouponHubBot self-registers its webhook at startup from the
+      # WEBHOOK_URL bot_setting (env fallback — see "Create bot env Secret"
+      # above), rather than CI calling Telegram's setWebhook itself. This
+      # step only VERIFIES that registration succeeded; it never calls
+      # setWebhook. Must run after "Wait for public healthz" — a webhook
+      # pointed at a still-502ing URL reports a populated
+      # last_error_message, and checking before healthz is green would just
+      # be checking a state we already know is broken. Without this check, a
+      # failed self-registration (e.g. WEBHOOK_URL not reaching the pod, or
+      # a startup-registration bug) would surface only as all 11 real tests
+      # timing out with no obvious cause — exactly the failure mode this
+      # step exists to catch early and legibly.
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+      run: |
+        EXPECTED_URL="$PUBLIC_URL/bot"
+
+        HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/webhookinfo.json" -w "%{http_code}" \
+          "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo")
+        INFO_OK=$(jq -r '.ok' "$RUNNER_TEMP/webhookinfo.json")
+        INFO_URL=$(jq -r '.result.url // ""' "$RUNNER_TEMP/webhookinfo.json")
+        INFO_LAST_ERROR=$(jq -r '.result.last_error_message // ""' "$RUNNER_TEMP/webhookinfo.json")
+        echo "getWebhookInfo: http=$HTTP_CODE ok=$INFO_OK url=$INFO_URL last_error_message=$INFO_LAST_ERROR"
+
+        if [ "$HTTP_CODE" != "200" ] || [ "$INFO_OK" != "true" ] || [ "$INFO_URL" != "$EXPECTED_URL" ]; then
+          echo "::error::Webhook self-registration not confirmed — expected url '$EXPECTED_URL', got '$INFO_URL' (http=$HTTP_CODE ok=$INFO_OK). The bot likely did not self-register: verify WEBHOOK_URL reached the pod via the coupon-bot-env Secret and check the startup log with 'kubectl logs deployment/coupon-bot -n $NAMESPACE'."
+          exit 1
+        fi
+        if [ -n "$INFO_LAST_ERROR" ]; then
+          echo "::error::getWebhookInfo reports last_error_message: $INFO_LAST_ERROR — Telegram could not deliver to the registered webhook."
+          exit 1
+        fi
 
     - name: Reconstruct MTProto session
       # Reuses Alita's session (ALITA_CI_TG_SESSION_B64) rather than a
