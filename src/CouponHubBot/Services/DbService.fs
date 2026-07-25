@@ -87,10 +87,13 @@ type UserEventCount =
       first_name: string | null
       count: int64 }
 
+/// One still-valid (not-yet-expired) overdue-taken coupon, for naming it in the DM reminder.
 [<CLIMutable>]
-type OverdueTakenUser =
+type OverdueTakenCoupon =
     { user_id: int64
-      overdue_count: int }
+      id: int
+      value: decimal
+      expires_at: DateOnly }
 
 [<CLIMutable>]
 type EventTypeCountRow =
@@ -571,23 +574,27 @@ ORDER BY id;
     member _.GetUsersWithOverdueTakenCoupons(nowUtc: DateTime, minAge: TimeSpan) =
         task {
             use! conn = openConn()
+            // "today" is derived from the caller-supplied nowUtc (as the reminder job does),
+            // not from the injected TimeProvider — matches how nowUtc already drives this query.
+            let today = DateOnly.FromDateTime(nowUtc)
             //language=postgresql
             let sql =
                 """
-SELECT taken_by AS user_id, COUNT(*)::int AS overdue_count
+SELECT taken_by AS user_id, id, value, expires_at
 FROM coupon
 WHERE status = 'taken'
   AND taken_by IS NOT NULL
   AND taken_at IS NOT NULL
   AND taken_at <= (@now_utc - (@min_age_seconds * interval '1 second'))
-GROUP BY taken_by
-ORDER BY taken_by;
+  AND expires_at >= @today
+ORDER BY taken_by, id;
 """
             let! rows =
-                conn.QueryAsync<OverdueTakenUser>(
+                conn.QueryAsync<OverdueTakenCoupon>(
                     sql,
                     {| now_utc = nowUtc
-                       min_age_seconds = int64 minAge.TotalSeconds |}
+                       min_age_seconds = int64 minAge.TotalSeconds
+                       today = today |}
                 )
             return rows |> Seq.toArray
         }
