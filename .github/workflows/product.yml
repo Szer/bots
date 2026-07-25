@@ -41,15 +41,21 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install PostgreSQL client
+      run: sudo apt-get install -y postgresql-client
+
     - name: Setup WireGuard VPN
       run: |
         chmod +x scripts/setup-vpn.sh
         ./scripts/setup-vpn.sh
       env:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-
-    - name: Install PostgreSQL client
-      run: sudo apt-get install -y postgresql-client
+        # DB_PROD_HOST is a public endpoint reachable only via the VPN peer's
+        # firewall allowlist (same as _bot-deploy.yml's migration step) — split
+        # tunnel (10.0.0.0/8 only) leaves it unreachable and psql silently times
+        # out on every query, so gather-product-data.sh emits an empty chat
+        # message table instead of failing loudly.
+        SPLIT_TUNNEL: "false"
 
     - name: Gather product data
       run: |
@@ -61,6 +67,14 @@ jobs:
         CONTAINER_NAME: coupon-bot
         DATABASE_URL: postgresql://${{ secrets.DB_PROD_USERNAME }}:${{ secrets.DB_PROD_PASSWORD }}@${{ secrets.DB_PROD_HOST }}/coupon_hub_bot
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # Full-tunnel VPN (SPLIT_TUNNEL=false above) routes ALL traffic — including
+    # api.github.com and the Azure OpenAI endpoint — through the VPN peer,
+    # which times out on non-AKS-internal public traffic (see scripts/setup-vpn.sh).
+    # Disconnect as soon as the DB/Prometheus-dependent step is done so the
+    # remaining gh/Codex API calls use normal internet routing again.
+    - name: Disconnect VPN (post product-data gather)
+      run: sudo wg-quick down wg0 || true
 
     - name: Create orchestration issue
       id: create-issue
