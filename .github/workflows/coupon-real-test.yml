@@ -1,0 +1,325 @@
+name: "CouponHubBot: Real Telegram test (AKS)"
+
+# Full E2E (real Telegram, real Azure OCR): run on demand via
+#   gh workflow run coupon-real-test.yml --ref <branch>
+# NOT per-PR. The PR gate is the hermetic suite (tests/CouponHubBot.Tests,
+# tests/CouponHubBot.Ocr.Tests, see coupon-deploy.yml) — it runs against
+# fakes with no network egress and no external API cost. This workflow
+# deploys CouponHubBot transiently into the coupon-test AKS namespace
+# (kubectl apply, no ArgoCD/GitOps for the workload — see
+# .github/k8s/coupon-test/), runs the real-Telegram suite
+# (tests/CouponHubBot.RealTests) against it over the public
+# https://coupon-test.szer.dev endpoint, then tears everything it applied
+# back down. Singleton: only one run uses the shared coupon-test namespace at
+# a time, so concurrent manual dispatches queue rather than collide.
+# GitHub Actions runs workflow_dispatch on whichever ref you pass to --ref
+# (or the default branch if omitted) — no extra input plumbing needed here.
+#
+# Isolation model and every secret/env-var/bot_setting name below are BINDING
+# per the coupon-real-test-contract.md this workflow was built against
+# (dedicated CI bot/chat/DB — production bot_setting and the prod Postgres
+# are never touched by this pipeline). CouponHubBot is LIVE, unlike Alita's
+# test target, so this isolation is the whole point of the design.
+#
+# Known blocker (outside this repo): the persistent coupon-test namespace +
+# TLS cert + gateway listener + RBAC do not exist in AKS yet — that needs a
+# my-infra PR (the CouponHubBot analogue of alita-test's my-infra #83/#84).
+# Until it lands, this workflow fails fast and legibly at the "Verify
+# cluster access" step below; that failure is expected.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: coupon-aks-real-test
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/szer/coupon-bot
+  NAMESPACE: coupon-test
+  PUBLIC_URL: https://coupon-test.szer.dev
+
+jobs:
+  real-test:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 30
+    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident,
+    # see alita-real-test.yml). This run queues behind production deploys of every bot —
+    # that is correct, not a bug.
+    concurrency:
+      group: aks-vpn
+      cancel-in-progress: false
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - uses: actions/setup-dotnet@v4
+      with:
+        global-json-file: global.json
+
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push test image
+      uses: docker/build-push-action@v5
+      with:
+        push: true
+        # test-<sha> tag — never collides with prod's `:<sha>`/`:latest` tags
+        # published by _bot-deploy.yml (coupon-deploy.yml:132), same
+        # convention as alita-real-test.yml.
+        tags: ${{ env.IMAGE }}:test-${{ github.sha }}
+        file: ./src/Dockerfile.bot
+        build-args: BOT_PROJECT=CouponHubBot
+        platforms: linux/arm64
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Write kubeconfig
+      run: |
+        mkdir -p "$RUNNER_TEMP/kube"
+        echo "${{ secrets.COUPON_TEST_KUBECONFIG }}" | base64 -d > "$RUNNER_TEMP/kube/config"
+        chmod 600 "$RUNNER_TEMP/kube/config"
+        echo "KUBECONFIG=$RUNNER_TEMP/kube/config" >> "$GITHUB_ENV"
+
+    - name: Verify cluster access (scoped to coupon-test)
+      run: |
+        if ! kubectl auth can-i create deployments -n "$NAMESPACE"; then
+          echo "::error::kubectl auth can-i failed for namespace '$NAMESPACE'. This is EXPECTED until the persistent coupon-test namespace + TLS cert + gateway listener + RBAC exist in AKS — the CouponHubBot analogue of alita-test's my-infra PR #83/#84. Land that my-infra PR first, then re-run this workflow."
+          exit 1
+        fi
+
+    - name: Deploy Postgres
+      # Flyway/the seed step below run `docker run ... --network host` on
+      # this runner directly, NOT as in-cluster Jobs — they consume zero AKS
+      # node capacity. Only these two Deployments (postgres, bot) do; see
+      # their explicit requests/limits — the single ARM node has tight
+      # headroom, same posture as alita-real-test.yml.
+      run: |
+        kubectl create configmap coupon-test-postgres-init \
+          -n "$NAMESPACE" --from-file=init.sql=src/coupon-hub-bot/init.sql \
+          --dry-run=client -o yaml \
+        | kubectl label -f - coupon-ci=transient --local -o yaml \
+        | kubectl apply -f -
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/coupon-test/postgres.yaml
+
+        # Fast-fail: an unschedulable/crashlooping pod should fail the job
+        # in well under 180s, not sit until the 30-minute job timeout and
+        # block the singleton queue behind it.
+        if ! kubectl wait --for=condition=Ready pod -l app=coupon-test-postgres \
+              -n "$NAMESPACE" --timeout=120s; then
+          echo "::error::postgres pod not Ready within 120s"
+          kubectl describe pod -l app=coupon-test-postgres -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
+
+    - name: Port-forward Postgres to localhost:15434
+      # 15434, NOT Alita's 15433 (alita-real-test.yml) — so a coupon run and
+      # an Alita run on the same runner can never collide (contract-BINDING).
+      run: |
+        kubectl port-forward svc/coupon-test-postgres -n "$NAMESPACE" 15434:5432 \
+          > "$RUNNER_TEMP/pg-port-forward.log" 2>&1 &
+        echo $! > "$RUNNER_TEMP/pg-port-forward.pid"
+
+        for i in $(seq 1 30); do
+          if (exec 3<>/dev/tcp/127.0.0.1/15434) 2>/dev/null; then
+            exec 3<&- 3>&-
+            echo "postgres reachable on localhost:15434 after ${i}0.5s-ish tries"
+            exit 0
+          fi
+          sleep 1
+        done
+
+        echo "::error::port-forward to postgres never became reachable"
+        cat "$RUNNER_TEMP/pg-port-forward.log"
+        exit 1
+
+    - name: Flyway migrate
+      run: >-
+        docker run --rm --network host
+        --volume ${{ github.workspace }}/src/coupon-hub-bot/migrations:/flyway/sql:ro
+        flyway/flyway
+        -url="jdbc:postgresql://127.0.0.1:15434/coupon_hub_bot"
+        -user=admin -password=admin
+        migrate -schemas=public
+
+    - name: Seed bot_setting
+      # Generated inline (not a checked-in seed file like Alita's
+      # dev-bot-settings.sql) because two rows carry per-run secrets
+      # (COMMUNITY_CHAT_ID, FEEDBACK_ADMINS) that must never be committed.
+      # Must run BEFORE the bot pod starts — loadDbSettings() runs at process
+      # start and a missing/incomplete bot_setting table is not itself fatal,
+      # but CommunityChatId falling back to "-1" would silently break every
+      # membership/isolation check the CI run depends on.
+      env:
+        CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
+        # NOT in the contract's binding secret list (coupon-real-test-contract.md
+        # only says "the test MTProto user's own id", names no secret) — see
+        # this workflow's PR description / the delivering agent's report for
+        # why this name was introduced and needs a human decision before
+        # first real run. Left unset, FEEDBACK_ADMINS seeds as an empty
+        # string, which BotConfiguration.parseAdmins tolerates (no admin
+        # forward, not a boot failure) — non-fatal degradation, not a hard
+        # blocker.
+        FEEDBACK_ADMIN_ID: ${{ secrets.COUPON_CI_FEEDBACK_ADMIN_ID }}
+      run: |
+        cat > "$RUNNER_TEMP/coupon-test-bot-settings.sql" <<SQL
+        INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
+            ('TEST_MODE',              'true',                 'FEATURE_FLAG', 'diagnostics', 'Unlocks /test/clock/advance + /test/run-reminder for the real-Telegram CI suite'),
+            ('COMMUNITY_CHAT_ID',      '${CHAT_ID}',           'FREE_FORM',    'telegram',    'Dedicated CI group — the single highest-leverage isolation control'),
+            ('FEEDBACK_ADMINS',        '${FEEDBACK_ADMIN_ID}', 'FREE_FORM',    'feedback',    'Test MTProto user''s own id, so /feedback forwards land in an observable DM'),
+            ('OCR_ENABLED',            'true',                 'FEATURE_FLAG', 'ocr',         'OCR cost is negligible; endpoint/key come from env (AZURE_OCR_ENDPOINT/KEY via the coupon-bot-env Secret), not this table'),
+            ('MAX_TAKEN_COUPONS',      '6',                    'FREE_FORM',    'coupons',     'Match prod'),
+            ('REMINDER_RUN_ON_START',  'false',                'FEATURE_FLAG', 'reminders',   'Reminders are driven on demand via /test/run-reminder instead'),
+            ('REMINDER_HOUR_DUBLIN',   '10',                   'FREE_FORM',    'reminders',   'Irrelevant given REMINDER_RUN_ON_START=false; set for parity with prod'),
+            ('BATCH_DEBOUNCE_MS',      '1000',                 'FREE_FORM',    'coupons',     'Short, so album/batch tests do not idle 5s each')
+        ON CONFLICT (key) DO NOTHING;
+        SQL
+
+        docker run --rm --network host \
+          -e PGPASSWORD=admin \
+          --volume "$RUNNER_TEMP/coupon-test-bot-settings.sql:/seed.sql:ro" \
+          postgres:17.10 \
+          psql -h 127.0.0.1 -p 15434 -U admin -d coupon_hub_bot -v ON_ERROR_STOP=1 -f /seed.sql
+
+    - name: Create bot env Secret
+      env:
+        # Dedicated CI bot/chat/session — fully decoupled from production
+        # (@coupon_hub_bot / the real community chat), so a real-Telegram run
+        # can never touch prod data. GITHUB_TOKEN is deliberately absent —
+        # see the "why" comment in bot-deployment.yaml; do not add it here.
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+        WEBHOOK_SECRET: ${{ secrets.COUPON_WEBHOOK_SECRET }}
+        OCR_ENDPOINT: ${{ secrets.COUPON_AZURE_OCR_ENDPOINT }}
+        OCR_KEY: ${{ secrets.COUPON_AZURE_OCR_KEY }}
+      run: |
+        kubectl create secret generic coupon-bot-env -n "$NAMESPACE" \
+          --from-literal=DATABASE_URL="Server=coupon-test-postgres;Port=5432;Database=coupon_hub_bot;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;" \
+          --from-literal=BOT_TELEGRAM_TOKEN="$BOT_TOKEN" \
+          --from-literal=BOT_AUTH_TOKEN="$WEBHOOK_SECRET" \
+          --from-literal=ASPNETCORE_URLS="http://0.0.0.0:5000" \
+          --from-literal=AZURE_OCR_ENDPOINT="$OCR_ENDPOINT" \
+          --from-literal=AZURE_OCR_KEY="$OCR_KEY" \
+          --dry-run=client -o yaml \
+        | kubectl label -f - coupon-ci=transient --local -o yaml \
+        | kubectl apply -f -
+
+    - name: Deploy bot
+      run: |
+        sed "s|IMAGE_PLACEHOLDER|${{ env.IMAGE }}:test-${{ github.sha }}|" \
+          .github/k8s/coupon-test/bot-deployment.yaml \
+          | kubectl apply -n "$NAMESPACE" -f -
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/coupon-test/bot-service.yaml
+        kubectl apply -n "$NAMESPACE" -f .github/k8s/coupon-test/httproute.yaml
+
+    - name: Fast-fail if the transient stack isn't Ready
+      run: |
+        if ! kubectl wait --for=condition=Ready pod -l coupon-ci=transient \
+              -n "$NAMESPACE" --timeout=180s; then
+          echo "::error::transient pod(s) not Ready within 180s"
+          kubectl describe pod -l coupon-ci=transient -n "$NAMESPACE"
+          kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp
+          exit 1
+        fi
+
+    - name: Wait for public healthz (DNS/cert to be provisioned by a future my-infra PR)
+      run: |
+        for i in $(seq 1 60); do
+          if curl -fsS "$PUBLIC_URL/healthz"; then
+            echo
+            echo "healthy after $((i * 2))s"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "::error::$PUBLIC_URL/healthz never came up within 120s"
+        kubectl logs deployment/coupon-bot -n "$NAMESPACE" --tail=200
+        exit 1
+
+    - name: Reconstruct MTProto session
+      run: |
+        mkdir -p "$HOME/.coupon-test"
+        echo "${{ secrets.COUPON_CI_TG_SESSION_B64 }}" \
+          | base64 -d | gunzip > "$HOME/.coupon-test/tg.session"
+
+    - name: Run real-Telegram suite
+      env:
+        COUPON_REAL_MODE: remote
+        COUPON_TEST_BOT_USERNAME: ${{ secrets.COUPON_CI_BOT_USERNAME }}
+        COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
+        # ALITA_-prefixed names are a misnomer per the contract: these are
+        # account/application-level MTProto credentials for the same real
+        # Telegram account, reused as-is to avoid three redundant manual
+        # secret creations. The session itself is NOT reused — see
+        # COUPON_CI_TG_SESSION_B64 above.
+        COUPON_TG_API_ID: ${{ secrets.ALITA_TG_API_ID }}
+        COUPON_TG_API_HASH: ${{ secrets.ALITA_TG_API_HASH }}
+        COUPON_TG_API_PHONE: ${{ secrets.ALITA_TG_API_PHONE }}
+        COUPON_BOT_BASE_URL: ${{ env.PUBLIC_URL }}
+        COUPON_BOT_AUTH_TOKEN: ${{ secrets.COUPON_WEBHOOK_SECRET }}
+        COUPON_TEST_DB_URL: "Server=127.0.0.1;Port=15434;Database=coupon_hub_bot;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;"
+      run: >-
+        dotnet test tests/CouponHubBot.RealTests -c Release
+        --logger "trx;LogFileName=real-test-results.trx"
+        --logger "console;verbosity=detailed"
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: real-test-results
+        path: "**/*.trx"
+
+    - name: Upload test-artifacts (bot/ngrok logs — n/a in remote mode, kept for parity)
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: real-test-artifacts
+        path: test-artifacts/
+        if-no-files-found: ignore
+
+    - name: Teardown transient workload
+      if: always()
+      # Explicit kinds only — NOT `all` (kubectl expands that to every kind
+      # k8s knows, including several the coupon-ci Role was never granted;
+      # those show up as noisy "Forbidden" errors and, under `bash -e`, fail
+      # this step even though every actual transient object was already
+      # deleted cleanly — same reasoning as alita-real-test.yml).
+      run: |
+        kill "$(cat "$RUNNER_TEMP/pg-port-forward.pid" 2>/dev/null)" 2>/dev/null || true
+
+        kubectl delete deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
+          -n "$NAMESPACE" -l coupon-ci=transient --wait --timeout=60s || true
+
+        echo "Leftover transient objects (should be empty):"
+        kubectl get deployments,services,pods,secrets,configmaps,httproutes.gateway.networking.k8s.io \
+          -n "$NAMESPACE" -l coupon-ci=transient || true
+
+    - name: Delete webhook (safety net — the harness already does this on normal exit)
+      # A leftover webhook pointed at a dead pod wedges the bot for the next run.
+      if: always()
+      run: |
+        TOKEN="${{ secrets.COUPON_CI_BOT_TOKEN }}"
+        curl -s "https://api.telegram.org/bot${TOKEN}/deleteWebhook?drop_pending_updates=true" \
+          -o /dev/null -w "deleteWebhook: %{http_code}\n" || true
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true
