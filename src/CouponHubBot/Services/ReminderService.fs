@@ -84,20 +84,34 @@ type ReminderService(
                 do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(options.Value.CommunityChatId, text)) |> taskIgnore
                 anySent <- true
 
-            // DM reminder: user has taken coupons older than 1 day and forgot to mark used/return.
-            // One message per user even if multiple overdue coupons.
-            let! overdueUsers = db.GetUsersWithOverdueTakenCoupons(nowUtc, TimeSpan.FromDays(1.0))
-            for r in overdueUsers do
+            // DM reminder: user has taken coupons older than 1 day, still not expired, and forgot
+            // to mark used/return. One message per user even if multiple overdue coupons.
+            // Coupons that already expired are excluded (DbService.fs: expires_at >= today) —
+            // there's nothing actionable left to do with those via /my.
+            let! overdueRows = db.GetUsersWithOverdueTakenCoupons(nowUtc, TimeSpan.FromDays(1.0))
+            let overdueByUser = overdueRows |> Array.groupBy (fun r -> r.user_id)
+            for (userId, coupons) in overdueByUser do
                 try
-                    let couponWord = Utils.RussianPlural.choose r.overdue_count "купон" "купона" "купонов"
-                    let participle = if r.overdue_count = 1 then "взятый" else "взятых"
-                    let notMarked = if r.overdue_count = 1 then "не отмеченный" else "не отмеченных"
+                    let count = coupons.Length
+                    let couponWord = Utils.RussianPlural.choose count "купон" "купона" "купонов"
+                    let participle = if count = 1 then "взятый" else "взятых"
+                    let notMarked = if count = 1 then "не отмеченный" else "не отмеченных"
+                    let couponIds = coupons |> Array.map (fun c -> c.id)
+                    let couponLines =
+                        coupons
+                        |> Array.map (fun c ->
+                            let v = c.value.ToString("0.##")
+                            let mc = c.min_check.ToString("0.##")
+                            let d = Utils.DateFormatting.formatDateNoYearWithDow c.expires_at
+                            $"Купон ID:{c.id} на {v}€ из {mc}€, до {d}")
+                        |> String.concat "\n"
                     let text =
-                        $"Напоминание: у тебя есть {r.overdue_count} {couponWord}, {participle} более 1 дня назад и всё ещё {notMarked}.\nОткрой /my и нажми «Использован» или «Вернуть»."
-                    do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(r.user_id, text)) |> taskIgnore
+                        $"Напоминание: у тебя есть {count} {couponWord}, {participle} более 1 дня назад и всё ещё {notMarked}.\n{couponLines}\nОткрой /my и нажми «Использован» или «Вернуть»."
+                    logger.LogInformation("Sending overdue-taken reminder to {UserId} for coupons {CouponIds}", userId, couponIds)
+                    do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(userId, text)) |> taskIgnore
                     anySent <- true
                 with ex ->
-                    logger.LogWarning(ex, "Failed to send overdue-taken reminder to {UserId}", r.user_id)
+                    logger.LogWarning(ex, "Failed to send overdue-taken reminder to {UserId}", userId)
 
             // DM reminder: user used coupon yesterday but did not add any coupon on the same day.
             // One message per user.
