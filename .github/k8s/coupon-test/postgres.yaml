@@ -1,0 +1,97 @@
+---
+# Transient Postgres for CouponHubBot's CI real-test flow. Applied and torn
+# down by .github/workflows/coupon-real-test.yml every run — emptyDir storage
+# is intentional, data never needs to survive past one CI run.
+#
+# `coupon-ci: transient` (never `app.kubernetes.io/instance`) is the ONLY
+# label CI teardown keys off — the ArgoCD instance label would make this
+# object a prune target of some unrelated Application and get deleted
+# mid-run (see alita-test/postgres.yaml for the same reasoning).
+#
+# Requires a ConfigMap named `coupon-test-postgres-init` (created by the
+# workflow from src/coupon-hub-bot/init.sql — same file the local dev compose
+# stack mounts) to exist in this namespace before this is applied; it seeds
+# the `admin` / `coupon_hub_bot_service` roles and the `coupon_hub_bot`
+# database on first boot via /docker-entrypoint-initdb.d. CouponHubBot has no
+# pgvector dependency, so plain postgres (not the pgvector image Alita needs)
+# is enough here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coupon-test-postgres
+  namespace: coupon-test
+  labels:
+    coupon-ci: transient
+    app: coupon-test-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coupon-test-postgres
+  template:
+    metadata:
+      labels:
+        coupon-ci: transient
+        app: coupon-test-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17.10
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          timeoutSeconds: 3
+          failureThreshold: 20
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        # Explicit + minimal, matching alita-test/postgres.yaml's rationale:
+        # the cluster is a single ARM node with tight headroom — CPU request
+        # matches what production bots actually use on this node (20m); the
+        # 500m limit is just a safety cap — limits don't count against
+        # scheduling quota, only requests do.
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "20m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: data
+        emptyDir: {}
+      - name: initdb
+        configMap:
+          name: coupon-test-postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coupon-test-postgres
+  namespace: coupon-test
+  labels:
+    coupon-ci: transient
+spec:
+  selector:
+    app: coupon-test-postgres
+  ports:
+  - name: postgres
+    port: 5432
+    targetPort: 5432
+  type: ClusterIP
