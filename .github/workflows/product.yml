@@ -52,9 +52,10 @@ jobs:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         # DB_PROD_HOST is a public endpoint reachable only via the VPN peer's
         # firewall allowlist (same as _bot-deploy.yml's migration step) — split
-        # tunnel (10.0.0.0/8 only) leaves it unreachable and psql silently times
-        # out on every query, so gather-product-data.sh emits an empty chat
-        # message table instead of failing loudly.
+        # tunnel (10.0.0.0/8 only) leaves it unreachable and every psql query
+        # times out. This silently produced 21 consecutive empty product
+        # reports (2026-05-15 → 2026-07-25); gather-product-data.sh now aborts
+        # loudly on query failure, but it still needs the full tunnel to work.
         SPLIT_TUNNEL: "false"
 
     - name: Gather product data
