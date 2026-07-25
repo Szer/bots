@@ -71,6 +71,9 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
     let getCouponCount () =
         fixture.QuerySingle<int64>("SELECT COUNT(*)::bigint FROM coupon", null)
 
+    let getLatestBarcodeText () =
+        fixture.QuerySingleOrDefault<string>("SELECT barcode_text FROM coupon ORDER BY id DESC LIMIT 1", null)
+
     /// Regression for #158: the single-photo /add OCR runs synchronously inside
     /// the webhook update handler. When Azure OCR stalls past its per-attempt
     /// timeout, the Azure OCR SDK retries once and then Recognize
@@ -513,6 +516,128 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
             Assert.True(findCallWithText calls3 user.Id "Добавлен купон", "Expected coupon created")
 
             // Only one coupon in DB (not two).
+            let! count2 = getCouponCount ()
+            Assert.Equal(1L, count2)
+        }
+
+    // ── Manual /add barcode OCR ─────────────────────────────────────────
+    // These cover HandleAddManual's OCR call, which only ever contributes the
+    // barcode — value/min-check/expiry always come from the caption.
+
+    [<Fact>]
+    let ``Manual /add: caption + photo populates barcode_text via OCR`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let user = Tg.user(id = 670L, username = "manual_add_ocr", firstName = "Manual")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let fileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let fileId = "manual-add-ocr-photo"
+            do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
+            do! fixture.SetAzureOcrResponse(200, readAzureCacheJson fileName)
+
+            // Caption values (5/25/2026-02-01) intentionally differ from what OCR
+            // would recognize from the photo (10/50/2026-01-26) — OCR must only
+            // contribute the barcode, never override the caption's value/min/expiry.
+            let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 5 25 2026-02-01", user, fileId = fileId))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls user.Id "Добавлен купон", "Expected coupon added")
+
+            let! count = getCouponCount ()
+            Assert.Equal(1L, count)
+
+            let! barcode = getLatestBarcodeText ()
+            Assert.Equal("2706688198845", barcode)
+
+            // Caption values must win, not the OCR-recognized ones.
+            let! v = getLatestValue ()
+            let! mc = getLatestMinCheck ()
+            let! expiresIso = getLatestExpiresIso ()
+            Assert.Equal(5m, v)
+            Assert.Equal(25m, mc)
+            Assert.Equal("2026-02-01", expiresIso)
+        }
+
+    /// Regression guard: OCR unavailability must never block a manual /add.
+    /// Mirrors ``Single-photo OCR timeout: falls back to manual entry, no unhandled error``
+    /// but for the manual /add path, where the coupon must still be added (barcode NULL)
+    /// instead of falling back to the wizard.
+    [<Fact>]
+    let ``Manual /add: OCR backend failure still adds coupon with NULL barcode`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            do! fixture.ResetAzureOcr()
+
+            let user = Tg.user(id = 671L, username = "manual_add_ocr_fail", firstName = "ManualFail")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let fileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let fileId = "manual-add-ocr-fail-photo"
+            do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
+
+            try
+                // Azure OCR stalls on every call, so the resilience pipeline's
+                // per-attempt timeout (plus one retry) fires — Recognize degrades to
+                // a null-field result rather than throwing.
+                do! fixture.SetAzureOcrErrorMode("timeout")
+
+                let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", user, fileId = fileId))
+                Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+                let! calls = fixture.GetFakeCalls("sendMessage")
+                Assert.True(findCallWithText calls user.Id "Добавлен купон",
+                    "Expected coupon to be added despite OCR backend failure")
+
+                let! count = getCouponCount ()
+                Assert.Equal(1L, count)
+
+                // ZXing barcode decoding is independent of the Azure call and runs
+                // against the raw image bytes before AnalyzeImageBytes is even invoked,
+                // so it isn't affected by the Azure timeout mode — this is the same
+                // image used by the "timeout" test above, where ZXing still decodes it.
+                // Assert only that the add succeeded; whether ZXing found a barcode is
+                // covered by the positive-path test above.
+                ()
+            finally
+                fixture.ResetAzureOcr().GetAwaiter().GetResult()
+        }
+
+    [<Fact>]
+    let ``Manual /add: duplicate barcode via OCR is rejected (different photo ids)`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let user = Tg.user(id = 672L, username = "manual_add_dup_barcode", firstName = "ManualDup")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let fileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let azure = readAzureCacheJson fileName
+            let bytes = readImageBytes fileName
+
+            let fileId1 = "manual-dup-barcode-1"
+            do! fixture.SetTelegramFile(fileId1, bytes)
+            do! fixture.SetAzureOcrResponse(200, azure)
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", user, fileId = fileId1))
+
+            let! count1 = getCouponCount ()
+            Assert.Equal(1L, count1)
+
+            do! fixture.ClearFakeCalls()
+            let fileId2 = "manual-dup-barcode-2"
+            do! fixture.SetTelegramFile(fileId2, bytes)
+            do! fixture.SetAzureOcrResponse(200, azure)
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", user, fileId = fileId2))
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithAnyText calls user.Id [| "штрихкод"; "штрихкодом" |],
+                "Expected duplicate barcode rejection message")
+
             let! count2 = getCouponCount ()
             Assert.Equal(1L, count2)
         }

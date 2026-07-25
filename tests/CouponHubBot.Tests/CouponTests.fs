@@ -43,6 +43,9 @@ type CouponTests(fixture: DefaultCouponHubTestContainers) =
     let getLatestCouponPhotoFileId () =
         fixture.QuerySingle<string>("SELECT photo_file_id FROM coupon ORDER BY id DESC LIMIT 1", null)
 
+    let getLatestCouponBarcodeText () =
+        fixture.QuerySingleOrDefault<string>("SELECT barcode_text FROM coupon ORDER BY id DESC LIMIT 1", null)
+
     [<Fact>]
     let ``Cannot add expired coupon (manual /add with past date)`` () =
         task {
@@ -339,6 +342,27 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls 211L "Не понял discount/min_check/date",
                 $"Expected DM with 'Не понял discount/min_check/date'. Got %d{calls.Length} calls")
+        }
+
+    [<Fact>]
+    let ``Manual /add with OCR disabled still succeeds with NULL barcode_text`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let user = Tg.user(id = 217L, username = "manual_add_ocr_off", firstName = "OcrOff")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+            // OCR_ENABLED is false in this test container — HandleAddManual must not
+            // attempt OCR at all and must keep behaving exactly as before this change.
+
+            let! resp = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", user, fileId = "manual-add-ocr-off-photo"))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls 217L "Добавлен купон",
+                $"Expected DM with 'Добавлен купон'. Got %d{calls.Length} calls")
+
+            let! barcode = getLatestCouponBarcodeText ()
+            Assert.Null(barcode)
         }
 
     [<Fact>]
