@@ -96,7 +96,42 @@ type CouponFlowHandler(
             do! sendText chatId text
         }
 
-    member _.HandleAddManual (user: DbUser) (msg: Message) =
+    /// Best-effort OCR barcode lookup for the manual /add path. Only the barcode is
+    /// taken from OCR — value/min-check/expiry always come from the caption and are
+    /// never overridden — so manual adds gain barcode-based duplicate detection
+    /// without changing what the user typed. Gated on OCR_ENABLED like the other two
+    /// OCR call sites. Any failure (GetFile/download error, OCR backend error, no
+    /// barcode found) degrades to null exactly like today: adding a coupon must
+    /// never fail because OCR/Azure is unavailable.
+    member private _.TryOcrBarcodeForManualAdd (userId: int64) (photoFileId: string) : Task<string | null> =
+        task {
+            let ocrConfig = ocrOptions.Value
+            if not ocrConfig.OcrEnabled then
+                return null
+            else
+                try
+                    let! file = tg.CallExn(Funogram.Telegram.Req.GetFile.Make(photoFileId))
+                    let filePath = file.FilePath |> Option.defaultValue ""
+                    if String.IsNullOrWhiteSpace filePath then
+                        return null
+                    else
+                        let! bytes = tg.DownloadFile filePath
+                        if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
+                            return null
+                        else
+                            let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                            let barcodeText =
+                                if String.IsNullOrWhiteSpace ocr.barcode then null else ocr.barcode
+                            logger.LogInformation(
+                                "Manual-add OCR result for user {UserId}: hasBarcode={HasBarcode}",
+                                userId, not (isNull barcodeText))
+                            return barcodeText
+                with ex ->
+                    logger.LogWarning(ex, "Manual-add OCR failed for user {UserId}; adding coupon without barcode", userId)
+                    return null
+        }
+
+    member this.HandleAddManual (user: DbUser) (msg: Message) =
         task {
             use a = botActivity.StartActivity("handleAdd")
             %a.SetTag("userId", user.id)
@@ -122,7 +157,8 @@ type CouponFlowHandler(
                     let largestPhoto =
                         photos
                         |> Array.maxBy (fun p -> p.FileSize |> Option.defaultValue 0L)
-                    match! db.TryAddCoupon(user.id, largestPhoto.FileId, value, minCheck, expiresAt, null) with
+                    let! barcodeText = this.TryOcrBarcodeForManualAdd user.id largestPhoto.FileId
+                    match! db.TryAddCoupon(user.id, largestPhoto.FileId, value, minCheck, expiresAt, barcodeText) with
                     | AddCouponResult.Added coupon ->
                         let v = coupon.value.ToString("0.##")
                         let mc = coupon.min_check.ToString("0.##")

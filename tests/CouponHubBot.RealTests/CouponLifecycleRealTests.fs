@@ -91,6 +91,9 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
             Assert.Contains("добавил", myMsg.message)
             Assert.Contains(expectedHandle, myMsg.message)
 
+            // /my's per-coupon listing keyboard (CommandHandler.fs's InlineKeyboardButton.Create
+            // calls, distinct from singleTakenKeyboard below) emits bare "return:<id>"/"used:<id>"
+            // with no suffix — unlike the take-confirmation card's buttons, see the two tests below.
             let hasReturn = fx.UserClient.FindCallbackData(myMsg, fun d -> d = $"return:{couponId}")
             let hasUsed = fx.UserClient.FindCallbackData(myMsg, fun d -> d = $"used:{couponId}")
             Assert.True(hasReturn.IsSome, $"Expected a return:{couponId} button under /my")
@@ -106,8 +109,13 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! takenMsg = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)
 
-            let usedData = fx.UserClient.FindCallbackData(takenMsg, fun d -> d = $"used:{couponId}")
-            Assert.True(usedData.IsSome, $"Expected a used:{couponId} button on the take confirmation")
+            // BotHelpers.singleTakenKeyboard (used by handleTake's take-confirmation card,
+            // src/CouponHubBot/Services/BotHelpers.fs:290-294) emits "used:<id>:del" — a
+            // ":del" suffix the /my listing's separate keyboard does NOT have (see the test
+            // above). An exact match on the bare "used:<id>" (no suffix) can never find this
+            // button; confirmed against the real bot's reply in run 30163952072 (2026-07-25).
+            let usedData = fx.UserClient.FindCallbackData(takenMsg, fun d -> d = $"used:{couponId}:del")
+            Assert.True(usedData.IsSome, $"Expected a used:{couponId}:del button on the take confirmation")
 
             do! fx.UserClient.PressCallbackButton(fx.BotChatId, takenMsg.id, usedData.Value)
             let! _usedReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, takenMsg.id, $"Купон ID:{couponId} отмечен", TimeSpan.FromSeconds 60.)
@@ -130,8 +138,9 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! takenMsg = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)
 
-            let returnData = fx.UserClient.FindCallbackData(takenMsg, fun d -> d = $"return:{couponId}")
-            Assert.True(returnData.IsSome, $"Expected a return:{couponId} button on the take confirmation")
+            // Same ":del"-suffixed singleTakenKeyboard format as the "used" test above.
+            let returnData = fx.UserClient.FindCallbackData(takenMsg, fun d -> d = $"return:{couponId}:del")
+            Assert.True(returnData.IsSome, $"Expected a return:{couponId}:del button on the take confirmation")
 
             do! fx.UserClient.PressCallbackButton(fx.BotChatId, takenMsg.id, returnData.Value)
             let! _returnedReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, takenMsg.id, $"Купон ID:{couponId} возвращён", TimeSpan.FromSeconds 60.)

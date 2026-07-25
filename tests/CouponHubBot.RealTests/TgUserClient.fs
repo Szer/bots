@@ -273,12 +273,14 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
     member _.PressCallbackButton(chatId: int64, msgId: int, callbackData: string) : Task =
         task {
             let! peer = resolvePeer chatId
-            let req =
-                TL.Methods.Messages_GetBotCallbackAnswer(
-                    peer = peer,
-                    msg_id = msgId,
-                    data = Encoding.UTF8.GetBytes callbackData)
-            let! _answer = client.Invoke req
+            // Use the SchemaExtensions helper, not a bare `TL.Methods.Messages_GetBotCallbackAnswer`
+            // object initializer: that raw request type has a `flags` field that gates
+            // whether `data` is written to the wire at all (WriteTL only serializes
+            // `data` when the `has_data` bit is set), and object-initializer syntax
+            // does NOT set it — every press silently went out with no data attached,
+            // which Telegram rejects with DATA_INVALID. The extension method computes
+            // `flags` from which optional args are non-null.
+            let! _answer = client.Messages_GetBotCallbackAnswer(peer, msgId, data = Encoding.UTF8.GetBytes callbackData)
             ()
         }
         :> Task

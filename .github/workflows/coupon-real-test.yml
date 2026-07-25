@@ -58,6 +58,96 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Validate COUPON_CI_BOT_TOKEN shape and identity
+      # Runs BEFORE the VPN/kubeconfig/image-build/deploy steps below so a
+      # bad token fails in seconds, not after a ~5-minute deploy. A 404/ok=false
+      # from getWebhookInfo or getMe means Telegram rejected the TOKEN — an
+      # unregistered webhook on a *valid* token returns http=200, ok=true,
+      # url="". This step never prints the token value, only its shape
+      # (length/whitespace) and the getMe result (username is not secret).
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+      run: |
+        LEN=${#BOT_TOKEN}
+        TRIMMED="$(printf '%s' "$BOT_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        TRIMMED_LEN=${#TRIMMED}
+        HAS_LEADING_TRAILING_WS="no"
+        if [ "$LEN" != "$TRIMMED_LEN" ]; then HAS_LEADING_TRAILING_WS="yes"; fi
+
+        # Embedded newline/CR check — a raw value with internal line breaks
+        # reports a non-zero line count here.
+        LINE_COUNT=$(printf '%s' "$BOT_TOKEN" | wc -l)
+        HAS_EMBEDDED_NEWLINE="no"
+        if [ "$LINE_COUNT" != "0" ]; then HAS_EMBEDDED_NEWLINE="yes"; fi
+
+        SHAPE_MATCH="no"
+        if printf '%s' "$BOT_TOKEN" | grep -Eq '^[0-9]+:[A-Za-z0-9_-]+$'; then
+          SHAPE_MATCH="yes"
+        fi
+
+        echo "COUPON_CI_BOT_TOKEN shape: len=$LEN trimmed_len=$TRIMMED_LEN leading_trailing_whitespace=$HAS_LEADING_TRAILING_WS embedded_newline_or_cr=$HAS_EMBEDDED_NEWLINE matches_pattern(^[0-9]+:[A-Za-z0-9_-]+\$)=$SHAPE_MATCH"
+
+        HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getme.json" -w "%{http_code}" "https://api.telegram.org/bot${BOT_TOKEN}/getMe")
+        OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getme.json" 2>/dev/null || echo "null")
+        USERNAME=$(jq -r '.result.username // ""' "$RUNNER_TEMP/getme.json" 2>/dev/null || echo "")
+        echo "getMe: http_code=$HTTP_CODE ok=$OK username=$USERNAME"
+
+        if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+          echo "::error::COUPON_CI_BOT_TOKEN was rejected by Telegram (getMe http_code=$HTTP_CODE ok=$OK). Ranked hypotheses: (1) trailing newline/whitespace in the secret — the classic 'echo x | gh secret set' trap; (2) the secret is empty/unset; (3) the REVOKED token was stored instead of its replacement. Remediation: have the repo owner re-set the secret with: printf '%s' '<token>' | gh secret set COUPON_CI_BOT_TOKEN --repo Szer/bots (printf, not echo — echo appends the newline that causes this)."
+          exit 1
+        fi
+        if [ "$USERNAME" != "coupon_test_bot" ]; then
+          echo "::warning::getMe succeeded but result.username='$USERNAME', expected 'coupon_test_bot' — token may belong to the wrong bot."
+        fi
+
+    - name: Validate CI chat and bot membership
+      # Runs immediately after the token-shape/identity check above, still before the
+      # image build and AKS deploy, so a stale/wrong COUPON_CI_CHAT_ID also fails in
+      # seconds instead of surfacing 90+ minutes later as every real test's
+      # ensureCommunityMember gate silently rejecting the test account (see
+      # MembershipService.fs's IsMember — a getChatMember error and a genuine
+      # non-member verdict both collapse to `false` there, so this workflow-level
+      # check is the only place that can tell them apart without a src/ change).
+      # Telegram auto-upgrades a basic group to a supergroup (member-limit growth, a
+      # public link, or enabling "new members see history") and the chat id CHANGES
+      # SHAPE when that happens (bare negative id -> -100<id>) — dev-bot-settings.sql's
+      # COMMUNITY_CHAT_ID ('-5252116059') is a live example of this exact drift having
+      # already happened once for prod. This step never prints the token.
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
+      run: |
+        HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getchat.json" -w "%{http_code}" \
+          "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${CHAT_ID}")
+        OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "null")
+        TYPE=$(jq -r '.result.type // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
+        TITLE=$(jq -r '.result.title // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
+        # Deliberately NOT printing .result.id here — for a group/supergroup
+        # getChat's returned id is the same secret value as COUPON_CI_CHAT_ID
+        # (or its supergroup-migrated form), so echoing it would leak the
+        # secret into the run log.
+        echo "getChat: http_code=$HTTP_CODE ok=$OK type=$TYPE title=$TITLE"
+
+        if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+          echo "::error::getChat failed for COUPON_CI_CHAT_ID (http_code=$HTTP_CODE ok=$OK) — the chat id is wrong or the bot is not a member of that chat. Most likely cause: the group was upgraded from a basic group to a supergroup, which changes its id (Telegram assigns a new -100... id on upgrade — dev-bot-settings.sql's stale COMMUNITY_CHAT_ID is a precedent for this exact drift). Remediation: send any message in the group, call https://api.telegram.org/bot<token>/getUpdates and read the CURRENT chat.id off a recent update (or migrate_to_chat_id on the old chat's entry), then re-set the secret with: printf '%s' '<id>' | gh secret set COUPON_CI_CHAT_ID --repo Szer/bots (printf, not echo)."
+          exit 1
+        fi
+
+        if [ "$TYPE" = "group" ]; then
+          echo "::warning::COUPON_CI_CHAT_ID resolves to a basic 'group' (title=$TITLE), not a 'supergroup'. Basic-group ids are UNSTABLE — Telegram silently upgrades a group to a supergroup and its id changes shape when it does, breaking getChatMember-based membership checks until the secret is manually re-set. This is a standing risk, not a one-time fix."
+        fi
+
+        COUNT_HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getchatmembercount.json" -w "%{http_code}" \
+          "https://api.telegram.org/bot${BOT_TOKEN}/getChatMemberCount?chat_id=${CHAT_ID}")
+        COUNT_OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getchatmembercount.json" 2>/dev/null || echo "null")
+        COUNT=$(jq -r '.result // ""' "$RUNNER_TEMP/getchatmembercount.json" 2>/dev/null || echo "")
+        echo "getChatMemberCount: http_code=$COUNT_HTTP_CODE ok=$COUNT_OK count=$COUNT"
+
+        if [ "$COUNT_HTTP_CODE" != "200" ] || [ "$COUNT_OK" != "true" ]; then
+          echo "::error::getChatMemberCount failed (http_code=$COUNT_HTTP_CODE ok=$COUNT_OK) for a chat that getChat above reported as valid — investigate manually before proceeding."
+          exit 1
+        fi
+
     - uses: actions/setup-dotnet@v4
       with:
         global-json-file: global.json
@@ -195,7 +285,18 @@ jobs:
             ('REMINDER_RUN_ON_START',  'false',                'FEATURE_FLAG', 'reminders',   'Reminders are driven on demand via /test/run-reminder instead'),
             ('REMINDER_HOUR_DUBLIN',   '10',                   'FREE_FORM',    'reminders',   'Irrelevant given REMINDER_RUN_ON_START=false; set for parity with prod'),
             ('BATCH_DEBOUNCE_MS',      '1000',                 'FREE_FORM',    'coupons',     'Short, so album/batch tests do not idle 5s each')
-        ON CONFLICT (key) DO NOTHING;
+        -- DO UPDATE, not DO NOTHING: migration V16__pending_add_batch.sql
+        -- already seeds BATCH_DEBOUNCE_MS='5000' with its own ON CONFLICT DO
+        -- NOTHING, so a fresh DB (via Flyway migrate above) already has that
+        -- row when this INSERT runs. DO NOTHING here would silently keep the
+        -- migration's 5000ms default instead of this step's CI-authoritative
+        -- 1000ms override — exactly the album/batch idling this row's own
+        -- description says it exists to avoid. DO UPDATE makes every value in
+        -- this list authoritative for the CI run regardless of what any
+        -- migration pre-seeds, matching every other row's existing intent
+        -- (see e.g. TEST_MODE's "must already be true at FIRST boot" comment
+        -- above).
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
         SQL
 
         docker run --rm --network host \
@@ -291,8 +392,12 @@ jobs:
         INFO_LAST_ERROR=$(jq -r '.result.last_error_message // ""' "$RUNNER_TEMP/webhookinfo.json")
         echo "getWebhookInfo: http=$HTTP_CODE ok=$INFO_OK url=$INFO_URL last_error_message=$INFO_LAST_ERROR"
 
-        if [ "$HTTP_CODE" != "200" ] || [ "$INFO_OK" != "true" ] || [ "$INFO_URL" != "$EXPECTED_URL" ]; then
-          echo "::error::Webhook self-registration not confirmed — expected url '$EXPECTED_URL', got '$INFO_URL' (http=$HTTP_CODE ok=$INFO_OK). The bot likely did not self-register: verify WEBHOOK_URL reached the pod via the coupon-bot-env Secret and check the startup log with 'kubectl logs deployment/coupon-bot -n $NAMESPACE'."
+        if [ "$HTTP_CODE" != "200" ] || [ "$INFO_OK" != "true" ]; then
+          echo "::error::getWebhookInfo returned http=$HTTP_CODE ok=$INFO_OK — this shape (non-200 or ok=false) means Telegram rejected the BOT TOKEN itself, not that the webhook is unregistered (an unregistered webhook on a valid token returns http=200, ok=true, url=\"\"). See the 'Validate COUPON_CI_BOT_TOKEN shape and identity' step earlier in this run for the diagnosis (token shape/whitespace + getMe result)."
+          exit 1
+        fi
+        if [ "$INFO_URL" != "$EXPECTED_URL" ]; then
+          echo "::error::Webhook self-registration not confirmed — expected url '$EXPECTED_URL', got '$INFO_URL' (http=200, ok=true, so the token itself is valid). This means self-registration genuinely did not happen: verify WEBHOOK_URL reached the pod via the coupon-bot-env Secret and check the startup log with 'kubectl logs deployment/coupon-bot -n $NAMESPACE'."
           exit 1
         fi
         if [ -n "$INFO_LAST_ERROR" ]; then
@@ -352,6 +457,19 @@ jobs:
         name: real-test-artifacts
         path: test-artifacts/
         if-no-files-found: ignore
+
+    - name: Dump pod diagnostics on failure (before teardown deletes them)
+      # Teardown below runs with if: always() and deletes the deployment, so
+      # by the time a human reads the failed step's "run kubectl logs ..."
+      # advice, the pod is already gone. Capture it here first. Startup logs
+      # should not contain secrets (the webhook service only logs the URL),
+      # but redact-and-report rather than trust that blindly.
+      if: failure()
+      run: |
+        echo "--- kubectl -n $NAMESPACE get pods,deploy ---"
+        kubectl -n "$NAMESPACE" get pods,deploy || true
+        echo "--- kubectl -n $NAMESPACE logs deployment/coupon-bot --tail=200 ---"
+        kubectl -n "$NAMESPACE" logs deployment/coupon-bot --tail=200 || true
 
     - name: Teardown transient workload
       if: always()
