@@ -246,6 +246,9 @@ type CommandHandler(
                     |> Array.map (fun c ->
                         [| InlineKeyboardButton.Create($"Вернуть ID:{c.id}", callbackData = $"return:{c.id}")
                            InlineKeyboardButton.Create($"Использован ID:{c.id}", callbackData = $"used:{c.id}") |])
+                // Reported coupons offer only «Использован», never «Вернуть» — recirculating a
+                // known-dead coupon is the exact harm this feature exists to stop (it previously
+                // burned ~3 holders on the same dead coupon). ReportFlowTests test 5 guards this.
                 let reportedRows =
                     reported
                     |> Array.map (fun c ->
