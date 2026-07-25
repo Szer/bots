@@ -168,11 +168,12 @@ INSERT INTO "user"(id, username, first_name, created_at, updated_at)
 VALUES (601,'u601','U601',NOW(),NOW())
 ON CONFLICT (id) DO NOTHING;
 
--- Two overdue taken coupons for same user (should still only get 1 DM)
+-- Two overdue taken coupons for same user, both still valid on the run date
+-- (should still only get 1 DM, naming both coupons)
 INSERT INTO coupon(id, owner_id, photo_file_id, value, min_check, expires_at, status, taken_by, taken_at)
 VALUES
   (8101,601,'p-8101',10.00,50.00,'2026-02-01','taken',601,'2026-01-17T08:00:00Z'),
-  (8102,601,'p-8102',10.00,50.00,'2026-01-10','taken',601,'2026-01-17T09:00:00Z')
+  (8102,601,'p-8102',10.00,50.00,'2026-01-25','taken',601,'2026-01-17T09:00:00Z')
 ON CONFLICT (id) DO NOTHING;
 """
                 )
@@ -193,7 +194,96 @@ ON CONFLICT (id) DO NOTHING;
                     | _ -> false)
 
             Assert.Equal(1, dmCallsToUser.Length)
-            Assert.True(dmCallsToUser[0].Body.Contains("\"text\""), "Expected DM call to include text")
+            Assert.True(findCallWithText calls 601L "ID:8101", "Expected DM to name coupon 8101")
+            Assert.True(findCallWithText calls 601L "ID:8102", "Expected DM to name coupon 8102")
+        }
+
+    [<Fact>]
+    let ``Overdue taken coupon that has already expired does not trigger nag reminder`` () =
+        // Bug repro (2026-07-24 "Elena Fedulova" report): coupon 1409 was taken 2026-07-22,
+        // expired 2026-07-23, and was still unmarked when the 2026-07-24 09:00 UTC reminder run
+        // fired. GetUsersWithOverdueTakenCoupons (DbService.fs) has no expires_at filter at all,
+        // so it nags about coupons the user can no longer act on (past their expiry). Correct
+        // behavior: an overdue-taken coupon whose expires_at is in the past should NOT produce
+        // the "Напоминание: ..." DM. This currently FAILS against main.
+        task {
+            do! fixture.ClearFakeCalls()
+
+            use conn = new NpgsqlConnection(fixture.DbConnectionString)
+            do!
+                conn.ExecuteAsync(
+                    """
+INSERT INTO "user"(id, username, first_name, created_at, updated_at)
+VALUES (1409601,'u1409601','U1409601',NOW(),NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- Taken 2026-07-22 18:25 UTC, expired 2026-07-23 (before the 2026-07-24 09:00 UTC reminder run),
+-- still unmarked ('taken') — mirrors coupon 1409 in prod.
+INSERT INTO coupon(id, owner_id, photo_file_id, value, min_check, expires_at, status, taken_by, taken_at)
+VALUES
+  (140901,1409601,'p-140901',5.00,25.00,'2026-07-23','taken',1409601,'2026-07-22T18:25:17Z')
+ON CONFLICT (id) DO NOTHING;
+"""
+                )
+                :> Task
+
+            use body = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-07-24T09:00:00Z", body)
+            if not resp.IsSuccessStatusCode then
+                let! text = resp.Content.ReadAsStringAsync()
+                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let dmCallsToUser =
+                calls
+                |> Array.filter (fun c ->
+                    match parseCallBody c.Body with
+                    | Some p -> p.ChatId = Some 1409601L
+                    | _ -> false)
+
+            Assert.Equal(0, dmCallsToUser.Length)
+        }
+
+    [<Fact>]
+    let ``Overdue taken coupon expiring today still triggers nag reminder and names the coupon`` () =
+        // Pins the inclusive boundary (expires_at = @today must still nag — the coupon is usable
+        // through the end of today) together with the new identity requirement (DM must name it).
+        task {
+            do! fixture.ClearFakeCalls()
+
+            use conn = new NpgsqlConnection(fixture.DbConnectionString)
+            do!
+                conn.ExecuteAsync(
+                    """
+INSERT INTO "user"(id, username, first_name, created_at, updated_at)
+VALUES (1409701,'u1409701','U1409701',NOW(),NOW())
+ON CONFLICT (id) DO NOTHING;
+
+-- Taken 2 days before the run, expires exactly on the run's UTC date — still usable today.
+INSERT INTO coupon(id, owner_id, photo_file_id, value, min_check, expires_at, status, taken_by, taken_at)
+VALUES
+  (140971,1409701,'p-140971',5.00,25.00,'2026-07-24','taken',1409701,'2026-07-22T18:25:17Z')
+ON CONFLICT (id) DO NOTHING;
+"""
+                )
+                :> Task
+
+            use body = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-07-24T09:00:00Z", body)
+            if not resp.IsSuccessStatusCode then
+                let! text = resp.Content.ReadAsStringAsync()
+                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let dmCallsToUser =
+                calls
+                |> Array.filter (fun c ->
+                    match parseCallBody c.Body with
+                    | Some p -> p.ChatId = Some 1409701L
+                    | _ -> false)
+
+            Assert.Equal(1, dmCallsToUser.Length)
+            Assert.True(findCallWithText calls 1409701L "ID:140971", "Expected DM to name coupon 140971")
         }
 
     [<Fact>]
