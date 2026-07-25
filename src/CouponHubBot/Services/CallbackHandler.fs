@@ -379,6 +379,53 @@ type CallbackHandler(
                             let isAdmin = options.Value.FeedbackAdminIds |> Array.contains user.id
                             do! commandHandler.HandleVoid user chatId couponId isAdmin deleteOnSuccess (Some messageId)
                         | None -> ()
+                    elif isPrivateChat && hasData && data.StartsWith("reportedUsed:") then
+                        // Adder marks their own 'reported' coupon as used (§4) — distinct from "used:" (taker-only).
+                        Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "reportedUsed"))
+                        let idStr = data.Substring("reportedUsed:".Length)
+                        match BotHelpers.parseInt idStr with
+                        | Some couponId ->
+                            let! _ = commandHandler.HandleReportedUsed user chatId couponId
+                            ()
+                        | None -> ()
+                    elif isPrivateChat && hasData && data = "report" then
+                        // Bottom-row entry point from /my (§3b): "Какой купон уже использован?"
+                        Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "report"))
+                        Metrics.buttonClickTotal.Add(1L, KeyValuePair("button", box "report"))
+                        let! held = db.GetCouponsTakenBy(user.id)
+                        if held.Length = 0 then
+                            do! sendText chatId "У тебя нет купонов на руках, чтобы отметить использованным."
+                        else
+                            let kb = BotHelpers.reportSelectKeyboard (held |> Array.map (fun c -> c.id))
+                            do! BotHelpers.sendTextMarkup tg chatId "Какой купон уже использован?" kb
+                    elif isPrivateChat && hasData && data = "reportCancel" then
+                        Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "reportCancel"))
+                        do! sendText chatId "Ок, отменено."
+                    elif isPrivateChat && hasData && data.StartsWith("report:") then
+                        Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "report_select"))
+                        let rest = data.Substring("report:".Length)
+                        if rest.EndsWith(":confirm") then
+                            let idStr = rest.Substring(0, rest.Length - ":confirm".Length)
+                            match BotHelpers.parseInt idStr with
+                            | Some couponId -> do! commandHandler.HandleReport user chatId couponId
+                            | None -> ()
+                        else
+                            match BotHelpers.parseInt rest with
+                            | Some couponId ->
+                                match! db.GetCouponById couponId with
+                                | Some coupon when coupon.status = "taken" && coupon.taken_by.HasValue && coupon.taken_by.Value = user.id ->
+                                    let! ownerOpt = db.GetUserById coupon.owner_id
+                                    let ownerHandle =
+                                        match ownerOpt with
+                                        | Some owner -> BotHelpers.formatUserHandle owner.id owner.username owner.first_name
+                                        | None -> string coupon.owner_id
+                                    let kb = BotHelpers.reportConfirmKeyboard couponId
+                                    do! BotHelpers.sendTextMarkup tg chatId $"Купон ID:{couponId} уйдёт владельцу {ownerHandle} как использованный. Подтвердить?" kb
+                                | Some _ ->
+                                    do! sendText chatId "Этот купон не у тебя."
+                                | None ->
+                                    do! sendText chatId "Купон не найден."
+                            | None -> ()
                     elif isPrivateChat && hasData && data = "myAdded" then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "myAdded"))
                         do! commandHandler.HandleAdded user chatId

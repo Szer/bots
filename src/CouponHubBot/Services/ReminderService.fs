@@ -26,9 +26,14 @@ type ReminderService(
         else
             string userId
 
-    let formatCombinedStats (usedRows: UserEventCount array) (addedRows: UserEventCount array) =
+    // reportedRows carries reports RECEIVED (keyed on the coupon's owner_id, via
+    // GetReportedCountsByOwner). The marker is shown only for users who already have a
+    // leaderboard line from used/added activity; a user with reports but no used/added
+    // history has no line to attach the marker to.
+    let formatCombinedStats (usedRows: UserEventCount array) (addedRows: UserEventCount array) (reportedRows: ReportedCountRow array) =
         let usedMap = usedRows |> Array.map (fun r -> r.user_id, r.count) |> Map.ofArray
         let addedMap = addedRows |> Array.map (fun r -> r.user_id, r.count) |> Map.ofArray
+        let reportedMap = reportedRows |> Array.map (fun r -> r.user_id, r.count) |> Map.ofArray
 
         // Collect all users from both arrays, prefer usedRows for user info (username, first_name)
         let userInfoMap =
@@ -56,7 +61,10 @@ type ReminderService(
             |> Array.map (fun (i, (uid, username, firstName, usedCount, addedCount)) ->
                 let n = i + 1
                 let who = formatUser uid username firstName
-                $"{n}. {who} — {usedCount}/{addedCount}")
+                // Marker shown only when non-zero so the leaderboard doesn't grow a column of zeros.
+                let reportedCount = Map.tryFind uid reportedMap |> Option.defaultValue 0L
+                let reportSuffix = if reportedCount > 0L then $" ⚠️{reportedCount}" else ""
+                $"{n}. {who} — {usedCount}/{addedCount}{reportSuffix}")
             |> String.concat "\n"
 
     let runOnce (nowUtc: DateTime) =
@@ -76,10 +84,11 @@ type ReminderService(
                 // All-time stats: no lower bound (None), not a DateTime.MinValue sentinel.
                 let! usedRows = db.GetUserEventCounts("used", None, nowUtc)
                 let! addedRows = db.GetUserEventCounts("added", None, nowUtc)
+                let! reportedRows = db.GetReportedCountsByOwner(None, nowUtc)
 
                 let text =
                     "Статистика за всё время (использовано/добавлено):\n"
-                    + formatCombinedStats usedRows addedRows
+                    + formatCombinedStats usedRows addedRows reportedRows
 
                 do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(options.Value.CommunityChatId, text)) |> taskIgnore
                 anySent <- true
