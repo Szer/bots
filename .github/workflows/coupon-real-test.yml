@@ -100,6 +100,51 @@ jobs:
           echo "::warning::getMe succeeded but result.username='$USERNAME', expected 'coupon_test_bot' — token may belong to the wrong bot."
         fi
 
+    - name: Validate CI chat and bot membership
+      # Runs immediately after the token-shape/identity check above, still before the
+      # image build and AKS deploy, so a stale/wrong COUPON_CI_CHAT_ID also fails in
+      # seconds instead of surfacing 90+ minutes later as every real test's
+      # ensureCommunityMember gate silently rejecting the test account (see
+      # MembershipService.fs's IsMember — a getChatMember error and a genuine
+      # non-member verdict both collapse to `false` there, so this workflow-level
+      # check is the only place that can tell them apart without a src/ change).
+      # Telegram auto-upgrades a basic group to a supergroup (member-limit growth, a
+      # public link, or enabling "new members see history") and the chat id CHANGES
+      # SHAPE when that happens (bare negative id -> -100<id>) — dev-bot-settings.sql's
+      # COMMUNITY_CHAT_ID ('-5252116059') is a live example of this exact drift having
+      # already happened once for prod. This step never prints the token.
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+        CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
+      run: |
+        HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getchat.json" -w "%{http_code}" \
+          "https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${CHAT_ID}")
+        OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "null")
+        TYPE=$(jq -r '.result.type // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
+        TITLE=$(jq -r '.result.title // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
+        RESULT_ID=$(jq -r '.result.id // ""' "$RUNNER_TEMP/getchat.json" 2>/dev/null || echo "")
+        echo "getChat: http_code=$HTTP_CODE ok=$OK type=$TYPE title=$TITLE id=$RESULT_ID"
+
+        if [ "$HTTP_CODE" != "200" ] || [ "$OK" != "true" ]; then
+          echo "::error::getChat failed for COUPON_CI_CHAT_ID (http_code=$HTTP_CODE ok=$OK) — the chat id is wrong or the bot is not a member of that chat. Most likely cause: the group was upgraded from a basic group to a supergroup, which changes its id (Telegram assigns a new -100... id on upgrade — dev-bot-settings.sql's stale COMMUNITY_CHAT_ID is a precedent for this exact drift). Remediation: send any message in the group, call https://api.telegram.org/bot<token>/getUpdates and read the CURRENT chat.id off a recent update (or migrate_to_chat_id on the old chat's entry), then re-set the secret with: printf '%s' '<id>' | gh secret set COUPON_CI_CHAT_ID --repo Szer/bots (printf, not echo)."
+          exit 1
+        fi
+
+        if [ "$TYPE" = "group" ]; then
+          echo "::warning::COUPON_CI_CHAT_ID resolves to a basic 'group' (id=$RESULT_ID, title=$TITLE), not a 'supergroup'. Basic-group ids are UNSTABLE — Telegram silently upgrades a group to a supergroup and its id changes shape when it does, breaking getChatMember-based membership checks until the secret is manually re-set. This is a standing risk, not a one-time fix."
+        fi
+
+        COUNT_HTTP_CODE=$(curl -s -o "$RUNNER_TEMP/getchatmembercount.json" -w "%{http_code}" \
+          "https://api.telegram.org/bot${BOT_TOKEN}/getChatMemberCount?chat_id=${CHAT_ID}")
+        COUNT_OK=$(jq -r '.ok // "null"' "$RUNNER_TEMP/getchatmembercount.json" 2>/dev/null || echo "null")
+        COUNT=$(jq -r '.result // ""' "$RUNNER_TEMP/getchatmembercount.json" 2>/dev/null || echo "")
+        echo "getChatMemberCount: http_code=$COUNT_HTTP_CODE ok=$COUNT_OK count=$COUNT"
+
+        if [ "$COUNT_HTTP_CODE" != "200" ] || [ "$COUNT_OK" != "true" ]; then
+          echo "::error::getChatMemberCount failed (http_code=$COUNT_HTTP_CODE ok=$COUNT_OK) for a chat that getChat above reported as valid — investigate manually before proceeding."
+          exit 1
+        fi
+
     - uses: actions/setup-dotnet@v4
       with:
         global-json-file: global.json
