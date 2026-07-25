@@ -57,29 +57,19 @@ alita-clean:
 
 # CouponHubBot real-Telegram test loop — tests/CouponHubBot.RealTests. Credentials:
 # ~/.coupon-test/env. Unlike the AlitaBot loop above, this harness never spawns the bot
-# itself: point COUPON_BOT_BASE_URL at an already-running bot (either the CI AKS pod, or
-# your own local `docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile
-# smoke up -d --build` + ngrok + manual setWebhook per src/CouponHubBot/README.dev.md)
-# before running any of these. `coupon-real-test` runs everything EXCEPT the
-# membership-gate test (see MembershipGateRealTests.fs — it self-skips by default and
-# must be run alone, via `coupon-real-test-membership`, against a pod you're prepared
-# to discard afterward). Scope with FILTER, e.g.:
+# itself: point COUPON_BOT_BASE_URL at an already-running bot (either the CI AKS pod —
+# which self-registers its webhook at startup when WEBHOOK_URL is set, see
+# src/CouponHubBot/Services/WebhookRegistration.fs — or your own local
+# `docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile smoke up -d
+# --build` + ngrok + manual setWebhook per src/CouponHubBot/README.dev.md) before
+# running any of these. Scope with FILTER, e.g.:
 #   make coupon-real-test FILTER="FullyQualifiedName~AddFlowRealTests"
 COUPON_REAL_FILTER = $(FILTER)
 
-.PHONY: coupon-real-test coupon-real-test-membership coupon-tg-login coupon-tg-chats
+.PHONY: coupon-real-test coupon-tg-login coupon-tg-chats
 
 coupon-real-test:
-	dotnet test tests/CouponHubBot.RealTests -c Release \
-		--filter "FullyQualifiedName!~MembershipGateRealTests$(if $(COUPON_REAL_FILTER), & $(COUPON_REAL_FILTER),)"
-
-# Isolated run of the one test that poisons TelegramMembershipService's in-memory cache
-# for the rest of a pod's life — see MembershipGateRealTests.fs's doc comment. Do not
-# run coupon-real-test against the same pod afterward without a restart/redeploy.
-coupon-real-test-membership:
-	COUPON_REAL_TEST_RUN_MEMBERSHIP_GATE=1 dotnet test tests/CouponHubBot.RealTests -c Release \
-		--filter "FullyQualifiedName~MembershipGateRealTests"
-
+	dotnet test tests/CouponHubBot.RealTests -c Release $(if $(COUPON_REAL_FILTER),--filter "$(COUPON_REAL_FILTER)",)
 
 # Local dev loop only — CI does NOT run this. The coupon real-test workflow reuses
 # Alita's already-logged-in MTProto session (same real Telegram account; the two

@@ -19,6 +19,11 @@ type BotConfiguration =
       FeedbackAdminIds: int64 array
       GitHubToken: string
       GitHubRepo: string
+      /// bot_setting key (env fallback WEBHOOK_URL) — full webhook URL to self-register
+      /// at startup (WebhookRegistrationService.fs). Empty/absent means "do nothing":
+      /// production's webhook is set once, manually (README.dev.md), and must keep
+      /// working untouched with no config present.
+      WebhookUrl: string
       TestMode: bool
       MaxTakenCoupons: int
       BatchDebounceMs: int }

@@ -18,6 +18,7 @@
     <Compile Include="Services/BatchRecoveryService.fs" />
     <Compile Include="Services/BotService.fs" />
     <Compile Include="Services/BotCommandsSetup.fs" />
+    <Compile Include="Services/WebhookRegistration.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

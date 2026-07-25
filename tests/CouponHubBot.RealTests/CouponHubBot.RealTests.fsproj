@@ -15,13 +15,10 @@
     <Compile Include="TestRetry.fs" />
     <Compile Include="DbSeed.fs" />
     <Compile Include="RealAssemblyFixture.fs" />
-    <!-- Declared FIRST among the test files: MembershipGateRealTests MUST run in
-         isolation, before anything else populates TelegramMembershipService's 1-day
-         cache for this suite's single test account — see its doc comment. File order
-         is not a guarantee of xUnit execution order (same caveat AlitaBot.RealTests'
-         .fsproj notes for NlToolLoopRealTests); the real enforcement is that this
-         class is excluded from the default suite run (see the
-         coupon-real-test-membership Makefile target) and run alone. -->
+    <!-- Runs safely anywhere in the default suite: it flips COMMUNITY_CHAT_ID and
+         restores it via POST /test/membership/invalidate (Program.fs), which busts
+         TelegramMembershipService's 1-day cache on both the flip and the restore — see
+         its doc comment. -->
     <Compile Include="MembershipGateRealTests.fs" />
     <Compile Include="SmokeTests.fs" />
     <Compile Include="AddFlowRealTests.fs" />

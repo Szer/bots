@@ -47,6 +47,7 @@ type RealEnv =
     member this.ReloadSettingsUrl = this.BotBaseUrl.TrimEnd('/') + "/reload-settings"
     member this.ClockAdvanceUrl = this.BotBaseUrl.TrimEnd('/') + "/test/clock/advance"
     member this.RunReminderUrl = this.BotBaseUrl.TrimEnd('/') + "/test/run-reminder"
+    member this.MembershipInvalidateUrl = this.BotBaseUrl.TrimEnd('/') + "/test/membership/invalidate"
 
     /// Everything needed to reach the bot's HTTP surface and its DB — no MTProto
     /// required. In practice every real test also needs the user client (there is no

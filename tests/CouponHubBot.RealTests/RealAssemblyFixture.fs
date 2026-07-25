@@ -9,12 +9,14 @@ open Xunit
 /// Assembly-wide fixture: log in the MTProto user (its id feeds the FEEDBACK_ADMINS
 /// seed) -> seed bot_setting -> wait /healthz -> POST /reload-settings. Unlike
 /// AlitaBot.RealTests' RealAssemblyFixture, there is no BotProcess/NgrokTunnel branch
-/// and no setWebhook/deleteWebhook here — this project has no bot-token env var (see
-/// RealEnv.fs's doc comment), so registering/tearing down the Telegram webhook is the
-/// workflow/k8s manifests' responsibility in CI, and the developer's own
-/// docker-compose smoke profile + manual setWebhook curl (per
-/// src/CouponHubBot/README.dev.md) in local mode. Both modes therefore run the exact
-/// same path here.
+/// here, and this project still never calls setWebhook/deleteWebhook itself — this
+/// project has no bot-token env var (see RealEnv.fs's doc comment). The bot now
+/// self-registers its OWN webhook at startup when WEBHOOK_URL is set
+/// (src/CouponHubBot/Services/WebhookRegistration.fs), which is how CI wires this up;
+/// teardown (deleteWebhook) is still the workflow's job, per the contract's
+/// containment section. Local dev mode still follows README.dev.md's manual
+/// setWebhook curl UNLESS WEBHOOK_URL is also set in that bot_setting/env. Both modes
+/// run the exact same path here regardless.
 type RealAssemblyFixture() =
 
     static let waitHealthyAsync (url: string) =
@@ -117,6 +119,28 @@ type RealAssemblyFixture() =
             if not resp.IsSuccessStatusCode then
                 let! body = resp.Content.ReadAsStringAsync()
                 failwith $"POST {env.RunReminderUrl}?nowUtc={nowUtcIso} -> {int resp.StatusCode}: {body}"
+        }
+
+    /// Reapplies the currently-running pod's bot_setting into IOptions<BotConfiguration>
+    /// — public wrapper around the same call InitializeAsync makes at fixture startup,
+    /// exposed for MembershipGateRealTests' save-flip-assert-restore sequence.
+    member _.ReloadSettingsAsync() = reloadSettingsAsync env
+
+    /// Clears TelegramMembershipService's in-memory cache (Program.fs's
+    /// /test/membership/invalidate — TEST_MODE-gated, same shape as the two hooks
+    /// above). Required around MembershipGateRealTests' COMMUNITY_CHAT_ID flip: without
+    /// this, a stale cached verdict (up to 1 day old) can mask both the flip itself and
+    /// its restoration — see that test's doc comment.
+    member _.InvalidateMembershipCacheAsync() =
+        task {
+            use http = new HttpClient(Timeout = TimeSpan.FromSeconds 10.)
+            http.DefaultRequestHeaders.Add("X-Telegram-Bot-Api-Secret-Token", env.BotAuthToken)
+            use content = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = http.PostAsync(env.MembershipInvalidateUrl, content)
+
+            if not resp.IsSuccessStatusCode then
+                let! body = resp.Content.ReadAsStringAsync()
+                failwith $"POST {env.MembershipInvalidateUrl} -> {int resp.StatusCode}: {body}"
         }
 
     interface IAsyncLifetime with
