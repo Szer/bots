@@ -1,0 +1,52 @@
+name: "SRE Agent: Manual Investigation"
+
+# workflow_dispatch is not valid on a reusable (workflow_call) workflow, so
+# this thin wrapper exists purely to give _sre-agent.yml a hand-triggered
+# entry point — for investigating an incident that wasn't caught by (or
+# happened between) deploys.
+#
+#   gh workflow run sre-manual.yml --ref <branch> \
+#     -f bot=CouponHubBot -f argocd-app-name=coupon-bot -f container-name=coupon-bot \
+#     -f docker-image=ghcr.io/szer/coupon-bot -f commit=<sha> -f run-url=<url>
+
+on:
+  workflow_dispatch:
+    inputs:
+      bot:
+        required: true
+        type: string
+        description: "Bot display name, e.g. VahterBanBot / CouponHubBot / AlitaBot"
+      argocd-app-name:
+        required: true
+        type: string
+      container-name:
+        required: true
+        type: string
+      docker-image:
+        required: true
+        type: string
+      commit:
+        required: false
+        type: string
+        description: "Commit SHA to investigate (blank = the ref's HEAD, i.e. github.sha)"
+      run-url:
+        required: false
+        type: string
+        description: "Link to a related workflow run (blank = this manual run's own URL)"
+      issue-number:
+        required: false
+        type: string
+        description: "deploy-failure issue number to comment on/close, if one exists"
+
+jobs:
+  investigate:
+    uses: ./.github/workflows/_sre-agent.yml
+    with:
+      bot: ${{ inputs.bot }}
+      argocd-app-name: ${{ inputs.argocd-app-name }}
+      container-name: ${{ inputs.container-name }}
+      docker-image: ${{ inputs.docker-image }}
+      commit: ${{ inputs.commit != '' && inputs.commit || github.sha }}
+      run-url: ${{ inputs.run-url != '' && inputs.run-url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      issue-number: ${{ inputs.issue-number }}
+    secrets: inherit

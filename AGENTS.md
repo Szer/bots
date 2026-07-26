@@ -1,6 +1,6 @@
 # Bots Monorepo — Agent Instructions
 
-Monorepo for F# Telegram bots: **VahterBanBot** (spam moderation) and **CouponHubBot** (coupon management).
+Monorepo for F# Telegram bots: **VahterBanBot** (spam moderation), **CouponHubBot** (coupon management), and **AlitaBot** (conversational chatbot).
 
 ## Repository Structure
 
@@ -9,16 +9,20 @@ src/
   BotInfra/            — shared bot infrastructure library
   VahterBanBot/        — VahterBanBot application
   CouponHubBot/        — CouponHubBot application
+  AlitaBot/            — AlitaBot application (see AlitaBot/README.md, AlitaBot/docs/)
   vahter-bot/          — VahterBanBot Helm chart + migrations
   coupon-hub-bot/      — CouponHubBot Helm chart + migrations
+  alita-bot/           — AlitaBot Helm chart + migrations + dev bot_setting seed
   Dockerfile.bot       — shared multi-stage Dockerfile (BOT_PROJECT build arg)
 tests/
   BotTestInfra/        — shared test infrastructure (containers, helpers)
   VahterBanBot.Tests/  — VahterBanBot integration tests
   CouponHubBot.Tests/  — CouponHubBot integration tests
   CouponHubBot.Ocr.Tests/ — CouponHubBot OCR unit tests
+  AlitaBot.Tests/      — AlitaBot hermetic integration tests (Testcontainers + fakes, the PR gate)
+  AlitaBot.RealTests/  — AlitaBot real-Telegram/real-LLM tests (manual/dev-iteration only, paid calls)
   FakeTgApi/           — fake Telegram API for testing
-  FakeAzureOcrApi/     — fake Azure OCR + OpenAI API for testing
+  FakeAzureOcrApi/     — fake Azure OCR + OpenAI API for testing (also doubles as AlitaBot's fake LLM/embeddings/image backend)
 scripts/
   setup-vpn.sh         — WireGuard VPN setup for CI
   verify-deploy.sh     — post-deploy verification (ArgoCD + Loki + Prometheus)
@@ -71,6 +75,7 @@ scripts/
 - Use parameterized SQL only — never string-interpolate user input into SQL
 - VahterBanBot DB: `vahter_db_v2`, role: `vahter_bot_service`
 - CouponHubBot DB: `coupon_hub_bot`, role: `coupon_hub_bot_service`
+- AlitaBot DB: `alita_bot`, role: `alita_bot_service` (pgvector-backed — `message_embedding`/`interaction_memory` use the `vector` extension, `pgvector/pgvector:pg17` everywhere AlitaBot provisions its own Postgres)
 
 ## Settings configuration
 
@@ -88,16 +93,18 @@ scripts/
 
 ## CI/CD
 
-- Reusable workflows: `_bot-build.yml` (PR builds), `_bot-deploy.yml` (deploy on push to main)
+- Reusable workflows: `_bot-build.yml` (PR builds), `_bot-deploy.yml` (deploy on push to main), `_sre-agent.yml` (deploy-failure incident response, see Agentic Workflows below)
+- Per-bot build/deploy: `vahter-build.yml`/`vahter-deploy.yml`, `coupon-build.yml`/`coupon-deploy.yml`, `alita-build.yml`/`alita-deploy.yml` — each is a thin wrapper passing bot-specific `with:`/`secrets:` into the shared reusable workflows
 - Deploy pipeline: test → migrate DB → build & push Docker image to GHCR → verify deployment
 - Post-deploy verification checks ArgoCD sync, pod health, Loki errors, and Prometheus 5xx rate
 - VahterBanBot upstream sync: creates PRs to `fsharplang-ru/vahter-bot` mirror repo
+- AlitaBot also has `alita-real-test.yml` — `workflow_dispatch`-only full E2E (real Telegram + paid LLM/media calls) against a transient AKS deployment; NOT a PR gate, see `src/AlitaBot/docs/TESTING.md`
 
 ## Agentic Workflows
 
-- Three GPT-5-mini agents run via `openai/codex-action@v1` on Microsoft Foundry — SRE (`sre.yml`), Project (`project.yml`), Product (`product.yml`). See `src/CouponHubBot/docs/PROJECT-AGENT.md` for the full design.
-- **SRE coverage is automatic for every bot** that uses `_bot-deploy.yml`. When `verify-deploy.sh` fails the reusable workflow opens a `deploy-failure` issue with bot identity in the body; the SRE agent reads it and acts. Opt-out by passing `sre-enabled: false` to `_bot-deploy.yml`.
-- Project and Product agents are coupon-only for now. Both rely on `AZURE_OPENAI_API_KEY` (secret) + `AZURE_OPENAI_BASE_URL` (var, base URL only — no `/responses` suffix).
+- GPT-5-mini agents run via `openai/codex-action@v1` on Microsoft Foundry — SRE (`_sre-agent.yml`), Project (`project.yml`), Product (`product.yml`). See `src/CouponHubBot/docs/PROJECT-AGENT.md` for the full design, and `.github/AGENT-FLOWS-REDESIGN.md` for the in-flight redesign of this area.
+- **SRE coverage is automatic for every bot** that uses `_bot-deploy.yml`. `_sre-agent.yml` is a reusable workflow called directly from `_bot-deploy.yml` when the deploy or its post-deploy verification fails — bot identity (`bot`, `argocd-app-name`, `container-name`, `docker-image`, `commit`, `run-url`) is passed in as workflow inputs, not read from an issue body. `verify-deploy.sh` failing still opens a `deploy-failure` issue as the incident record; its number is passed to the SRE agent when available so it can comment/close. `sre-manual.yml` (`workflow_dispatch`) gives the same agent a hand-triggered entry point for incidents outside a deploy. Opt-out of the deploy-triggered path by passing `sre-enabled: false` to `_bot-deploy.yml`.
+- Project and Product agents are coupon-only for now; AlitaBot has no project/product coverage yet (§3.8 of the redesign doc: insufficient chat signal for a product agent). Both rely on `AZURE_OPENAI_API_KEY` (secret) + `AZURE_OPENAI_BASE_URL` (var, base URL only — no `/responses` suffix) — as does the SRE agent.
 
 ## Code Review Rules
 
@@ -128,3 +135,16 @@ Commands: `/add`, `/list`, `/my`, `/stats`, `/feedback`, `/take <id>`, `/used <i
 Callback data uses colon-separated format: `"action:param1:param2"`. Wizard flows persist state in `PendingAddFlow` table.
 
 See `src/CouponHubBot/docs/` for detailed architecture, testing, database, OCR, and deployment documentation.
+
+## AlitaBot — Specific Notes
+
+Conversational Telegram chatbot for a ~30-person IT chat: replies when mentioned/named/replied-to, with full message history logged for context (`message_log`). Two responder modes (`echo` walking-skeleton, `llm` real Azure AI Foundry chat completions) and three streaming renderers (`plain`/`edit`/`draft`) for delivering an LLM reply as it generates.
+
+- Persona/config is entirely `bot_setting`-driven and hot-reloadable (`POST /reload-settings`) — see this file's "Settings configuration" section. Prompts (`SYSTEM_PROMPT`, `ROAST_PROMPT`, etc.) are tuned live in prod; `src/alita-bot/dev-bot-settings.sql` only seeds dev/test values.
+- Features beyond the core responder: image generation (`/img`, Azure or Gemini via `IMAGE_PROVIDER`), per-message semantic memory + `/ask` (pgvector embeddings), per-person "dossiers" from nightly fact extraction, a small social-features set (`/roast`, `/awards`, `/quote`, `/karma`), and opt-in proactive behavior (morning digest, willingness-gated interjections, meme reactions) — all default OFF/0.0 except the core reactive responder.
+- Commands: `/img`, `/model`, `/summary` (`/tldr`), `/usage`, `/ask`, `/say`, `/song`, `/sql` (admin-only), `/dossier`, `/forget-me`, `/roast`, `/awards`, `/quote`, `/karma`, `/help` (`/start`) — see `src/AlitaBot/README.md`'s "Commands" table for full details.
+- Uses `AZURE_FOUNDRY_ENDPOINT` (`szer-foundry.cognitiveservices.azure.com`), the **same Foundry resource CouponHubBot's project/product agents use** — every AlitaBot deployment name is prefixed `alita-` purely to avoid collisions in that shared account's flat deployment list.
+- Testing tiers (same model as VahterBanBot/CouponHubBot, but with two additional real-mode tiers given the paid LLM/image/voice APIs involved): hermetic (`tests/AlitaBot.Tests`, the PR gate, `alita-build.yml`), developer real-Telegram (`tests/AlitaBot.RealTests` via `make real-test`, deliberate/scoped runs only), and full AKS E2E (`alita-real-test.yml`, `workflow_dispatch`-only). See `src/AlitaBot/docs/TESTING.md`.
+- Not yet covered by the Project/Product agents (insufficient chat signal — see `.github/AGENT-FLOWS-REDESIGN.md` §3.8); SRE coverage on deploy failure is automatic like every other bot on `_bot-deploy.yml`, though `alita-deploy.yml` currently sets `sre-enabled: false` until the bot has settled in prod.
+
+See `src/AlitaBot/README.md` and `src/AlitaBot/docs/` (`OBSERVABILITY.md`, `TECH-DEBT.md`, `TESTING.md`) for detailed architecture, testing, and operational documentation.
