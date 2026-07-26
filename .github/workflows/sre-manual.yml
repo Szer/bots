@@ -38,6 +38,14 @@ on:
         type: string
         description: "deploy-failure issue number to comment on/close, if one exists"
 
+permissions:
+  # Must match what _sre-agent.yml requests; a called reusable workflow
+  # cannot escalate beyond its caller, and an under-granted caller fails
+  # the whole run at load time with a jobless startup_failure.
+  contents: write
+  pull-requests: write
+  issues: write
+
 jobs:
   investigate:
     uses: ./.github/workflows/_sre-agent.yml
