@@ -54,8 +54,19 @@ type AddFlowRealTests(fx: RealAssemblyFixture) =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let imagePath = Path.Combine(RealEnv.ocrFixtureImagesDir, "5_25_01-15_01-21_2706528422291.jpg")
+            let fixtureImage = "5_25_01-15_01-21_2706528422291.jpg"
+            let imagePath = Path.Combine(RealEnv.ocrFixtureImagesDir, fixtureImage)
             Assert.True(File.Exists imagePath, $"Expired-coupon fixture missing: {imagePath}")
+
+            // Idempotence (not a hollowing-out of this test's own subject — the manual
+            // /add path itself is still what's being exercised below, unlike
+            // RealTestHelpers.addCouponViaCaptionAsync, which this test deliberately does
+            // NOT call): delete any pre-existing row for this fixture's barcode FIRST, so
+            // a leftover coupon from any other test that shares this fixture (or from
+            // TestRetry's own retry of THIS test) can never turn the "Добавлен купон"
+            // confirmation below into a "Купон с таким штрихкодом уже есть в базе…"
+            // rejection — see README.md's "Fixture reuse rule" section.
+            do! DbSeed.deleteCouponsByBarcodeAsync fx.DbConnectionString RealTestHelpers.fixtureBarcodes.[fixtureImage]
 
             let caption = $"/add 5 25 {futureExpiry}"
             let! sentId = fx.UserClient.SendPhoto(fx.BotChatId, imagePath, caption)

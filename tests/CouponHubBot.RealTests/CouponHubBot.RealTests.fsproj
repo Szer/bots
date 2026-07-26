@@ -15,6 +15,10 @@
     <Compile Include="TestRetry.fs" />
     <Compile Include="DbSeed.fs" />
     <Compile Include="RealAssemblyFixture.fs" />
+    <!-- Cross-cutting DB+Telegram combinators (addCouponViaCaptionAsync/fixtureBarcodes)
+         — needs RealAssemblyFixture's type, so it must land after it and before every
+         test file that opens CouponHubBot.RealTests and calls into it. -->
+    <Compile Include="RealTestHelpers.fs" />
     <!-- Runs safely anywhere in the default suite: it flips COMMUNITY_CHAT_ID and
          restores it via POST /test/membership/invalidate (Program.fs), which busts
          TelegramMembershipService's 1-day cache on both the flip and the restore — see
@@ -26,6 +30,14 @@
     <Compile Include="CouponLifecycleRealTests.fs" />
     <Compile Include="ReportFlowRealTests.fs" />
     <Compile Include="ReminderRealTests.fs" />
+    <!-- Expansion-suite stubs (real-tests-expansion scaffolding task) — one file per
+         parallel author, no shared file among them; only this .fsproj entry list and
+         RealTestHelpers.fs/DbSeed.fs/TgUserClient.fs above are shared, and per that
+         task's brief the four authors do not touch any of those. -->
+    <Compile Include="AddWizardRealTests.fs" />
+    <Compile Include="ReportButtonFlowRealTests.fs" />
+    <Compile Include="MyAndAddedRealTests.fs" />
+    <Compile Include="AdminAndFeedbackRealTests.fs" />
     <!-- CompileAfter guarantees the [<EntryPoint>] file lands after build-injected
          sources (xunit runner reporters, MTP SelfRegisteredExtensions). -->
     <CompileAfter Include="Program.fs" />

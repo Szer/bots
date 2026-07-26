@@ -285,6 +285,60 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
         }
         :> Task
 
+    /// FindCallbackData + PressCallbackButton in one call — nearly every wizard/callback
+    /// step in the real suite is exactly that pair (see CouponLifecycleRealTests.fs and
+    /// BulkAddRealTests.fs, which both do it by hand today). Unlike a bare
+    /// `FindCallbackData` miss (currently surfaced per call site as
+    /// `Assert.True(data.IsSome, "Expected a foo:X button")`, which says nothing about
+    /// what buttons WERE on the message), a miss here raises with the full list of
+    /// callback_data actually present, so a wrong-button failure is self-explanatory
+    /// without a debugger. Deliberately NOT an AwaitTimeoutException: `msg` already
+    /// arrived, so a missing button is a real behavioral assertion about the bot's
+    /// reply, not flakiness — TestRetry.withTimeoutRetry does not catch this (see its
+    /// own doc comment on why assertion failures must not be retried).
+    member this.PressCallbackButtonMatching(chatId: int64, msg: TL.Message, predicate: string -> bool, description: string) : Task =
+        task {
+            match this.FindCallbackData(msg, predicate) with
+            | Some data -> do! this.PressCallbackButton(chatId, msg.id, data)
+            | None ->
+                let present =
+                    match msg.reply_markup with
+                    | :? ReplyInlineMarkup as markup ->
+                        markup.rows
+                        |> Array.collect (fun r -> r.buttons)
+                        |> Array.choose (fun b ->
+                            match b with
+                            | :? KeyboardButtonCallback as cb -> Some(Encoding.UTF8.GetString cb.data)
+                            | _ -> None)
+                        |> String.concat ", "
+                    | _ -> "<no inline keyboard on this message>"
+
+                failwith
+                    $"No button matching '{description}' on message {msg.id} in chat {chatId}. Callback data present: [{present}]"
+        }
+        :> Task
+
+    /// AwaitTextContaining + PressCallbackButtonMatching in one call — the shape of
+    /// nearly every step in the expansion suite's wizard/callback chains ("wait for the
+    /// next prompt, tap the button that advances it"). The await half can raise
+    /// AwaitTimeoutException (retryable, per TestRetry); the press half raises via
+    /// PressCallbackButtonMatching above (not retryable) — callers get both failure
+    /// modes for free without re-deriving which is which at each call site.
+    member this.AwaitAndPressButton
+        (
+            chatId: int64,
+            afterMsgId: int,
+            textMarker: string,
+            timeout: TimeSpan,
+            buttonPredicate: string -> bool,
+            buttonDescription: string
+        ) : Task<TL.Message> =
+        task {
+            let! msg = this.AwaitTextContaining(chatId, afterMsgId, textMarker, timeout)
+            do! this.PressCallbackButtonMatching(chatId, msg, buttonPredicate, buttonDescription)
+            return msg
+        }
+
     /// Human-readable dialog list with Bot API chat id conventions (-100… for channels)
     /// — `make coupon-tg-chats` uses this to find the CI group id.
     member _.ListDialogsAsync() =
