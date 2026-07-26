@@ -227,6 +227,12 @@ LIMIT 1;
                     let hasBarcode = not (String.IsNullOrWhiteSpace barcodeText)
                     
                     // Query duplicate barcode id only when barcode is known; otherwise treat as no-dup (0).
+                    // Status list must match coupon_barcode_active_uniq's predicate (V18__coupon_reported_status.sql)
+                    // so this check doesn't reject re-adds the index would happily allow — e.g. a barcode whose
+                    // only prior row was voided or used. NOTE: unlike the index (and the 23505 race-recovery
+                    // lookup below), this check intentionally keeps `expires_at >= @today` instead of exact
+                    // equality — it's a broader, deliberate guard against re-adding the same physical coupon
+                    // under a different (e.g. mistyped) future expiry date, not a stand-in for the unique index.
                     //language=postgresql
                     let dupBarcodeSql =
                         """
@@ -234,6 +240,7 @@ SELECT id
 FROM coupon
 WHERE barcode_text = @barcode_text
   AND expires_at >= @today
+  AND status IN ('available', 'taken', 'reported')
 LIMIT 1;
 """
 

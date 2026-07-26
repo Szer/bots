@@ -13,6 +13,7 @@
     <Compile Include="BatchTestHelpers.fs" />
     <Compile Include="MembershipTests.fs" />
     <Compile Include="OcrAddFlowTests.fs" />
+    <Compile Include="DuplicateBarcodeStatusTests.fs" />
     <Compile Include="BatchAddFlowTests.fs" />
     <Compile Include="BatchSkipAndWarnTests.fs" />
     <Compile Include="BatchStateMachineTests.fs" />
