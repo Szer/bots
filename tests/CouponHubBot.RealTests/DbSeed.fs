@@ -8,6 +8,7 @@
 /// module only applies/refreshes rows in an already-reachable, already-migrated database.
 module CouponHubBot.RealTests.DbSeed
 
+open System
 open System.Threading.Tasks
 open Dapper
 open Npgsql
@@ -83,6 +84,117 @@ let truncateBatchesAsync (connectionString: string) : Task =
         use conn = new NpgsqlConnection(connectionString)
         do! conn.OpenAsync()
         let! _ = conn.ExecuteAsync "TRUNCATE pending_add_batch CASCADE"
+        ()
+    }
+
+/// Status + holder columns for one coupon id — the shape every take/used/return/report
+/// real test's final DB assertion needs. `owner_id`/`taken_by` are exposed too (rather
+/// than just `status`) so a caller can assert who currently holds it without a second
+/// query — `taken_by` is nullable in the schema (coupon.taken_by BIGINT NULL), hence
+/// `Nullable<int64>` per the src/CouponHubBot/Services/DbService.fs convention for the
+/// same column, not `int64 option` (AGENTS.md's Dapper-nullable-column rule technically
+/// only calls out `string | null`, but `coupon.taken_by`'s existing F# mapping already
+/// sets the precedent for this column specifically).
+[<CLIMutable>]
+type CouponStatusRow =
+    { status: string
+      owner_id: int64
+      taken_by: Nullable<int64> }
+
+/// Coupon status/owner/taken_by by id — used by every take/used/return/report/void real
+/// test's terminal-state DB assertion (`SELECT status FROM coupon WHERE id=@id` is
+/// currently copy-pasted inline in CouponLifecycleRealTests.fs and ReportFlowRealTests.fs;
+/// this gives that query one home and adds owner_id/taken_by for the tests that need them).
+let getCouponStatusAsync (connectionString: string) (couponId: int) : Task<CouponStatusRow> =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        return!
+            conn.QuerySingleAsync<CouponStatusRow>(
+                "SELECT status, owner_id, taken_by FROM coupon WHERE id = @coupon_id",
+                {| coupon_id = couponId |})
+    }
+
+/// Newest coupon id owned by `ownerId` — the "SELECT id FROM coupon WHERE owner_id=@o
+/// ORDER BY id DESC LIMIT 1" pattern copy-pasted inline in AddFlowRealTests.fs,
+/// CouponLifecycleRealTests.fs and ReportFlowRealTests.fs, given one home. Relies on the
+/// same single-account/no-cross-test-ordering assumptions those call sites already
+/// document — call it immediately after the add that's supposed to have produced the
+/// coupon, before any other add for the same owner can land.
+let getLatestOwnedCouponIdAsync (connectionString: string) (ownerId: int64) : Task<int> =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        return!
+            conn.QuerySingleAsync<int>(
+                "SELECT id FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
+                {| owner_id = ownerId |})
+    }
+
+/// Overwrites `expires_at` for one coupon id via direct SQL — BulkAddRealTests.fs's
+/// `bumpItemsToFutureExpiry` already does the pending_add_batch_item equivalent of this
+/// inline (it needs to override OCR's own past-dated expiry before TryAddCoupon's
+/// `expires_at < todayUtc()` gate runs); the interactive wizard tests need the same trick
+/// against the `coupon` table itself once a coupon already exists (e.g. to manufacture an
+/// expiring-today/expired coupon for a status-dependent flow) rather than pending_add_batch_item.
+let setCouponExpiryAsync (connectionString: string) (couponId: int) (expiresAt: DateOnly) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ =
+            conn.ExecuteAsync(
+                "UPDATE coupon SET expires_at = @expires_at WHERE id = @coupon_id",
+                {| coupon_id = couponId; expires_at = expiresAt |})
+        ()
+    }
+
+/// Deletes every coupon row for a given `barcode_text` (all expiries, all statuses) —
+/// THE helper that makes /add fixture-reuse safe (contract, "problem" section 1+2).
+/// `coupon_event.coupon_id REFERENCES coupon(id) ON DELETE CASCADE` (V1__initial.sql) is
+/// the only FK pointing at `coupon` anywhere in migrations/ (checked: `grep -rl
+/// "REFERENCES coupon"` finds only V1__initial.sql, which defines that one cascade) — no
+/// extra child-table deletes are needed; a plain DELETE on `coupon` cascades automatically.
+/// Call this BEFORE sending a fixture photo, not after: it's what makes a retried /add
+/// attempt (TestRetry's one automatic retry, after an AwaitTimeoutException on attempt 1)
+/// safe even if attempt 1's coupon actually landed — and what lets the same fixture image
+/// be reused by many different tests instead of needing one distinct barcode per test.
+let deleteCouponsByBarcodeAsync (connectionString: string) (barcodeText: string) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ = conn.ExecuteAsync("DELETE FROM coupon WHERE barcode_text = @barcode_text", {| barcode_text = barcodeText |})
+        ()
+    }
+
+/// Clears a user's in-flight interactive `/add` wizard state (the `pending_add` table —
+/// mapped in src/CouponHubBot/Services/DbService.fs as the `PendingAddFlow` record;
+/// there is no separate "PendingAddFlow table", it's `pending_add`, checked against
+/// V6__recreate_pending_add.sql and DbService.fs's own ClearPendingAddFlow: "DELETE FROM
+/// pending_add WHERE user_id = @user_id"). Lets a wizard test guarantee a clean starting
+/// stage regardless of what a previous test — or a previous TestRetry attempt of the SAME
+/// test — left behind; GetPendingAddFlow's own 1-hour staleness expiry
+/// (DbService.fs:758-770) is too coarse-grained to rely on between fast-running tests.
+let deletePendingAddFlowAsync (connectionString: string) (userId: int64) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ = conn.ExecuteAsync("DELETE FROM pending_add WHERE user_id = @user_id", {| user_id = userId |})
+        ()
+    }
+
+/// Clears a user's in-flight album/bulk-add batches (`pending_add_batch`, all statuses —
+/// V16__pending_add_batch.sql). `pending_add_batch_item.batch_id REFERENCES
+/// pending_add_batch(id) ON DELETE CASCADE`, so deleting the parent row is enough; no
+/// separate pending_add_batch_item delete needed. Lets an album/bulk-add wizard test
+/// guarantee no stale batch survives from a previous test or retry attempt — BulkAddRealTests
+/// already relies on `pending_add_batch_user_mgid_active_uniq` (one active batch per
+/// (user_id, media_group_id) while status IN ('open','awaiting_user')) never colliding
+/// with a leftover row from an earlier run; this is that cleanup, given one home.
+let deletePendingBatchesAsync (connectionString: string) (userId: int64) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ = conn.ExecuteAsync("DELETE FROM pending_add_batch WHERE user_id = @user_id", {| user_id = userId |})
         ()
     }
 
