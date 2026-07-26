@@ -104,6 +104,12 @@ type ReportButtonFlowRealTests(fx: RealAssemblyFixture) =
 
             let! status = DbSeed.getCouponStatusAsync fx.DbConnectionString couponId
             Assert.Equal("taken", status.status)
+
+            // Cleanup, not assertion: the "still taken" assertion above is this test's own
+            // point. Left 'taken' forever, this coupon would permanently eat one of this
+            // account's shared MAX_TAKEN_COUPONS=6 slots for the rest of the serial run —
+            // see DbSeed.releaseTakenCouponAsync's doc comment.
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     /// `reportCancel` pressed at the CONFIRM step (`/my` -> `report` -> `report:<id>` ->
@@ -141,6 +147,9 @@ type ReportButtonFlowRealTests(fx: RealAssemblyFixture) =
 
             let! status = DbSeed.getCouponStatusAsync fx.DbConnectionString couponId
             Assert.Equal("taken", status.status)
+
+            // Cleanup, not assertion — see the sibling test above's identical comment.
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     /// Owner-side `reportedUsed:<id>` acknowledgement (§4). Setup drives the coupon into

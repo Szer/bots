@@ -52,15 +52,33 @@ RETURNING id;
                        expires_at = futureExpiry
                        taken_at = takenAt.ToString("o", CultureInfo.InvariantCulture) |})
 
-            // Fresh baseline in this long-lived private DM's message-id sequence — the
-            // reminder is triggered over plain HTTP (no MTProto send of our own), so
-            // there is no naturally fresh "afterMsgId" otherwise (see TgUserClient.fs's
-            // doc comment on why AfterMsgId-gating exists at all).
-            let! baselineId = fx.UserClient.SendText(fx.BotChatId, "/help")
-            let! _helpReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, baselineId, "Команды", TimeSpan.FromSeconds 30.)
+            // Cleanup is mandatory, not cosmetic: this coupon's `photo_file_id` is a
+            // synthetic GUID string, never a real Telegram file id, and its `barcode_text`
+            // is NULL (deleteCouponsByBarcodeAsync can never find/remove it by barcode).
+            // Left behind 'taken' for the rest of this serial run, it (a) permanently eats
+            // one of this account's MAX_TAKEN_COUPONS=6 slots, and (b) gets included in
+            // every later /my's photo/media-group send (CommandHandler.fs:196-199,
+            // `GetCouponsTakenBy` has no way to exclude it) — Telegram rejects that whole
+            // request with "wrong remote file identifier specified: Wrong padding in the
+            // string", crashing the /my handler for every later test in the run
+            // (confirmed against run 30181924500's bot pod logs, UpdateId 84308640/84308644).
+            // F#'s task CE can't `do!`/`let!` inside a `finally` block, hence try/with +
+            // explicit re-raise (same shape AdminAndFeedbackRealTests.fs's "short aliases"
+            // test already uses for the same reason).
+            try
+                // Fresh baseline in this long-lived private DM's message-id sequence — the
+                // reminder is triggered over plain HTTP (no MTProto send of our own), so
+                // there is no naturally fresh "afterMsgId" otherwise (see TgUserClient.fs's
+                // doc comment on why AfterMsgId-gating exists at all).
+                let! baselineId = fx.UserClient.SendText(fx.BotChatId, "/help")
+                let! _helpReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, baselineId, "Команды", TimeSpan.FromSeconds 30.)
 
-            do! fx.RunReminderAsync(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture))
+                do! fx.RunReminderAsync(DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture))
 
-            let! dm = fx.UserClient.AwaitTextContaining(fx.BotChatId, baselineId, $"ID:{couponId}", TimeSpan.FromSeconds 60.)
-            Assert.Contains("Напоминание", dm.message)
+                let! dm = fx.UserClient.AwaitTextContaining(fx.BotChatId, baselineId, $"ID:{couponId}", TimeSpan.FromSeconds 60.)
+                Assert.Contains("Напоминание", dm.message)
+                do! DbSeed.deleteCouponByIdAsync fx.DbConnectionString couponId
+            with ex ->
+                do! DbSeed.deleteCouponByIdAsync fx.DbConnectionString couponId
+                raise ex
         })

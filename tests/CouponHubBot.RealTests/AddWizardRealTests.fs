@@ -284,11 +284,27 @@ type AddWizardRealTests(fx: RealAssemblyFixture) =
                     do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, confirmMsg, (fun d -> d = "addflow:confirm"), "addflow:confirm")
                     let! _addedMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, confirmMsg.id, "Добавлен купон ID:", TimeSpan.FromSeconds 60.)
 
+                    // NOT QuerySingleAsync<DateOnly> against a bare scalar column — root-
+                    // caused (run 30181924500, failure 5): Dapper 2.1.72 doesn't recognize
+                    // `DateOnly` as one of its "simple"/scalar-mappable result types, so
+                    // `QuerySingleAsync<DateOnly>` falls back to its reflection-based
+                    // object mapper, which looks for a settable member NAMED "expires_at"
+                    // on `DateOnly` (a struct with no such member, only Year/Month/Day) —
+                    // finds none, leaves the value at `default(DateOnly)` = 0001-01-01,
+                    // and returns THAT with no error and no row-count mismatch (a row was
+                    // genuinely found; only the column-to-scalar mapping silently no-ops).
+                    // That is exactly what "Expected: 01/02/0001, Actual: 01/01/0001" is:
+                    // both `todayExpiry` and `tomorrowExpiry` are `DateOnly.MinValue`.
+                    // Mapping into `CouponRow` (a named record with an `expires_at: DateOnly`
+                    // field, already used successfully elsewhere in this same file and in
+                    // AddFlowRealTests.fs) uses Dapper's ordinary per-column-by-name row
+                    // mapper instead, which works.
                     use conn = new NpgsqlConnection(fx.DbConnectionString)
-                    return!
-                        conn.QuerySingleAsync<DateOnly>(
-                            "SELECT expires_at FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
+                    let! coupon =
+                        conn.QuerySingleAsync<CouponRow>(
+                            "SELECT id, value, min_check, expires_at, barcode_text FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
                             {| owner_id = ownerId |})
+                    return coupon.expires_at
                 }
 
             let! todayExpiry = addViaDateButtonAndGetExpiry "10_50_01-12_01-21_2706513420233.jpg" "addflow:date:today"
@@ -473,7 +489,22 @@ type AddWizardRealTests(fx: RealAssemblyFixture) =
                     (fun d -> d.StartsWith "addflow:bulk:cancel:"),
                     "addflow:bulk:cancel:<batchId>")
 
-            let! _cancelled = fx.UserClient.AwaitTextContaining(fx.BotChatId, confirmMsg.id, "Ок, пакет отменён.", TimeSpan.FromSeconds 30.)
+            // NOT an AwaitTextContaining("Ок, пакет отменён.", ...) here — root-caused (run
+            // 30181924500, failure 4): BulkBatchCancel's outcome text is delivered via
+            // `EditBulkOrSend` (CallbackHandler.fs:29-38,51), which EDITS the existing
+            // `confirmMsg` in place (Telegram `messages.editMessage`, not a new send) when
+            // `batch.bulk_message_id` is set — which it always is here, to `confirmMsg.id`
+            // itself. TgUserClient.fs's `record` (TgUserClient.fs:76-78) explicitly drops
+            // every `UpdateEditMessage` (`if not isEdit then ...`), so no Await* call can
+            // EVER observe an edited message's new text — this awaited a message that,
+            // structurally, could never arrive, hence a 100%-reproducible timeout on both
+            // TestRetry attempts (bot pod logs confirm "Batch N cancelled by user ... had_ok
+            // _items=True" succeeded server-side both times). BulkAddRealTests.fs's own
+            // confirm test already avoids this exact trap by DB-polling
+            // (`waitForBatchCleared`) instead of awaiting the outcome as Telegram text; this
+            // reuses the same, already-defined-in-this-file helper for the same reason. The
+            // `countAfter = countBefore` assertion below is the real proof the cancel (not a
+            // confirm) is what happened.
             do! waitForBatchCleared batchId
 
             let! countAfter = countCouponsForOwner ownerId

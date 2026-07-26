@@ -66,6 +66,13 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
             let! takenMsg =
                 fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, listMsg.id, $"Купон ID:{couponId} теперь твой", TimeSpan.FromSeconds 60.)
             Assert.Contains("теперь твой", takenMsg.message)
+
+            // Cleanup, not assertion: this test's own point is proven above. Left 'taken'
+            // forever, this coupon would permanently eat one of this account's shared
+            // MAX_TAKEN_COUPONS=6 slots for the rest of the serial run — the root cause of
+            // AdminAndFeedbackRealTests.fs's "undo" test hitting `LimitReached` on its own
+            // /take in run 30181924500 (see DbSeed.releaseTakenCouponAsync's doc comment).
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     [<Fact>]
@@ -98,6 +105,9 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
             let hasUsed = fx.UserClient.FindCallbackData(myMsg, fun d -> d = $"used:{couponId}")
             Assert.True(hasReturn.IsSome, $"Expected a return:{couponId} button under /my")
             Assert.True(hasUsed.IsSome, $"Expected a used:{couponId} button under /my")
+
+            // Cleanup, not assertion — see the sibling test above's identical comment.
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     [<Fact>]

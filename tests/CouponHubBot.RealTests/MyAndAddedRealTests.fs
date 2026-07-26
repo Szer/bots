@@ -70,6 +70,12 @@ type MyAndAddedRealTests(fx: RealAssemblyFixture) =
             do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, myMsg, (fun d -> d = "myAdded"), "myAdded")
             let! addedMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, myMsg.id, "Мои добавленные купоны", TimeSpan.FromSeconds 60.)
             Assert.Contains($"ID:{couponId}", addedMsg.message)
+
+            // Cleanup, not assertion: this test's own point is proven above. Left 'taken'
+            // forever, this coupon would permanently eat one of this account's shared
+            // MAX_TAKEN_COUPONS=6 slots for the rest of the serial run — see
+            // DbSeed.releaseTakenCouponAsync's doc comment.
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     [<Fact>]

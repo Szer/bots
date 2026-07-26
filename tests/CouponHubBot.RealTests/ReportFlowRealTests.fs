@@ -1,8 +1,6 @@
 namespace CouponHubBot.RealTests
 
 open System
-open System.Globalization
-open System.IO
 open Dapper
 open Npgsql
 open Xunit
@@ -17,26 +15,40 @@ open Xunit
 /// land in the same private chat — this test asserts on BOTH distinct texts rather
 /// than on which chat each landed in (which is how the hermetic ReportFlowTests.fs
 /// tells them apart, using two different synthetic user ids).
+///
+/// Root-caused (run 30181924500, failure 1): this test used to hand-roll
+/// SendPhoto + "/add" directly, with no delete-by-barcode-first step. Its final status
+/// is 'reported' — an ACTIVE status under both `coupon_barcode_active_uniq`'s partial
+/// index AND (this is the actual trigger) DbService.TryAddCoupon's primary duplicate-
+/// barcode check (DbService.fs:231-238), which — unlike its own race-condition recovery
+/// path a few lines below (DbService.fs:296-305) — does NOT filter by status at all, so
+/// it also treats a `voided`/`used`/`returned` row for the same barcode+future-expiry as
+/// a blocking duplicate. In run 30181924500, MyAndAddedRealTests' "added lists..." test
+/// ran first, added+voided a coupon for this SAME fixture's barcode (2706658654210,
+/// expiry 365 days out), and that VOIDED row then wrongly blocked this test's own
+/// (non-deleting) /add on both the original attempt and TestRetry's one retry — see
+/// `RealTestHelpers.addCouponViaCaptionAsync`'s doc comment for the general shape of this
+/// hazard. Switched to that idempotent helper (deletes any existing row for the fixture's
+/// barcode FIRST, regardless of status) so this test no longer depends on what any other
+/// test using the same fixture left behind. The underlying DbService.fs:231-238 status-
+/// blind duplicate check is a genuine production bug — reported separately, not fixed
+/// here (out of scope: src/ changes need a human decision per this task's brief).
 type ReportFlowRealTests(fx: RealAssemblyFixture) =
-
-    let futureExpiry = DateTime.UtcNow.AddDays(200.).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
 
     [<Fact>]
     member _.``report command removes the coupon from the pool and DMs the adder``() =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let imagePath = Path.Combine(RealEnv.ocrFixtureImagesDir, "10_50_01-14_01-23_2706658654210.jpg")
-            Assert.True(File.Exists imagePath, $"Expired-coupon fixture missing: {imagePath}")
-
-            let! addSentId = fx.UserClient.SendPhoto(fx.BotChatId, imagePath, $"/add 10 50 {futureExpiry}")
-            let! _addReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, addSentId, "Добавлен купон", TimeSpan.FromSeconds 90.)
+            let! couponId =
+                RealTestHelpers.addCouponViaCaptionAsync
+                    fx
+                    "10_50_01-14_01-23_2706658654210.jpg"
+                    "10"
+                    "50"
+                    (Some(RealTestHelpers.futureExpiry 200.))
 
             use conn = new NpgsqlConnection(fx.DbConnectionString)
-            let! couponId =
-                conn.QuerySingleAsync<int>(
-                    "SELECT id FROM coupon WHERE owner_id=@o ORDER BY id DESC LIMIT 1",
-                    {| o = fx.UserClient.Me.id |})
 
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! _taken = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)

@@ -198,6 +198,45 @@ let deletePendingBatchesAsync (connectionString: string) (userId: int64) : Task 
         ()
     }
 
+/// Direct-SQL release of a taken coupon back to 'available' (status/taken_by/taken_at
+/// cleared) — no live Telegram round trip needed. Cleanup-only: for a test whose own
+/// assertions are already done with a coupon it took, so it stops permanently consuming
+/// one of this account's MAX_TAKEN_COUPONS=6 slots (bot_setting seed above) for the rest
+/// of a serial run shared with every other real test. Root-caused against run 30181924500:
+/// AdminAndFeedbackRealTests.fs's "undo" test's own `/take` got DbService.TryTakeCoupon's
+/// `LimitReached` branch (DbService.fs:512-514) — a plain text reply, never a photo
+/// caption — because enough EARLIER tests' leftover 'taken' coupons (never returned/used)
+/// had already filled the 6-slot budget for this single shared MTProto account.
+let releaseTakenCouponAsync (connectionString: string) (couponId: int) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ =
+            conn.ExecuteAsync(
+                "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id",
+                {| coupon_id = couponId |})
+        ()
+    }
+
+/// Deletes one coupon row by id — used only by ReminderRealTests.fs to remove its own
+/// direct-SQL-inserted synthetic coupon (a fake, non-Telegram `photo_file_id`, see that
+/// file's doc comment) once its assertion is done. That row has no `barcode_text`
+/// (`deleteCouponsByBarcodeAsync` can never find/clean it) and, left behind as 'taken',
+/// both permanently consumes one of this account's MAX_TAKEN_COUPONS slots AND poisons
+/// every later `/my` for the rest of the run — handleMy (CommandHandler.fs:196-199) sends
+/// a photo/media-group built from every 'taken' coupon's `photo_file_id`, and Telegram
+/// rejects the whole request with "wrong remote file identifier specified: Wrong padding
+/// in the string" the moment the synthetic one is included (confirmed against run
+/// 30181924500's bot pod logs, UpdateId 84308640/84308644, both landing on
+/// CommandHandler.fs:199 per the unhandled-error stack trace).
+let deleteCouponByIdAsync (connectionString: string) (couponId: int) : Task =
+    task {
+        use conn = new NpgsqlConnection(connectionString)
+        do! conn.OpenAsync()
+        let! _ = conn.ExecuteAsync("DELETE FROM coupon WHERE id = @coupon_id", {| coupon_id = couponId |})
+        ()
+    }
+
 /// Current value of a bot_setting row — used by MembershipGateRealTests to save/restore
 /// COMMUNITY_CHAT_ID around its DB-driven "point the gate at a chat this user isn't in" trick.
 let getSettingAsync (connectionString: string) (key: string) : Task<string> =
