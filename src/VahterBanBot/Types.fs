@@ -287,6 +287,25 @@ type Detection =
         | InvisibleMentionDetected _    -> state
         | LlmReactionTriageClassified e -> { state with LlmReactionTriageVerdict = Some e.verdict }
 
+// ---------------------------------------------------------------------------
+
+/// Free-form moderator discussion (and /vahter commands) posted in the private admin
+/// channel — a queryable feedback source. Deliberately a DISTINCT event type from
+/// MessageEvent/MessageReceived: this stream is never read by ML training (MlData),
+/// LLM triage, user_msg_text_index, or the snapshot_message projection — see the
+/// consumer trace in the PR description. It exists purely so vahter discussion isn't lost.
+type AdminChannelEvent =
+    | AdminChannelMessage of {| chatId: int64; messageId: int64; userId: int64; username: string option; text: string option; postedAt: DateTime |}
+
+/// Trivial aggregate — one event per (chatId, messageId) stream, just enough state to
+/// make re-delivery of the same Telegram update idempotent (see EVENTSTORE.md convention).
+type AdminChannelMessageState =
+    { Posted: bool }
+    static member Zero = { Posted = false }
+    static member Fold (state: AdminChannelMessageState, event: AdminChannelEvent) : AdminChannelMessageState =
+        match event with
+        | AdminChannelMessage _ -> { state with Posted = true }
+
 [<CLIMutable>]
 type BotConfiguration =
     { BotToken: string
@@ -443,12 +462,18 @@ type CallbackMessage =
 /// JSON serializer options for event store (de)serialization.
 /// Uses internal tag, unwrapped record cases, named fields, and unwrapped options.
 /// WithSkippableOptionFields ensures missing JSONB keys deserialize as None (not an error).
+/// WithUnionUnwrapSingleCaseUnions(false) is REQUIRED: FSharp.SystemTextJson's default
+/// (true) strips the "Case" discriminator entirely for a union with exactly one case
+/// (e.g. AdminChannelEvent's single `AdminChannelMessage` case) — that silently breaks the
+/// event table's GENERATED event_type column (see EVENTSTORE.md), which stays NULL forever
+/// for that event type. Every OTHER event DU here has 2+ cases, so this is a no-op for them.
 let eventJsonOpts =
     JsonFSharpOptions.Default()
         .WithUnionInternalTag()
         .WithUnionUnwrapRecordCases()
         .WithUnionNamedFields()
         .WithUnwrapOption()
+        .WithUnionUnwrapSingleCaseUnions(false)
         .WithSkippableOptionFields(SkippableOptionFields.Always, deserializeNullAsNone = true)
         .ToJsonSerializerOptions()
 

@@ -227,6 +227,18 @@ ON CONFLICT DO NOTHING
             return ()
         }
 
+    /// Persists a message posted in the private admin (vahter) channel as an `AdminChannelMessage`
+    /// event — a queryable feedback source, deliberately kept OUT of the `message:*` stream (see
+    /// Types.fs doc comment on AdminChannelEvent). Idempotent per (chatId, messageId), same
+    /// convention as recordMessageReceived, so Telegram update redelivery is a no-op.
+    let recordAdminChannelMessage (chatId: int64) (messageId: int64) (userId: int64) (username: string option) (text: string option) (postedAt: DateTime) : Task<unit> =
+        task {
+            let! _ = EventStore.appendEvent store $"admin-channel:{chatId}:{messageId}" (fun (state: AdminChannelMessageState) ->
+                if state.Posted then []
+                else [ AdminChannelMessage {| chatId = chatId; messageId = messageId; userId = userId; username = username; text = text; postedAt = postedAt |} ])
+            return ()
+        }
+
     let recordVahterAction
         (vahterId: int64) (actionType: VahterAction) (targetUserId: int64)
         (chatId: int64) (messageId: int64) : Task<bool> =
@@ -316,6 +328,19 @@ ON CONFLICT DO NOTHING
                     (Option.ofObj msg.Text)
                     msg.RawJson
         }
+
+    // -----------------------------------------------------------------------
+    // Public members — Admin (vahter) channel feedback capture
+    // -----------------------------------------------------------------------
+
+    /// Records a message posted in the private admin channel — free-form discussion or a
+    /// /vahter command — as an AdminChannelMessage event. Does NOT touch the message:* stream,
+    /// user_msg_text_index, or any ML/LLM/snapshot pipeline (see Types.fs AdminChannelEvent doc).
+    member _.RecordAdminChannelMessage(msg: TgMessage) : Task =
+        recordAdminChannelMessage msg.ChatId msg.MessageId msg.SenderId
+            (Option.ofObj msg.SenderUsername)
+            (Option.ofObj msg.Text)
+            (utcNow())
 
     member _.GetUserMessages(userId: int64) : Task<UserMessage array> =
         task {

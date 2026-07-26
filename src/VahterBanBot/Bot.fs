@@ -1370,6 +1370,16 @@ type BotService(
             replyParameters = ReplyParameters.Create(msg.MessageId, allowSendingWithoutReply = true)))
         |> taskIgnore
 
+    /// Persists every message posted in the admin channel (free-form discussion AND /vahter
+    /// commands) as an AdminChannelMessage event — a queryable feedback source. Best-effort:
+    /// a persistence failure must never break command dispatch, so it's logged and swallowed.
+    member private _.PersistAdminChannelMessage(msg: TgMessage) = task {
+        try
+            do! db.RecordAdminChannelMessage(msg)
+        with e ->
+            logger.LogWarning(e, "Failed to persist admin-channel message {MessageId} in chat {ChatId}", msg.MessageId, msg.ChatId)
+    }
+
     /// Resolves a public chat/channel by @username via Telegram getChat.
     member private _.ResolveChatByUsername(username: string) = task {
         try
@@ -1537,12 +1547,22 @@ type BotService(
         if botConfig.Value.AdminChannelId <> 0L
            && msg.ChatId = botConfig.Value.AdminChannelId
            && isVahterCommand msg then
+            do! this.PersistAdminChannelMessage(msg)
             let! user = db.UpsertUser(msg.SenderId, Option.ofObj msg.SenderUsername)
             if isUserVahter botConfig.Value user then
                 do! this.VahterAdminCommand(user, msg)
             else
                 logger.LogWarning("Non-vahter {Id} attempted /vahter command in admin channel", msg.SenderId)
                 do! this.ReplyAdmin(msg, "⛔ You are not authorized to use vahter admin commands.")
+        else
+
+        // Free-form moderator discussion in the admin channel (not a recognized /vahter
+        // command): persist it as feedback, but do NOT fall through to the monitored-chat
+        // pipeline (ML/LLM/etc.) below — this is a pure side-channel capture, preserving the
+        // pre-existing no-op behaviour for this branch other than the persistence itself.
+        if botConfig.Value.AdminChannelId <> 0L
+           && msg.ChatId = botConfig.Value.AdminChannelId then
+            do! this.PersistAdminChannelMessage(msg)
         else
 
         // early return if we don't monitor this chat
