@@ -9,7 +9,16 @@
 #   ARGOCD_APP_NAME       ArgoCD application name (default: coupon-bot)
 #   CONTAINER_NAME        container label (default: coupon-bot)
 #
-# Output: structured markdown report to stdout
+# Output: structured markdown report to stdout, led by a machine-readable
+# JSON source manifest line, e.g. {"sources":{"prometheus":"ok","loki":"ok","argocd":"ok"}}
+#
+# Failure behavior: every data source (Prometheus, Loki, ArgoCD) is probed
+# up front. A failed probe is fatal, after retries — the script prints the
+# real curl error to stderr and exits non-zero rather than substituting an
+# empty/N-A result (a genuinely empty result set from a *successful* query is
+# not an error and is reported as-is). "Source unreachable" must never render
+# as "everything is fine" — see gather-product-data.sh for the sibling
+# version of this same rule.
 
 set -euo pipefail
 
@@ -24,10 +33,31 @@ AUTH_HEADER="Authorization: Bearer ${ARGOCD_AUTH_TOKEN}"
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
 
+# Generic retrying curl wrapper shared by all three sources below. `-S` keeps
+# curl's own diagnostic ("Could not resolve host", "Connection refused", the
+# failing HTTP status, etc) visible on stderr even though `-s` mutes the
+# progress meter; stderr itself is left unredirected so that text reaches the
+# workflow log. A failed request (after retries) is fatal — the caller only
+# picks the label used in the log line.
+retry_curl() {
+    local label="$1"
+    shift
+    local attempt
+    for attempt in 1 2 3; do
+        if result=$(curl -sSf --connect-timeout 5 --max-time 20 "$@"); then
+            echo "$result"
+            return 0
+        fi
+        log "${label} request failed (attempt ${attempt}/3), retrying..."
+        sleep 1
+    done
+    log "ERROR: ${label} request failed after 3 attempts (see curl error above)"
+    exit 1
+}
+
 # Helper: query Prometheus instant endpoint, return raw JSON
 prom_query() {
-    curl -sf -G "${PROMETHEUS_URL}/api/v1/query" \
-        --data-urlencode "query=$1" 2>/dev/null || echo '{"data":{"result":[]}}'
+    retry_curl "Prometheus" -G "${PROMETHEUS_URL}/api/v1/query" --data-urlencode "query=$1"
 }
 
 # Helper: extract scalar value from Prometheus response (first result)
@@ -35,15 +65,37 @@ prom_value() {
     echo "$1" | jq -r '[.data.result[].value[1]] | first // "N/A"'
 }
 
-# ─── Verify connectivity ─────────────────────────────────────────────────────
+# Helper: query Loki, return raw JSON
+loki_query() {
+    retry_curl "Loki" -G "$1" "${@:2}"
+}
+
+# Helper: query ArgoCD, return raw JSON
+argocd_query() {
+    retry_curl "ArgoCD" "$1" -H "${AUTH_HEADER}"
+}
+
+# ─── Preflight connectivity check ────────────────────────────────────────────
+# One trivial probe per data source so a broken endpoint fails in one second
+# with one clear error, instead of after many identical multi-second timeouts
+# scattered through the report below. Every probe below is fatal on failure
+# (via retry_curl/exit 1) — by the time the source manifest is emitted, all
+# three sources are known reachable.
 
 log "Verifying connectivity..."
 
-PROM_OK=$(curl -sf -o /dev/null "${PROMETHEUS_URL}/-/healthy" 2>/dev/null && echo "yes" || echo "no")
-LOKI_OK=$(curl -sf -o /dev/null "${LOKI_URL}/loki/api/v1/labels" 2>/dev/null && echo "yes" || echo "no")
-ARGO_OK=$(curl -sf "${ARGOCD_URL}/api/v1/applications" -H "${AUTH_HEADER}" -o /dev/null 2>/dev/null && echo "yes" || echo "no")
+log "Checking Prometheus connectivity..."
+prom_query "vector(1)" >/dev/null
 
-log "Prometheus: ${PROM_OK}, Loki: ${LOKI_OK}, ArgoCD: ${ARGO_OK}"
+log "Checking Loki connectivity..."
+loki_query "${LOKI_URL}/loki/api/v1/labels" >/dev/null
+
+log "Checking ArgoCD connectivity..."
+argocd_query "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" >/dev/null
+
+log "Prometheus: ok, Loki: ok, ArgoCD: ok"
+
+SOURCES_MANIFEST='{"sources":{"prometheus":"ok","loki":"ok","argocd":"ok"}}'
 
 # ─── Prometheus metrics ───────────────────────────────────────────────────────
 
@@ -106,66 +158,53 @@ THROTTLE_TOTAL=$(echo "$THROTTLE_JSON" | jq -r '[.data.result[].value[1] | tonum
 
 # ─── Loki logs ────────────────────────────────────────────────────────────────
 
-if [ "$LOKI_OK" = "yes" ]; then
-    log "Querying Loki logs (last 24h)..."
+log "Querying Loki logs (last 24h)..."
 
-    START_24H=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
+START_24H=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
 
-    # Error/Fatal total count (accurate, uncapped)
-    ERROR_LOG_COUNT_JSON=$(curl -sf -G "${LOKI_URL}/loki/api/v1/query" \
-        --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"[24h]))" \
-        2>/dev/null || echo '{"data":{"result":[]}}')
-    ERROR_LOG_COUNT=$(echo "$ERROR_LOG_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+# Error/Fatal total count (accurate, uncapped)
+ERROR_LOG_COUNT_JSON=$(loki_query "${LOKI_URL}/loki/api/v1/query" \
+    --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"[24h]))")
+ERROR_LOG_COUNT=$(echo "$ERROR_LOG_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
 
-    # Sample of Error/Fatal logs for pattern extraction (capped at 200)
-    ERROR_LOGS_RESPONSE=$(curl -sf -G "${LOKI_URL}/loki/api/v1/query_range" \
-        --data-urlencode "query={container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"" \
-        --data-urlencode "start=${START_24H}" \
-        --data-urlencode "limit=200" 2>/dev/null || echo '{"data":{"result":[]}}')
+# Sample of Error/Fatal logs for pattern extraction (capped at 200)
+ERROR_LOGS_RESPONSE=$(loki_query "${LOKI_URL}/loki/api/v1/query_range" \
+    --data-urlencode "query={container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\"" \
+    --data-urlencode "start=${START_24H}" \
+    --data-urlencode "limit=200")
 
-    # Top unique error messages (deduplicated, counts only — messages redacted for public issues)
-    TOP_ERRORS_COUNT=$(echo "$ERROR_LOGS_RESPONSE" | jq -r '
-        [.data.result[].values[] | .[1]] |
-        map(. as $line | try (fromjson | .RenderedMessage // .message // .msg // $line) catch $line) |
-        group_by(.) |
-        map({count: length}) |
-        sort_by(-.count) |
-        .[:10] |
-        .[] |
-        "  - \(.count) occurrence(s)"
-    ' 2>/dev/null || echo "  - (parse error)")
+# Top unique error messages (deduplicated, counts only — messages redacted for public issues)
+TOP_ERRORS_COUNT=$(echo "$ERROR_LOGS_RESPONSE" | jq -r '
+    [.data.result[].values[] | .[1]] |
+    map(. as $line | try (fromjson | .RenderedMessage // .message // .msg // $line) catch $line) |
+    group_by(.) |
+    map({count: length}) |
+    sort_by(-.count) |
+    .[:10] |
+    .[] |
+    "  - \(.count) occurrence(s)"
+' 2>/dev/null || echo "  - (parse error)")
 
-    # Warning total count (accurate, uncapped)
-    WARN_LOG_COUNT_JSON=$(curl -sf -G "${LOKI_URL}/loki/api/v1/query" \
-        --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=\"Warning\"[24h]))" \
-        2>/dev/null || echo '{"data":{"result":[]}}')
-    WARN_LOG_COUNT=$(echo "$WARN_LOG_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+# Warning total count (accurate, uncapped)
+WARN_LOG_COUNT_JSON=$(loki_query "${LOKI_URL}/loki/api/v1/query" \
+    --data-urlencode "query=sum(count_over_time({container=\"${CONTAINER}\"} | json | level=\"Warning\"[24h]))")
+WARN_LOG_COUNT=$(echo "$WARN_LOG_COUNT_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
 
-    # Total log volume (last 24h)
-    LOG_VOLUME_JSON=$(curl -sf -G "${LOKI_URL}/loki/api/v1/query" \
-        --data-urlencode "query=count_over_time({container=\"${CONTAINER}\"}[24h])" \
-        2>/dev/null || echo '{"data":{"result":[]}}')
-    LOG_VOLUME_RAW=$(echo "$LOG_VOLUME_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "N/A")
-    if [[ "$LOG_VOLUME_RAW" =~ ^[0-9]+$ ]]; then
-        LOG_VOLUME="${LOG_VOLUME_RAW} lines"
-    else
-        LOG_VOLUME="$LOG_VOLUME_RAW"
-    fi
+# Total log volume (last 24h)
+LOG_VOLUME_JSON=$(loki_query "${LOKI_URL}/loki/api/v1/query" \
+    --data-urlencode "query=count_over_time({container=\"${CONTAINER}\"}[24h])")
+LOG_VOLUME_RAW=$(echo "$LOG_VOLUME_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "N/A")
+if [[ "$LOG_VOLUME_RAW" =~ ^[0-9]+$ ]]; then
+    LOG_VOLUME="${LOG_VOLUME_RAW} lines"
 else
-    log "Skipping Loki queries (unreachable)..."
-    ERROR_LOG_COUNT="N/A (Loki unreachable)"
-    WARN_LOG_COUNT="N/A (Loki unreachable)"
-    LOG_VOLUME="N/A (Loki unreachable)"
-
-    TOP_ERRORS_COUNT="  - N/A (Loki unreachable)"
+    LOG_VOLUME="$LOG_VOLUME_RAW"
 fi
 
 # ─── ArgoCD status ────────────────────────────────────────────────────────────
 
 log "Querying ArgoCD status..."
 
-ARGO_RESPONSE=$(curl -sf "${ARGOCD_URL}/api/v1/applications/${APP_NAME}" \
-    -H "${AUTH_HEADER}" 2>/dev/null || echo "{}")
+ARGO_RESPONSE=$(argocd_query "${ARGOCD_URL}/api/v1/applications/${APP_NAME}")
 
 SYNC_STATUS=$(echo "$ARGO_RESPONSE" | jq -r '.status.sync.status // "Unknown"')
 HEALTH_STATUS=$(echo "$ARGO_RESPONSE" | jq -r '.status.health.status // "Unknown"')
@@ -207,9 +246,11 @@ BUTTON_COUNT=$(echo "$BUTTON_JSON" | jq -r '[.data.result[].value[1] | tonumber 
 
 # ─── Output markdown report ──────────────────────────────────────────────────
 
-log "Generating report..."
+log "Generating report."
 
 cat <<EOF
+${SOURCES_MANIFEST}
+
 ## Infrastructure Health (Prometheus)
 
 ### Current Status
@@ -236,9 +277,9 @@ cat <<EOF
 
 | Service | Reachable |
 |---------|-----------|
-| Prometheus | ${PROM_OK} |
-| Loki | ${LOKI_OK} |
-| ArgoCD | ${ARGO_OK} |
+| Prometheus | yes |
+| Loki | yes |
+| ArgoCD | yes |
 
 ## Error Logs (24h via Loki)
 

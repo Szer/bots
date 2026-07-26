@@ -47,3 +47,5 @@ jobs:
       DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
       DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}

@@ -1,0 +1,127 @@
+name: "_SRE Agent (reusable)"
+
+# Reusable workflow: the actual SRE investigation, callable directly from
+# _bot-deploy.yml on failure (no anti-recursion issue-label trigger — see
+# .github/AGENT-FLOWS-REDESIGN.md §3.5) and from sre-manual.yml for
+# hand-triggered incidents.
+#
+# Bot identity is passed in as inputs, not read from an issue body — the
+# deploy-failure issue (if any) is now purely the incident record the agent
+# comments on, not its only source of truth.
+
+on:
+  workflow_call:
+    inputs:
+      bot:
+        required: true
+        type: string
+        description: "Bot display name, e.g. VahterBanBot / CouponHubBot / AlitaBot"
+      argocd-app-name:
+        required: true
+        type: string
+      container-name:
+        required: true
+        type: string
+      docker-image:
+        required: true
+        type: string
+      commit:
+        required: true
+        type: string
+      run-url:
+        required: true
+        type: string
+        description: "Link to the workflow run that triggered this investigation"
+      issue-number:
+        required: false
+        type: string
+        description: "deploy-failure issue number to comment on/close, if one was filed"
+    secrets:
+      WIREGUARD_CONFIG:
+        required: true
+      ARGOCD_AUTH_TOKEN:
+        required: true
+      AZURE_OPENAI_API_KEY:
+        required: true
+      AZURE_OPENAI_BASE_URL:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  investigate:
+    runs-on: ubuntu-latest
+    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident).
+    concurrency:
+      group: aks-vpn
+      cancel-in-progress: false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+
+    - name: Read SRE agent prompt
+      run: |
+        {
+          echo "AGENT_PROMPT<<PROMPT_EOF"
+          cat .github/prompts/sre.md
+          echo "PROMPT_EOF"
+        } >> "$GITHUB_ENV"
+
+    - name: Run SRE agent
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+        model: gpt-5-mini
+        sandbox: workspace-write
+        safety-strategy: drop-sudo
+        effort: high
+        codex-args: '--config sandbox_workspace_write.network_access=true'
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          A deploy pipeline has failed. Bot identity and incident context:
+
+          - **Bot:** ${{ inputs.bot }}
+          - **ArgoCD app:** ${{ inputs.argocd-app-name }}
+          - **Container label:** ${{ inputs.container-name }}
+          - **GHCR image:** ${{ inputs.docker-image }}
+          - **Commit:** ${{ inputs.commit }}
+          - **Workflow run:** ${{ inputs.run-url }}
+          ${{ inputs.issue-number != '' && format('- **Deploy-failure issue:** #{0} — comment your incident report on it and close it once resolved.', inputs.issue-number) || '- No deploy-failure issue number was provided for this run; skip issue comment/close steps in the runbook.' }}
+
+          Use these values for APP_NAME, CONTAINER, and IMAGE_NAME throughout the runbook.
+          Investigate following the runbook.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+    - name: Re-enable ArgoCD auto-sync (safety net — a killed run must not leave it off)
+      # Idempotent: a no-op if the agent never touched auto-sync. Runs even if
+      # earlier steps failed/were cancelled, so a killed investigation can't
+      # leave production permanently un-synced with only a prose reminder.
+      if: always()
+      run: |
+        curl -sS -X PATCH "http://argo.internal/api/v1/applications/${{ inputs.argocd-app-name }}" \
+          -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d '{"spec": {"syncPolicy": {"automated": {"prune": true, "selfHeal": true}}}}' \
+          || true
+      env:
+        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+    - name: Disconnect VPN
+      if: always()
+      run: sudo wg-quick down wg0 || true

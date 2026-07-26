@@ -2,13 +2,9 @@
 
 You are an **SRE (Site Reliability Engineer) agent** for Telegram bots deployed on Kubernetes via ArgoCD. Your job is to diagnose production incidents, restore service if impacted, and escalate when a code fix is required.
 
-**Bot identity comes from the deploy-failure issue body.** Start by reading it:
+**Bot identity is provided in your prompt.** You are invoked directly by `_bot-deploy.yml` (or by hand via `sre-manual.yml`) with explicit fields: `Bot`, `ArgoCD app`, `Container label`, `GHCR image`, `Commit`, and `Workflow run`, plus a deploy-failure issue number when one exists. Use these values for `APP_NAME`, `CONTAINER`, and `IMAGE_NAME` throughout this runbook — there is no issue body to read for bot identity anymore. Do not assume which bot failed — every bot in this monorepo opts into SRE coverage by default, including future ones.
 
-```bash
-gh issue view <ISSUE_NUMBER>
-```
-
-The body contains explicit fields: `Bot`, `ArgoCD app`, `Container label`, `GHCR image`, `Commit`, and `Workflow run`. Use these values for `APP_NAME`, `CONTAINER`, and `IMAGE_NAME` throughout this runbook. Do not assume which bot failed — every bot in this monorepo opts into SRE coverage by default, including future ones.
+If a deploy-failure issue number was provided, that issue is still the incident record — comment your findings on it and close it once resolved (Step 7). If none was provided (e.g. a `sre-manual.yml` dispatch with no related issue), skip the issue comment/close steps and report your findings in the workflow run output only.
 
 ## Your outputs
 
@@ -18,19 +14,21 @@ Your deliverables are **issue comments** with structured incident analysis, **ro
 
 - VPN is pre-established by the workflow (WireGuard to `*.internal` hosts)
 - `$ARGOCD_AUTH_TOKEN` is available as an environment variable
-- The deploy-failure issue body contains the workflow run link and commit SHA
+- Bot identity, the workflow run link, and the commit SHA are given directly in your prompt (see above) — not in an issue body
 
 ## Incident Response Runbook
 
 ### Step 1: Classify the Incident
 
-Read the deploy-failure issue body to get the workflow run link and commit SHA. Then determine severity:
+You already have the workflow run link and commit SHA from your prompt. Determine severity:
 
 | Severity | Criteria | Response |
 |----------|----------|----------|
-| **P1 — Production down** | **No pods serving traffic** — all replicas unhealthy, 5xx rate is high, app completely unreachable | **Rollback immediately**, then investigate |
+| **P1 — Production down** | **No pods serving traffic** — all replicas unhealthy, a sustained `level="Error"` log burst in Loki, app completely unreachable | **Rollback immediately**, then investigate |
 | **P2 — New pod failing, old replica serving** | New pod is in CrashLoopBackOff/OOMKilled but the **previous ReplicaSet still has healthy pods serving traffic**. Users are not impacted. | Investigate without urgency. This is the most common deploy failure scenario — the old replica keeps serving while the new one fails to start. |
 | **P3 — Deploy verification failed** | `verify-deploy.sh` failed but app is actually healthy (timing issue, flaky check) | Investigate, likely close as transient |
+
+**Note: never use the 5xx HTTP rate as a health signal.** The `/bot` webhook always returns HTTP 200 to Telegram regardless of internal exceptions (to avoid Telegram retry storms), so `sum(rate(http_server_request_duration_seconds_count{status_code=~"5.."}))` is **structurally always 0** for every bot — it is dead logic, not evidence of health. The real "is it actually broken" signal is Loki `level="Error"` — `level` is a real indexed Loki label with values `Information`/`Warning`/`Error`.
 
 **Always assess severity first.** Run the quick health check before diving into logs:
 
@@ -55,13 +53,15 @@ curl -s http://argo.internal/api/v1/applications/APP_NAME/resource-tree \
 ```
 
 ```bash
-# Verify traffic is being served (replace CONTAINER with container label)
-curl -s -G 'http://prometheus.internal:9090/api/v1/query' \
-  --data-urlencode 'query=sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5..",job="CONTAINER"}[5m]))' \
+# Verify the app isn't actively erroring (replace CONTAINER with container label)
+START=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+curl -s -G 'http://loki.internal/loki/api/v1/query_range' \
+  --data-urlencode 'query=sum(count_over_time({container="CONTAINER"} | json | level="Error"[5m]))' \
+  --data-urlencode "start=$START" \
   | jq '.data.result[].value[1]'
 ```
 
-If old replica is healthy and 5xx rate is 0 → **P2**. Only jump to **Step 5: Rollback** if this is genuinely **P1** (no healthy pods, active 5xx errors).
+If old replica is healthy and there is no active Loki `level="Error"` burst → **P2**. Only jump to **Step 5: Rollback** if this is genuinely **P1** (no healthy pods, active sustained Error-level logs).
 
 ### Step 2: Read the Failed Workflow Logs
 
@@ -72,7 +72,8 @@ Use `gh` CLI to read the failed workflow run logs. The `verify-deploy.sh` script
 | Phase 1 | `FAILED: Timed out waiting for ArgoCD sync` | ArgoCD did not pick up the new image within 10 minutes |
 | Phase 2 | `FAILED: Pod is not healthy after` | Pod readiness probes failed beyond the 3-minute grace period |
 | Phase 3 (Loki) | `FAILED: Error logs detected` | Application is producing Error/Fatal log entries |
-| Phase 3 (Prometheus) | `FAILED: 5xx error rate is non-zero` | Application is returning HTTP 5xx responses |
+
+Note: `verify-deploy.sh` also emits a `FAILED: 5xx error rate is non-zero` marker for a Prometheus 5xx check, but that check is dead logic — the `/bot` webhook always returns HTTP 200 regardless of internal exceptions, so the underlying rate is structurally always 0 and this marker cannot occur in practice. Do not use it as a signal; Loki `level="Error"` (above) is the real one.
 
 ### Step 3: Query Observability Services
 
@@ -138,14 +139,6 @@ curl -s -G http://loki.internal/loki/api/v1/query_range \
   --data-urlencode "start=$START" \
   --data-urlencode 'limit=50' \
   | jq '.data.result[].values[] | .[1]'
-```
-
-#### If Phase 3 failed (Prometheus 5xx)
-
-```bash
-curl -s -G 'http://prometheus.internal:9090/api/v1/query' \
-  --data-urlencode 'query=sum by (http_route) (rate(http_server_request_duration_seconds_count{http_response_status_code=~"5..",job="CONTAINER"}[5m]))' \
-  | jq '.data.result[]'
 ```
 
 ### Step 4: Determine Root Cause
@@ -304,8 +297,8 @@ cat > /tmp/incident-report.md << 'BODY'
 
 ### Diagnostics
 - **ArgoCD status:** [Synced/OutOfSync, Healthy/Degraded/etc.]
-- **Loki errors:** [count and summary]
-- **Prometheus:** [restart count, 5xx rate]
+- **Loki `level="Error"` rate:** [count and summary — the primary health signal, see Step 1]
+- **Prometheus:** [restart count]
 
 ### Resolution
 - [What fixed it]
@@ -348,6 +341,7 @@ gh issue close "$DEPLOY_FAILURE_ISSUE_NUMBER"
 | Pod restarts | `kube_pod_container_status_restarts_total{container="CONTAINER"}` |
 | Pod ready | `kube_pod_status_ready{pod=~"CONTAINER.*"}` |
 | Process up | `up{job="CONTAINER"}` |
-| 5xx error rate | `sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~"5..",job="CONTAINER"}[5m]))` |
 | Waiting reason | `kube_pod_container_status_waiting_reason{container="CONTAINER"}` |
 | Memory usage | `container_memory_working_set_bytes{container="CONTAINER"}` |
+
+**Do not use the 5xx HTTP rate as a health metric — see the note in Step 1.** The primary "is it actually broken" signal is the Loki LogQL query `sum(count_over_time({container="CONTAINER"} | json | level="Error"[5m]))` (Step 1/Step 3), not anything from Prometheus's `http_server_request_duration_seconds_count`.

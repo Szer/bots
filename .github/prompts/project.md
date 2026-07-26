@@ -11,7 +11,6 @@ production right now. **Correctness is already owned by other layers:**
 
 - the **F# compiler** (type errors, invalid casts, compilation-order issues cannot reach `main`),
 - the **test suite** (`tests/**` — migrations, DB grants, command/callback flows),
-- the **review agent** (`.github/prompts/review.md`) at PR time,
 - the **SRE agent** for runtime incidents.
 
 Do **not** duplicate those layers with speculative static code review. Assume what shipped works

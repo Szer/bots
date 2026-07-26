@@ -46,6 +46,12 @@ on:
         required: true
       ARGOCD_AUTH_TOKEN:
         required: true
+      AZURE_OPENAI_API_KEY:
+        required: true
+        description: "For the SRE agent (_sre-agent.yml), invoked on deploy/verify failure"
+      AZURE_OPENAI_BASE_URL:
+        required: true
+        description: "For the SRE agent (_sre-agent.yml), invoked on deploy/verify failure"
 
 env:
   DOCKER_IMAGE: flyway/flyway
@@ -177,13 +183,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       issues: write
+    outputs:
+      issue-number: ${{ steps.create-issue.outputs.issue-number }}
     steps:
     - name: Create deploy-failure issue
+      id: create-issue
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         SHORT_SHA="${GITHUB_SHA::7}"
-        gh issue create \
+        ISSUE_URL=$(gh issue create \
           --repo "$GITHUB_REPOSITORY" \
           --title "Deploy failure: ${{ inputs.argocd-app-name }} (${SHORT_SHA})" \
           --label "deploy-failure" \
@@ -196,4 +205,28 @@ jobs:
         **Commit:** ${{ github.sha }}
         **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-        Follow the runbook in \`.github/prompts/sre.md\`. Identify which \`verify-deploy.sh\` phase failed from the run logs above."
+        Follow the runbook in \`.github/prompts/sre.md\`. Identify which \`verify-deploy.sh\` phase failed from the run logs above.")
+        echo "Created: ${ISSUE_URL}"
+        echo "issue-number=${ISSUE_URL##*/}" >> "$GITHUB_OUTPUT"
+
+  sre:
+    # Reusable-workflow call, not a plain job — this is the fix for the SRE
+    # agent never running (see .github/AGENT-FLOWS-REDESIGN.md §1.1/§3.5):
+    # sre.yml used to trigger on `issues: [labeled]`, but the deploy-failure
+    # issue above is created with secrets.GITHUB_TOKEN, and GitHub Actions
+    # does not trigger workflows from events authored by the default
+    # GITHUB_TOKEN (anti-recursion) — so that trigger fired zero times, ever.
+    # Calling the reusable workflow directly from this same failed run sidesteps
+    # the whole problem: no token games, no label propagation to depend on.
+    needs: [deploy, verify-deploy, notify-failure]
+    if: ${{ failure() && inputs.sre-enabled }}
+    uses: ./.github/workflows/_sre-agent.yml
+    with:
+      bot: ${{ inputs.bot-project }}
+      argocd-app-name: ${{ inputs.argocd-app-name }}
+      container-name: ${{ inputs.container-name }}
+      docker-image: ${{ inputs.docker-image }}
+      commit: ${{ github.sha }}
+      run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      issue-number: ${{ needs.notify-failure.outputs.issue-number }}
+    secrets: inherit
