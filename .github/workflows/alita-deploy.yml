@@ -13,7 +13,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # contents: write (not read) because this workflow calls _bot-deploy.yml,
+  # which calls _sre-agent.yml on failure. A called reusable workflow cannot
+  # escalate beyond its caller's permissions, and the SRE agent needs to push
+  # a branch for a one-liner mitigation PR. With contents: read the whole run
+  # fails at load time with a jobless startup_failure (2026-07-26).
+  contents: write
   packages: write
   issues: write
   pull-requests: write
