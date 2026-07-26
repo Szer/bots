@@ -1,9 +1,6 @@
 namespace CouponHubBot.RealTests
 
 open System
-open System.Globalization
-open System.IO
-open System.Threading.Tasks
 open Dapper
 open Npgsql
 open Xunit
@@ -26,35 +23,12 @@ open Xunit
 /// single coupon.
 type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
 
-    let futureExpiry = DateTime.UtcNow.AddDays(200.).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-
-    let latestCouponIdForOwner (ownerId: int64) =
-        task {
-            use conn = new NpgsqlConnection(fx.DbConnectionString)
-            return! conn.QuerySingleAsync<int>("SELECT id FROM coupon WHERE owner_id=@o ORDER BY id DESC LIMIT 1", {| o = ownerId |})
-        }
-
-    /// Adds a coupon via photo + explicit "/add <value> <minCheck> <futureDate>"
-    /// caption (same reasoning as AddFlowRealTests: OCR still runs server-side, but the
-    /// caption's explicit values are what the app actually uses — see AddFlowRealTests'
-    /// doc comment for why a bare "/add" + OCR-derived expiry can't be used against an
-    /// intentionally-expired fixture image). Returns the new coupon's id.
-    let addCoupon (fixtureFileName: string) (value: string) (minCheck: string) =
-        task {
-            let imagePath = Path.Combine(RealEnv.ocrFixtureImagesDir, fixtureFileName)
-            Assert.True(File.Exists imagePath, $"Expired-coupon fixture missing: {imagePath}")
-
-            let! sentId = fx.UserClient.SendPhoto(fx.BotChatId, imagePath, $"/add {value} {minCheck} {futureExpiry}")
-            let! _reply = fx.UserClient.AwaitTextContaining(fx.BotChatId, sentId, "Добавлен купон", TimeSpan.FromSeconds 90.)
-            return! latestCouponIdForOwner fx.UserClient.Me.id
-        }
-
     [<Fact>]
     member _.``list shows the coupon and its take callback takes it``() =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let! couponId = addCoupon "10_50_01-04_01-13_2706602781191.jpg" "10" "50"
+            let! couponId = RealTestHelpers.addCouponViaCaptionAsync fx "10_50_01-04_01-13_2706602781191.jpg" "10" "50" None
 
             let! sentId = fx.UserClient.SendText(fx.BotChatId, "/list")
             let! listMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, sentId, $"ID:{couponId}", TimeSpan.FromSeconds 60.)
@@ -80,7 +54,7 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let! couponId = addCoupon "10_50_01-06_01-15_2706643333717.jpg" "12" "60"
+            let! couponId = RealTestHelpers.addCouponViaCaptionAsync fx "10_50_01-06_01-15_2706643333717.jpg" "12" "60" None
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! _taken = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)
 
@@ -115,7 +89,7 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let! couponId = addCoupon "10_50_01-12_01-21_2706513420233.jpg" "10" "50"
+            let! couponId = RealTestHelpers.addCouponViaCaptionAsync fx "10_50_01-12_01-21_2706513420233.jpg" "10" "50" None
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! takenMsg = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)
 
@@ -144,7 +118,7 @@ type CouponLifecycleRealTests(fx: RealAssemblyFixture) =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
-            let! couponId = addCoupon "10_50_01-12_01-21_2706530490622.jpg" "10" "50"
+            let! couponId = RealTestHelpers.addCouponViaCaptionAsync fx "10_50_01-12_01-21_2706530490622.jpg" "10" "50" None
             let! takeSentId = fx.UserClient.SendText(fx.BotChatId, $"/take {couponId}")
             let! takenMsg = fx.UserClient.AwaitPhotoCaptionContaining(fx.BotChatId, takeSentId, "теперь твой", TimeSpan.FromSeconds 60.)
 

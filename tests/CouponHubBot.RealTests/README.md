@@ -6,6 +6,41 @@ post to real Telegram. Never run it locally or from an agent; the CI workflow th
 dispatches it is the only sanctioned runner. Local `dotnet build` (not `dotnet test`) is
 fine and is how you validate a new file compiles.
 
+## RULE: every coupon add MUST be idempotent
+
+The suite runs SERIALLY over ONE shared transient Postgres and ONE Telegram account, with
+no per-test cleanup by default, and **test class execution order is NOT guaranteed** (not
+`.fsproj` order — proven empirically by CI run `30193635437`, which failed 4/32 tests
+this way). Combined with `coupon_barcode_active_uniq` (the partial unique index `/add`'s
+OCR-extracted barcode is checked against since merge #269), this means: if ANY two
+coupon-adds anywhere in this assembly can use the same fixture's barcode, and one of them
+doesn't delete-first, then whichever one runs SECOND — in whatever order THIS run happens
+to pick — gets rejected with «Купон с таким штрихкодом уже есть в базе…» instead of
+«Добавлен купон ID:», and its `Await*` call times out waiting for text that will never
+arrive.
+
+**"The other test always runs first" is not a safety argument.** There is no guaranteed
+order, so any reasoning of that shape is wrong by construction — this is exactly the bug
+this rule exists to close. The only correct fix is that every add is safe regardless of
+what ran before it, including a retried attempt of itself (see "Retry contract" below).
+
+Two sanctioned patterns, pick whichever fits the test:
+1. **Default**: route the add through `RealTestHelpers.addCouponViaCaptionAsync`, which
+   deletes any pre-existing row for the fixture's barcode FIRST, then sends the photo.
+   Use this whenever the add is just setup for something else under test.
+2. **Bespoke add** (the test's own subject IS the add reply, or it inserts via raw SQL):
+   call `DbSeed.deleteCouponsByBarcodeAsync` yourself, immediately before the add, and
+   keep asserting on the add's own reply/DB row as before. If the row has no barcode
+   (`NULL`/synthetic `barcode_text`, e.g. a direct SQL insert), you cannot clean up by
+   barcode — instead delete the row by id (`DbSeed.deleteCouponByIdAsync`) once your
+   assertions are done, on BOTH the success and the failure path (`try`/`with` +
+   re-raise, since F#'s `task { }` can't `do!`/`let!` inside `finally`).
+
+Never hand-roll `SendPhoto` + an `/add` caption (or a raw `INSERT INTO coupon`) without
+one of the two patterns above — that reintroduces the exact flake this rule exists to
+close, even if the fixture "looks" unshared today; a later PR reusing the same fixture
+elsewhere in this assembly won't know that assumption existed.
+
 ## New-test skeleton
 
 ```fsharp

@@ -119,6 +119,13 @@ type AdminAndFeedbackRealTests(fx: RealAssemblyFixture) =
             let! history = fx.UserClient.AwaitTextContaining(fx.BotChatId, debugSentId, "event_type", TimeSpan.FromSeconds 60.)
             Assert.Contains("added", history.message)
             Assert.Contains("taken", history.message)
+
+            // Cleanup, not assertion: this test's own point (the history dump) is proven
+            // above. Left 'taken' forever, this coupon would permanently eat one of this
+            // account's shared MAX_TAKEN_COUPONS=6 slots for the rest of the serial run —
+            // same leak DbSeed.releaseTakenCouponAsync's doc comment describes; this test
+            // took a coupon but never released/used/returned it before this fix.
+            do! DbSeed.releaseTakenCouponAsync fx.DbConnectionString couponId
         })
 
     /// Covers `/undo <id>` (CommandHandler.fs:485-489 -> handleUndo :49-77). Sets up a

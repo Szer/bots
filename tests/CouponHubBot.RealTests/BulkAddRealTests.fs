@@ -42,11 +42,12 @@ open Xunit
 /// booted for /test/clock/advance to work at all.
 type BulkAddRealTests(fx: RealAssemblyFixture) =
 
-    let images =
+    let imageFileNames =
         [ "10_50_2026-01-17_2026-01-26_2706688198821.jpg"
           "10_50_2026-01-17_2026-01-26_2706688198838.jpg"
           "10_50_2026-01-17_2026-01-26_2706688198845.jpg" ]
-        |> List.map (fun f -> Path.Combine(RealEnv.ocrFixtureImagesDir, f))
+
+    let images = imageFileNames |> List.map (fun f -> Path.Combine(RealEnv.ocrFixtureImagesDir, f))
 
     let pollInterval = TimeSpan.FromMilliseconds 500.
 
@@ -131,6 +132,16 @@ type BulkAddRealTests(fx: RealAssemblyFixture) =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
             images |> List.iter (fun p -> Assert.True(File.Exists p, $"Expired-coupon fixture missing: {p}"))
+
+            // Idempotence: delete any pre-existing row for each fixture's barcode FIRST —
+            // this is the album-flow equivalent of RealTestHelpers.addCouponViaCaptionAsync's
+            // own delete-first step. Without this, a leftover 'available' coupon from an
+            // earlier run of THIS test (via TestRetry's one retry, if the confirm succeeded
+            // but a later await in this same attempt timed out) would make the
+            // addflow:bulk:confirm below silently skip that item as a duplicate instead of
+            // landing all 3 — see README.md's "Fixture reuse rule" section.
+            for f in imageFileNames do
+                do! DbSeed.deleteCouponsByBarcodeAsync fx.DbConnectionString RealTestHelpers.fixtureBarcodes.[f]
 
             let ownerId = fx.UserClient.Me.id
             let! countBefore = countCouponsForOwner ownerId
