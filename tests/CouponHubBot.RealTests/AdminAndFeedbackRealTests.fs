@@ -41,6 +41,29 @@ type AdminAndFeedbackRealTests(fx: RealAssemblyFixture) =
                     {| user_id = userId |})
         }
 
+    /// DB-level disarm of the pending `/feedback` flag — mirrors
+    /// DbService.ClearPendingFeedback's own SQL verbatim (`pending_feedback` table,
+    /// DbService.fs:858-863: "DELETE FROM pending_feedback WHERE user_id = @user_id").
+    /// No DbSeed.fs helper exists for this yet (contract: "add it as a private function
+    /// inside your own file" when a shared helper is missing). Used only for test
+    /// cleanup below — never to assert on the flow itself.
+    ///
+    /// Exists specifically so that cleanup can be a plain, genuinely async DB delete
+    /// instead of a blocking Telegram round trip (review Fix 2): the previous cleanup
+    /// disarmed the flag by sending "/help" and blocking on
+    /// `.GetAwaiter().GetResult()` from inside a `task { }` body — a deadlock/latency
+    /// hazard (AGENTS.md: "never use `.Result`/`.Wait()`/`.GetAwaiter().GetResult()` —
+    /// they cause deadlocks"). This DB delete is exactly what "any command clears
+    /// pending feedback" (BotService.fs:89-91) does server-side anyway, without needing
+    /// a live Telegram call at all.
+    let clearPendingFeedbackAsync (userId: int64) : Task =
+        task {
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            do! conn.OpenAsync()
+            let! _ = conn.ExecuteAsync("DELETE FROM pending_feedback WHERE user_id = @user_id", {| user_id = userId |})
+            ()
+        }
+
     /// Covers `/feedback` (CommandHandler.fs:434-436 -> handleFeedback :370-379): arms
     /// the pending flag, the next non-command message is saved (DbService.SaveUserFeedback),
     /// forwarded to every FeedbackAdminIds admin (here: this account itself), and answered
@@ -137,10 +160,27 @@ type AdminAndFeedbackRealTests(fx: RealAssemblyFixture) =
     /// earlier tests/runs left behind), and explicit, deliberate cleanup of both stateful
     /// aliases (/a's add-wizard row, /f's pending-feedback flag) so this test can never
     /// corrupt a later test class in the same serial run (contract, "Isolation model").
+    ///
+    /// Cleanup shape (review Fix 2): F#'s `task { }` computation expression cannot have a
+    /// `let!`/`do!` inside a `try/finally`'s `finally` block, and the previous cleanup
+    /// blocked on `.GetAwaiter().GetResult()` from inside this async body — a
+    /// deadlock/latency hazard (AGENTS.md: never use `.Result`/`.Wait()`/
+    /// `.GetAwaiter().GetResult()`, they cause deadlocks in ASP.NET Core; the same
+    /// applies to any async F# body). Restructured as `try/with` + explicit re-raise
+    /// instead: the happy path runs `cleanupAsync()` inline at the end of `try`, and the
+    /// `with` handler re-runs the SAME (idempotent) cleanup before re-raising — so the
+    /// pending-feedback flag and the add-wizard row are disarmed on every exit path,
+    /// including an assertion throwing partway through, with no blocking wait anywhere.
     [<Fact>]
     member _.``short aliases behave as their canonical commands``() =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
+
+            let cleanupAsync () : Task =
+                task {
+                    do! DbSeed.deletePendingAddFlowAsync fx.DbConnectionString fx.UserClient.Me.id
+                    do! clearPendingFeedbackAsync fx.UserClient.Me.id
+                }
 
             try
                 // /l, /coupons, bare /take all alias handleCoupons (CommandHandler.fs:404-415).
@@ -189,26 +229,18 @@ type AdminAndFeedbackRealTests(fx: RealAssemblyFixture) =
                 // /f -> handleFeedback (CommandHandler.fs:437-439), which arms
                 // SetPendingFeedback. Full /feedback coverage (forward, DB write,
                 // thank-you) lives in its own test above; here we only confirm the alias
-                // reaches handleFeedback — the `finally` below disarms it.
+                // reaches handleFeedback — `cleanupAsync` below disarms it on every exit path.
                 let! fSentId = fx.UserClient.SendText(fx.BotChatId, "/f")
                 let! fReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, fSentId, "Следующее твоё сообщение", TimeSpan.FromSeconds 30.)
                 Assert.Contains("Следующее твоё сообщение", fReply.message)
-            finally
-                // Runs even if an assertion above threw. Both cleanups are idempotent
-                // no-ops if their respective state was already cleared (deletePendingAddFlowAsync
-                // is a plain DELETE; any command unconditionally clears pending feedback —
-                // BotService.fs:89-91), so calling both unconditionally here is safe. Waits
-                // for the disarming /help's own reply (rather than firing-and-forgetting the
-                // send) so the flag is guaranteed cleared server-side before this test method
-                // returns and a later test class can send its own first message.
-                DbSeed.deletePendingAddFlowAsync fx.DbConnectionString fx.UserClient.Me.id
-                |> fun t -> t.GetAwaiter().GetResult()
 
-                let helpSentId =
-                    fx.UserClient.SendText(fx.BotChatId, "/help")
-                    |> fun t -> t.GetAwaiter().GetResult()
-
-                fx.UserClient.AwaitTextContaining(fx.BotChatId, helpSentId, "Команды", TimeSpan.FromSeconds 30.)
-                |> fun t -> t.GetAwaiter().GetResult()
-                |> ignore
+                do! cleanupAsync ()
+            with ex ->
+                // Guarantees the pending-feedback flag and the add-wizard row are
+                // disarmed even when an assertion above threw. `raise ex` rather than
+                // `reraise()`: this handler awaits (`do!`) before re-throwing, and
+                // `reraise()` is only valid synchronously inside the original handler
+                // frame — it would not survive the `await` in a task CE's desugaring.
+                do! cleanupAsync ()
+                raise ex
         })

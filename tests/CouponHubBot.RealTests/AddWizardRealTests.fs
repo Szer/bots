@@ -50,32 +50,24 @@ type private WizardCouponRow =
 ///    workaround (unlike BulkAddRealTests.fs's `bumpItemsToFutureExpiry`) is needed
 ///    here — `addflow:ocr:no` already does the equivalent for the interactive wizard.
 ///
-/// ── `addflow:ocr:yes` is UNREACHABLE as a happy path for these fixtures, left
-/// untested (see individual test docs below for the full citation) ──
+/// ── `addflow:ocr:yes` — reachable only via a documented SQL workaround (see the test
+/// below for the full citation) ──
 /// `addflow:ocr:yes` (CallbackHandler.fs:258-293) calls `TryAddCoupon` directly with
 /// `flow.expires_at.Value` — the OCR-derived date, which for every fixture in this
 /// public repo is deliberately in the past (repo-public constraint, see
 /// AddFlowRealTests.fs's doc comment). `DbService.TryAddCoupon` rejects
 /// `expires_at < todayUtc()` unconditionally (DbService.fs:198-200) BEFORE any DB
-/// write, so `addflow:ocr:yes` against any of these fixtures can only ever reach the
+/// write, so `addflow:ocr:yes` against an UNMODIFIED fixture can only ever reach the
 /// "Нельзя добавить истёкший купон" rejection branch (CallbackHandler.fs:285-287) —
 /// never `AddCouponResult.Added`. There is no photo in this fixture set whose printed
-/// date is in the future (every fixture is intentionally expired), so no happy path
-/// through `addflow:ocr:yes` can be constructed without either (a) publishing a
-/// currently-usable coupon photo (forbidden) or (b) overwriting `pending_add.expires_at`
-/// via direct SQL before pressing "yes" — which would stop exercising what a real user
-/// pressing "yes" on a real OCR-recognized (expired) photo actually experiences, i.e.
-/// it would silently paper over the rejection this task's brief explicitly says not to
-/// hide. Left untested per that instruction.
+/// date is in the future (every fixture is intentionally expired), so the Added-branch
+/// happy path can only be reached by overwriting the PENDING WIZARD ROW's own
+/// `pending_add.expires_at` via direct SQL after OCR lands and before pressing "yes" —
+/// the same trick BulkAddRealTests.fs's `bumpItemsToFutureExpiry` already uses for the
+/// album path's `pending_add_batch_item.expires_at`. See the test below for why this is
+/// safe (it overrides the wizard's OWN staged expiry, not the fixture photo) and why it
+/// must never be "cleaned up".
 type AddWizardRealTests(fx: RealAssemblyFixture) =
-
-    let ru = CultureInfo("ru-RU")
-
-    /// Mirrors Utils.DateFormatting.formatDateNoYearWithDow (Utils.fs:36-37) — the
-    /// exact rendering `BotHelpers.formatUiDate` uses for every date shown in wizard
-    /// screens, so test-side expectations can be built the same way the bot itself
-    /// builds its reply text.
-    let formatUiDate (d: DateOnly) = d.ToString("d MMMM, dddd", ru)
 
     let pollInterval = TimeSpan.FromMilliseconds 500.
 
@@ -149,6 +141,24 @@ type AddWizardRealTests(fx: RealAssemblyFixture) =
                 conn.QuerySingleAsync<WizardCouponRow>(
                     "SELECT id, value, min_check FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
                     {| owner_id = ownerId |})
+        }
+
+    /// No DbSeed.fs helper exists for this (contract: "add it as a private function
+    /// inside your own file" when a shared helper is missing) — overwrites the PENDING
+    /// WIZARD ROW's own `expires_at` (table `pending_add`, column `expires_at` — schema
+    /// confirmed against V6__recreate_pending_add.sql / V7__pending_add_barcode.sql, NOT
+    /// guessed), the same table DbSeed.deletePendingAddFlowAsync already targets. This is
+    /// what makes the `addflow:ocr:yes` test below (Fix 4) reachable — see that test's
+    /// doc comment for the full "why" and the public-repo constraint that makes this SQL
+    /// bump necessary at all.
+    let bumpPendingAddExpiryAsync (userId: int64) (expiresAt: string) : Task =
+        task {
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            let! _ =
+                conn.ExecuteAsync(
+                    "UPDATE pending_add SET expires_at = @expires_at::date WHERE user_id = @user_id",
+                    {| user_id = userId; expires_at = expiresAt |})
+            ()
         }
 
     /// Drives a fresh wizard from a bare "/add" through a bare (caption-less) photo of
@@ -228,34 +238,64 @@ type AddWizardRealTests(fx: RealAssemblyFixture) =
             Assert.Contains($"ID:{coupon.id}", addedMsg.message)
         })
 
-    /// Test 2 (contract item 2): addflow:date:tomorrow. Same chain as test 1 up to the
-    /// date choice, but presses "tomorrow" and asserts the confirm screen reflects
-    /// tomorrow's date — does NOT press addflow:confirm (no DB assertion needed per the
-    /// brief; the wizard is left pending and gets swept by the next test's
-    /// deletePendingAddFlowAsync).
+    /// Test 2 (contract item 2): addflow:date:today vs addflow:date:tomorrow.
+    ///
+    /// Rewritten (review Fix 3 + Fix 1): the original version asserted
+    /// `formatUiDate (DateOnly.FromDateTime(DateTime.UtcNow.AddDays(1.0)))` against the
+    /// confirm screen — a date computed from the TEST PROCESS's own clock, which
+    /// disagrees with the bot's frozen-and-advanceable `FakeTimeProvider` notion of
+    /// "today" whenever the pod booted on the other side of a UTC midnight from this
+    /// process, or after any earlier test in the run advanced the clock. It also never
+    /// pressed `addflow:confirm` or `addflow:cancel`, leaving a pending `pending_add`
+    /// row behind for a different, unrelated test to sweep — an ordering dependency in a
+    /// suite with no guaranteed test order.
+    ///
+    /// This version drives TWO full wizard flows to completion (through
+    /// `addflow:confirm`, one per date button, distinct fixtures so their barcodes never
+    /// collide) and compares the resulting `coupon.expires_at` DB rows directly to each
+    /// other. That proves the RELATIONSHIP ("tomorrow" is exactly one day after "today",
+    /// and the two are different) entirely from the bot's own recorded state — no
+    /// reference to this test process's `DateTime.UtcNow` anywhere in the assertion —
+    /// and each sub-flow reaches `addflow:confirm`, so nothing is left pending afterward.
     [<Fact>]
-    member _.``date:tomorrow reflects tomorrow's date on the confirm screen``() =
+    member _.``date:today and date:tomorrow set different, one-day-apart expiries``() =
         TestRetry.withTimeoutRetry (fun () -> task {
             fx.SkipUnlessUserClient()
 
             let ownerId = fx.UserClient.Me.id
-            do! DbSeed.deletePendingAddFlowAsync fx.DbConnectionString ownerId
-            do! DbSeed.deletePendingBatchesAsync fx.DbConnectionString ownerId
 
-            let! discountMsg = reachDiscountChoice "10_50_01-21_01-30_2706616470579.jpg"
-            do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, discountMsg, (fun d -> d = "addflow:disc:10:50"), "addflow:disc:10:50")
-            let! dateMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, discountMsg.id, "Выбери дату истечения", TimeSpan.FromSeconds 60.)
+            let addViaDateButtonAndGetExpiry (fixtureImage: string) (dateButtonData: string) : Task<DateOnly> =
+                task {
+                    do! DbSeed.deletePendingAddFlowAsync fx.DbConnectionString ownerId
+                    do! DbSeed.deletePendingBatchesAsync fx.DbConnectionString ownerId
 
-            do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, dateMsg, (fun d -> d = "addflow:date:tomorrow"), "addflow:date:tomorrow")
-            let! confirmMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, dateMsg.id, "Подтвердить добавление купона", TimeSpan.FromSeconds 60.)
+                    let barcode = RealTestHelpers.fixtureBarcodes.[fixtureImage]
+                    do! DbSeed.deleteCouponsByBarcodeAsync fx.DbConnectionString barcode
 
-            // The wizard's "tomorrow" is computed from the bot pod's own (frozen at
-            // boot, unless BOT_FIXED_UTC_NOW is set — Program.fs:111-122) TimeProvider,
-            // not this test process's clock; a midnight-UTC-boundary mismatch between
-            // the two is a known, accepted flake risk for this specific assertion (see
-            // final report).
-            let tomorrow = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(1.0))
-            Assert.Contains(formatUiDate tomorrow, confirmMsg.message)
+                    let! discountMsg = reachDiscountChoice fixtureImage
+                    do!
+                        fx.UserClient.PressCallbackButtonMatching(
+                            fx.BotChatId, discountMsg, (fun d -> d = "addflow:disc:10:50"), "addflow:disc:10:50")
+                    let! dateMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, discountMsg.id, "Выбери дату истечения", TimeSpan.FromSeconds 60.)
+
+                    do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, dateMsg, (fun d -> d = dateButtonData), dateButtonData)
+                    let! confirmMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, dateMsg.id, "Подтвердить добавление купона", TimeSpan.FromSeconds 60.)
+
+                    do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, confirmMsg, (fun d -> d = "addflow:confirm"), "addflow:confirm")
+                    let! _addedMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, confirmMsg.id, "Добавлен купон ID:", TimeSpan.FromSeconds 60.)
+
+                    use conn = new NpgsqlConnection(fx.DbConnectionString)
+                    return!
+                        conn.QuerySingleAsync<DateOnly>(
+                            "SELECT expires_at FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
+                            {| owner_id = ownerId |})
+                }
+
+            let! todayExpiry = addViaDateButtonAndGetExpiry "10_50_01-12_01-21_2706513420233.jpg" "addflow:date:today"
+            let! tomorrowExpiry = addViaDateButtonAndGetExpiry "10_50_01-12_01-21_2706530490622.jpg" "addflow:date:tomorrow"
+
+            Assert.Equal(todayExpiry.AddDays(1), tomorrowExpiry)
+            Assert.NotEqual(todayExpiry, tomorrowExpiry)
         })
 
     /// Test 3 (contract item 3): addflow:cancel. Reaches the confirm screen, cancels,
@@ -317,6 +357,79 @@ type AddWizardRealTests(fx: RealAssemblyFixture) =
                 do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, confirmMsg, (fun d -> d = "addflow:cancel"), "addflow:cancel")
                 let! _cancelReply = fx.UserClient.AwaitTextContaining(fx.BotChatId, confirmMsg.id, "Ок, добавление купона отменено.", TimeSpan.FromSeconds 60.)
                 ()
+        })
+
+    /// Test 5 (Fix 4, review follow-up): addflow:ocr:yes. Previously untestable as a
+    /// happy path — see class doc comment — because `addflow:ocr:yes`
+    /// (CallbackHandler.fs:258-293) calls `TryAddCoupon` with the wizard's OWN staged
+    /// `expires_at`, which for a bare (caption-less) photo of any fixture in this public
+    /// repo is OCR's own PRINTED date, always in the past (repo-public constraint: a
+    /// fixture with a future printed date would be a currently-usable, live coupon
+    /// barcode). `DbService.TryAddCoupon` rejects `expires_at < todayUtc()` unconditionally
+    /// (DbService.fs:198-200) before any DB write.
+    ///
+    /// WHY THE SQL BUMP BELOW EXISTS — READ BEFORE "CLEANING THIS UP": fixture photos
+    /// must stay expired forever (public-repo constraint above), so the printed date OCR
+    /// reads off them can never be future. `bumpPendingAddExpiryAsync` overwrites only
+    /// the PENDING WIZARD ROW's staged `pending_add.expires_at` (the value
+    /// `addflow:ocr:yes` will hand to `TryAddCoupon`), not the fixture photo itself — the
+    /// same "override the DB row that gates TryAddCoupon, never the photo"
+    /// trick BulkAddRealTests.fs's `bumpItemsToFutureExpiry` already uses for the album
+    /// path's `pending_add_batch_item.expires_at`. Without this bump, `addflow:ocr:yes`
+    /// can only ever be exercised against the "Нельзя добавить истёкший купон" rejection
+    /// branch — this bump is the only way to reach `AddCouponResult.Added` through this
+    /// specific button without publishing a live barcode. Removing it "as unnecessary
+    /// scaffolding" would silently regress this test back to only covering rejection.
+    [<Fact>]
+    member _.``addflow:ocr:yes adds a coupon using OCR's own value/min-check once the staged expiry is future``() =
+        TestRetry.withTimeoutRetry (fun () -> task {
+            fx.SkipUnlessUserClient()
+
+            let ownerId = fx.UserClient.Me.id
+            do! DbSeed.deletePendingAddFlowAsync fx.DbConnectionString ownerId
+            do! DbSeed.deletePendingBatchesAsync fx.DbConnectionString ownerId
+
+            let fixtureImage = "10_50_01-04_01-13_2706602781191.jpg"
+            let barcode = RealTestHelpers.fixtureBarcodes.[fixtureImage]
+            do! DbSeed.deleteCouponsByBarcodeAsync fx.DbConnectionString barcode
+
+            let imagePath = Path.Combine(RealEnv.ocrFixtureImagesDir, fixtureImage)
+            Assert.True(File.Exists imagePath, $"Expired-coupon fixture missing: {imagePath}")
+
+            let! addSentId = fx.UserClient.SendText(fx.BotChatId, "/add")
+            let! _askPhoto = fx.UserClient.AwaitTextContaining(fx.BotChatId, addSentId, "Пришли фото", TimeSpan.FromSeconds 60.)
+
+            let! photoSentId = fx.UserClient.SendPhoto(fx.BotChatId, imagePath, "")
+            // Real Azure OCR call happens synchronously inside HandleAddWizardPhoto —
+            // same 90s budget reachDiscountChoice/AddFlowRealTests.fs give this round trip.
+            let! ocrConfirmMsg =
+                fx.UserClient.AwaitTextContaining(fx.BotChatId, photoSentId, "Всё верно?", TimeSpan.FromSeconds 90.)
+
+            // Bump the staged wizard row's expiry PAST TryAddCoupon's expiry gate — see
+            // this test's doc comment for why this (and never touching the fixture
+            // photo itself) is the correct and only way to reach the Added branch.
+            let futureDate = RealTestHelpers.futureExpiry 365.
+            do! bumpPendingAddExpiryAsync ownerId futureDate
+
+            do! fx.UserClient.PressCallbackButtonMatching(fx.BotChatId, ocrConfirmMsg, (fun d -> d = "addflow:ocr:yes"), "addflow:ocr:yes")
+            let! addedMsg = fx.UserClient.AwaitTextContaining(fx.BotChatId, ocrConfirmMsg.id, "Добавлен купон ID:", TimeSpan.FromSeconds 60.)
+
+            let! coupon = latestCouponForOwner ownerId
+            // OCR-derived value/min_check for this fixture — reliably 10/50, per the
+            // filename convention and OcrTests.fs's own theory case for this exact file
+            // (class doc comment: all 16 "good" fixtures OCR value+min_check+valid_to
+            // reliably).
+            Assert.Equal(10m, coupon.value)
+            Assert.Equal(50m, coupon.min_check)
+            Assert.Contains($"ID:{coupon.id}", addedMsg.message)
+
+            use conn = new NpgsqlConnection(fx.DbConnectionString)
+            let! couponRow =
+                conn.QuerySingleAsync<CouponRow>(
+                    "SELECT id, value, min_check, expires_at, barcode_text FROM coupon WHERE id = @coupon_id",
+                    {| coupon_id = coupon.id |})
+            Assert.Equal(DateOnly.ParseExact(futureDate, "yyyy-MM-dd", CultureInfo.InvariantCulture), couponRow.expires_at)
+            Assert.Equal(barcode, couponRow.barcode_text)
         })
 
     /// Test 6 (contract item 6): addflow:bulk:cancel:<batchId>. Album mechanics copied
