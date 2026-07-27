@@ -105,6 +105,17 @@ module RealEnv =
     let getVarOr (key: string) (defaultValue: string) =
         getVar key |> Option.defaultValue defaultValue
 
+    /// Explicit opt-in required IN ADDITION to credentials before RealAssemblyFixture
+    /// does anything real (Telegram). Deliberately process-env-only — never read from
+    /// ~/.coupon-test/env — so the opt-in can never get "cached" alongside credentials
+    /// and silently re-enable a real-money run on some future plain `dotnet test`; it
+    /// must be set fresh, on purpose, for each invocation that means to spend real
+    /// money. See RealAssemblyFixture.SkipUnlessCore.
+    let realTestsOptedIn () =
+        match Environment.GetEnvironmentVariable "COUPON_REAL_TESTS" with
+        | null -> false
+        | v -> v.Trim() = "1"
+
     let load () =
         { Mode = getVarOr "COUPON_REAL_MODE" "local"
           TestBotUsername = getVarOr "COUPON_TEST_BOT_USERNAME" ""

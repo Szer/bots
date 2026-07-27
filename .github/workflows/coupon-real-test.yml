@@ -424,6 +424,10 @@ jobs:
 
     - name: Run real-Telegram suite
       env:
+        # Explicit opt-in required in addition to credentials (RealAssemblyFixture.fs)
+        # — this workflow is the one deliberate, workflow_dispatch-only path that is
+        # meant to set it. Never set this for any other job/workflow.
+        COUPON_REAL_TESTS: "1"
         COUPON_REAL_MODE: remote
         COUPON_TEST_BOT_USERNAME: ${{ secrets.COUPON_CI_BOT_USERNAME }}
         COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}

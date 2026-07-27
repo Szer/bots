@@ -57,6 +57,13 @@ type RealAssemblyFixture() =
 
     let env = RealEnv.load ()
 
+    /// Explicit opt-in gate, checked BEFORE env.HasCore everywhere below — see
+    /// RealEnv.realTestsOptedIn's doc comment. This is the one choke point: as long
+    /// as InitializeAsync's real setup and every SkipUnlessCore/SkipUnlessUserClient
+    /// call both branch on this same value, no test in this assembly can reach a real
+    /// Telegram/LLM call without it.
+    let optedIn = RealEnv.realTestsOptedIn ()
+
     let mutable tunnel: NgrokTunnel option = None
     let mutable bot: BotProcess option = None
     let mutable webhook: TelegramWebhook option = None
@@ -78,7 +85,10 @@ type RealAssemblyFixture() =
         | None -> failwith "user client is not up — call SkipUnlessUserClient() first"
 
     member _.SkipUnlessCore() =
-        if not env.HasCore then
+        if not optedIn then
+            Assert.Skip
+                "real-money tests opted out: set ALITA_REAL_TESTS=1 to run this project. It drives a real Telegram MTProto session and real paid LLM/image/voice calls (Azure/Gemini) — reserved for deliberate feature work or the workflow_dispatch-only alita-real-test.yml, never for an unattended `dotnet test`."
+        elif not env.HasCore then
             Assert.Skip
                 $"core credentials missing in {RealEnv.envFilePath} (ngrok domain / bot token / username / webhook secret / chat id)"
 
@@ -92,7 +102,13 @@ type RealAssemblyFixture() =
     interface IAsyncLifetime with
         member _.InitializeAsync() : ValueTask =
             task {
-                if env.HasCore then
+                // optedIn gates ALL real setup below, ahead of (and independent of)
+                // env.HasCore — this is what actually prevents a real Telegram/LLM
+                // call from happening at all when ALITA_REAL_TESTS is unset, even
+                // though credentials are fully present (~/.alita-test/env). Every
+                // individual test's own SkipUnlessCore/SkipUnlessUserClient check is
+                // belt-and-braces on top of this, not the primary guard.
+                if optedIn && env.HasCore then
                     if not env.IsRemote then
                         do! DevDb.upAsync ()
 
