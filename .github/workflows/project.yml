@@ -111,6 +111,47 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+    # Guards against run 30241204433 (2026-07-27): every step exited 0, the
+    # orchestration issue was created and auto-closed, but the agent never
+    # made its required `gh issue comment` summary call — a silent no-op
+    # that is indistinguishable from a genuine clean day. See
+    # .github/AGENT-FLOWS-REDESIGN.md §1. This step only asserts PRESENCE of
+    # an agent-authored comment, never its content — a legitimate clean-day
+    # summary must still pass.
+    - name: Assert agent posted a summary
+      id: assert-agent-output
+      if: always() && steps.create-issue.outputs.issue_number
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ISSUE_NUMBER: ${{ steps.create-issue.outputs.issue_number }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        COMMENTS_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "${{ github.repository }}" --json comments)
+        # The agent posts its summary through the same GH_TOKEN identity as
+        # this workflow's own automated comments (cleanup's stale-issue
+        # auto-close, the "Close orchestration issue" step below, and this
+        # step's own recorded-silence comment), so comment author cannot
+        # distinguish "agent" from "workflow" here -- only the fixed
+        # boilerplate text of the workflow's own comments can. Anything that
+        # does not match one of those known prefixes must have come from
+        # the agent.
+        AGENT_COMMENTS=$(echo "$COMMENTS_JSON" | jq '[.comments[] | select(
+          ((.body | startswith("Orchestration issue auto-closed")) or
+           (.body | startswith("**Auto-closed by cleanup.**")) or
+           (.body | startswith("**Agent produced no summary.**"))) | not
+        )]')
+        COUNT=$(echo "$AGENT_COMMENTS" | jq 'length')
+        if [ "$COUNT" -gt 0 ]; then
+          echo "PASS: agent posted $COUNT non-workflow comment(s) on orchestration issue #$ISSUE_NUMBER."
+          echo "agent_posted=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "FAIL: agent produced no summary comment on orchestration issue #$ISSUE_NUMBER."
+          gh issue comment "$ISSUE_NUMBER" --repo "${{ github.repository }}" \
+            --body "**Agent produced no summary.** The project agent's run finished without posting the required summary comment (see \`.github/prompts/project.md\`: \"Your final tool call should always be the \`gh issue comment\` that posts the summary\"). Recording this run as a failure, not a clean day. Workflow run: ${RUN_URL}"
+          echo "agent_posted=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Close orchestration issue
       if: always() && steps.create-issue.outputs.issue_number
       env:
@@ -118,3 +159,20 @@ jobs:
       run: |
         gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
           --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    # Placed AFTER the close step (rather than exiting 1 directly in the
+    # assert step above) so the orchestration issue is always closed
+    # regardless of outcome -- a failed run must not leave the issue open
+    # for the next cleanup job to also complain about. `if: always()` makes
+    # this run even if an earlier step in the job failed outright.
+    - name: Fail run if agent produced no summary
+      if: always() && steps.create-issue.outputs.issue_number
+      env:
+        AGENT_POSTED: ${{ steps.assert-agent-output.outputs.agent_posted }}
+      run: |
+        set -euo pipefail
+        if [ "$AGENT_POSTED" != "true" ]; then
+          echo "::error::Project agent produced no summary comment this run -- see the recorded-silence comment on the orchestration issue. Failing the run so a silent no-op is never indistinguishable from a green clean-day run."
+          exit 1
+        fi
+        echo "Agent posted a summary comment -- run considered successful."
