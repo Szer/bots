@@ -2,12 +2,10 @@
 open System
 open System.Diagnostics
 open System.Globalization
-open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
-open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Time.Testing
@@ -19,50 +17,6 @@ open BotInfra
 open BotInfra.DbSettings
 
 type Root = class end
-
-// ============================================================================
-// DRILL 3 (2026-07-27) — DELIBERATE, OWNER-AUTHORIZED SRE-AGENT VALIDATION DRILL.
-// See the PR titled "DRILL 3 (revert after): ..." for the owner's authorization and the
-// full rationale. This is the third drill in the series: #298/#302 was a STARTUP failure
-// (correctly did not trigger a rollback, old pod kept serving); #303/#304 was a RUNTIME
-// failure of this same shape, but every emitted log line contained the literal token
-// SRE_DRILL_RUNTIME_FAILURE plus the words "deliberate"/"drill"/"must be reverted" — the
-// monitor agent read those words in the log text itself and filed nothing while AlitaBot
-// was completely dead (six defects in the detection pipeline were found and fixed in #307).
-// This drill re-tests those fixes, so the RUNTIME LOG TEXT BELOW IS DELIBERATELY DISGUISED
-// to read like an ordinary, undramatic application bug — it must never contain "drill",
-// "SRE_DRILL", "intentional", or "revert". This source comment (never shipped to Loki) is
-// the only place in this change that says so out loud.
-// `PendingUsageFlushLoop` is a hosted background loop (registered below, gated on
-// `not TestMode`) that ticks every 15s and logs an Error on every tick — deliberately
-// traffic-independent so `verify-deploy.sh`'s Loki `level=~"Error|Fatal"` window catches it
-// even with zero inbound Telegram traffic (AlitaBot is dormant and can go days between
-// updates in its only chat, the owner's staging chat).
-// THIS IS NOT A REAL BUG. REVERT IMMEDIATELY AFTER THE DRILL — `git revert` this commit.
-// ============================================================================
-type PendingUsageFlushLoop(time: TimeProvider, logger: ILogger<PendingUsageFlushLoop>) =
-    inherit BackgroundService()
-
-    override _.ExecuteAsync(ct: CancellationToken) =
-        task {
-            use timer = new PeriodicTimer(TimeSpan.FromSeconds 15.0, time)
-            while! timer.WaitForNextTickAsync(ct) do
-                try
-                    // DRILL 3 (2026-07-27): DELIBERATE, OWNER-AUTHORIZED SRE-AGENT
-                    // VALIDATION DRILL — see the module-level comment above this type.
-                    // THIS IS NOT A REAL BUG. REVERT IMMEDIATELY AFTER THE DRILL (`git
-                    // revert` this commit). The exception raised below is a plain, unguarded
-                    // `Seq.head` on an empty sequence — a realistic "forgot to check for the
-                    // empty case" bug shape, with no drill-identifying text anywhere in its
-                    // type name or message, so the resulting Loki line reads like a genuine
-                    // unguarded-empty-queue bug in a usage-flush tick.
-                    let pendingUsageRecordIds: int64 list = []
-                    let nextRecordId = Seq.head pendingUsageRecordIds
-                    logger.LogDebug("Flushing buffered usage record {RecordId}", nextRecordId)
-                with ex ->
-                    logger.LogError(ex, "Usage flush tick failed while flushing pending LLM usage records")
-        }
-        :> Task
 
 let connString = getEnv "DATABASE_URL"
 
@@ -287,17 +241,6 @@ if botConfOptions.Value.TestMode then
             sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
     .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
 
-// DRILL 3 (2026-07-27): DELIBERATE, OWNER-AUTHORIZED SRE-AGENT VALIDATION DRILL — only
-// registered when not TestMode, see the module-level comment above `PendingUsageFlushLoop`'s
-// definition. Gating on registration (rather than inside ExecuteAsync) keeps this hosted
-// service, and its PeriodicTimer, entirely absent under TEST_MODE, including in
-// tests/AlitaBot.Tests (which freezes TimeProvider via FakeTimeProvider and never advances
-// it across an assembly run — a registered-but-inert timer there would simply never fire,
-// but not registering it at all is simpler and safer).
-// THIS IS NOT A REAL BUG. REVERT IMMEDIATELY AFTER THE DRILL — `git revert` this commit.
-if not botConfOptions.Value.TestMode then
-    %builder.Services.AddHostedService<PendingUsageFlushLoop>()
-
 let app = builder.Build()
 
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
@@ -374,18 +317,6 @@ WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx raw
         JsonLogging.withRawJsonProperty "RawUpdate" rawBody (fun () ->
             logger.LogInformation("Received Telegram update {UpdateId}", update.UpdateId))
         try
-            // DRILL 3 (2026-07-27): DELIBERATE, OWNER-AUTHORIZED SRE-AGENT VALIDATION
-            // DRILL — see the module-level comment above `PendingUsageFlushLoop` (Telegram
-            // update handling is broken here too, so real Telegram traffic also fails, not
-            // just the background loop above; this is secondary — the loop is what actually
-            // gets detected on a dormant bot). THIS IS NOT A REAL BUG. REVERT IMMEDIATELY
-            // AFTER THE DRILL (`git revert` this commit). The exception below is a plain,
-            // unguarded null dereference with no drill-identifying text anywhere, so the
-            // resulting Loki line (via the existing catch block below) reads like a genuine
-            // null-reference bug in update handling.
-            if not botConfOptions.Value.TestMode then
-                let senderDisplayName: string = null
-                %(senderDisplayName.Length)
             let bot = ctx.RequestServices.GetRequiredService<BotService>()
             do! bot.OnUpdate(update)
             %topActivity.SetTag("update-error", false)
