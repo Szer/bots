@@ -208,11 +208,21 @@ jobs:
           # history" jq, which reads the same fields plus `initiatedBy`);
           # the full entry is also included as raw JSON so nothing is lost
           # if it carries other fields (e.g. `source`) we didn't name here.
+          #
+          # ONE fetch only (probe_optional_body, not probe_optional +
+          # a second curl for the real body): a second, unguarded curl here
+          # under this step's `set -e`/`pipefail` would abort the ENTIRE
+          # gather loop — including every bot processed after this one — on
+          # a transient failure even though the probe itself just succeeded.
+          # That silently starves later bots' change_context_manifest.json,
+          # which is exactly the "emitted no valid manifest" guard fallback
+          # (fixed 2026-07-27 — see probe_optional_body() in lib.sh).
           SOURCE_DIR="$(bot_field "$bot" '.source_dir')"
           APP_NAME="$(bot_field "$bot" '.argocd_app')"
           APP_PATH="/api/v1/applications/${APP_NAME}"
+          APP_JSON_FILE="/tmp/evidence/${bot}.argocd_app.json"
 
-          ARGOCD_HISTORY_STATUS=$(probe_optional "argocd_history" curl -sSf --connect-timeout 5 --max-time 20 \
+          ARGOCD_HISTORY_STATUS=$(probe_optional_body "argocd_history" "$APP_JSON_FILE" curl -sSf --connect-timeout 5 --max-time 20 \
               "${ARGOCD_URL}${APP_PATH}" -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}") || true
           jq -cn --arg s "$ARGOCD_HISTORY_STATUS" '{argocd_history: $s}' > "/tmp/evidence/${bot}.change_context_manifest.json"
 
@@ -222,14 +232,12 @@ jobs:
             echo
             echo "### ArgoCD deploy history (preceding 72h, OPTIONAL source — see monitor.md)"
             if [ "$ARGOCD_HISTORY_STATUS" = "ok" ]; then
-              curl -sSf --connect-timeout 5 --max-time 20 "${ARGOCD_URL}${APP_PATH}" \
-                -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
-                | jq -r --arg since "$START_72H" '
-                    [.status.history[]? | select(.deployedAt >= $since)]
-                    | if length == 0 then "(none in the last 72h)"
-                      else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt) raw=\(. | tojson)"
-                      end
-                  '
+              jq -r --arg since "$START_72H" '
+                  [.status.history[]? | select(.deployedAt >= $since)]
+                  | if length == 0 then "(none in the last 72h)"
+                    else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt) raw=\(. | tojson)"
+                    end
+                ' "$APP_JSON_FILE"
             else
               echo "UNKNOWN: ArgoCD deploy history was unavailable this run (${ARGOCD_HISTORY_STATUS})."
               echo "This is NOT evidence that no deploy occurred — it only means we could not check. Do not treat the absence of entries above as \"no recent deploy\"; rely on the git-log section above for change correlation and say explicitly in your summary that deploy history was unavailable."
