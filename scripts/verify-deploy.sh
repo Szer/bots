@@ -211,6 +211,7 @@ while [ "$grace_elapsed" -lt "$GRACE" ]; do
             summary "- **Time to Healthy:** ${grace_elapsed}s (within ${GRACE}s grace period)"
             summary ""
             healthy=true
+            READY_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
             break
         fi
     else
@@ -253,15 +254,71 @@ if [ "$healthy" = false ]; then
     summary "- **Health Status:** Healthy"
     summary "- **Time to Healthy:** ${GRACE}s (at end of grace period)"
     summary ""
+    READY_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 fi
+
+# ─── Settle: let the NEW pod actually emit logs before Phase 3 samples ───────
+#
+# ArgoCD's Health=Healthy reflects the readiness probe passing — that can
+# (and did, 2026-07-26) happen well before the new pod has run a single
+# application-loop tick. Phase 3 used to sample Loki immediately after Phase
+# 2 passed, while the OLD pod could still be up and serving during the tail
+# of the rollout — a genuinely broken deploy (a background loop throwing
+# every 15s + a throwing Telegram update handler, drill run 30259908859)
+# went entirely undetected because Phase 3's query ran and PASSED before the
+# new pod emitted its first error at 11:02:44.
+#
+# SETTLE_DELAY default: 45s = 3x the drill's 15s failing-loop period, so at
+# least two full iterations of a periodic background failure have time to
+# both fire AND propagate through the scrape+ship pipeline (Alloy/Promtail
+# scrape interval is typically 10-15s on this cluster, plus a few seconds of
+# Loki ingestion lag) before Phase 3 samples. Override via LOKI_SETTLE_DELAY
+# for a slower log pipeline.
+SETTLE_DELAY="${LOKI_SETTLE_DELAY:-45}"
+log "Settling ${SETTLE_DELAY}s after readiness before sampling Loki (new pod needs time to log)..."
+sleep "$SETTLE_DELAY"
+
+# ─── Identify the NEW pod(s) so Phase 3 doesn't sample the OLD ReplicaSet ────
+#
+# {container="..."} alone matches every pod carrying that container label,
+# old and new — Kubernetes/ArgoCD keep the old ReplicaSet's pod(s) briefly
+# during a rolling update, so a broad selector can (and did) sample the OLD,
+# still-healthy pod and pass. Scope to pods whose running image actually
+# contains EXPECTED_IMAGE_TAG, using the same resource-tree endpoint the SRE
+# runbook already uses to tell old/new pods apart (see .github/prompts/sre.md
+# "Check if old replicas are still serving" — `ResourceNode.images` is
+# populated by ArgoCD for Pod nodes).
+NEW_POD_NAMES=""
+TREE_RESPONSE=$(curl -sS -m 15 -w $'\n%{http_code}' \
+    "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/resource-tree" -H "${AUTH_HEADER}" 2>/dev/null || echo $'\n000')
+TREE_CODE="${TREE_RESPONSE##*$'\n'}"
+TREE_BODY="${TREE_RESPONSE%$'\n'*}"
+if [ "$TREE_CODE" = "200" ] && echo "$TREE_BODY" | jq -e . >/dev/null 2>&1; then
+    NEW_POD_NAMES=$(echo "$TREE_BODY" | jq -r --arg tag "$EXPECTED_IMAGE_TAG" '
+        [.nodes[]? | select(.kind == "Pod") | select((.images // []) | any(contains($tag))) | .name]
+        | join("|")
+    ' 2>/dev/null || echo "")
+fi
+
+if [ -n "$NEW_POD_NAMES" ]; then
+    log "  Scoped Phase 3 Loki query to new pod(s) running ${EXPECTED_IMAGE_TAG:0:12}...: ${NEW_POD_NAMES}"
+    POD_SELECTOR=", pod=~\"${NEW_POD_NAMES}\""
+else
+    log "  WARN: could not identify new pod(s) from ArgoCD resource-tree (HTTP ${TREE_CODE}) — falling back to the broad container selector; Phase 3 may sample old-pod logs too"
+    POD_SELECTOR=""
+fi
+summary "- **Phase 3 Loki pod scope:** ${NEW_POD_NAMES:-"(fallback: broad container selector — could not resolve new pod from resource-tree)"}"
 
 # ─── Phase 3: Verify logs and metrics ────────────────────────────────────────
 
 log "Phase 3: Checking Loki for error-level logs..."
 
-# Query Loki for errors in the last 2 minutes
-START=$(date -u -d '2 minutes ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-2M +%Y-%m-%dT%H:%M:%SZ)
-LOKI_QUERY="{container=\"${CONTAINER}\"} | json | level=~\"Error|Fatal\""
+# Sample from the moment the pod was confirmed Healthy (READY_AT), not a
+# rolling "N minutes ago from now" — combined with the settle delay and pod
+# scoping above, this guarantees the window starts no earlier than readiness
+# and only covers the new pod.
+START="$READY_AT"
+LOKI_QUERY="{container=\"${CONTAINER}\"${POD_SELECTOR}} | json | level=~\"Error|Fatal\""
 
 LOKI_RESPONSE=$(curl -sf -G "${LOKI_URL}/loki/api/v1/query_range" \
     --data-urlencode "query=${LOKI_QUERY}" \
