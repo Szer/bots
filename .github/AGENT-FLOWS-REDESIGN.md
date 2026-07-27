@@ -282,9 +282,30 @@ Loki/Prometheus rather than waiting a month for baselines to warm up.
 
 ### 3.4 Deploy annotations
 
-Add one step to `_bot-deploy.yml`: POST a Grafana annotation on every successful sync,
-tagged `deploy`, `bot:<name>`, `sha:<short>`. Cost: one curl. Payoff: change correlation
-becomes a query instead of a manual `git log`, and every dashboard gets deploy markers.
+**Change correlation does NOT depend on this.** Verified 2026-07-27: the bots repo has no
+Grafana/Loki/Prometheus secret (`gh secret list` — only `ARGOCD_AUTH_TOKEN` and the Azure
+pair). Rather than block Phase 2 on a credential only the owner can create, change
+correlation reads from two sources that already work:
+
+- **ArgoCD deploy history** — `GET /api/v1/applications/<app>/history`, using the existing
+  `ARGOCD_AUTH_TOKEN`.
+- **`git log` on `main`** filtered to the bot's `source_dir`.
+
+That covers the "did something ship right before this shifted?" question completely.
+
+Grafana annotations remain a genuine nice-to-have — they put deploy markers on every
+dashboard and make correlation a single query — but they are **optional and additive**. They
+need a Grafana token added as a repo secret, which is the owner's action:
+
+```bash
+# run from a shell where GRAFANA_SERVICE_ACCOUNT_TOKEN is set (it is, in the my-infra env)
+gh secret set GRAFANA_API_TOKEN --repo Szer/bots --body "$GRAFANA_SERVICE_ACCOUNT_TOKEN"
+gh secret set GRAFANA_URL      --repo Szer/bots --body "<grafana base url>"
+```
+
+Once those exist, add a single `if: success()` step to `_bot-deploy.yml` POSTing to
+`/api/annotations` with tags `deploy`, `bot:<name>`, `sha:<short>`. Until then, Phase 2 uses
+ArgoCD history and is not blocked.
 
 ### 3.5 Fix the SRE trigger
 
