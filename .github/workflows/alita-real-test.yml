@@ -217,6 +217,10 @@ jobs:
 
     - name: Run real-Telegram suite
       env:
+        # Explicit opt-in required in addition to credentials (RealAssemblyFixture.fs)
+        # — this workflow is the one deliberate, workflow_dispatch-only path that is
+        # meant to set it. Never set this for any other job/workflow.
+        ALITA_REAL_TESTS: "1"
         ALITA_REAL_MODE: remote
         ALITA_WEBHOOK_PUBLIC_URL: ${{ env.PUBLIC_URL }}/bot
         # Exercise the LLM path (incl. vision) rather than the echo walking

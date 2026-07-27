@@ -59,6 +59,13 @@ type RealAssemblyFixture() =
 
     let env = RealEnv.load ()
 
+    /// Explicit opt-in gate, checked BEFORE env.HasCore everywhere below — see
+    /// RealEnv.realTestsOptedIn's doc comment. This is the one choke point: as long
+    /// as InitializeAsync's real setup and every SkipUnlessCore/SkipUnlessUserClient
+    /// call both branch on this same value, no test in this assembly can reach a real
+    /// Telegram call without it.
+    let optedIn = RealEnv.realTestsOptedIn ()
+
     let mutable userClient: TgUserClient option = None
     let mutable botChatId: int64 = 0L
 
@@ -81,7 +88,10 @@ type RealAssemblyFixture() =
         botChatId
 
     member _.SkipUnlessCore() =
-        if not env.HasCore then
+        if not optedIn then
+            Assert.Skip
+                "real-money tests opted out: set COUPON_REAL_TESTS=1 to run this project. It drives a real Telegram MTProto session against a live bot — reserved for deliberate feature work or the workflow_dispatch-only coupon-real-test.yml, never for an unattended `dotnet test`."
+        elif not env.HasCore then
             Assert.Skip
                 $"core config missing in {RealEnv.envFilePath} (bot username / chat id / base url / auth token / db url)"
 
@@ -146,7 +156,13 @@ type RealAssemblyFixture() =
     interface IAsyncLifetime with
         member _.InitializeAsync() : ValueTask =
             task {
-                if env.HasUserClient then
+                // optedIn gates ALL real setup below, ahead of (and independent of)
+                // env.HasUserClient — this is what actually prevents a real Telegram
+                // call from happening at all when COUPON_REAL_TESTS is unset, even
+                // though credentials are fully present (~/.coupon-test/env). Every
+                // individual test's own SkipUnlessCore/SkipUnlessUserClient check is
+                // belt-and-braces on top of this, not the primary guard.
+                if optedIn && env.HasUserClient then
                     let c = new TgUserClient(env.TgApiId, env.TgApiHash, env.TgSessionPath, env.TgPhone)
                     let! me = c.LoginAsync()
                     userClient <- Some c

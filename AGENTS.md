@@ -61,12 +61,23 @@ scripts/
 
 ## Testing
 
-- Run tests: `dotnet test -c Release`
+- Run tests: `dotnet test -c Release`. **This is safe by default at the solution level** — it never spends real money, even on a machine where `~/.alita-test/env` / `~/.coupon-test/env` are fully populated with working credentials. See "Real/paid tests" below for why.
 - Run specific bot tests: `dotnet test tests/VahterBanBot.Tests -c Release` or `dotnet test tests/CouponHubBot.Tests -c Release`
 - When tests fail, check container logs in `test-artifacts/<ProjectName>/<Fixture>/` (app.log, postgres.log, flyway.log)
 - **Prefer black-box integration tests** — send HTTP to bot pod, observe behavior (messages sent/deleted, bans applied). Do NOT write unit tests against internal implementation.
 - Tests use xUnit v3 with assembly fixtures and Testcontainers (PostgreSQL, Flyway, FakeTgApi, bot)
 - When debugging runtime errors, write a minimal repro test FIRST, then fix. Don't exhaustively query databases.
+
+### Real/paid tests — explicit opt-in required, never automated
+
+`tests/AlitaBot.RealTests` and `tests/CouponHubBot.RealTests` drive a **real Telegram MTProto session** and **real paid LLM/OCR backends** (Azure AI Foundry, Gemini, Azure OCR). Every test in each project skips unless BOTH are true:
+
+1. Credentials are present (`~/.alita-test/env` / `~/.coupon-test/env`).
+2. The project's opt-in env var is explicitly set: `ALITA_REAL_TESTS=1` / `COUPON_REAL_TESTS=1`.
+
+Credential presence alone is deliberately **not** enough — a machine with a fully populated `~/.alita-test/env` (the normal state on a maintainer's dev box) must still see `dotnet test -c Release` at the solution level skip every real test, with zero real Telegram/LLM calls made. This was a real incident: a plain solution-wide `dotnet test` burned real API cost (~$6/day incident) because credential presence was the only gate. The opt-in check happens once, in each project's `RealAssemblyFixture` (`SkipUnlessCore`/`InitializeAsync`), not per-test — do not add per-test gating, and do not bypass the fixture.
+
+These tests are for **deliberate feature work and manual dev-iteration only** (`make real-test` / `make coupon-real-test`, which set the opt-in var themselves) or the two `workflow_dispatch`-only CI workflows (`alita-real-test.yml`, `coupon-real-test.yml`), which also set it. **Agents/automation must never set `ALITA_REAL_TESTS` or `COUPON_REAL_TESTS`** — if a task seems to call for running the real suites, stop and ask a human rather than opting in yourself.
 
 ## Database
 

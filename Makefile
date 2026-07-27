@@ -8,6 +8,11 @@
 # suite against a real AKS deployment (.github/workflows/alita-real-test.yml) is a
 # separate, manual `gh workflow run alita-real-test.yml --ref <branch>` — not part of
 # this loop and not run per-PR.
+# `real-test` sets ALITA_REAL_TESTS=1 itself — RealAssemblyFixture.fs requires this
+# explicit opt-in IN ADDITION to credentials, so a bare `dotnet test` (solution-wide
+# or on this project alone) always skips every test here even when ~/.alita-test/env
+# is fully populated. Do not set ALITA_REAL_TESTS anywhere other than this target and
+# alita-real-test.yml's dispatch-only job.
 
 # `docker` may be a shell alias for podman (not visible to make) — pick the real binary.
 DOCKER     ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
@@ -28,7 +33,7 @@ alita-test:
 	dotnet test tests/AlitaBot.Tests -c Release
 
 real-test: alita-db alita-build
-	dotnet test tests/AlitaBot.RealTests -c Release $(if $(REAL_FILTER),--filter "$(REAL_FILTER)",)
+	ALITA_REAL_TESTS=1 dotnet test tests/AlitaBot.RealTests -c Release $(if $(REAL_FILTER),--filter "$(REAL_FILTER)",)
 
 selfcheck: alita-db alita-build
 	dotnet run --project tests/AlitaBot.RealTests -c Release -- selfcheck
@@ -64,12 +69,17 @@ alita-clean:
 # --build` + ngrok + manual setWebhook per src/CouponHubBot/README.dev.md) before
 # running any of these. Scope with FILTER, e.g.:
 #   make coupon-real-test FILTER="FullyQualifiedName~AddFlowRealTests"
+# `coupon-real-test` sets COUPON_REAL_TESTS=1 itself — RealAssemblyFixture.fs requires
+# this explicit opt-in IN ADDITION to credentials, so a bare `dotnet test` always
+# skips every test here even when ~/.coupon-test/env is fully populated. Do not set
+# COUPON_REAL_TESTS anywhere other than this target and coupon-real-test.yml's
+# dispatch-only job.
 COUPON_REAL_FILTER = $(FILTER)
 
 .PHONY: coupon-real-test coupon-tg-login coupon-tg-chats
 
 coupon-real-test:
-	dotnet test tests/CouponHubBot.RealTests -c Release $(if $(COUPON_REAL_FILTER),--filter "$(COUPON_REAL_FILTER)",)
+	COUPON_REAL_TESTS=1 dotnet test tests/CouponHubBot.RealTests -c Release $(if $(COUPON_REAL_FILTER),--filter "$(COUPON_REAL_FILTER)",)
 
 # Local dev loop only — CI does NOT run this. The coupon real-test workflow reuses
 # Alita's already-logged-in MTProto session (same real Telegram account; the two
