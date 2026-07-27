@@ -165,15 +165,35 @@ ERROR_LOGS_RESPONSE=$(loki_query "${LOKI_URL}/loki/api/v1/query_range" \
     --data-urlencode "start=${START_24H}" \
     --data-urlencode "limit=200")
 
-TOP_ERRORS_COUNT=$(echo "$ERROR_LOGS_RESPONSE" | jq -r '
+# Grouped by SourceContext + message prefix (query_loki_patterns 404s on
+# this Loki — see AGENT-FLOWS-REDESIGN.md §1.8/§6.1, built by hand here).
+# Emits per-group SourceContext, count, AND one verbatim raw sample line —
+# counts-only output left rules 1 (new failure mode) and 2 (error-group
+# z-score) unevaluable during the 2026-07-26 drill: the new
+# `Program.DrillRuntimeFailureLoop` SourceContext (unseen in 28 days, a
+# guaranteed rule-1 hit) was invisible behind a bare "N occurrence(s)" line.
+TOP_ERRORS_GROUPED=$(echo "$ERROR_LOGS_RESPONSE" | jq -r '
     [.data.result[].values[] | .[1]] |
-    map(. as $line | try (fromjson | .RenderedMessage // .message // .msg // $line) catch $line) |
-    group_by(.) |
-    map({count: length}) |
+    map(
+        . as $raw
+        | (try fromjson catch {}) as $parsed
+        | {
+            source_context: ($parsed.SourceContext // "unknown"),
+            prefix: ((($parsed["@m"] // $parsed.RenderedMessage // $parsed.message // $parsed.msg // $raw) | tostring)[0:80]),
+            raw: $raw
+          }
+    ) |
+    group_by(.source_context + "|" + .prefix) |
+    map({
+        source_context: .[0].source_context,
+        prefix: .[0].prefix,
+        count: length,
+        sample: .[0].raw
+    }) |
     sort_by(-.count) |
     .[:10] |
     .[] |
-    "  - \(.count) occurrence(s)"
+    "  - **\(.source_context)** (\(.count)x): \(.prefix)\n    sample: `\(.sample)`"
 ' 2>/dev/null || echo "  - (parse error)")
 
 WARN_LOG_COUNT_JSON=$(loki_query "${LOKI_URL}/loki/api/v1/query" \
@@ -257,8 +277,8 @@ cat <<EOF
 - **Warning entries**: ${WARN_LOG_COUNT}
 - **Total log volume (24h)**: ${LOG_VOLUME}
 
-### Top Error Patterns (counts only — query Loki for details)
-${TOP_ERRORS_COUNT:-  - (none)}
+### Top Error Patterns (grouped by SourceContext + message prefix, verbatim sample per group)
+${TOP_ERRORS_GROUPED:-  - (none)}
 
 ## Deployment Status (ArgoCD)
 
