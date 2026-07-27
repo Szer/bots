@@ -51,6 +51,8 @@ jobs:
           --json files --jq '.files[].path')
 
         echo "Changed files in PR:"
+        # shellcheck disable=SC2086  # intentional word splitting: $CHANGED is a
+        # whitespace-separated file list and the splat makes printf emit one per line
         printf '  %s\n' $CHANGED
 
         # Strip doc-only files (markdown or anything under a docs/ dir)
@@ -63,12 +65,16 @@ jobs:
         fi
 
         echo "Non-doc files:"
+        # shellcheck disable=SC2086  # intentional word splitting: $NON_DOC is a
+        # whitespace-separated file list and the splat makes printf emit one per line
         printf '  %s\n' $NON_DOC
 
         RELEVANT=$(echo "$NON_DOC" | grep -E "$BOT_PATHS_REGEX" || true)
 
         if [ -n "$RELEVANT" ]; then
           echo "Bot-relevant non-doc changes:"
+          # shellcheck disable=SC2086  # intentional word splitting: $RELEVANT is a
+          # whitespace-separated file list and the splat makes printf emit one per line
           printf '  %s\n' $RELEVANT
           echo "yes=true" >> "$GITHUB_OUTPUT"
         else

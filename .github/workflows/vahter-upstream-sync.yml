@@ -103,6 +103,10 @@ jobs:
 
         # ── Solution file ──
         dotnet new sln --name vahter-ban-bot --force
+        # shellcheck disable=SC2012  # the glob is a fixed, known-safe filename
+        # pattern (no non-alphanumeric characters) right after `dotnet new sln`;
+        # switching to find is a possible follow-up, not done here (out of
+        # scope for a CI-hardening PR, and this touches the upstream mirror path)
         SLN=$(ls vahter-ban-bot.sln* 2>/dev/null | head -1)
         dotnet sln "$SLN" add \
           src/BotInfra/BotInfra.fsproj \
