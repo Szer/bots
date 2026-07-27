@@ -30,6 +30,8 @@ gh label create "evidence-pipeline-degraded" --repo "$REPO" --color "b60205" \
 
 RUN_URL="${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/runs/${GITHUB_RUN_ID:-unknown}"
 
+MANIFEST_RAW=$(cat "$FILE")
+
 BODY_FILE="$(mktemp)"
 trap 'rm -f "$BODY_FILE"' EXIT
 cat > "$BODY_FILE" <<BODY
@@ -41,8 +43,15 @@ cat > "$BODY_FILE" <<BODY
 ${BAD}
 \`\`\`
 
-The agent was **not invoked** for this bot/run — an LLM must never be handed
-a bundle of zeros and asked whether things look fine.
+**Manifest (verbatim):**
+\`\`\`json
+${MANIFEST_RAW}
+\`\`\`
+
+The agent was **not invoked for this bot** this run — an LLM must never be
+handed a bundle of zeros and asked whether things look fine. Other bots in
+the same run are evaluated independently and are unaffected by this one's
+degraded evidence.
 BODY
 
 EXISTING=$(gh issue list --repo "$REPO" --label "evidence-pipeline-degraded" --state open \

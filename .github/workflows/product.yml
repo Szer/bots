@@ -11,6 +11,16 @@ name: Product Analysis
 # therefore needs one bots.yml entry (roles: [..., product, ...]) plus one
 # copy of the "vahter" step block below (create-issue / load-prompt /
 # run-agent / close-issue), renamed to the new bot.
+#
+# The guard step evaluates EACH bot's manifest INDEPENDENTLY (§8 of the
+# redesign doc originally sketched an all-or-nothing guard — that was wrong;
+# one bot's outage must never blind an unrelated healthy bot, see the
+# updated §8 text). A degraded bot is skipped (its agent step doesn't run,
+# and the shared evidence-pipeline-degraded issue records exactly which bot
+# and which source), while every other bot's agent still runs normally. The
+# job still ends non-zero if anything was skipped — a red run is the correct
+# signal — but only via a final `if: always()` step placed AFTER the agent
+# steps, so a degraded bot can never pre-empt a healthy one's analysis.
 
 on:
   schedule:
@@ -122,7 +132,7 @@ jobs:
     - name: Disconnect VPN (post gather)
       run: sudo wg-quick down wg0 || true
 
-    - name: Guard — refuse to invoke the agent on degraded evidence
+    - name: Guard — evaluate each bot's evidence independently
       id: guard
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,29 +140,34 @@ jobs:
       run: |
         set -euo pipefail
         chmod +x scripts/report-degraded.sh
-        DEGRADED=0
+        SKIPPED=""
         for bot in $GATHER_BOTS; do
           FILE="/tmp/evidence/${bot}.md"
           MANIFEST=$(head -n1 "$FILE" 2>/dev/null || echo '{}')
           echo "$MANIFEST" > "/tmp/evidence/${bot}.manifest.json"
           BAD=$(echo "$MANIFEST" | jq -r '.sources? // {} | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
           if [ -n "$BAD" ]; then
-            echo "::error::unreachable sources for bot=${bot}: ${BAD}"
+            echo "::error::unreachable sources for bot=${bot}: ${BAD} — SKIPPING only ${bot}'s agent invocation this run; other bots are evaluated independently and are unaffected."
             ./scripts/report-degraded.sh "/tmp/evidence/${bot}.manifest.json"
-            DEGRADED=1
+            echo "run_${bot}=false" >> "$GITHUB_OUTPUT"
+            SKIPPED="${SKIPPED}${SKIPPED:+, }${bot} (${BAD})"
+          else
+            echo "bot=${bot}: evidence clean — proceeding to agent invocation."
+            echo "run_${bot}=true" >> "$GITHUB_OUTPUT"
           fi
         done
-        if [ "$DEGRADED" -eq 1 ]; then
-          echo "ERROR: one or more bots had a degraded evidence bundle this run — see the evidence-pipeline-degraded issue. Refusing to invoke the agent for ANY bot this run (an LLM must never be handed a bundle of zeros)."
-          exit 1
+        echo "skipped_bots=${SKIPPED}" >> "$GITHUB_OUTPUT"
+        if [ -n "$SKIPPED" ]; then
+          echo "::warning::Evidence pipeline degraded for: ${SKIPPED} — see the evidence-pipeline-degraded issue. Healthy bots below still run normally; this job will still end non-zero overall (see the final 'Fail the run if any bot's evidence was degraded' step) so the degradation isn't silently swallowed."
+        else
+          echo "All gathered bots reported a clean manifest."
         fi
-        echo "All gathered bots reported a clean manifest — proceeding to agent invocation."
 
     # ─── vahter ──────────────────────────────────────────────────────────
 
     - name: "Create orchestration issue: vahter"
       id: create-issue-vahter
-      if: contains(steps.gather.outputs.bots, 'vahter')
+      if: steps.guard.outputs.run_vahter == 'true'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -180,7 +195,7 @@ jobs:
         echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
     - name: "Load agent prompt and product data: vahter"
-      if: contains(steps.gather.outputs.bots, 'vahter')
+      if: steps.guard.outputs.run_vahter == 'true'
       run: |
         {
           PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
@@ -196,7 +211,7 @@ jobs:
         } >> "$GITHUB_ENV"
 
     - name: "Run product agent: vahter"
-      if: contains(steps.gather.outputs.bots, 'vahter')
+      if: steps.guard.outputs.run_vahter == 'true'
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -235,7 +250,7 @@ jobs:
 
     - name: "Create orchestration issue: coupon"
       id: create-issue-coupon
-      if: contains(steps.gather.outputs.bots, 'coupon')
+      if: steps.guard.outputs.run_coupon == 'true'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -263,7 +278,7 @@ jobs:
         echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
     - name: "Load agent prompt and product data: coupon"
-      if: contains(steps.gather.outputs.bots, 'coupon')
+      if: steps.guard.outputs.run_coupon == 'true'
       run: |
         {
           PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
@@ -279,7 +294,7 @@ jobs:
         } >> "$GITHUB_ENV"
 
     - name: "Run product agent: coupon"
-      if: contains(steps.gather.outputs.bots, 'coupon')
+      if: steps.guard.outputs.run_coupon == 'true'
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -313,6 +328,23 @@ jobs:
       run: |
         gh issue close "${{ steps.create-issue-coupon.outputs.issue_number }}" --repo "${{ github.repository }}" \
           --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    # Runs AFTER every agent step above (via if: always()) so a degraded bot
+    # can never pre-empt a healthy bot's analysis — the healthy bots' agents
+    # have already run by the time this step decides the job's exit code. A
+    # red run here is still the correct final signal: the evidence pipeline
+    # WAS degraded for at least one bot this run, even though the others
+    # completed normally.
+    - name: Fail the run if any bot's evidence was degraded
+      if: always()
+      env:
+        SKIPPED_BOTS: ${{ steps.guard.outputs.skipped_bots }}
+      run: |
+        if [ -n "$SKIPPED_BOTS" ]; then
+          echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent above still ran normally; this job ends non-zero only to surface the degradation, not to undo the healthy bots' analysis."
+          exit 1
+        fi
+        echo "No bots skipped this run — evidence pipeline healthy."
 
     - name: Disconnect VPN (final safety net)
       if: always()

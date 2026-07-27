@@ -623,23 +623,44 @@ jobs:
             scripts/gather/${{ inputs.role }}.sh "$bot" > "/tmp/evidence-$bot.json"
           done
 
-      - id: guard                               # THE anti-blindness gate
+      - id: guard                               # THE anti-blindness gate — PER BOT, not all-or-nothing
         run: |
           set -euo pipefail
-          for f in /tmp/evidence-*.json; do
+          run_flags=""                            # e.g. "vahter=false coupon=true"
+          skipped=""
+          for bot in $(echo '${{ inputs.bots }}' | jq -r '.[]'); do
+            f="/tmp/evidence-$bot.json"
             bad=$(jq -r '.sources | to_entries[] | select(.value != "ok") | .key' "$f")
             if [ -n "$bad" ]; then
-              echo "::error::unreachable sources in $f: $bad"
-              scripts/report-degraded.sh "$f"   # bumps one issue, does NOT invoke the agent
-              exit 1
+              echo "::error::unreachable sources for bot=$bot: $bad — skipping only this bot's agent invocation"
+              scripts/report-degraded.sh "$f"   # bumps the single shared issue; does NOT exit here
+              run_flags="$run_flags $bot=false"
+              skipped="$skipped $bot($bad)"
+            else
+              run_flags="$run_flags $bot=true"
+            fi
+          done
+          echo "run_flags=$run_flags" >> "$GITHUB_OUTPUT"
+          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+
+      - id: agent                               # only invokes bots the guard marked ok
+        env:
+          RUN_FLAGS: ${{ steps.guard.outputs.run_flags }}
+        run: |
+          for pair in $RUN_FLAGS; do
+            bot="${pair%%=*}"
+            ok="${pair#*=}"
+            if [ "$ok" = "true" ]; then
+              scripts/run-agent.sh "${{ inputs.role }}" "$bot" "${{ inputs.model }}" "${{ inputs.effort }}"
             fi
           done
 
-      - id: agent
+      - if: always()                            # fails the JOB, but only after agent/ has run
         run: |
-          for bot in $(echo '${{ inputs.bots }}' | jq -r '.[]'); do
-            scripts/run-agent.sh "${{ inputs.role }}" "$bot" "${{ inputs.model }}" "${{ inputs.effort }}"
-          done
+          if [ -n "${{ steps.guard.outputs.skipped }}" ]; then
+            echo "::error::evidence pipeline degraded for:${{ steps.guard.outputs.skipped }}"
+            exit 1
+          fi
 
       - if: always()
         run: |
@@ -647,13 +668,22 @@ jobs:
           sudo wg-quick down wg0 || true
 ```
 
-Two deliberate choices:
+Three deliberate choices:
 
 - **`for` loop, not `strategy.matrix`.** The `aks-vpn` concurrency group is single-occupancy;
   matrix jobs would queue behind each other and tear down/re-establish the tunnel per bot.
-- **The guard step exits non-zero and never reaches the agent.** A red workflow run is the
-  correct outcome of a degraded evidence pipeline. Today it is a green run with an empty
-  report and a "clean day" verdict.
+- **The guard evaluates each bot independently and never exits non-zero itself.** An earlier
+  draft of this sketch had the guard `exit 1` on the first bad bot, aborting the whole step
+  before any agent ran — that was wrong: one bot's transient Postgres blip must never blind an
+  unrelated healthy bot's analysis, and a workflow whose robustness is *worse* than the
+  single-bot status quo it replaces is not an improvement. The guard instead records a per-bot
+  `run_<bot>` decision; the `agent` step invokes only the bots marked `true`; bots marked
+  `false` are named (with their unreachable source) in the single shared
+  `evidence-pipeline-degraded` issue.
+- **The job still ends red if anything was skipped, but only via a final `if: always()` step
+  placed AFTER `agent`.** A red run is the correct outcome of a degraded evidence pipeline — but
+  it must be a *trailing* signal, never a gate that pre-empts the healthy bots' agent
+  invocations that already ran successfully earlier in the same job.
 
 ---
 
