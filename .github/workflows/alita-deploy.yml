@@ -42,7 +42,15 @@ jobs:
       # brand-new bot's first deploys are exactly when a human should be
       # reading verify-deploy.sh output directly, not routing it to an agent
       # that has no track record with this bot yet.
-      sre-enabled: false
+      # 2026-07-27: flipped false -> true. The caution above was right while
+      # AlitaBot was brand-new; it has now run in prod since 2026-07-22 and
+      # settled. Leaving it false meant AlitaBot was silently the ONE bot with
+      # no SRE coverage, while `.github/prompts/sre.md` simultaneously claimed
+      # "every bot in this monorepo opts into SRE coverage by default,
+      # including future ones" — documentation asserting the opposite of
+      # configuration. Found by the 2026-07-27 SRE drill, which failed a real
+      # prod deploy and got no agent response because of this line.
+      sre-enabled: true
     secrets:
       WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
       DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
