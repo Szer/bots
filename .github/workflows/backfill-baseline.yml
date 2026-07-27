@@ -1,0 +1,161 @@
+name: Backfill Baseline History
+
+# workflow_dispatch-only wrapper around scripts/gather/backfill-baseline.sh
+# (see AGENT-FLOWS-REDESIGN.md §3.3 and the script's own header). Reconstructs
+# ~<days> days of daily baseline rollups per bot into the `agent-state` orphan
+# branch, so the `monitor` role's 7d/28d medians are warm immediately instead
+# of after a month of real runs accumulate.
+#
+# backfill-baseline.sh has NEVER been executed against real data (its author
+# had no VPN/prod access) — default to dry_run=true. A dry run computes
+# everything exactly like a real run (same queries, same fail-loud preflight)
+# but prints the would-be JSONL lines + a summary instead of writing/pushing
+# anything. Inspect that output before ever setting dry_run=false.
+#
+# Copies monitor.yml's `gather` job patterns (agent-state checkout, VPN
+# setup/teardown) rather than inventing new ones — see that job's comments
+# for the reasoning behind each step.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bots:
+        description: 'Comma-separated bot keys from .github/bots.yml, or "all"'
+        type: string
+        default: 'all'
+      days:
+        description: 'Number of days to backfill'
+        type: string
+        default: '28'
+      dry_run:
+        description: 'Dry run: compute + print only, no write/commit/push'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # only needed for the real (dry_run=false) commit+push to agent-state
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # VPN peer is single-occupancy; concurrent connections break DNS
+    # (2026-07-23 incident, see product.yml / monitor.yml). Only this job
+    # touches the VPN, same as monitor.yml's `gather` job.
+    concurrency:
+      group: aks-vpn
+      cancel-in-progress: false
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Resolve + validate bot list
+      id: resolve
+      env:
+        INPUT_BOTS: ${{ inputs.bots }}
+      run: |
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        if [ "$INPUT_BOTS" = "all" ]; then
+          BOTS="$(bots_yml_json | jq -r '.bots | keys[]')"
+        else
+          BOTS=""
+          IFS=',' read -ra RAW <<< "$INPUT_BOTS"
+          for raw in "${RAW[@]}"; do
+            # trim whitespace
+            bot="$(echo "$raw" | xargs)"
+            [ -n "$bot" ] || continue
+            if ! bot_exists "$bot"; then
+              log "ERROR: bot '${bot}' is not present in ${BOTS_YML} (input was: ${INPUT_BOTS})"
+              exit 1
+            fi
+            BOTS="${BOTS}${BOTS:+$'\n'}${bot}"
+          done
+          if [ -z "$BOTS" ]; then
+            log "ERROR: no bots resolved from input '${INPUT_BOTS}'"
+            exit 1
+          fi
+        fi
+        {
+          echo "bots<<BOTS_EOF"
+          echo "$BOTS"
+          echo "BOTS_EOF"
+        } >> "$GITHUB_OUTPUT"
+        log "resolved bots: $(echo "$BOTS" | tr '\n' ' ')"
+
+    - name: Fetch or bootstrap agent-state branch
+      run: |
+        set -euo pipefail
+        if git ls-remote --exit-code --heads origin agent-state >/dev/null 2>&1; then
+          git fetch origin agent-state
+          git worktree add /tmp/agent-state origin/agent-state
+          echo "checked out existing agent-state branch"
+        else
+          echo "::warning::agent-state branch does not exist yet on origin — bootstrapping an empty orphan branch (first-ever run touching agent-state)."
+          git worktree add --orphan -b agent-state /tmp/agent-state
+        fi
+
+    - name: Setup WireGuard VPN
+      run: |
+        chmod +x scripts/setup-vpn.sh
+        ./scripts/setup-vpn.sh
+      env:
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+        SPLIT_TUNNEL: "false"   # DB_PROD_HOST is reachable only via the VPN peer's full-tunnel route, same as monitor.yml/product.yml.
+
+    - name: Backfill baseline history (per bot; dry-run prints only, never writes/pushes)
+      id: backfill
+      env:
+        LOKI_URL: http://loki.internal
+        DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
+        DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
+        DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
+        INPUT_DAYS: ${{ inputs.days }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        RESOLVED_BOTS: ${{ steps.resolve.outputs.bots }}
+      run: |
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        chmod +x scripts/gather/backfill-baseline.sh
+
+        if [ "$INPUT_DRY_RUN" = "true" ]; then
+          export DRY_RUN=1
+          log "DRY RUN requested — no files will be written, nothing will be committed or pushed. Inspect the output below before re-running with dry_run=false."
+        else
+          export DRY_RUN=0
+          log "REAL RUN requested — this WILL write to and push the agent-state branch."
+        fi
+
+        # Deliberately no per-bot error swallowing: the first bot that fails
+        # (e.g. an unreachable source) aborts the whole job immediately (set
+        # -e propagates the script's own non-zero exit) — never a partial,
+        # silent result. Any bot processed before the failure only wrote to
+        # the LOCAL /tmp/agent-state worktree; since the job stops here, the
+        # later commit+push step never runs, so nothing partial ever reaches
+        # the remote agent-state branch.
+        while IFS= read -r bot; do
+          [ -n "$bot" ] || continue
+          echo "::group::backfill ${bot}"
+          ./scripts/gather/backfill-baseline.sh "$bot" /tmp/agent-state "$INPUT_DAYS"
+          echo "::endgroup::"
+        done <<< "$RESOLVED_BOTS"
+
+    # Full-tunnel VPN routes ALL traffic (including api.github.com) through
+    # the VPN peer, which times out on non-AKS-internal public traffic —
+    # disconnect as soon as the DB/Loki-dependent backfill step is done, same
+    # pattern as monitor.yml/product.yml. if: always() so a mid-loop failure
+    # above still tears the VPN down.
+    - name: Disconnect VPN (post backfill)
+      if: always()
+      run: sudo wg-quick down wg0 || true
+
+    - name: Commit + push agent-state (real writes only — never runs on dry-run or on a failed backfill step)
+      if: ${{ success() && inputs.dry_run == false }}
+      env:
+        RESOLVED_BOTS: ${{ steps.resolve.outputs.bots }}
+        INPUT_DAYS: ${{ inputs.days }}
+      run: |
+        set -euo pipefail
+        chmod +x scripts/gather/baseline.sh
+        BOTS_ONELINE="$(echo "$RESOLVED_BOTS" | tr '\n' ',' | sed 's/,$//')"
+        ./scripts/gather/baseline.sh commit /tmp/agent-state \
+          "backfill: ${INPUT_DAYS}d for ${BOTS_ONELINE} (run ${{ github.run_id }})"
