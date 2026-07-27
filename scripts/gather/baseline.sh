@@ -12,8 +12,14 @@
 #       counts, and error lines grouped by SourceContext + message prefix —
 #       query_loki_patterns 404s here, see AGENT-FLOWS-REDESIGN.md §1.8/§6.1),
 #       and ArgoCD/Prometheus (pod health). Prints ONE JSON object to stdout:
-#       {"series":{...},"error_groups":{...},"pods":{...},"sources":{...}}
-#       This is the "today's rollup" that `append` persists.
+#       {"series":{...},"error_groups":[{"source_context":...,
+#       "message_prefix":...,"count":...,"sample":...},...],"pods":{...},
+#       "sources":{...}} — error_groups is an ARRAY (one entry per distinct
+#       SourceContext+message-prefix group, sorted by count descending), not
+#       a bare key->count map: see the 2026-07-26 drill postmortem in
+#       cmd_gather below for why per-group identifiers + a verbatim sample
+#       are required, not just counts. This is the "today's rollup" that
+#       `append` persists.
 #
 #   baseline.sh append <bot> <state-dir> [<gather-json-file>|-]
 #       Wraps the gather-json (file, or "-"/omitted for stdin) with
@@ -40,6 +46,16 @@
 #       never produce a spurious anomaly (this is the single most important
 #       property of this script — a wrong z-score silently produces false
 #       anomalies forever). Prints ONE JSON object to stdout.
+#
+#       `dormant_exempt` (2026-07-26 drill postmortem — a genuinely broken
+#       alita deploy read as "clean" partly because the monitor agent
+#       treated `log_errors_24h` as covered by the dormant carve-out): false
+#       for error/failure series (`log_errors_24h`, `log_warnings_24h` —
+#       rules 3/4 ALWAYS apply to these, regardless of traffic_class), true
+#       for every other (traffic/volume) series. monitor.md's dormant
+#       carve-out must gate on this flag, never on "is this bot dormant"
+#       alone — see the `error_series_keys` jq def below for the full
+#       rationale.
 #
 #       `emerged_from_zero` (2026-07-27, issue #289 postmortem): true only
 #       when BOTH the 7d AND 28d median are zero/null and `current > 0` — a
@@ -146,7 +162,7 @@ cmd_gather() {
 
     if echo "$sources_json" | jq -e 'to_entries[] | select(.value != "ok")' >/dev/null 2>&1; then
         log "ERROR: one or more required sources unreachable for bot=${bot}: $(echo "$sources_json" | jq -c .)"
-        jq -n --argjson sources "$sources_json" '{series:{}, error_groups:{}, pods:{}, sources:$sources}'
+        jq -n --argjson sources "$sources_json" '{series:{}, error_groups:[], pods:{}, sources:$sources}'
         exit 1
     fi
 
@@ -228,6 +244,16 @@ cmd_gather() {
     # ── loki: error lines grouped by SourceContext + message prefix ──────
     # query_loki_patterns 404s on this Loki — build the grouping by hand
     # (AGENT-FLOWS-REDESIGN.md §1.8/§6.1).
+    # error_groups is an ARRAY of {source_context, message_prefix, count, sample}
+    # objects, sorted by count descending — NOT a bare key->count map. A
+    # counts-only shape left rules 1 (new failure mode) and 2 (error-group
+    # z-score) unevaluable during the 2026-07-26 drill: the monitor agent
+    # reported "per-group identifiers and z-scores were not present in the
+    # provided Loki grouping output (only counts-only lines were included)",
+    # so the brand-new `Program.DrillRuntimeFailureLoop` SourceContext (a
+    # guaranteed rule-1 hit — unseen in 28 days) went unseen too. `sample` is
+    # the raw, verbatim Loki line (CLEF JSON as-is) so a finding can quote it
+    # directly per the Verbatim-Artifact Requirement in monitor.md.
     local start_24h error_groups_json
     start_24h=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-24H +%Y-%m-%dT%H:%M:%SZ)
     error_groups_json=$(curl -sSf --connect-timeout 5 --max-time 20 -G "${LOKI_URL}/loki/api/v1/query_range" \
@@ -236,14 +262,24 @@ cmd_gather() {
         --data-urlencode "limit=500" \
         | jq -c '
             [.data.result[].values[] | .[1]]
-            | map(try (fromjson) catch {RenderedMessage: ., SourceContext: "unknown"})
+            | map(
+                . as $raw
+                | (try fromjson catch {}) as $parsed
+                | {
+                    source_context: ($parsed.SourceContext // "unknown"),
+                    message_prefix: ((($parsed["@m"] // $parsed.RenderedMessage // $parsed.message // $parsed.msg // $raw) | tostring)[0:80]),
+                    raw: $raw
+                  }
+              )
+            | group_by(.source_context + "|" + .message_prefix)
             | map({
-                key: ((.SourceContext // "unknown") + "|" + ((.RenderedMessage // .message // .msg // "") | .[0:80]))
+                source_context: .[0].source_context,
+                message_prefix: .[0].message_prefix,
+                count: length,
+                sample: .[0].raw
               })
-            | group_by(.key)
-            | map({key: .[0].key, value: length})
-            | from_entries
-        ' 2>/dev/null || echo '{}')
+            | sort_by(-.count)
+        ' 2>/dev/null || echo '[]')
 
     # ── argocd / prometheus: pod health (direct rules, not baseline-relative) ─
     local argo_response sync_status health_status deployed_image
@@ -348,6 +384,32 @@ _stats_jq() {
         # these names collide with an unrelated series on another bot.
         def informational_only_keys: ["message_marked_spam_24h", "message_marked_ham_24h", "vahter_acted_24h"];
 
+        # Dormant carve-out scope (2026-07-26 drill postmortem — a genuinely
+        # broken alita deploy was reported "clean" partly because the monitor
+        # agent read the dormant carve-out as disabling rules 3/4 for EVERY
+        # series on a dormant bot, including `log_errors_24h` itself: it was
+        # handed current=13 median_28d=0 z_score_28d=33.59 emerged_from_zero=
+        # true emerged_from_zero_significant=true and suppressed it because
+        # "traffic_class: dormant — rules 3 and 4 are disabled for this bot").
+        # The carve-out exists ONLY to stop zero-inflated TRAFFIC/VOLUME
+        # series (message/log-line/user counts) from firing constantly on a
+        # bot that is silent most days — it must never blind rule 3/4 to an
+        # actual error/failure series. This flag makes that distinction
+        # mechanical instead of relying on the agent (or a prompt author) to
+        # infer "volume" vs "error" from a key name every time:
+        #   dormant_exempt: false — error/failure series. Rules 3 and 4
+        #     ALWAYS apply, regardless of traffic_class. Currently
+        #     log_errors_24h and log_warnings_24h (every bot has these).
+        #   dormant_exempt: true  — everything else (traffic/volume series:
+        #     message/event counts, log_lines_24h, user counts, etc). For
+        #     dormant bots (see the monitor.md "Dormant carve-out" section),
+        #     rules 3 and 4 are disabled ONLY for series where this is true.
+        # Deliberately a denylist of error-series keys (not an allowlist of
+        # volume-series keys) — the per-bot tracked-series list in cmd_gather
+        # differs by bot, but log_errors_24h/log_warnings_24h are common to
+        # every bot and are the two keys that must never be exempted.
+        def error_series_keys: ["log_errors_24h", "log_warnings_24h"];
+
         # "Emerged from zero" magnitude floor (2026-07-27, issue #289: fired on
         # message_marked_spam_24h going 0 -> 1 at z=1.34 — a routine, low-
         # frequency human moderation action, not an anomaly). Every other
@@ -431,7 +493,8 @@ _stats_jq() {
                                     emerged_from_zero: $emerged,
                                     emerged_from_zero_magnitude_floor: $floor,
                                     emerged_from_zero_significant: ($emerged and $cur >= $floor),
-                                    informational_only: ((informational_only_keys | index($k)) != null)
+                                    informational_only: ((informational_only_keys | index($k)) != null),
+                                    dormant_exempt: ((error_series_keys | index($k)) == null)
                                 }
                             )
                         }

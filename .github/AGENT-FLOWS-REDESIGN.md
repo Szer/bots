@@ -486,13 +486,34 @@ Recent 7d actuals: added 78, taken 71, used 47, returned 24, voided 6, feedback 
   with a `SourceContext` not seen in 28 days (new failure mode — the highest-value signal)
 - any series at ratio ≤0.4 or ≥2.5 vs 7d median, sustained across ≥2 consecutive windows
 - restarts > 0, or replicas available < desired, or ArgoCD health ≠ Healthy
-- `dormant` bots: **only** the pod/restart/error rules. Volume rules are disabled — alita
-  logs 0 lines on 8 of 14 days and would otherwise fire constantly.
+- `dormant` bots: rules 3/4 (series-ratio / emerged-from-zero) are disabled **only for
+  traffic/volume series** (message/log-line/user counts — alita logs 0 lines on 8 of 14 days
+  and would otherwise fire constantly). **`log_errors_24h`/`log_warnings_24h` (and every
+  error-group rule) always apply, dormant or not** — mechanically flagged per series as
+  `dormant_exempt` by `baseline.sh` (§6.1 postmortem below), not left to prose. Rules 1, 2, and
+  5 already apply unconditionally on every bot regardless of `traffic_class`.
 
-**Change correlation is mandatory.** For every candidate finding, the agent must check
-`change_context` and classify: `attributed` (a deploy/merge plausibly explains it — report
-in summary, do not file) or `unexplained` (file). The vahter PR #213 log-volume step is the
-canonical `attributed` case.
+**Change correlation is mandatory, and its power to suppress is scoped by finding kind.** For
+every candidate finding, the agent must check `change_context` and classify. For
+**traffic/volume findings** (rule 3/4 on a `dormant_exempt: true` series): `attributed` (a
+deploy/merge plausibly explains it — report in summary, do not file) or `unexplained` (file).
+The vahter PR #213 log-volume step is the canonical `attributed` case. For **error-rate
+findings** (rule 1, rule 2, or rule 3/4 on `log_errors_24h`/`log_warnings_24h`), `attributed`
+must NEVER suppress — a deploy that explains an error burst makes it a suspected bad deploy,
+not a benign one. Classify instead as `correlated — suspected bad deploy` (file `priority-high`,
+name the commit) or `unexplained` (file `priority-high` if the rule-1/2 bar is met).
+
+**2026-07-26 drill postmortem — why this split exists.** A deliberately broken alita deploy
+(background loop throwing every 15s + a throwing Telegram update handler; the bot was
+completely non-functional) produced `log_errors_24h: current=13 median_28d=0 z_score_28d=33.59
+emerged_from_zero=true emerged_from_zero_significant=true` and a brand-new
+`SourceContext=Program.DrillRuntimeFailureLoop` error group (unseen in 28 days — a guaranteed
+rule-1 hit). The monitor agent suppressed it twice over: it read the dormant carve-out as
+"rules 3 and 4 ... are disabled for this bot" without scoping to volume series, and separately
+classified the correlated drill deploy as `attributed`, reasoning "the increased error count is
+plausibly explained by the recent intentional DRILL changes... that makes the observed error
+volume expected." Both are now closed off mechanically (`dormant_exempt`) and by prompt rule
+(error-rate findings can never be `attributed`) — see `.github/prompts/monitor.md`.
 
 **Refusal condition.** If `sources` shows any required source not `ok`, the workflow does not
 invoke the agent at all. If the agent finds itself reasoning about a series with fewer than
