@@ -143,9 +143,21 @@ jobs:
         SKIPPED=""
         for bot in $GATHER_BOTS; do
           FILE="/tmp/evidence/${bot}.md"
-          MANIFEST=$(head -n1 "$FILE" 2>/dev/null || echo '{}')
+          MANIFEST=$(head -n1 "$FILE" 2>/dev/null || echo '')
+          # An unreadable manifest must count as DEGRADED, never as clean.
+          # Previously a malformed line made jq fail, `|| true` swallowed it,
+          # BAD came back empty, and the guard waved a blind bot through as
+          # healthy — the exact failure class this guard exists to prevent
+          # (2026-07-27 incident: emit_manifest pretty-printed, so `head -n1`
+          # returned a bare "{").
+          if ! echo "$MANIFEST" | jq -e 'type == "object" and has("sources")' >/dev/null 2>&1; then
+            MANIFEST=$(jq -cn --arg b "$bot" \
+              '{bot: $b, sources: {manifest: "unreadable — gatherer emitted no valid manifest line"}}')
+            BAD="manifest"
+          else
+            BAD=$(echo "$MANIFEST" | jq -r '.sources | to_entries[] | select(.value != "ok") | .key')
+          fi
           echo "$MANIFEST" > "/tmp/evidence/${bot}.manifest.json"
-          BAD=$(echo "$MANIFEST" | jq -r '.sources? // {} | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
           if [ -n "$BAD" ]; then
             echo "::error::unreachable sources for bot=${bot}: ${BAD} — SKIPPING only ${bot}'s agent invocation this run; other bots are evaluated independently and are unaffected."
             ./scripts/report-degraded.sh "/tmp/evidence/${bot}.manifest.json"

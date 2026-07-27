@@ -96,7 +96,12 @@ emit_manifest() {
         src_filter="(${src_filter} + {(\$k${i}): \$v${i}})"
         i=$((i + 1))
     done
-    jq -n "${jq_args[@]}" "{bot: \$bot, generated_at: \$now, sources: (${src_filter})}"
+    # -c is load-bearing: the manifest MUST be a single line, because every
+    # consumer reads it with `head -n1`. Without -c, jq pretty-prints and
+    # consumers get a bare "{" — see the 2026-07-27 incident where this made
+    # monitor.yml's guard exit 2 and, worse, made product.yml's guard read a
+    # degraded bot as CLEAN (its jq error was swallowed by `|| true`).
+    jq -cn "${jq_args[@]}" "{bot: \$bot, generated_at: \$now, sources: (${src_filter})}"
 }
 
 # manifest_has_bad_source MANIFEST_JSON

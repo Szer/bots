@@ -211,8 +211,22 @@ jobs:
         chmod +x scripts/report-degraded.sh
         SKIPPED=""
         for bot in $GATHER_BOTS; do
-          RUNTIME_MANIFEST=$(head -n1 "/tmp/evidence/${bot}.runtime.md" 2>/dev/null || echo '{}')
-          GATHER_JSON=$(cat "/tmp/evidence/${bot}.gather.json" 2>/dev/null || echo '{}')
+          # Both manifests must be valid JSON objects. An unreadable one counts
+          # as DEGRADED, never as clean — the fail-safe direction. (2026-07-27:
+          # emit_manifest pretty-printed its output, so `head -n1` returned a
+          # bare "{"; here that crashed the guard at exit 2, and in product.yml
+          # the same malformed input was swallowed and read as healthy.)
+          RUNTIME_MANIFEST=$(head -n1 "/tmp/evidence/${bot}.runtime.md" 2>/dev/null || echo '')
+          GATHER_JSON=$(cat "/tmp/evidence/${bot}.gather.json" 2>/dev/null || echo '')
+          MANIFEST_BAD=""
+          if ! echo "$RUNTIME_MANIFEST" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            RUNTIME_MANIFEST='{"sources":{"runtime_manifest":"unreadable — runtime.sh emitted no valid manifest line"}}'
+            MANIFEST_BAD="yes"
+          fi
+          if ! echo "$GATHER_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            GATHER_JSON='{"sources":{"baseline_manifest":"unreadable — baseline.sh gather emitted no valid manifest"}}'
+            MANIFEST_BAD="yes"
+          fi
 
           # Merge BOTH manifests (runtime.sh's prometheus/loki/argocd probe +
           # baseline.sh gather's prometheus/loki/argocd/postgres probe) into
@@ -227,6 +241,11 @@ jobs:
           echo "$COMBINED_MANIFEST" > "/tmp/evidence/${bot}.combined-manifest.json"
 
           BAD=$(echo "$COMBINED_MANIFEST" | jq -r '.sources | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
+          # Belt and braces: if either manifest was unreadable, force this bot
+          # degraded even if the merged .sources somehow came out empty.
+          if [ -n "$MANIFEST_BAD" ] && [ -z "$BAD" ]; then
+            BAD="manifest"
+          fi
 
           if [ -n "$BAD" ]; then
             echo "::error::unreachable source(s) for bot=${bot}: ${BAD} — SKIPPING only ${bot}'s agent invocation this run."
