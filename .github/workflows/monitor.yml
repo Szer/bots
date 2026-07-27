@@ -516,7 +516,13 @@ jobs:
         DORMANT_NOTE=""
         if [ "$TRAFFIC_CLASS" = "dormant" ]; then
           CADENCE_NOTE="the scheduled runtime monitor run (DAILY cadence for this bot — traffic_class: dormant)"
-          DORMANT_NOTE=" Remember: the dormant carve-out (monitor.md) disables volume-based rules entirely for this bot."
+          # Scoped deliberately: the carve-out applies ONLY to traffic/volume
+          # series (those with dormant_exempt: true). Error series
+          # (log_errors_24h, log_warnings_24h) are NEVER exempt. The previous
+          # wording said "disables volume-based rules entirely for this bot",
+          # and on 2026-07-27 the agent read that and suppressed
+          # log_errors_24h at z_score 33.59 on a bot that was completely dead.
+          DORMANT_NOTE=" Remember: the dormant carve-out (monitor.md) applies ONLY to series with dormant_exempt: true (traffic/volume). Error series are never exempt — evaluate them normally."
         fi
         {
           echo "display_name=${DISPLAY_NAME}"
