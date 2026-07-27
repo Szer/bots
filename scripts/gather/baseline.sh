@@ -23,23 +23,37 @@
 #       of a new month). Never rewrites history — append-only.
 #
 #   baseline.sh stats <bot> <state-dir>
-#       PURE / hermetic — reads only files already on disk, no network, no
-#       wall-clock dependency (the "current" run is the most recent line by
-#       its own `ts`, and all windows are computed relative to THAT
-#       timestamp — not `date -u now` — so this is fully deterministic and
-#       safe to unit-test against synthetic fixtures). Reads every
-#       <state-dir>/<bot>/*.jsonl file, and for every series key present in
-#       the most recent line computes: current, trailing-7d median,
-#       trailing-28d median, ratio-vs-28d-median, z-score-vs-28d, the number
-#       of distinct calendar days of history within the 28d window, and a
-#       `low_confidence` flag (true when history_days_28d < 14 — see
-#       AGENT-FLOWS-REDESIGN.md §6.1 "Refusal condition"). Guards every
-#       division: a zero (or absent) 28d median yields `ratio: null`, not a
-#       divide-by-zero, and the same for a zero (or single-sample) 28d
+#       PURE / hermetic — reads only files already on disk, no network. The
+#       "current" run is the most recent (surviving, see below) line by its
+#       own `ts`, and all windows are computed relative to THAT timestamp —
+#       not `date -u now` — so the arithmetic itself stays fully
+#       deterministic and safe to unit-test against synthetic fixtures.
+#       Reads every <state-dir>/<bot>/*.jsonl file, and for every series key
+#       present in the most recent line computes: current, trailing-7d
+#       median, trailing-28d median, ratio-vs-28d-median, z-score-vs-28d,
+#       the number of distinct calendar days of history within the 28d
+#       window, and a `low_confidence` flag (true when history_days_28d < 14
+#       — see AGENT-FLOWS-REDESIGN.md §6.1 "Refusal condition"). Guards
+#       every division: a zero (or absent) 28d median yields `ratio: null`,
+#       not a divide-by-zero, and the same for a zero (or single-sample) 28d
 #       stdev yielding `z_score: null` — a dormant/zero-inflated series must
 #       never produce a spurious anomaly (this is the single most important
 #       property of this script — a wrong z-score silently produces false
 #       anomalies forever). Prints ONE JSON object to stdout.
+#
+#       Defensive guard (added after the 2026-07-27 incident — see
+#       backfill-baseline.sh's header comment for the root cause): before
+#       any of the above, lines with `run_id == "backfill"` whose `ts` falls
+#       on the CURRENT UTC day are dropped entirely from the input, so such
+#       a line can never become `current` nor be folded into a 7d/28d
+#       median, no matter what future bug in backfill-baseline.sh (or a
+#       hand-run backfill) might someday reintroduce a partial-day line.
+#       Live per-run lines (`run_id != "backfill"`) are trailing-24h windows
+#       and remain valid at any time of day — they are NOT filtered. This is
+#       the one deliberate exception to "no wall-clock dependency" above:
+#       `cmd_stats` reads real `date -u` as "today" by default, but honors
+#       `BASELINE_STATS_TODAY` so fixtures can pin a fixed date and keep the
+#       rest of the computation hermetic/deterministic under test.
 #
 #   baseline.sh commit <state-dir> <commit-message>
 #       Commits + pushes whatever `append` (and its caller) wrote in
@@ -280,12 +294,13 @@ cmd_append() {
 
 # ─── stats ─────────────────────────────────────────────────────────────────
 
-# The jq statistics core. Pure function of the input array of run-objects
-# (already sorted by ts ascending) — no network, no wall-clock. Exposed as
-# its own function so the CLI plumbing (globbing files, sorting) stays
-# separate from the arithmetic under test.
+# The jq statistics core. Function of the input array of run-objects (NOT
+# necessarily pre-sorted — sorting happens below) plus `today` (UTC
+# YYYY-MM-DD). Exposed as its own function so the CLI plumbing (globbing
+# files, sorting) stays separate from the arithmetic under test.
 _stats_jq() {
-    jq -s '
+    local today="$1"
+    jq -s --arg today "$today" '
         def median(a):
             (a | length) as $n
             | if $n == 0 then null
@@ -306,9 +321,21 @@ _stats_jq() {
               | ($variance | sqrt)
               end;
 
-        (sort_by(.ts)) as $all
+        # Defensive guard (2026-07-27 incident, see header comment above):
+        # drop backfill-origin lines dated "today" BEFORE anything else can
+        # see them — they can never become $current nor enter $hist/medians.
+        # Live (non-backfill) lines dated today are trailing-24h windows and
+        # are left untouched.
+        def is_partial_today_backfill: (.run_id == "backfill") and (.ts[0:10] == $today);
+
+        . as $raw
+        | (map(select(is_partial_today_backfill | not)) | sort_by(.ts)) as $all
         | if ($all | length) == 0 then
-            {error: "no history at all for this bot"}
+            if ($raw | length) == 0 then
+                {error: "no history at all for this bot"}
+            else
+                {error: "no usable history for this bot (only a same-day backfill line was present; excluded to avoid treating a partial day as complete — see the 2026-07-27 incident)"}
+            end
           else
             $all[-1] as $current
             | ($current.ts | fromdateiso8601) as $now_epoch
@@ -358,6 +385,11 @@ cmd_stats() {
     local bot="${1:?usage: baseline.sh stats <bot> <state-dir>}"
     local state_dir="${2:?usage: baseline.sh stats <bot> <state-dir>}"
     local bot_dir="${state_dir}/${bot}"
+    # Real "today" in production; BASELINE_STATS_TODAY lets fixtures pin a
+    # fixed date so the guard in _stats_jq is testable without a wall-clock
+    # dependency leaking into the rest of the arithmetic (see header comment
+    # on the `stats` subcommand above).
+    local today="${BASELINE_STATS_TODAY:-$(date -u +%Y-%m-%d)}"
 
     if [ ! -d "$bot_dir" ]; then
         log "WARNING: no baseline history directory for bot=${bot} at ${bot_dir} — first-run case, reporting empty history"
@@ -374,7 +406,7 @@ cmd_stats() {
         return 0
     fi
 
-    cat "${files[@]}" | _stats_jq
+    cat "${files[@]}" | _stats_jq "$today"
 }
 
 # ─── commit ────────────────────────────────────────────────────────────────
