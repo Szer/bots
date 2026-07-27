@@ -177,21 +177,62 @@ numbers look.
 ## Mandatory Change Correlation
 
 **Every candidate finding — from any rule above — must be checked against `change_context`
-before you decide to file.** Classify it as:
+before you decide to file.** What `change_context` is ALLOWED to do with that finding depends
+entirely on what KIND of finding it is — this split is not optional, and it is the direct fix
+for the 2026-07-26 drill (see the worked example below): **a deploy explaining an error burst
+does not make the burst benign — it makes the deploy bad.** Most real outages ARE
+deploy-correlated; suppressing on correlation is exactly how the incidents that matter most
+get filed as "expected."
+
+### Traffic/volume findings — `attributed` may suppress these, and only these
+
+A rule 3/4 candidate on a **traffic/volume series** (any series with `dormant_exempt: true` in
+the evidence bundle — message counts, log-line counts, user counts; e.g.
+`messages_received_24h`, `log_lines_24h`, `chat_message_24h`, `message_log_24h`). For these
+ONLY:
 
 - **`attributed`** — a deploy or merge to `main` touching this bot's `source_dir` in the
   preceding 72h plausibly explains the shift (a new logging statement explains higher log
   volume, a new feature explains a new metric appearing, etc). **Report it in your summary as
-  expected/attributed. Do NOT file an issue for it.** The canonical example: vahter's log
-  volume stepped ~5× on 2026-07-18 because of `cb7f346` / PR #213 (`RawUpdate` logging) — an
-  intentional change. A detector that files that as an anomaly is broken; do not be that
-  detector.
-- **`unexplained`** — nothing in `change_context` plausibly explains it. **This is what you
-  file.**
+  expected/attributed. Do NOT file an issue for it.**
+  **Worked example — volume, correctly suppressed:** vahter's log volume stepped ~5× on
+  2026-07-18 because of `cb7f346` / PR #213 (`RawUpdate` logging) — an intentional change to a
+  volume series. Attributed, not filed. A detector that files that as an anomaly is broken; do
+  not be that detector.
+- **`unexplained`** — nothing in `change_context` plausibly explains it. File it.
 
-State your classification and reasoning for every candidate explicitly in your summary, even
-the ones you attribute and skip — "I saw X, checked change_context, attributed to commit Y" is
-exactly as much a part of your job as filing the ones you can't explain.
+### Error-rate findings — `attributed` must NEVER suppress these
+
+Rule 1 (new failure mode), rule 2 (error-group z-score ≥3σ), or a rule 3/4 candidate on an
+**error/failure series** (`dormant_exempt: false` — currently `log_errors_24h`,
+`log_warnings_24h`), plus any Loki error-group anomaly. **A correlated deploy is never a
+reason to suppress one of these.** Classify instead as:
+
+- **`correlated — suspected bad deploy`** — a deploy/merge in the preceding 72h plausibly
+  explains the error burst. **This RAISES severity — file it, do not suppress it.** File with
+  `priority-high`, name the suspected commit/PR in the issue title or body, and include an
+  explicit `Suspected bad deploy: <short-sha> / <PR title if known>` line pointing at the
+  correlated change from `change_context`.
+  **Worked example — error-rate, must be filed, not suppressed:** the 2026-07-26 drill.
+  `log_errors_24h` came back `current=13 median_28d=0 z_score_28d=33.59
+  emerged_from_zero=true emerged_from_zero_significant=true`, and the new Loki error group was
+  `SourceContext=Program.DrillRuntimeFailureLoop` — unseen in the preceding 28 days (rule 1). A
+  deploy had landed on `main` shortly before, touching this bot's `source_dir`. The actual
+  2026-07-26 run classified this as `attributed`: *"the increased error count is plausibly
+  explained by the recent intentional DRILL changes... that makes the observed error volume
+  expected"* — and suppressed it, while the bot was completely non-functional (owner sent two
+  messages, got no reply). **That reasoning is backwards and must never recur.** The correct
+  classification is `correlated — suspected bad deploy`, filed `priority-high`, naming the
+  correlated commit — precisely BECAUSE the deploy explains the error, that is what makes it a
+  bad deploy, not what excuses it.
+- **`unexplained`** — no deploy/merge in `change_context` explains the burst either. Still
+  `priority-high` if the rule-1/rule-2 bar is met; file it the same way, just without a
+  suspected-commit line.
+
+State your classification (`attributed`, `unexplained`, or `correlated — suspected bad
+deploy`) and reasoning for every candidate explicitly in your summary, even the ones you
+attribute and skip — "I saw X, checked change_context, attributed to commit Y" is exactly as
+much a part of your job as filing the ones you can't explain.
 
 ### ArgoCD deploy history unavailable ⇒ unknown, never "no deploy occurred"
 
@@ -263,7 +304,9 @@ from the evidence bundle — never a paraphrase]
 current=... median_7d=... median_28d=... ratio_vs_28d=... z_score_28d=... history_days_28d=...
 
 ## Change correlation
-[attributed to commit X, or: checked change_context, no plausible deploy/merge explains this]
+[unexplained: checked change_context, no plausible deploy/merge explains this — OR, for an
+error-rate finding only: "Suspected bad deploy: <short-sha> / <PR title if known>" — never
+"attributed" for an error-rate finding, see Mandatory Change Correlation above]
 
 <!-- agent-fingerprint: <bot>/monitor/<short-kind>/<stable-detail> -->
 BODY
