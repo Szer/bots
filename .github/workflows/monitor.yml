@@ -184,36 +184,55 @@ jobs:
           fi
 
           # change_context: source-dir merges to main (already have full
-          # history via fetch-depth 0) + ArgoCD deploy history, preceding 72h.
-          # ArgoCD history is a REQUIRED source, same as prometheus/loki/argocd
-          # app status/postgres above — it must fail loud (not swallow a
-          # curl error into "(ArgoCD history unavailable)") and be reflected
-          # in this bot's manifest, so the guard step below can mark the bot
-          # degraded instead of the agent silently reasoning from a bundle
-          # that is missing half its change-correlation evidence.
+          # history via fetch-depth 0, REQUIRED — git log alone already
+          # answers "did something ship recently?") + ArgoCD deploy history,
+          # preceding 72h.
+          #
+          # ArgoCD deploy history is OPTIONAL evidence — enrichment for
+          # change correlation only, not core evidence (pod health/sync is
+          # core evidence and is already probed as the REQUIRED "argocd"
+          # source in runtime.sh, above). A failure here must degrade this
+          # bot's change_context, NOT skip the bot — see probe_optional() in
+          # lib.sh and monitor.md. (Fixed 2026-07-27: run 30233211533 hit a
+          # wrong /history endpoint, 404'd for all three bots, and — because
+          # it was wired as fail-loud/REQUIRED — blanked clean_bots to `[]`
+          # and skipped the entire monitor run.)
+          #
+          # There is no separate ArgoCD "/history" endpoint. Deploy history
+          # lives at `.status.history[]` INSIDE the application object — the
+          # SAME object scripts/verify-deploy.sh's argocd_fetch() already
+          # reads `.status.sync`/`.status.health`/`.status.summary.images`
+          # from at `GET /api/v1/applications/<app>`. Each history entry's
+          # `id`/`revision`/`deployedAt` fields are extracted explicitly
+          # (verified against .github/prompts/sre.md's "Get deployment
+          # history" jq, which reads the same fields plus `initiatedBy`);
+          # the full entry is also included as raw JSON so nothing is lost
+          # if it carries other fields (e.g. `source`) we didn't name here.
           SOURCE_DIR="$(bot_field "$bot" '.source_dir')"
           APP_NAME="$(bot_field "$bot" '.argocd_app')"
+          APP_PATH="/api/v1/applications/${APP_NAME}"
 
-          ARGOCD_HISTORY_STATUS=$(probe "argocd_history" curl -sSf --connect-timeout 5 --max-time 20 \
-              "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/history" -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}") || true
+          ARGOCD_HISTORY_STATUS=$(probe_optional "argocd_history" curl -sSf --connect-timeout 5 --max-time 20 \
+              "${ARGOCD_URL}${APP_PATH}" -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}") || true
           jq -cn --arg s "$ARGOCD_HISTORY_STATUS" '{argocd_history: $s}' > "/tmp/evidence/${bot}.change_context_manifest.json"
 
           {
             echo "### Merges to main touching ${SOURCE_DIR} (preceding 72h)"
             git log --since="72 hours ago" --oneline -- "$SOURCE_DIR" | sed 's/^/- /' || true
             echo
-            echo "### ArgoCD deploy history (preceding 72h)"
+            echo "### ArgoCD deploy history (preceding 72h, OPTIONAL source — see monitor.md)"
             if [ "$ARGOCD_HISTORY_STATUS" = "ok" ]; then
-              curl -sSf --connect-timeout 5 --max-time 20 "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/history" \
+              curl -sSf --connect-timeout 5 --max-time 20 "${ARGOCD_URL}${APP_PATH}" \
                 -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
                 | jq -r --arg since "$START_72H" '
-                    [.items[]? | select(.deployedAt >= $since)]
+                    [.status.history[]? | select(.deployedAt >= $since)]
                     | if length == 0 then "(none in the last 72h)"
-                      else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt)"
+                      else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt) raw=\(. | tojson)"
                       end
                   '
             else
-              echo "ERROR: ArgoCD deploy history unreachable: ${ARGOCD_HISTORY_STATUS} — see this bot's manifest, the guard step will mark it degraded."
+              echo "UNKNOWN: ArgoCD deploy history was unavailable this run (${ARGOCD_HISTORY_STATUS})."
+              echo "This is NOT evidence that no deploy occurred — it only means we could not check. Do not treat the absence of entries above as \"no recent deploy\"; rely on the git-log section above for change correlation and say explicitly in your summary that deploy history was unavailable."
             fi
           } > "/tmp/evidence/${bot}.change_context.md"
 
@@ -239,11 +258,19 @@ jobs:
         SKIPPED=""
         declare -a CLEAN_BOTS=()
         for bot in $GATHER_BOTS; do
-          # Both manifests must be valid JSON objects. An unreadable one counts
-          # as DEGRADED, never as clean — the fail-safe direction. (2026-07-27:
-          # emit_manifest pretty-printed its output, so `head -n1` returned a
-          # bare "{"; here that crashed the guard at exit 2, and in product.yml
-          # the same malformed input was swallowed and read as healthy.)
+          # RUNTIME_MANIFEST and GATHER_JSON carry only REQUIRED sources
+          # (prometheus/loki/argocd app-status/postgres) and must be valid
+          # JSON objects. An unreadable one counts as DEGRADED, never as
+          # clean — the fail-safe direction. (2026-07-27: emit_manifest
+          # pretty-printed its output, so `head -n1` returned a bare "{";
+          # here that crashed the guard at exit 2, and in product.yml the
+          # same malformed input was swallowed and read as healthy.)
+          #
+          # CC_MANIFEST carries only the argocd_history probe, which is
+          # OPTIONAL evidence (see probe_optional() in lib.sh and the gather
+          # step above) — an unreadable/missing CC_MANIFEST must NOT force
+          # this bot degraded, only give it a "degraded(optional)" status so
+          # it is visible but ignored by the BAD computation below.
           RUNTIME_MANIFEST=$(head -n1 "/tmp/evidence/${bot}.runtime.md" 2>/dev/null || echo '')
           GATHER_JSON=$(cat "/tmp/evidence/${bot}.gather.json" 2>/dev/null || echo '')
           CC_MANIFEST=$(cat "/tmp/evidence/${bot}.change_context_manifest.json" 2>/dev/null || echo '')
@@ -257,14 +284,13 @@ jobs:
             MANIFEST_BAD="yes"
           fi
           if ! echo "$CC_MANIFEST" | jq -e 'type == "object"' >/dev/null 2>&1; then
-            CC_MANIFEST='{"argocd_history":"unreadable — change_context ArgoCD-history probe emitted no valid manifest"}'
-            MANIFEST_BAD="yes"
+            CC_MANIFEST='{"argocd_history":"degraded(optional): change_context ArgoCD-history probe emitted no valid manifest"}'
           fi
 
           # Merge ALL THREE manifests (runtime.sh's prometheus/loki/argocd
           # probe + baseline.sh gather's prometheus/loki/argocd/postgres probe
-          # + the change_context step's argocd_history probe) into ONE
-          # combined manifest — report-degraded.sh reads `.sources` from
+          # + the change_context step's OPTIONAL argocd_history probe) into
+          # ONE combined manifest — report-degraded.sh reads `.sources` from
           # whatever file it's given, so a postgres-only or argocd-history-only
           # failure (each probed by only one of the three) must still show up
           # there, not just in a manifest that would misleadingly read all-"ok".
@@ -275,9 +301,23 @@ jobs:
               '{bot: $bot, sources: ($rt + $bl + $cc)}')
           echo "$COMBINED_MANIFEST" > "/tmp/evidence/${bot}.combined-manifest.json"
 
-          BAD=$(echo "$COMBINED_MANIFEST" | jq -r '.sources | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
-          # Belt and braces: if either manifest was unreadable, force this bot
-          # degraded even if the merged .sources somehow came out empty.
+          # REQUIRED-vs-OPTIONAL is purely data-driven off the status STRING,
+          # not the source key: any status other than "ok" that does NOT start
+          # with "degraded(optional):" is a required-source failure and marks
+          # the bot BAD (skipped). A "degraded(optional): ..." status (from
+          # probe_optional(), currently only argocd_history) is deliberately
+          # excluded here — it is enrichment evidence, so its failure degrades
+          # this bot's change_context (visible in combined-manifest.json and
+          # change_context.md) but must never skip the bot.
+          BAD=$(echo "$COMBINED_MANIFEST" | jq -r '
+              .sources
+              | to_entries[]
+              | select(.value != "ok")
+              | select((.value | startswith("degraded(optional):")) | not)
+              | .key
+            ' 2>/dev/null || true)
+          # Belt and braces: if a REQUIRED manifest was unreadable, force this
+          # bot degraded even if the merged .sources somehow came out empty.
           if [ -n "$MANIFEST_BAD" ] && [ -z "$BAD" ]; then
             BAD="manifest"
           fi
@@ -288,7 +328,17 @@ jobs:
             echo "run_${bot}=false" >> "$GITHUB_OUTPUT"
             SKIPPED="${SKIPPED}${SKIPPED:+, }${bot} (${BAD})"
           else
-            echo "bot=${bot}: evidence clean — proceeding."
+            OPTIONAL_DEGRADED=$(echo "$COMBINED_MANIFEST" | jq -r '
+                .sources
+                | to_entries[]
+                | select(.value | startswith("degraded(optional):"))
+                | "\(.key): \(.value)"
+              ' 2>/dev/null || true)
+            if [ -n "$OPTIONAL_DEGRADED" ]; then
+              echo "::warning::bot=${bot}: evidence clean (required sources ok) but OPTIONAL source(s) degraded — proceeding anyway: ${OPTIONAL_DEGRADED}"
+            else
+              echo "bot=${bot}: evidence clean — proceeding."
+            fi
             echo "run_${bot}=true" >> "$GITHUB_OUTPUT"
             CLEAN_BOTS+=("$bot")
           fi
