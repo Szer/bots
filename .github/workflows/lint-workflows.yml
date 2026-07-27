@@ -36,3 +36,10 @@ jobs:
     - name: Run actionlint
       run: |
         ./actionlint -color
+
+    # Workflows that are generated into other repositories rather than run here.
+    # They live outside .github/workflows/ so GitHub doesn't schedule them, which
+    # also means the default actionlint sweep above skips them — lint explicitly.
+    - name: Run actionlint on generated upstream-mirror workflows
+      run: |
+        ./actionlint -color .github/upstream/build.yml
