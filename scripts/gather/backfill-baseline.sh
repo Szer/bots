@@ -27,6 +27,14 @@
 # LIVE current run in monitor.yml, never baseline-relative (see monitor.md),
 # so there is nothing to warm there.
 #
+# Known gap (see report deliverable 3): coupon's `user_feedback_7d` series
+# (baseline.sh gather: a 7-day TRAILING count, unlike every other series
+# here which is a plain 24h-per-calendar-day bucket) is deliberately NOT
+# backfilled — computing a correct rolling 7-day sum per historical day is
+# a materially different query shape, and there is no live data available
+# to this agent to validate it against. `chat_message_24h` (same 24h-bucket
+# shape as everything else) IS backfilled.
+#
 # One JSONL line PER CALENDAR DAY (UTC, 00:00–24:00) is written, with
 # "run_id":"backfill" and "origin":"backfill", timestamped at that day's
 # 23:59:59Z so it sorts correctly among real per-run entries and is
@@ -42,6 +50,13 @@
 # scripts/gather/baseline.sh gather: PROMETHEUS_URL, LOKI_URL, DB_PROD_HOST,
 # DB_PROD_USERNAME, DB_PROD_PASSWORD. ARGOCD_URL/ARGOCD_AUTH_TOKEN are not
 # required (no ArgoCD backfill, see above).
+#
+# Dry run: set DRY_RUN=1 (or "true") to compute everything exactly as a real
+# run would (same queries, same preflight, fails loud the same way on an
+# unreachable source), but stop before the write step — no mkdir, no file
+# write, no git state touched. Instead it prints the exact JSONL line(s) it
+# would (re)write for this bot plus a summary (line count, date range,
+# how many days already have a backfill entry that would be refreshed).
 
 set -euo pipefail
 
@@ -51,6 +66,11 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 BOT="${1:?usage: backfill-baseline.sh <bot> <state-dir> [days=28]}"
 STATE_DIR="${2:?usage: backfill-baseline.sh <bot> <state-dir> [days=28]}"
 DAYS="${3:-28}"
+
+case "${DRY_RUN:-0}" in
+    1|true|TRUE|True) DRY_RUN=1 ;;
+    *) DRY_RUN=0 ;;
+esac
 
 : "${LOKI_URL:?LOKI_URL is required}"
 : "${DB_PROD_HOST:?DB_PROD_HOST is required}"
@@ -66,7 +86,7 @@ CONTAINER="$(bot_field "$BOT" '.container')"
 DB_NAME="$(bot_field "$BOT" '.db_name')"
 DATABASE_URL="postgresql://${DB_PROD_USERNAME}:${DB_PROD_PASSWORD}@${DB_PROD_HOST}/${DB_NAME}"
 
-log "backfill-baseline: bot=${BOT} state_dir=${STATE_DIR} days=${DAYS} container=${CONTAINER} db=${DB_NAME}"
+log "backfill-baseline: bot=${BOT} state_dir=${STATE_DIR} days=${DAYS} container=${CONTAINER} db=${DB_NAME} dry_run=${DRY_RUN}"
 
 # ── preflight (fail loud — a backfill built on an unreachable source would
 # silently seed false "everything is zero" history, exactly the class of bug
@@ -142,6 +162,29 @@ case "$BOT" in
                 voided_24h: (.[5] | tonumber),
                 unique_users_24h: (.[6] | tonumber)
             })')
+        # baseline.sh gather also tracks chat_message_24h (day-bucketable the
+        # same way as the coupon_event series above) and user_feedback_7d
+        # (a 7-day TRAILING window, a different shape entirely — see report
+        # deliverable 3: deliberately NOT backfilled here, flagged as a known
+        # gap rather than risking a wrong rolling-window query with no live
+        # data to validate it against).
+        CHAT_ROWS_JSON=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -t -A -F $'\t' -c "
+            SELECT
+                date_trunc('day', created_at)::date AS day,
+                count(*) AS chat_message_count
+            FROM chat_message
+            WHERE created_at >= NOW() - INTERVAL '${DAYS} days'
+            GROUP BY day
+            ORDER BY day;
+        " | jq -R -s '
+            split("\n") | map(select(length > 0)) | map(split("\t")) | map({
+                day: .[0],
+                chat_message_24h: (.[1] | tonumber)
+            })')
+        # Merge coupon_event and chat_message rows by day (full outer join, missing side = 0).
+        PG_ROWS_JSON=$(jq -n --argjson a "$PG_ROWS_JSON" --argjson b "$CHAT_ROWS_JSON" '
+            ($a + $b) | group_by(.day) | map(reduce .[] as $r ({}; . + $r))
+        ')
         ;;
     alita)
         PG_ROWS_JSON=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -t -A -F $'\t' -c "
@@ -226,15 +269,23 @@ log "Backfill computed ${DAY_COUNT} day(s) of rollups for bot=${BOT}."
 # ── idempotent write: drop prior origin=backfill lines for the days we are
 # about to (re)write, in every existing month file for this bot, then
 # append the freshly computed backfill lines, grouped back by month ───────
+# NOTE: mkdir is skipped entirely in DRY_RUN — a dry run must not create so
+# much as an empty directory. Existing lines are still read (read-only) if
+# the directory already exists, so the "already present" count below is
+# accurate.
 BOT_DIR="${STATE_DIR}/${BOT}"
-mkdir -p "$BOT_DIR"
+if [ "$DRY_RUN" != "1" ]; then
+    mkdir -p "$BOT_DIR"
+fi
 
 EXISTING_JSON="[]"
-shopt -s nullglob
-existing_files=("${BOT_DIR}"/*.jsonl)
-shopt -u nullglob
-if [ "${#existing_files[@]}" -gt 0 ]; then
-    EXISTING_JSON=$(cat "${existing_files[@]}" | jq -s '.')
+if [ -d "$BOT_DIR" ]; then
+    shopt -s nullglob
+    existing_files=("${BOT_DIR}"/*.jsonl)
+    shopt -u nullglob
+    if [ "${#existing_files[@]}" -gt 0 ]; then
+        EXISTING_JSON=$(cat "${existing_files[@]}" | jq -s '.')
+    fi
 fi
 
 DAYS_BEING_WRITTEN=$(echo "$MERGED_JSON" | jq -c '[.[].day]')
@@ -258,6 +309,25 @@ NEW_LINES_JSON=$(echo "$MERGED_JSON" | jq -c --arg bot "$BOT" '
     }
 ')
 
+ALREADY_PRESENT=$(jq -n --argjson existing "$EXISTING_JSON" --argjson days "$DAYS_BEING_WRITTEN" '
+    [$existing[] | select(.run_id == "backfill") | .ts[0:10]]
+    | map(select(. as $d | $days | index($d)))
+    | unique
+    | length
+')
+NEW_COUNT=$((DAY_COUNT - ALREADY_PRESENT))
+DATE_MIN=$(echo "$MERGED_JSON" | jq -r '[.[].day] | if length == 0 then "n/a" else min end')
+DATE_MAX=$(echo "$MERGED_JSON" | jq -r '[.[].day] | if length == 0 then "n/a" else max end')
+
+if [ "$DRY_RUN" = "1" ]; then
+    log "DRY RUN: bot=${BOT} — no files written, nothing committed/pushed."
+    log "DRY RUN: bot=${BOT} — would (re)write ${DAY_COUNT} line(s) to ${STATE_DIR}/${BOT}/, covering ${DATE_MIN}..${DATE_MAX}. ${ALREADY_PRESENT} day(s) already have a backfill entry (would be refreshed in place), ${NEW_COUNT} day(s) are new."
+    log "DRY RUN: bot=${BOT} — exact JSONL line(s) that would be (re)written:"
+    echo "$NEW_LINES_JSON"
+    log "DRY RUN complete for bot=${BOT}. Re-run with DRY_RUN unset (or 0) to actually write + push."
+    exit 0
+fi
+
 ALL_JSON=$(jq -n --argjson kept "$KEPT_JSON" --argjson new "[$(echo "$NEW_LINES_JSON" | paste -sd, -)]" '
     ($kept + $new) | sort_by(.ts)
 ')
@@ -272,4 +342,4 @@ for month in $MONTHS; do
     log "wrote $(echo "$ALL_JSON" | jq --arg m "$month" '[.[] | select(.ts[0:7] == $m)] | length') line(s) to ${out_file}"
 done
 
-log "Backfill complete for bot=${BOT}: ${DAY_COUNT} day(s) written/refreshed across ${STATE_DIR}/${BOT}/. UNVERIFIED against real data — inspect the output before trusting it."
+log "Backfill complete for bot=${BOT}: ${DAY_COUNT} day(s) written/refreshed across ${STATE_DIR}/${BOT}/ (${ALREADY_PRESENT} refreshed, ${NEW_COUNT} new), covering ${DATE_MIN}..${DATE_MAX}. UNVERIFIED against real data — inspect the output before trusting it."
