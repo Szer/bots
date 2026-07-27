@@ -1,0 +1,38 @@
+name: "Lint: GitHub Actions workflows"
+
+# actionlint gate for .github/workflows/**. Catches malformed expressions,
+# unknown inputs/outputs/secrets, invalid job dependencies, shellcheck issues
+# in `run:` blocks, and other structural workflow bugs that `yaml.safe_load`
+# happily accepts.
+#
+# NOTE: actionlint does NOT catch the reusable-workflow permission-escalation
+# class from PR #274 (a caller declaring `permissions: contents: read` calling
+# a reusable workflow that declares `permissions: contents: write`) — GitHub
+# rejects that at run-load time with a jobless startup_failure, but actionlint
+# has no cross-workflow permission-escalation check. Verified locally against
+# a minimal repro (caller `contents: read` + reusable `contents: write`):
+# actionlint v1.7.12 reports 0 errors. This gate still catches many other real
+# workflow bug classes, so it's added regardless.
+
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+  workflow_dispatch:
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download actionlint (pinned v1.7.12 / commit 914e7df21a07ef503a81201c76d2b11c789d3fca)
+      run: |
+        bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash") 1.7.12
+
+    - name: Run actionlint
+      run: |
+        ./actionlint -color
