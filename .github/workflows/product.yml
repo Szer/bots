@@ -2,25 +2,40 @@ name: Product Analysis
 
 # Loops over every bot whose `roles` (.github/bots.yml) include `product` —
 # currently vahter and coupon; alita is deliberately excluded (13 messages
-# ever, see AGENT-FLOWS-REDESIGN.md §3.8). Gather/probe/guard/labeling below
-# are fully bots.yml-driven via a bash loop (add a bot = one bots.yml entry).
-# The per-bot AGENT INVOCATION steps ("Run product agent: <bot>") are NOT
-# loop-driven: `uses: openai/codex-action@v1` is a GitHub Action step, which
-# cannot be invoked from inside a bash loop the way scripts/run-agent.sh in
-# the redesign doc's idealized §8 sketch can. Adding a THIRD product bot
-# therefore needs one bots.yml entry (roles: [..., product, ...]) plus one
-# copy of the "vahter" step block below (create-issue / load-prompt /
-# run-agent / close-issue), renamed to the new bot.
+# ever, see AGENT-FLOWS-REDESIGN.md §3.8). Gather/probe/guard/labeling are
+# fully bots.yml-driven via a bash loop (add a bot = one bots.yml entry).
 #
-# The guard step evaluates EACH bot's manifest INDEPENDENTLY (§8 of the
-# redesign doc originally sketched an all-or-nothing guard — that was wrong;
-# one bot's outage must never blind an unrelated healthy bot, see the
-# updated §8 text). A degraded bot is skipped (its agent step doesn't run,
-# and the shared evidence-pipeline-degraded issue records exactly which bot
-# and which source), while every other bot's agent still runs normally. The
-# job still ends non-zero if anything was skipped — a red run is the correct
-# signal — but only via a final `if: always()` step placed AFTER the agent
-# steps, so a degraded bot can never pre-empt a healthy one's analysis.
+# Three-job graph (see monitor.yml for the identical pattern, driven by the
+# same drop-sudo bug):
+#   gather   — VPN-bound (aks-vpn concurrency group, single-occupancy):
+#              product-data gathering + the per-bot guard. Uploads
+#              /tmp/evidence as a short-lived artifact (7-day retention — it
+#              contains user chat text) and emits `clean_bots`, a JSON array
+#              of bots that passed the guard (suitable for `fromJson`).
+#   agent    — one job PER BOT via `strategy.matrix: bot: fromJson(clean_bots)`,
+#              `fail-fast: false`, NOT in the aks-vpn group. Each matrix leg
+#              is its own runner, so each gets exactly ONE
+#              `openai/codex-action@v1` invocation: `safety-strategy:
+#              drop-sudo` is a one-way, once-per-runner operation, and a
+#              SECOND invocation on the same runner dies at
+#              `ensurePasswordlessSudo` — the same bug fixed in monitor.yml
+#              (before the split, only the first bot in the old single job
+#              ever got analysed). Creates + closes the per-bot orchestration
+#              issue around the agent invocation. Skipped entirely (guarded
+#              by `if:`) when `clean_bots` is `[]`, since GitHub errors on an
+#              empty matrix.
+#   finalize — `if: always()`; fails the run if the gather job reports any
+#              skipped bot OR if any `agent` matrix leg failed, but not
+#              merely because `agent` itself was skipped (empty matrix).
+#
+# The guard step evaluates EACH bot's manifest INDEPENDENTLY — one bot's
+# outage must never blind an unrelated healthy bot. A degraded bot is
+# skipped (its agent leg never runs, and the shared
+# evidence-pipeline-degraded issue records exactly which bot and which
+# source), while every other bot's agent still runs normally.
+#
+# Adding a THIRD product bot is now purely a `.github/bots.yml` entry with
+# `product` in its `roles` — no workflow edit needed.
 
 on:
   schedule:
@@ -52,16 +67,18 @@ jobs:
             || echo "WARNING: Failed to close orchestration issue #${NUM}, continuing"
         done
 
-  product-analysis:
+  gather:
     needs: cleanup
     runs-on: ubuntu-latest
     # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23
-    # incident). ONE job for ALL bots — a strategy.matrix would queue behind
-    # itself on this group and re-establish the tunnel per bot (see
-    # AGENT-FLOWS-REDESIGN.md §4 Phase 1 / §8).
+    # incident). Only THIS job touches the VPN.
     concurrency:
       group: aks-vpn
       cancel-in-progress: false
+
+    outputs:
+      clean_bots: ${{ steps.guard.outputs.clean_bots }}
+      skipped_bots: ${{ steps.guard.outputs.skipped_bots }}
 
     steps:
     - uses: actions/checkout@v4
@@ -141,6 +158,7 @@ jobs:
         set -euo pipefail
         chmod +x scripts/report-degraded.sh
         SKIPPED=""
+        declare -a CLEAN_BOTS=()
         for bot in $GATHER_BOTS; do
           FILE="/tmp/evidence/${bot}.md"
           MANIFEST=$(head -n1 "$FILE" 2>/dev/null || echo '')
@@ -166,198 +184,175 @@ jobs:
           else
             echo "bot=${bot}: evidence clean — proceeding to agent invocation."
             echo "run_${bot}=true" >> "$GITHUB_OUTPUT"
+            CLEAN_BOTS+=("$bot")
           fi
         done
         echo "skipped_bots=${SKIPPED}" >> "$GITHUB_OUTPUT"
+        # JSON array of bots that passed the guard, suitable for the `agent`
+        # job's `fromJson(...)` matrix. jq's --args/$ARGS.positional handles
+        # the zero-bots case correctly (emits `[]`), unlike naive string
+        # concatenation.
+        CLEAN_JSON=$(jq -cn --args '$ARGS.positional' "${CLEAN_BOTS[@]}")
+        echo "clean_bots=${CLEAN_JSON}" >> "$GITHUB_OUTPUT"
         if [ -n "$SKIPPED" ]; then
-          echo "::warning::Evidence pipeline degraded for: ${SKIPPED} — see the evidence-pipeline-degraded issue. Healthy bots below still run normally; this job will still end non-zero overall (see the final 'Fail the run if any bot's evidence was degraded' step) so the degradation isn't silently swallowed."
+          echo "::warning::Evidence pipeline degraded for: ${SKIPPED} — see the evidence-pipeline-degraded issue. Healthy bots below still run normally; this run will still end non-zero overall (see the 'finalize' job) so the degradation isn't silently swallowed."
         else
           echo "All gathered bots reported a clean manifest."
         fi
 
-    # ─── vahter ──────────────────────────────────────────────────────────
-
-    - name: "Create orchestration issue: vahter"
-      id: create-issue-vahter
-      if: steps.guard.outputs.run_vahter == 'true'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -euo pipefail
-        DATE=$(date -u +%Y-%m-%d)
-        REPORT=$(cat /tmp/evidence/vahter.md)
-
-        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
-          --title "Product analysis: VahterBanBot ${DATE}" \
-          --label "product" --label "bot:vahter" \
-          --body "## Product Analysis — VahterBanBot — ${DATE}
-
-        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-        ---
-
-        ${REPORT}")
-
-        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
-        if [ -z "$ISSUE_NUMBER" ]; then
-          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
-          exit 1
-        fi
-        echo "Created issue #${ISSUE_NUMBER}"
-        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
-
-    - name: "Load agent prompt and product data: vahter"
-      if: steps.guard.outputs.run_vahter == 'true'
-      run: |
-        {
-          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
-          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
-          cat .github/prompts/product.md
-          echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
-          echo "PRODUCT_REPORT_VAHTER<<${REPORT_DELIM}"
-          cat /tmp/evidence/vahter.md
-          echo "${REPORT_DELIM}"
-        } >> "$GITHUB_ENV"
-
-    - name: "Run product agent: vahter"
-      if: steps.guard.outputs.run_vahter == 'true'
-      uses: openai/codex-action@v1
-      with:
-        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-        model: gpt-5-mini
-        sandbox: workspace-write
-        safety-strategy: drop-sudo
-        effort: medium
-        codex-args: '--config sandbox_workspace_write.network_access=true'
-        prompt: |
-          <instructions>
-          ${{ env.AGENT_PROMPT }}
-          </instructions>
-
-          <bot registry-key="vahter">VahterBanBot</bot>
-
-          <product-data-report>
-          ${{ env.PRODUCT_REPORT_VAHTER }}
-          </product-data-report>
-
-          You have been triggered for the scheduled product analysis (runs Tuesday and Friday), for VahterBanBot only.
-          Every issue you create must carry the label `bot:vahter` in addition to any other labels required by your instructions.
-          The orchestration issue is #${{ steps.create-issue-vahter.outputs.issue_number }}.
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: "Close orchestration issue: vahter"
-      if: always() && steps.create-issue-vahter.outputs.issue_number
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh issue close "${{ steps.create-issue-vahter.outputs.issue_number }}" --repo "${{ github.repository }}" \
-          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-    # ─── coupon ──────────────────────────────────────────────────────────
-
-    - name: "Create orchestration issue: coupon"
-      id: create-issue-coupon
-      if: steps.guard.outputs.run_coupon == 'true'
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -euo pipefail
-        DATE=$(date -u +%Y-%m-%d)
-        REPORT=$(cat /tmp/evidence/coupon.md)
-
-        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
-          --title "Product analysis: CouponHubBot ${DATE}" \
-          --label "product" --label "bot:coupon" \
-          --body "## Product Analysis — CouponHubBot — ${DATE}
-
-        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-        ---
-
-        ${REPORT}")
-
-        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
-        if [ -z "$ISSUE_NUMBER" ]; then
-          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
-          exit 1
-        fi
-        echo "Created issue #${ISSUE_NUMBER}"
-        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
-
-    - name: "Load agent prompt and product data: coupon"
-      if: steps.guard.outputs.run_coupon == 'true'
-      run: |
-        {
-          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
-          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
-          cat .github/prompts/product.md
-          echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
-          echo "PRODUCT_REPORT_COUPON<<${REPORT_DELIM}"
-          cat /tmp/evidence/coupon.md
-          echo "${REPORT_DELIM}"
-        } >> "$GITHUB_ENV"
-
-    - name: "Run product agent: coupon"
-      if: steps.guard.outputs.run_coupon == 'true'
-      uses: openai/codex-action@v1
-      with:
-        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-        model: gpt-5-mini
-        sandbox: workspace-write
-        safety-strategy: drop-sudo
-        effort: medium
-        codex-args: '--config sandbox_workspace_write.network_access=true'
-        prompt: |
-          <instructions>
-          ${{ env.AGENT_PROMPT }}
-          </instructions>
-
-          <bot registry-key="coupon">CouponHubBot</bot>
-
-          <product-data-report>
-          ${{ env.PRODUCT_REPORT_COUPON }}
-          </product-data-report>
-
-          You have been triggered for the scheduled product analysis (runs Tuesday and Friday), for CouponHubBot only.
-          Every issue you create must carry the label `bot:coupon` in addition to any other labels required by your instructions.
-          The orchestration issue is #${{ steps.create-issue-coupon.outputs.issue_number }}.
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: "Close orchestration issue: coupon"
-      if: always() && steps.create-issue-coupon.outputs.issue_number
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh issue close "${{ steps.create-issue-coupon.outputs.issue_number }}" --repo "${{ github.repository }}" \
-          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-    # Runs AFTER every agent step above (via if: always()) so a degraded bot
-    # can never pre-empt a healthy bot's analysis — the healthy bots' agents
-    # have already run by the time this step decides the job's exit code. A
-    # red run here is still the correct final signal: the evidence pipeline
-    # WAS degraded for at least one bot this run, even though the others
-    # completed normally.
-    - name: Fail the run if any bot's evidence was degraded
+    - name: Upload evidence artifact for the agent job
       if: always()
-      env:
-        SKIPPED_BOTS: ${{ steps.guard.outputs.skipped_bots }}
-      run: |
-        if [ -n "$SKIPPED_BOTS" ]; then
-          echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent above still ran normally; this job ends non-zero only to surface the degradation, not to undo the healthy bots' analysis."
-          exit 1
-        fi
-        echo "No bots skipped this run — evidence pipeline healthy."
+      uses: actions/upload-artifact@v4
+      with:
+        name: product-evidence
+        path: /tmp/evidence
+        # Contains user chat text (product report excerpts) — do not keep it
+        # around beyond what the agent job needs it for.
+        retention-days: 7
 
     - name: Disconnect VPN (final safety net)
       if: always()
       run: sudo wg-quick down wg0 || true
+
+  # ─── agent — one job per bot that passed the guard, so each runner gets
+  # exactly ONE openai/codex-action@v1 invocation (see the header comment's
+  # "agent" bullet for the drop-sudo bug this fixes). ──────────────────────
+
+  agent:
+    needs: gather
+    # GitHub errors outright on an empty strategy.matrix — this guard is
+    # mandatory, not optional, whenever clean_bots could legitimately be `[]`
+    # (e.g. every bot degraded this run).
+    if: needs.gather.outputs.clean_bots != '[]' && needs.gather.outputs.clean_bots != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bot: ${{ fromJson(needs.gather.outputs.clean_bots) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download evidence artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: product-evidence
+        path: /tmp/evidence
+
+    - name: "Load agent prompt and product data"
+      id: load
+      run: |
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        BOT="${{ matrix.bot }}"
+        DISPLAY_NAME="$(bot_field "$BOT" '.display_name')"
+        echo "display_name=${DISPLAY_NAME}" >> "$GITHUB_OUTPUT"
+        {
+          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
+          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
+          cat .github/prompts/product.md
+          echo "${PROMPT_DELIM}"
+        } >> "$GITHUB_ENV"
+        {
+          REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
+          echo "PRODUCT_REPORT<<${REPORT_DELIM}"
+          cat "/tmp/evidence/${BOT}.md"
+          echo "${REPORT_DELIM}"
+        } >> "$GITHUB_ENV"
+
+    - name: "Create orchestration issue"
+      id: create-issue
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        BOT="${{ matrix.bot }}"
+        DISPLAY_NAME="${{ steps.load.outputs.display_name }}"
+        DATE=$(date -u +%Y-%m-%d)
+        REPORT=$(cat "/tmp/evidence/${BOT}.md")
+
+        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
+          --title "Product analysis: ${DISPLAY_NAME} ${DATE}" \
+          --label "product" --label "bot:${BOT}" \
+          --body "## Product Analysis — ${DISPLAY_NAME} — ${DATE}
+
+        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        ---
+
+        ${REPORT}")
+
+        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
+        if [ -z "$ISSUE_NUMBER" ]; then
+          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
+          exit 1
+        fi
+        echo "Created issue #${ISSUE_NUMBER}"
+        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+
+    - name: "Run product agent"
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+        model: gpt-5-mini
+        sandbox: workspace-write
+        safety-strategy: drop-sudo
+        effort: medium
+        codex-args: '--config sandbox_workspace_write.network_access=true'
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          <bot registry-key="${{ matrix.bot }}">${{ steps.load.outputs.display_name }}</bot>
+
+          <product-data-report>
+          ${{ env.PRODUCT_REPORT }}
+          </product-data-report>
+
+          You have been triggered for the scheduled product analysis (runs Tuesday and Friday), for ${{ steps.load.outputs.display_name }} only.
+          Every issue you create must carry the label `bot:${{ matrix.bot }}` in addition to any other labels required by your instructions.
+          The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: "Close orchestration issue"
+      if: always() && steps.create-issue.outputs.issue_number
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
+          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # ─── finalize — surfaces both failure modes (degraded evidence pipeline,
+  # and any bot's agent invocation failing) without depending on `agent`
+  # having actually run (an empty matrix is a legitimate, non-failing
+  # skip). ──────────────────────────────────────────────────────────────
+
+  finalize:
+    needs: [gather, agent]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fail the run if any bot's evidence was degraded or any bot's agent failed
+      env:
+        SKIPPED_BOTS: ${{ needs.gather.outputs.skipped_bots }}
+        AGENT_RESULT: ${{ needs.agent.result }}
+      run: |
+        set -euo pipefail
+        FAILED="false"
+        if [ -n "$SKIPPED_BOTS" ]; then
+          echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent still ran normally; this job ends non-zero only to surface the degradation, not to undo the healthy bots' analysis."
+          FAILED="true"
+        fi
+        # AGENT_RESULT is "skipped" (not "failure") when clean_bots was `[]` —
+        # that must NOT fail this job, only an actual matrix-leg failure should.
+        if [ "$AGENT_RESULT" = "failure" ]; then
+          echo "::error::One or more bot agent invocations failed this run (see the 'agent' job's matrix legs)."
+          FAILED="true"
+        fi
+        if [ "$FAILED" = "true" ]; then
+          exit 1
+        fi
+        echo "No bots skipped and no agent failures this run — evidence pipeline + agent invocations healthy."

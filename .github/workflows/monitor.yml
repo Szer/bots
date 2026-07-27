@@ -11,21 +11,31 @@ name: Monitor
 # invoked when the run lands in the first slot of the UTC day (hour < 4) or
 # on a manual workflow_dispatch.
 #
-# ONE job for the gather/guard/agent-invocation phase (aks-vpn concurrency
-# group is single-occupancy — a strategy.matrix would queue behind itself
-# and re-establish the VPN tunnel per bot, see product.yml's header comment
-# and AGENT-FLOWS-REDESIGN.md §4/§8). The guard evaluates each bot's
-# evidence INDEPENDENTLY: a degraded bot is skipped (and recorded on the
-# shared evidence-pipeline-degraded issue) while every other bot's agent
-# still runs normally; the job still ends non-zero if anything was
-# skipped, but only via a final `if: always()` step placed AFTER every
-# agent invocation, so a degraded bot can never pre-empt a healthy one.
+# Three-job graph:
+#   gather   — VPN-bound (aks-vpn concurrency group, single-occupancy):
+#              evidence gathering, the per-bot guard, baseline append/push,
+#              fingerprint fetch, and the mechanical P1 detection. Uploads
+#              /tmp/evidence as a short-lived artifact (7-day retention — it
+#              contains user chat text) and emits `clean_bots`, a JSON array
+#              of bots that passed the guard (suitable for `fromJson`).
+#   agent    — one job PER BOT via `strategy.matrix: bot: fromJson(clean_bots)`,
+#              `fail-fast: false`, NOT in the aks-vpn group (the agent
+#              invocation needs no VPN — only gather does). Each matrix leg
+#              is its own runner, so each gets exactly ONE
+#              `openai/codex-action@v1` invocation: `safety-strategy:
+#              drop-sudo` is a one-way, once-per-runner operation, and a
+#              SECOND invocation on the same runner dies at
+#              `ensurePasswordlessSudo` (see monitor run 30229614320, step
+#              15 — before this split, only the first bot in the old single
+#              job ever got analysed). Skipped entirely (guarded by `if:`)
+#              when `clean_bots` is `[]`, since GitHub errors on an empty
+#              matrix.
+#   finalize — `if: always()`; fails the run if the gather job reports any
+#              skipped bot OR if any `agent` matrix leg failed, but not
+#              merely because `agent` itself was skipped (empty matrix).
 #
-# Adding a THIRD monitor bot needs one bots.yml entry (roles including
-# monitor) plus one copy of the per-bot step block below (gather/guard
-# already loop bots.yml-driven; the agent-invocation `uses:
-# openai/codex-action@v1` step cannot itself live inside a bash loop, same
-# constraint documented in product.yml).
+# Adding a THIRD monitor bot is now purely a `.github/bots.yml` entry with
+# `monitor` in its `roles` — no workflow edit needed.
 
 on:
   schedule:
@@ -38,15 +48,17 @@ permissions:
   pull-requests: write
 
 jobs:
-  monitor:
+  gather:
     runs-on: ubuntu-latest
     # VPN peer is single-occupancy; concurrent connections break DNS
-    # (2026-07-23 incident, see product.yml). ONE job for ALL bots.
+    # (2026-07-23 incident, see product.yml). Only THIS job touches the VPN.
     concurrency:
       group: aks-vpn
       cancel-in-progress: false
 
     outputs:
+      clean_bots: ${{ steps.guard.outputs.clean_bots }}
+      skipped_bots: ${{ steps.guard.outputs.skipped_bots }}
       p1_vahter: ${{ steps.detect-p1.outputs.p1_vahter }}
       p1_coupon: ${{ steps.detect-p1.outputs.p1_coupon }}
       p1_alita: ${{ steps.detect-p1.outputs.p1_alita }}
@@ -210,6 +222,7 @@ jobs:
         set -euo pipefail
         chmod +x scripts/report-degraded.sh
         SKIPPED=""
+        declare -a CLEAN_BOTS=()
         for bot in $GATHER_BOTS; do
           # Both manifests must be valid JSON objects. An unreadable one counts
           # as DEGRADED, never as clean — the fail-safe direction. (2026-07-27:
@@ -255,9 +268,16 @@ jobs:
           else
             echo "bot=${bot}: evidence clean — proceeding."
             echo "run_${bot}=true" >> "$GITHUB_OUTPUT"
+            CLEAN_BOTS+=("$bot")
           fi
         done
         echo "skipped_bots=${SKIPPED}" >> "$GITHUB_OUTPUT"
+        # JSON array of bots that passed the guard, suitable for the `agent`
+        # job's `fromJson(...)` matrix. jq's --args/$ARGS.positional handles
+        # the zero-bots case correctly (emits `[]`), unlike naive string
+        # concatenation.
+        CLEAN_JSON=$(jq -cn --args '$ARGS.positional' "${CLEAN_BOTS[@]}")
+        echo "clean_bots=${CLEAN_JSON}" >> "$GITHUB_OUTPUT"
         if [ -n "$SKIPPED" ]; then
           echo "::warning::Evidence pipeline degraded for: ${SKIPPED} — see the evidence-pipeline-degraded issue."
         else
@@ -344,6 +364,11 @@ jobs:
           IMAGE=$(echo "$GATHER_JSON" | jq -r '.pods.deployed_image // empty')
           echo "image_${bot}=${IMAGE}" >> "$GITHUB_OUTPUT"
 
+          # This value is also consumed by the `agent` job (via the evidence
+          # artifact) since a dynamic matrix can't address a job output by a
+          # runtime-computed key derived from matrix.bot.
+          echo "$P1" > "/tmp/evidence/${bot}.p1.txt"
+
           # Best-effort: most recent open priority-high monitor issue for this
           # bot, so the SRE agent has something to comment on if the monitor
           # agent already filed the P1 finding this run. Optional — omitted
@@ -352,189 +377,6 @@ jobs:
             --state open -L 5 --json number,createdAt --jq 'sort_by(.createdAt) | reverse | .[0].number // empty' 2>/dev/null || true)
           echo "issue_${bot}=${ISSUE}" >> "$GITHUB_OUTPUT"
         done
-
-    # ─── vahter ──────────────────────────────────────────────────────────
-
-    - name: "Load agent prompt and evidence: vahter"
-      if: steps.guard.outputs.run_vahter == 'true'
-      run: |
-        {
-          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
-          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
-          cat .github/prompts/monitor.md
-          echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          EV_DELIM="EV_EOF_$(openssl rand -hex 16)"
-          echo "RUNTIME_EVIDENCE_VAHTER<<${EV_DELIM}"
-          cat /tmp/evidence/vahter.runtime.md
-          echo
-          echo "## Baseline comparison (series)"
-          echo '```json'
-          cat /tmp/evidence/vahter.stats.json
-          echo '```'
-          echo
-          echo "## Change context (preceding 72h)"
-          cat /tmp/evidence/vahter.change_context.md
-          echo
-          echo "## Known fingerprints + suppressions"
-          echo '```json'
-          cat /tmp/evidence/vahter.fingerprints.json
-          echo '```'
-          echo
-          echo "## Mechanical P1 flag (computed by the workflow, NOT your judgment — see monitor.md)"
-          echo "p1=${{ steps.detect-p1.outputs.p1_vahter }}"
-          echo "${EV_DELIM}"
-        } >> "$GITHUB_ENV"
-
-    - name: "Run monitor agent: vahter"
-      if: steps.guard.outputs.run_vahter == 'true'
-      uses: openai/codex-action@v1
-      with:
-        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-        model: gpt-5-mini
-        sandbox: workspace-write
-        safety-strategy: drop-sudo
-        effort: high
-        codex-args: '--config sandbox_workspace_write.network_access=true'
-        prompt: |
-          <instructions>
-          ${{ env.AGENT_PROMPT }}
-          </instructions>
-
-          <bot registry-key="vahter">VahterBanBot</bot>
-
-          <runtime-evidence>
-          ${{ env.RUNTIME_EVIDENCE_VAHTER }}
-          </runtime-evidence>
-
-          You have been triggered for the scheduled runtime monitor run (every 4 hours), for VahterBanBot only.
-          Every issue you create or comment on must carry the label `bot:vahter` in addition to `monitor`, `anomaly`, and a priority label.
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    # ─── coupon ──────────────────────────────────────────────────────────
-
-    - name: "Load agent prompt and evidence: coupon"
-      if: steps.guard.outputs.run_coupon == 'true'
-      run: |
-        {
-          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
-          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
-          cat .github/prompts/monitor.md
-          echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          EV_DELIM="EV_EOF_$(openssl rand -hex 16)"
-          echo "RUNTIME_EVIDENCE_COUPON<<${EV_DELIM}"
-          cat /tmp/evidence/coupon.runtime.md
-          echo
-          echo "## Baseline comparison (series)"
-          echo '```json'
-          cat /tmp/evidence/coupon.stats.json
-          echo '```'
-          echo
-          echo "## Change context (preceding 72h)"
-          cat /tmp/evidence/coupon.change_context.md
-          echo
-          echo "## Known fingerprints + suppressions"
-          echo '```json'
-          cat /tmp/evidence/coupon.fingerprints.json
-          echo '```'
-          echo
-          echo "## Mechanical P1 flag (computed by the workflow, NOT your judgment — see monitor.md)"
-          echo "p1=${{ steps.detect-p1.outputs.p1_coupon }}"
-          echo "${EV_DELIM}"
-        } >> "$GITHUB_ENV"
-
-    - name: "Run monitor agent: coupon"
-      if: steps.guard.outputs.run_coupon == 'true'
-      uses: openai/codex-action@v1
-      with:
-        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-        model: gpt-5-mini
-        sandbox: workspace-write
-        safety-strategy: drop-sudo
-        effort: high
-        codex-args: '--config sandbox_workspace_write.network_access=true'
-        prompt: |
-          <instructions>
-          ${{ env.AGENT_PROMPT }}
-          </instructions>
-
-          <bot registry-key="coupon">CouponHubBot</bot>
-
-          <runtime-evidence>
-          ${{ env.RUNTIME_EVIDENCE_COUPON }}
-          </runtime-evidence>
-
-          You have been triggered for the scheduled runtime monitor run (every 4 hours), for CouponHubBot only.
-          Every issue you create or comment on must carry the label `bot:coupon` in addition to `monitor`, `anomaly`, and a priority label.
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    # ─── alita (daily cadence — gated additionally by alita-gate) ────────
-
-    - name: "Load agent prompt and evidence: alita"
-      if: steps.guard.outputs.run_alita == 'true' && steps.alita-gate.outputs.alita_ok == 'true'
-      run: |
-        {
-          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
-          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
-          cat .github/prompts/monitor.md
-          echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          EV_DELIM="EV_EOF_$(openssl rand -hex 16)"
-          echo "RUNTIME_EVIDENCE_ALITA<<${EV_DELIM}"
-          cat /tmp/evidence/alita.runtime.md
-          echo
-          echo "## Baseline comparison (series)"
-          echo '```json'
-          cat /tmp/evidence/alita.stats.json
-          echo '```'
-          echo
-          echo "## Change context (preceding 72h)"
-          cat /tmp/evidence/alita.change_context.md
-          echo
-          echo "## Known fingerprints + suppressions"
-          echo '```json'
-          cat /tmp/evidence/alita.fingerprints.json
-          echo '```'
-          echo
-          echo "## Mechanical P1 flag (computed by the workflow, NOT your judgment — see monitor.md)"
-          echo "p1=${{ steps.detect-p1.outputs.p1_alita }}"
-          echo "${EV_DELIM}"
-        } >> "$GITHUB_ENV"
-
-    - name: "Run monitor agent: alita"
-      if: steps.guard.outputs.run_alita == 'true' && steps.alita-gate.outputs.alita_ok == 'true'
-      uses: openai/codex-action@v1
-      with:
-        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
-        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
-        model: gpt-5-mini
-        sandbox: workspace-write
-        safety-strategy: drop-sudo
-        effort: high
-        codex-args: '--config sandbox_workspace_write.network_access=true'
-        prompt: |
-          <instructions>
-          ${{ env.AGENT_PROMPT }}
-          </instructions>
-
-          <bot registry-key="alita">AlitaBot</bot>
-
-          <runtime-evidence>
-          ${{ env.RUNTIME_EVIDENCE_ALITA }}
-          </runtime-evidence>
-
-          You have been triggered for the scheduled runtime monitor run (DAILY cadence for this bot — traffic_class: dormant), for AlitaBot only. Remember: the dormant carve-out (monitor.md) disables volume-based rules entirely for this bot.
-          Every issue you create or comment on must carry the label `bot:alita` in addition to `monitor`, `anomaly`, and a priority label.
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     # ─── commit agent-state (append-only, always attempted) ─────────────
 
@@ -545,30 +387,164 @@ jobs:
         ./scripts/gather/baseline.sh commit /tmp/agent-state \
           "monitor: append run $(date -u +%Y-%m-%dT%H:%M:%SZ) (run ${{ github.run_id }})"
 
-    # Runs AFTER every agent step above (via if: always()) so a degraded bot
-    # can never pre-empt a healthy bot's analysis — see product.yml for the
-    # identical rationale.
-    - name: Fail the run if any bot's evidence was degraded
+    - name: Upload evidence artifact for the agent job
       if: always()
-      env:
-        SKIPPED_BOTS: ${{ steps.guard.outputs.skipped_bots }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: monitor-evidence
+        path: /tmp/evidence
+        # Contains user chat text (Loki log excerpts, error groups) — do not
+        # keep it around beyond what the agent job needs it for.
+        retention-days: 7
+
+  # ─── agent — one job per bot that passed the guard, so each runner gets
+  # exactly ONE openai/codex-action@v1 invocation (see the header comment's
+  # "agent" bullet for the drop-sudo bug this fixes). ──────────────────────
+
+  agent:
+    needs: gather
+    # GitHub errors outright on an empty strategy.matrix — this guard is
+    # mandatory, not optional, whenever clean_bots could legitimately be `[]`
+    # (e.g. every bot degraded, or alita outside its daily slot with the
+    # other two also degraded).
+    if: needs.gather.outputs.clean_bots != '[]' && needs.gather.outputs.clean_bots != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bot: ${{ fromJson(needs.gather.outputs.clean_bots) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download evidence artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: monitor-evidence
+        path: /tmp/evidence
+
+    - name: Load agent prompt and evidence
+      id: load
       run: |
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        BOT="${{ matrix.bot }}"
+        DISPLAY_NAME="$(bot_field "$BOT" '.display_name')"
+        TRAFFIC_CLASS="$(bot_field "$BOT" '.traffic_class')"
+
+        CADENCE_NOTE="the scheduled runtime monitor run (every 4 hours)"
+        DORMANT_NOTE=""
+        if [ "$TRAFFIC_CLASS" = "dormant" ]; then
+          CADENCE_NOTE="the scheduled runtime monitor run (DAILY cadence for this bot — traffic_class: dormant)"
+          DORMANT_NOTE=" Remember: the dormant carve-out (monitor.md) disables volume-based rules entirely for this bot."
+        fi
+        {
+          echo "display_name=${DISPLAY_NAME}"
+          echo "cadence_note=${CADENCE_NOTE}"
+          echo "dormant_note=${DORMANT_NOTE}"
+        } >> "$GITHUB_OUTPUT"
+
+        P1_FLAG=$(cat "/tmp/evidence/${BOT}.p1.txt" 2>/dev/null || echo "false")
+
+        {
+          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
+          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
+          cat .github/prompts/monitor.md
+          echo "${PROMPT_DELIM}"
+        } >> "$GITHUB_ENV"
+        {
+          EV_DELIM="EV_EOF_$(openssl rand -hex 16)"
+          echo "RUNTIME_EVIDENCE<<${EV_DELIM}"
+          cat "/tmp/evidence/${BOT}.runtime.md"
+          echo
+          echo "## Baseline comparison (series)"
+          echo '```json'
+          cat "/tmp/evidence/${BOT}.stats.json"
+          echo '```'
+          echo
+          echo "## Change context (preceding 72h)"
+          cat "/tmp/evidence/${BOT}.change_context.md"
+          echo
+          echo "## Known fingerprints + suppressions"
+          echo '```json'
+          cat "/tmp/evidence/${BOT}.fingerprints.json"
+          echo '```'
+          echo
+          echo "## Mechanical P1 flag (computed by the workflow, NOT your judgment — see monitor.md)"
+          echo "p1=${P1_FLAG}"
+          echo "${EV_DELIM}"
+        } >> "$GITHUB_ENV"
+
+    - name: "Run monitor agent"
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+        model: gpt-5-mini
+        sandbox: workspace-write
+        safety-strategy: drop-sudo
+        effort: high
+        codex-args: '--config sandbox_workspace_write.network_access=true'
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          <bot registry-key="${{ matrix.bot }}">${{ steps.load.outputs.display_name }}</bot>
+
+          <runtime-evidence>
+          ${{ env.RUNTIME_EVIDENCE }}
+          </runtime-evidence>
+
+          You have been triggered for ${{ steps.load.outputs.cadence_note }}, for ${{ steps.load.outputs.display_name }} only.${{ steps.load.outputs.dormant_note }}
+          Every issue you create or comment on must carry the label `bot:${{ matrix.bot }}` in addition to `monitor`, `anomaly`, and a priority label.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── finalize — surfaces both failure modes (degraded evidence pipeline,
+  # and any bot's agent invocation failing) without depending on `agent`
+  # having actually run (an empty matrix is a legitimate, non-failing
+  # skip). ──────────────────────────────────────────────────────────────
+
+  finalize:
+    needs: [gather, agent]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fail the run if any bot's evidence was degraded or any bot's agent failed
+      env:
+        SKIPPED_BOTS: ${{ needs.gather.outputs.skipped_bots }}
+        AGENT_RESULT: ${{ needs.agent.result }}
+      run: |
+        set -euo pipefail
+        FAILED="false"
         if [ -n "$SKIPPED_BOTS" ]; then
-          echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent above still ran normally."
+          echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent still ran normally."
+          FAILED="true"
+        fi
+        # AGENT_RESULT is "skipped" (not "failure") when clean_bots was `[]` —
+        # that must NOT fail this job, only an actual matrix-leg failure should.
+        if [ "$AGENT_RESULT" = "failure" ]; then
+          echo "::error::One or more bot agent invocations failed this run (see the 'agent' job's matrix legs)."
+          FAILED="true"
+        fi
+        if [ "$FAILED" = "true" ]; then
           exit 1
         fi
-        echo "No bots skipped this run — evidence pipeline healthy."
+        echo "No bots skipped and no agent failures this run — evidence pipeline + agent invocations healthy."
 
   # ─── P1 escalation — one job per bot, gated on the MECHANICAL flag from
-  # the monitor job (never the agent's own judgment, see monitor.md "P1"
+  # the gather job (never the agent's own judgment, see monitor.md "P1"
   # section and the Phase 2 report). commit/argocd-app-name/container-name
   # are hardcoded per bot, matching the existing vahter-deploy.yml /
   # coupon-deploy.yml / alita-deploy.yml precedent of passing bot identity
-  # as literal `with:` values into a reusable workflow. ─────────────────
+  # as literal `with:` values into a reusable workflow. These do NOT depend
+  # on the `agent` job — P1 detection is purely mechanical and independent
+  # of whether/how the LLM agent ran. ─────────────────────────────────────
 
   escalate-vahter:
-    needs: monitor
-    if: needs.monitor.outputs.p1_vahter == 'true'
+    needs: gather
+    if: needs.gather.outputs.p1_vahter == 'true'
     permissions:
       contents: write
       pull-requests: write
@@ -578,17 +554,17 @@ jobs:
       bot: VahterBanBot
       argocd-app-name: vahter-bot
       container-name: vahter-bot
-      docker-image: ${{ needs.monitor.outputs.image_vahter != '' && needs.monitor.outputs.image_vahter || 'ghcr.io/szer/vahter-bot' }}
+      docker-image: ${{ needs.gather.outputs.image_vahter != '' && needs.gather.outputs.image_vahter || 'ghcr.io/szer/vahter-bot' }}
       commit: ${{ github.sha }}
       run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      issue-number: ${{ needs.monitor.outputs.issue_vahter }}
+      issue-number: ${{ needs.gather.outputs.issue_vahter }}
       failure-class: app
       trigger: monitor-p1
     secrets: inherit
 
   escalate-coupon:
-    needs: monitor
-    if: needs.monitor.outputs.p1_coupon == 'true'
+    needs: gather
+    if: needs.gather.outputs.p1_coupon == 'true'
     permissions:
       contents: write
       pull-requests: write
@@ -598,17 +574,17 @@ jobs:
       bot: CouponHubBot
       argocd-app-name: coupon-bot
       container-name: coupon-bot
-      docker-image: ${{ needs.monitor.outputs.image_coupon != '' && needs.monitor.outputs.image_coupon || 'ghcr.io/szer/coupon-bot' }}
+      docker-image: ${{ needs.gather.outputs.image_coupon != '' && needs.gather.outputs.image_coupon || 'ghcr.io/szer/coupon-bot' }}
       commit: ${{ github.sha }}
       run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      issue-number: ${{ needs.monitor.outputs.issue_coupon }}
+      issue-number: ${{ needs.gather.outputs.issue_coupon }}
       failure-class: app
       trigger: monitor-p1
     secrets: inherit
 
   escalate-alita:
-    needs: monitor
-    if: needs.monitor.outputs.p1_alita == 'true'
+    needs: gather
+    if: needs.gather.outputs.p1_alita == 'true'
     permissions:
       contents: write
       pull-requests: write
@@ -618,10 +594,10 @@ jobs:
       bot: AlitaBot
       argocd-app-name: alita-bot
       container-name: alita-bot
-      docker-image: ${{ needs.monitor.outputs.image_alita != '' && needs.monitor.outputs.image_alita || 'ghcr.io/szer/alita-bot' }}
+      docker-image: ${{ needs.gather.outputs.image_alita != '' && needs.gather.outputs.image_alita || 'ghcr.io/szer/alita-bot' }}
       commit: ${{ github.sha }}
       run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      issue-number: ${{ needs.monitor.outputs.issue_alita }}
+      issue-number: ${{ needs.gather.outputs.issue_alita }}
       failure-class: app
       trigger: monitor-p1
     secrets: inherit
