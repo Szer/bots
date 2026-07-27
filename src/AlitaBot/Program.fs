@@ -2,10 +2,12 @@
 open System
 open System.Diagnostics
 open System.Globalization
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Time.Testing
@@ -17,6 +19,40 @@ open BotInfra
 open BotInfra.DbSettings
 
 type Root = class end
+
+// ============================================================================
+// SRE_DRILL_RUNTIME_FAILURE (2026-07-27)
+// Deliberate, owner-authorized SRE-agent validation drill, take 2 — see #298/#302 for take
+// 1 (a STARTUP failure that crashlooped the new ReplicaSet while the old pod kept serving;
+// the SRE agent correctly did NOT roll back, so the rollback path is still unvalidated).
+// This drill is different on purpose: startup and /healthz succeed normally, so Kubernetes
+// retires the old ReplicaSet and this broken one takes over — AlitaBot looks healthy to
+// Kubernetes while being functionally dead, which is the failure mode that should push the
+// SRE agent toward a rollback. `DrillRuntimeFailureLoop` is a hosted background loop
+// (registered below, gated on `not TestMode`) that ticks every 15s and logs an Error on
+// every tick — deliberately short so `verify-deploy.sh`'s 2-minute Loki
+// `level=~"Error|Fatal"` window catches it even with zero inbound Telegram traffic (AlitaBot
+// is dormant and can go days between updates in its only chat, the owner's staging chat).
+// THIS IS NOT A REAL BUG. REVERT IMMEDIATELY AFTER THE DRILL — `git revert` this commit.
+// ============================================================================
+type DrillRuntimeFailureLoop(time: TimeProvider, logger: ILogger<DrillRuntimeFailureLoop>) =
+    inherit BackgroundService()
+
+    override _.ExecuteAsync(ct: CancellationToken) =
+        task {
+            use timer = new PeriodicTimer(TimeSpan.FromSeconds 15.0, time)
+            while! timer.WaitForNextTickAsync(ct) do
+                try
+                    failwith
+                        "SRE_DRILL_RUNTIME_FAILURE: this is a deliberate, owner-authorized SRE-agent \
+                         validation drill — AlitaBot's background loop is intentionally broken and must \
+                         be reverted immediately after the drill completes."
+                with ex ->
+                    logger.LogError(
+                        ex,
+                        "SRE_DRILL_RUNTIME_FAILURE: background loop tick failed (deliberate drill, revert immediately)")
+        }
+        :> Task
 
 let connString = getEnv "DATABASE_URL"
 
@@ -241,6 +277,15 @@ if botConfOptions.Value.TestMode then
             sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
     .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
 
+// SRE_DRILL_RUNTIME_FAILURE (2026-07-27): only registered when not TestMode — see the
+// comment above `DrillRuntimeFailureLoop`'s definition. Gating on registration (rather than
+// inside ExecuteAsync) keeps this hosted service, and its PeriodicTimer, entirely absent
+// under TEST_MODE, including in tests/AlitaBot.Tests (which freezes TimeProvider via
+// FakeTimeProvider and never advances it across an assembly run — a registered-but-inert
+// timer there would simply never fire, but not registering it at all is simpler and safer).
+if not botConfOptions.Value.TestMode then
+    %builder.Services.AddHostedService<DrillRuntimeFailureLoop>()
+
 let app = builder.Build()
 
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
@@ -317,6 +362,17 @@ WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx raw
         JsonLogging.withRawJsonProperty "RawUpdate" rawBody (fun () ->
             logger.LogInformation("Received Telegram update {UpdateId}", update.UpdateId))
         try
+            // SRE_DRILL_RUNTIME_FAILURE (2026-07-27): deliberate, owner-authorized SRE-agent
+            // validation drill (see `DrillRuntimeFailureLoop` above for the primary,
+            // traffic-independent trigger) — this also breaks real Telegram update handling
+            // so the bot is genuinely non-functional on inbound messages, not merely noisy
+            // in the background. Gated on `not TestMode`. THIS IS NOT A REAL BUG. REVERT
+            // IMMEDIATELY AFTER THE DRILL — `git revert` the commit that introduced this.
+            if not botConfOptions.Value.TestMode then
+                failwith
+                    "SRE_DRILL_RUNTIME_FAILURE: this is a deliberate, owner-authorized SRE-agent \
+                     validation drill — AlitaBot's Telegram update handling is intentionally broken \
+                     and must be reverted immediately after the drill completes."
             let bot = ctx.RequestServices.GetRequiredService<BotService>()
             do! bot.OnUpdate(update)
             %topActivity.SetTag("update-error", false)
