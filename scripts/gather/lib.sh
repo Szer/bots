@@ -103,6 +103,37 @@ probe_optional() {
     return 1
 }
 
+# probe_optional_body NAME OUTFILE cmd [args...]
+# Same status/log semantics as probe_optional() (never aborts, "ok" or
+# "degraded(optional): ..." on stdout), but ALSO writes the command's stdout
+# to OUTFILE so a caller that needs the response body (not just a
+# connectivity check) doesn't have to issue the same request a second time.
+# A second, unguarded request under a caller's `set -e`/`pipefail` can abort
+# the ENTIRE surrounding loop if it transiently fails even though this first
+# (probing) request just succeeded — that would silently starve every bot
+# processed *after* the one that hit the transient failure of its
+# change_context_manifest.json, which is exactly the
+# "emitted no valid manifest" fallback text in monitor.yml's guard step (the
+# double-fetch in the ArgoCD deploy-history change_context step, fixed
+# 2026-07-27 after PR #293 introduced probe_optional() but kept a separate,
+# unguarded curl for the real fetch). OUTFILE is truncated to empty on
+# failure so a stale/partial body is never mistaken for real data.
+probe_optional_body() {
+    local name="$1" outfile="$2"
+    shift 2
+    local err status
+    if err=$("$@" 2>&1 >"$outfile"); then
+        echo "ok"
+        return 0
+    else
+        status=$?
+    fi
+    log "PROBE DEGRADED (optional) [${name}] (exit ${status}): ${err}"
+    : > "$outfile"
+    echo "degraded(optional): $(printf '%s' "$err" | head -1 | cut -c1-200)"
+    return 1
+}
+
 # emit_manifest BOT name1=status1 [name2=status2 ...]
 # Prints one JSON line: {"bot":"...","generated_at":"...","sources":{...}}.
 # Built with jq (not string concatenation) so status text containing quotes
