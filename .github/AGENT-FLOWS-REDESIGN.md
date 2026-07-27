@@ -588,6 +588,23 @@ The existing runbook in `sre.md` is good and mostly survives. Required edits:
 - Add a guaranteed cleanup step: if the agent disabled ArgoCD auto-sync and the run ends for
   any reason, an `if: always()` step re-enables it. Today a killed run leaves auto-sync off
   with only a prose reminder.
+
+**2026-07-27 addendum — the 5xx-gate edit above was necessary but not sufficient.** Deleting
+the 5xx signal still left the severity table's P1 row implicitly AND-ing "no healthy pods"
+with the Loki error-burst condition, so P1 stayed structurally unreachable for these bots —
+pods never go unhealthy from a bug in update handling, they just stop doing anything useful.
+Drill 3 (AlitaBot: `NullReferenceException` on every update + a throwing background loop,
+total outage, zero replies) proved it: the SRE agent found the exact root cause, then wrote
+`Severity: P2 (no user-facing outage; pods healthy and serving traffic)` and declined to roll
+back, reasoning verbatim that "the app remains Healthy and serving traffic." Fixed in the PR
+that introduced this addendum: the table's P1 row is now OR-based — a sustained
+update-handling error burst (`Unhandled error in update handler for {UpdateId}` /
+`Unexpected error while processing update {UpdateId}`) or work-loop error burst is P1
+*regardless* of pod health, and P3 now requires positive evidence of a successful handled
+update rather than the mere absence of an error (which was always true here and proved
+nothing). The AlitaBot-dormant carve-out from §6.1's monitor postmortem applies here too:
+P1 must key on errors being *present*, never on successes being absent, or a quiet dormant
+night pages for no reason. See `.github/prompts/sre.md` Step 1/1a/1b/1c for the full rewrite.
 - Remove the hardcoded `Szer` GHCR owner and `Szer/my-infra` strings; read from config.
 
 ---
