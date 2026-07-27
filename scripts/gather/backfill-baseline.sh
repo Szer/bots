@@ -88,6 +88,52 @@ DATABASE_URL="postgresql://${DB_PROD_USERNAME}:${DB_PROD_PASSWORD}@${DB_PROD_HOS
 
 log "backfill-baseline: bot=${BOT} state_dir=${STATE_DIR} days=${DAYS} container=${CONTAINER} db=${DB_NAME} dry_run=${DRY_RUN}"
 
+# ── single-sourced day range (root cause of the 2026-07-27 vahter incident —
+# see this script's report/git history for the full writeup) ─────────────
+# days=N means "the N complete UTC days ending yesterday" — TODAY is always
+# in progress and can never report a complete 24h count, so it is excluded
+# for every bot and every data source. FIRST_DAY..LAST_DAY is computed ONCE
+# here and reused verbatim by both the postgres query bound below and the
+# Loki per-day loop.
+#
+# Previously it was NOT single-sourced: the postgres queries below bounded
+# only the START of the range (`WHERE created_at >= NOW() - INTERVAL
+# '${DAYS} days'`, no upper bound at all), while the Loki loop separately
+# generated its own day list starting at "1 day ago" (correctly excluding
+# today). Any postgres row with created_at between today's 00:00 UTC and
+# "now" fell into today's `date_trunc('day', created_at)` bucket and was
+# written as if today were a complete day. This stayed invisible for
+# coupon/alita only because neither bot happened to have a row in the
+# elapsed hours of the run's day — vahter, the highest-traffic bot, did
+# (run 30231267170, ~02:05 UTC: wrote ts=2026-07-27T23:59:59Z with
+# callback_created_24h=7, messages_received_24h=18 — about 2 hours of real
+# traffic recorded as a full day). The bug was identical across all three
+# bots' postgres blocks; it only *manifested* on vahter because of traffic
+# timing, which is why the ranges looked "per-bot inconsistent" in the
+# incident even though the underlying defect was the same missing upper
+# bound everywhere. Fix: give postgres the same explicit, exclusive-of-today
+# upper bound the Loki loop always had, computed from one shared day list.
+TODAY_DAY="$(date -u +%Y-%m-%d)"
+LAST_DAY="$(date -u -d '1 day ago' +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d)"
+FIRST_DAY="$(date -u -d "${DAYS} days ago" +%Y-%m-%d 2>/dev/null || date -u -v-"${DAYS}"d +%Y-%m-%d)"
+
+DAY_LIST=()
+for ((_i = 0; _i < DAYS; _i++)); do
+    DAY_LIST+=("$(date -u -d "${FIRST_DAY} +${_i} days" +%Y-%m-%d 2>/dev/null || date -u -j -v+"${_i}"d -f %Y-%m-%d "${FIRST_DAY}" +%Y-%m-%d)")
+done
+unset _i
+
+# Sanity check on the range we just built (fail loud rather than silently
+# backfill a wrong or partial range — same fail-loud philosophy as the
+# preflight checks below): it must start at FIRST_DAY, end at LAST_DAY, and
+# never reach TODAY_DAY.
+if [ "${DAY_LIST[0]}" != "$FIRST_DAY" ] || [ "${DAY_LIST[-1]}" != "$LAST_DAY" ] || [ "${DAY_LIST[-1]}" = "$TODAY_DAY" ]; then
+    log "ERROR: day-range computation is inconsistent (first=${FIRST_DAY} last=${LAST_DAY} today=${TODAY_DAY} list=[${DAY_LIST[*]}]) — refusing to backfill"
+    exit 1
+fi
+
+log "backfilling ${FIRST_DAY}..${LAST_DAY} (${DAYS} complete days; current day ${TODAY_DAY} excluded as incomplete)"
+
 # ── preflight (fail loud — a backfill built on an unreachable source would
 # silently seed false "everything is zero" history, exactly the class of bug
 # this whole redesign exists to kill) ─────────────────────────────────────
@@ -120,7 +166,7 @@ case "$BOT" in
                 count(*) FILTER (WHERE event_type = 'MessageMarkedHam') AS message_marked_ham,
                 count(*) FILTER (WHERE event_type = 'MessageMarkedSpam') AS message_marked_spam
             FROM event
-            WHERE created_at >= NOW() - INTERVAL '${DAYS} days'
+            WHERE created_at >= '${FIRST_DAY}'::date AND created_at < '${LAST_DAY}'::date + INTERVAL '1 day'
             GROUP BY day
             ORDER BY day;
         " | jq -R -s '
@@ -149,7 +195,7 @@ case "$BOT" in
                 count(*) FILTER (WHERE event_type = 'voided') AS voided,
                 count(DISTINCT user_id) AS unique_users
             FROM coupon_event
-            WHERE created_at >= NOW() - INTERVAL '${DAYS} days'
+            WHERE created_at >= '${FIRST_DAY}'::date AND created_at < '${LAST_DAY}'::date + INTERVAL '1 day'
             GROUP BY day
             ORDER BY day;
         " | jq -R -s '
@@ -173,7 +219,7 @@ case "$BOT" in
                 date_trunc('day', created_at)::date AS day,
                 count(*) AS chat_message_count
             FROM chat_message
-            WHERE created_at >= NOW() - INTERVAL '${DAYS} days'
+            WHERE created_at >= '${FIRST_DAY}'::date AND created_at < '${LAST_DAY}'::date + INTERVAL '1 day'
             GROUP BY day
             ORDER BY day;
         " | jq -R -s '
@@ -192,7 +238,7 @@ case "$BOT" in
                 date_trunc('day', sent_at)::date AS day,
                 count(*) AS message_count
             FROM message_log
-            WHERE sent_at >= NOW() - INTERVAL '${DAYS} days'
+            WHERE sent_at >= '${FIRST_DAY}'::date AND sent_at < '${LAST_DAY}'::date + INTERVAL '1 day'
             GROUP BY day
             ORDER BY day;
         " | jq -R -s '
@@ -206,7 +252,7 @@ case "$BOT" in
                 count(*) AS call_count,
                 coalesce(sum(cost_usd), 0) AS total_cost_usd
             FROM llm_usage
-            WHERE called_at >= NOW() - INTERVAL '${DAYS} days'
+            WHERE called_at >= '${FIRST_DAY}'::date AND called_at < '${LAST_DAY}'::date + INTERVAL '1 day'
             GROUP BY day
             ORDER BY day;
         " | jq -R -s '
@@ -233,8 +279,7 @@ esac
 log "Querying ${DAYS} days of Loki log volume/error/warning counts (container=${CONTAINER})..."
 
 LOKI_ROWS_JSON="[]"
-for offset in $(seq 1 "$DAYS"); do
-    day=$(date -u -d "${offset} days ago" +%Y-%m-%d 2>/dev/null || date -u -v-"${offset}"d +%Y-%m-%d)
+for day in "${DAY_LIST[@]}"; do
     day_end="${day}T23:59:59Z"
 
     lines=$(retry_curl "Loki(lines,${day})" -G "${LOKI_URL}/loki/api/v1/query" \
@@ -265,6 +310,16 @@ MERGED_JSON=$(jq -n --argjson pg "$PG_ROWS_JSON" --argjson lk "$LOKI_ROWS_JSON" 
 
 DAY_COUNT=$(echo "$MERGED_JSON" | jq 'length')
 log "Backfill computed ${DAY_COUNT} day(s) of rollups for bot=${BOT}."
+
+# ── defensive guard: this must be structurally impossible after the range
+# fix above (postgres is now bounded the same as Loki), but a bug here would
+# silently manufacture false anomalies forever (see incident in the header
+# comment) — so verify it and fail loud rather than trust it silently.
+BAD_DAYS=$(echo "$MERGED_JSON" | jq -r --arg last "$LAST_DAY" '[.[] | select(.day > $last) | .day] | unique | .[]')
+if [ -n "$BAD_DAYS" ]; then
+    log "ERROR: computed rollup(s) for day(s) after ${LAST_DAY} (i.e. today or later, which is always incomplete) for bot=${BOT} — refusing to write. Offending day(s): $(echo "$BAD_DAYS" | tr '\n' ' ')"
+    exit 1
+fi
 
 # ── idempotent write: drop prior origin=backfill lines for the days we are
 # about to (re)write, in every existing month file for this bot, then
