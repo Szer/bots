@@ -1,5 +1,17 @@
 name: Product Analysis
 
+# Loops over every bot whose `roles` (.github/bots.yml) include `product` —
+# currently vahter and coupon; alita is deliberately excluded (13 messages
+# ever, see AGENT-FLOWS-REDESIGN.md §3.8). Gather/probe/guard/labeling below
+# are fully bots.yml-driven via a bash loop (add a bot = one bots.yml entry).
+# The per-bot AGENT INVOCATION steps ("Run product agent: <bot>") are NOT
+# loop-driven: `uses: openai/codex-action@v1` is a GitHub Action step, which
+# cannot be invoked from inside a bash loop the way scripts/run-agent.sh in
+# the redesign doc's idealized §8 sketch can. Adding a THIRD product bot
+# therefore needs one bots.yml entry (roles: [..., product, ...]) plus one
+# copy of the "vahter" step block below (create-issue / load-prompt /
+# run-agent / close-issue), renamed to the new bot.
+
 on:
   schedule:
     - cron: '15 10 * * 2,5'
@@ -22,7 +34,7 @@ jobs:
           --label "product" \
           --state open \
           --json number,title \
-          --jq '.[] | select(.title | test("Product analysis \\d{4}-\\d{2}-\\d{2}"; "i")) | .number' \
+          --jq '.[] | select(.title | test("Product analysis.*\\d{4}-\\d{2}-\\d{2}"; "i")) | .number' \
         | while read -r NUM; do
           echo "Closing stale product orchestration issue #${NUM}"
           gh issue close "$NUM" --repo "${{ github.repository }}" \
@@ -33,7 +45,10 @@ jobs:
   product-analysis:
     needs: cleanup
     runs-on: ubuntu-latest
-    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident).
+    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23
+    # incident). ONE job for ALL bots — a strategy.matrix would queue behind
+    # itself on this group and re-establish the tunnel per bot (see
+    # AGENT-FLOWS-REDESIGN.md §4 Phase 1 / §8).
     concurrency:
       group: aks-vpn
       cancel-in-progress: false
@@ -43,6 +58,17 @@ jobs:
 
     - name: Install PostgreSQL client
       run: sudo apt-get install -y postgresql-client
+
+    - name: Ensure bot:<name> labels exist
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        for bot in $(bots_yml_json | jq -r '.bots | keys[]'); do
+          gh label create "bot:${bot}" --repo "${{ github.repository }}" --color "1d76db" \
+            --description "Findings for the ${bot} bot" --force
+        done
 
     - name: Setup WireGuard VPN
       run: |
@@ -54,19 +80,38 @@ jobs:
         # firewall allowlist (same as _bot-deploy.yml's migration step) — split
         # tunnel (10.0.0.0/8 only) leaves it unreachable and every psql query
         # times out. This silently produced 21 consecutive empty product
-        # reports (2026-05-15 → 2026-07-25); gather-product-data.sh now aborts
+        # reports (2026-05-15 → 2026-07-25); scripts/gather/product.sh aborts
         # loudly on query failure, but it still needs the full tunnel to work.
         SPLIT_TUNNEL: "false"
 
-    - name: Gather product data
+    - name: Gather product data (bash loop, not matrix — single VPN session)
+      id: gather
       run: |
-        chmod +x scripts/gather-product-data.sh
-        ./scripts/gather-product-data.sh > /tmp/product-report.md
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        chmod +x scripts/gather/product.sh
+        mkdir -p /tmp/evidence
+        BOTS="$(all_bots_with_role product)"
+        {
+          echo "bots<<BOTS_EOF"
+          echo "$BOTS"
+          echo "BOTS_EOF"
+        } >> "$GITHUB_OUTPUT"
+        for bot in $BOTS; do
+          echo "::group::gather product evidence for ${bot}"
+          if ./scripts/gather/product.sh "$bot" > "/tmp/evidence/${bot}.md"; then
+            echo "gather OK for ${bot}"
+          else
+            echo "WARNING: gather failed for ${bot} — whatever manifest/partial report it printed before failing is in /tmp/evidence/${bot}.md; continuing to gather remaining bots so the guard step sees the full picture"
+          fi
+          echo "::endgroup::"
+        done
       env:
         PROMETHEUS_URL: http://prometheus.internal:9090
         LOKI_URL: http://loki.internal
-        CONTAINER_NAME: coupon-bot
-        DATABASE_URL: postgresql://${{ secrets.DB_PROD_USERNAME }}:${{ secrets.DB_PROD_PASSWORD }}@${{ secrets.DB_PROD_HOST }}/coupon_hub_bot
+        DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
+        DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
+        DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     # Full-tunnel VPN (SPLIT_TUNNEL=false above) routes ALL traffic — including
@@ -74,22 +119,51 @@ jobs:
     # which times out on non-AKS-internal public traffic (see scripts/setup-vpn.sh).
     # Disconnect as soon as the DB/Prometheus-dependent step is done so the
     # remaining gh/Codex API calls use normal internet routing again.
-    - name: Disconnect VPN (post product-data gather)
+    - name: Disconnect VPN (post gather)
       run: sudo wg-quick down wg0 || true
 
-    - name: Create orchestration issue
-      id: create-issue
+    - name: Guard — refuse to invoke the agent on degraded evidence
+      id: guard
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GATHER_BOTS: ${{ steps.gather.outputs.bots }}
+      run: |
+        set -euo pipefail
+        chmod +x scripts/report-degraded.sh
+        DEGRADED=0
+        for bot in $GATHER_BOTS; do
+          FILE="/tmp/evidence/${bot}.md"
+          MANIFEST=$(head -n1 "$FILE" 2>/dev/null || echo '{}')
+          echo "$MANIFEST" > "/tmp/evidence/${bot}.manifest.json"
+          BAD=$(echo "$MANIFEST" | jq -r '.sources? // {} | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::unreachable sources for bot=${bot}: ${BAD}"
+            ./scripts/report-degraded.sh "/tmp/evidence/${bot}.manifest.json"
+            DEGRADED=1
+          fi
+        done
+        if [ "$DEGRADED" -eq 1 ]; then
+          echo "ERROR: one or more bots had a degraded evidence bundle this run — see the evidence-pipeline-degraded issue. Refusing to invoke the agent for ANY bot this run (an LLM must never be handed a bundle of zeros)."
+          exit 1
+        fi
+        echo "All gathered bots reported a clean manifest — proceeding to agent invocation."
+
+    # ─── vahter ──────────────────────────────────────────────────────────
+
+    - name: "Create orchestration issue: vahter"
+      id: create-issue-vahter
+      if: contains(steps.gather.outputs.bots, 'vahter')
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
         DATE=$(date -u +%Y-%m-%d)
-        REPORT=$(cat /tmp/product-report.md)
+        REPORT=$(cat /tmp/evidence/vahter.md)
 
         ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
-          --title "Product analysis ${DATE}" \
-          --label "product" \
-          --body "## Product Analysis — ${DATE}
+          --title "Product analysis: VahterBanBot ${DATE}" \
+          --label "product" --label "bot:vahter" \
+          --body "## Product Analysis — VahterBanBot — ${DATE}
 
         **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -105,7 +179,8 @@ jobs:
         echo "Created issue #${ISSUE_NUMBER}"
         echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
-    - name: Load agent prompt and product data
+    - name: "Load agent prompt and product data: vahter"
+      if: contains(steps.gather.outputs.bots, 'vahter')
       run: |
         {
           PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
@@ -115,12 +190,13 @@ jobs:
         } >> "$GITHUB_ENV"
         {
           REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
-          echo "PRODUCT_REPORT<<${REPORT_DELIM}"
-          cat /tmp/product-report.md
+          echo "PRODUCT_REPORT_VAHTER<<${REPORT_DELIM}"
+          cat /tmp/evidence/vahter.md
           echo "${REPORT_DELIM}"
         } >> "$GITHUB_ENV"
 
-    - name: Run product agent
+    - name: "Run product agent: vahter"
+      if: contains(steps.gather.outputs.bots, 'vahter')
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -135,23 +211,109 @@ jobs:
           ${{ env.AGENT_PROMPT }}
           </instructions>
 
+          <bot registry-key="vahter">VahterBanBot</bot>
+
           <product-data-report>
-          ${{ env.PRODUCT_REPORT }}
+          ${{ env.PRODUCT_REPORT_VAHTER }}
           </product-data-report>
 
-          You have been triggered for the scheduled product analysis (runs Tuesday and Friday).
-          The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
+          You have been triggered for the scheduled product analysis (runs Tuesday and Friday), for VahterBanBot only.
+          Every issue you create must carry the label `bot:vahter` in addition to any other labels required by your instructions.
+          The orchestration issue is #${{ steps.create-issue-vahter.outputs.issue_number }}.
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Close orchestration issue
-      if: always() && steps.create-issue.outputs.issue_number
+    - name: "Close orchestration issue: vahter"
+      if: always() && steps.create-issue-vahter.outputs.issue_number
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
+        gh issue close "${{ steps.create-issue-vahter.outputs.issue_number }}" --repo "${{ github.repository }}" \
           --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-    - name: Disconnect VPN
+    # ─── coupon ──────────────────────────────────────────────────────────
+
+    - name: "Create orchestration issue: coupon"
+      id: create-issue-coupon
+      if: contains(steps.gather.outputs.bots, 'coupon')
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        DATE=$(date -u +%Y-%m-%d)
+        REPORT=$(cat /tmp/evidence/coupon.md)
+
+        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
+          --title "Product analysis: CouponHubBot ${DATE}" \
+          --label "product" --label "bot:coupon" \
+          --body "## Product Analysis — CouponHubBot — ${DATE}
+
+        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+        ---
+
+        ${REPORT}")
+
+        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
+        if [ -z "$ISSUE_NUMBER" ]; then
+          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
+          exit 1
+        fi
+        echo "Created issue #${ISSUE_NUMBER}"
+        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+
+    - name: "Load agent prompt and product data: coupon"
+      if: contains(steps.gather.outputs.bots, 'coupon')
+      run: |
+        {
+          PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
+          echo "AGENT_PROMPT<<${PROMPT_DELIM}"
+          cat .github/prompts/product.md
+          echo "${PROMPT_DELIM}"
+        } >> "$GITHUB_ENV"
+        {
+          REPORT_DELIM="REPORT_EOF_$(openssl rand -hex 16)"
+          echo "PRODUCT_REPORT_COUPON<<${REPORT_DELIM}"
+          cat /tmp/evidence/coupon.md
+          echo "${REPORT_DELIM}"
+        } >> "$GITHUB_ENV"
+
+    - name: "Run product agent: coupon"
+      if: contains(steps.gather.outputs.bots, 'coupon')
+      uses: openai/codex-action@v1
+      with:
+        openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        responses-api-endpoint: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+        model: gpt-5-mini
+        sandbox: workspace-write
+        safety-strategy: drop-sudo
+        effort: medium
+        codex-args: '--config sandbox_workspace_write.network_access=true'
+        prompt: |
+          <instructions>
+          ${{ env.AGENT_PROMPT }}
+          </instructions>
+
+          <bot registry-key="coupon">CouponHubBot</bot>
+
+          <product-data-report>
+          ${{ env.PRODUCT_REPORT_COUPON }}
+          </product-data-report>
+
+          You have been triggered for the scheduled product analysis (runs Tuesday and Friday), for CouponHubBot only.
+          Every issue you create must carry the label `bot:coupon` in addition to any other labels required by your instructions.
+          The orchestration issue is #${{ steps.create-issue-coupon.outputs.issue_number }}.
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: "Close orchestration issue: coupon"
+      if: always() && steps.create-issue-coupon.outputs.issue_number
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh issue close "${{ steps.create-issue-coupon.outputs.issue_number }}" --repo "${{ github.repository }}" \
+          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    - name: Disconnect VPN (final safety net)
       if: always()
       run: sudo wg-quick down wg0 || true

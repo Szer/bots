@@ -1,5 +1,13 @@
 name: Daily Project Assessment
 
+# Repo-wide, ONE invocation per run (not looped per bot — see
+# AGENT-FLOWS-REDESIGN.md §3/§6.3). No VPN/live-metrics gather anymore:
+# project.md dropped all runtime signals (memory thresholds, log-volume
+# threshold, 5xx, Loki queries, pod-health summary) per §6.3/§9 — that
+# responsibility moves to the future `monitor` role (Phase 2), which is the
+# one that will still need the aks-vpn concurrency group. The project agent
+# now works purely from the repo checkout + the GitHub issues API.
+
 on:
   schedule:
     - cron: '37 4 * * *'
@@ -30,32 +38,20 @@ jobs:
   project:
     needs: cleanup
     runs-on: ubuntu-latest
-    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23 incident).
-    concurrency:
-      group: aks-vpn
-      cancel-in-progress: false
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Setup WireGuard VPN
-      run: |
-        chmod +x scripts/setup-vpn.sh
-        ./scripts/setup-vpn.sh
+    - name: Ensure bot:<name> labels exist
       env:
-        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
-
-    - name: Gather metrics snapshot
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        chmod +x scripts/gather-metrics.sh
-        ./scripts/gather-metrics.sh > /tmp/metrics-report.md
-      env:
-        PROMETHEUS_URL: http://prometheus.internal:9090
-        LOKI_URL: http://loki.internal
-        ARGOCD_URL: http://argo.internal
-        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
-        ARGOCD_APP_NAME: coupon-bot
-        CONTAINER_NAME: coupon-bot
+        set -euo pipefail
+        source scripts/gather/lib.sh
+        for bot in $(bots_yml_json | jq -r '.bots | keys[]'); do
+          gh label create "bot:${bot}" --repo "${{ github.repository }}" --color "1d76db" \
+            --description "Findings for the ${bot} bot" --force
+        done
 
     - name: Create orchestration issue
       id: create-issue
@@ -64,7 +60,6 @@ jobs:
       run: |
         set -euo pipefail
         DATE=$(date -u +%Y-%m-%d)
-        REPORT=$(cat /tmp/metrics-report.md)
 
         ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
           --title "Daily project assessment ${DATE}" \
@@ -73,9 +68,10 @@ jobs:
 
         **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-        ---
-
-        ${REPORT}")
+        Repo-wide tech-debt / stale-doc / config-drift sweep. No runtime
+        metrics snapshot in this role anymore — see
+        \`.github/AGENT-FLOWS-REDESIGN.md\` §6.3; runtime anomaly detection
+        is the future \`monitor\` role's job (Phase 2, not yet built).")
 
         ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
         if [ -z "$ISSUE_NUMBER" ]; then
@@ -85,19 +81,13 @@ jobs:
         echo "Created issue #${ISSUE_NUMBER}"
         echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
-    - name: Load agent prompt and metrics
+    - name: Load agent prompt
       run: |
         {
           PROMPT_DELIM="PROMPT_EOF_$(openssl rand -hex 16)"
           echo "AGENT_PROMPT<<${PROMPT_DELIM}"
           cat .github/prompts/project.md
           echo "${PROMPT_DELIM}"
-        } >> "$GITHUB_ENV"
-        {
-          METRICS_DELIM="METRICS_EOF_$(openssl rand -hex 16)"
-          echo "METRICS_REPORT<<${METRICS_DELIM}"
-          cat /tmp/metrics-report.md
-          echo "${METRICS_DELIM}"
         } >> "$GITHUB_ENV"
 
     - name: Run project agent
@@ -115,15 +105,11 @@ jobs:
           ${{ env.AGENT_PROMPT }}
           </instructions>
 
-          <metrics-snapshot>
-          ${{ env.METRICS_REPORT }}
-          </metrics-snapshot>
-
-          You have been triggered for the daily project assessment.
+          You have been triggered for the daily project assessment — repo-wide, covering every bot in `.github/bots.yml` (VahterBanBot, CouponHubBot, AlitaBot).
+          When a finding is specific to one bot's source directory, add its `bot:<name>` label (e.g. `bot:vahter`) in addition to `project`. Shared-infra findings (BotInfra, tests, CI) need no bot label.
           The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
 
     - name: Close orchestration issue
       if: always() && steps.create-issue.outputs.issue_number
@@ -132,7 +118,3 @@ jobs:
       run: |
         gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
           --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-    - name: Disconnect VPN
-      if: always()
-      run: sudo wg-quick down wg0 || true
