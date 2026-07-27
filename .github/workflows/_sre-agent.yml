@@ -36,6 +36,10 @@ on:
         required: false
         type: string
         description: "deploy-failure issue number to comment on/close, if one was filed"
+      failure-class:
+        required: false
+        type: string
+        description: "infra|app|unknown — classification from verify-deploy.sh, if available"
     secrets:
       WIREGUARD_CONFIG:
         required: true
@@ -100,6 +104,7 @@ jobs:
           - **GHCR image:** ${{ inputs.docker-image }}
           - **Commit:** ${{ inputs.commit }}
           - **Workflow run:** ${{ inputs.run-url }}
+          - **Failure class:** ${{ inputs.failure-class != '' && inputs.failure-class || 'unknown' }}
           ${{ inputs.issue-number != '' && format('- **Deploy-failure issue:** #{0} — comment your incident report on it and close it once resolved.', inputs.issue-number) || '- No deploy-failure issue number was provided for this run; skip issue comment/close steps in the runbook.' }}
 
           Use these values for APP_NAME, CONTAINER, and IMAGE_NAME throughout the runbook.

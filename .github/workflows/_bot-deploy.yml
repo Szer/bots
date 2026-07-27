@@ -147,6 +147,11 @@ jobs:
     concurrency:
       group: aks-vpn
       cancel-in-progress: false
+    outputs:
+      # infra|app|unknown — set by verify-deploy.sh even when the step fails
+      # (GITHUB_OUTPUT is captured regardless of the step's exit code), so
+      # downstream jobs know which class of failure this was without parsing logs.
+      failure-class: ${{ steps.verify.outputs.failure-class }}
 
     steps:
     - name: Checkout
@@ -160,6 +165,7 @@ jobs:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
 
     - name: Verify deployment
+      id: verify
       run: |
         chmod +x scripts/verify-deploy.sh
         ./scripts/verify-deploy.sh
@@ -190,12 +196,18 @@ jobs:
       id: create-issue
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        FAILURE_CLASS: ${{ needs.verify-deploy.outputs.failure-class }}
       run: |
         SHORT_SHA="${GITHUB_SHA::7}"
+        FAILURE_CLASS="${FAILURE_CLASS:-unknown}"
+        LABELS=(--label "deploy-failure")
+        if [ "$FAILURE_CLASS" = "infra" ]; then
+          LABELS+=(--label "infra")
+        fi
         ISSUE_URL=$(gh issue create \
           --repo "$GITHUB_REPOSITORY" \
           --title "Deploy failure: ${{ inputs.argocd-app-name }} (${SHORT_SHA})" \
-          --label "deploy-failure" \
+          "${LABELS[@]}" \
           --body "## Deploy Failure
 
         **Bot:** ${{ inputs.argocd-app-name }}
@@ -204,6 +216,7 @@ jobs:
         **GHCR image:** ${{ inputs.docker-image }}
         **Commit:** ${{ github.sha }}
         **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        **Failure class:** ${FAILURE_CLASS}
 
         Follow the runbook in \`.github/prompts/sre.md\`. Identify which \`verify-deploy.sh\` phase failed from the run logs above.")
         echo "Created: ${ISSUE_URL}"
@@ -229,4 +242,5 @@ jobs:
       commit: ${{ github.sha }}
       run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       issue-number: ${{ needs.notify-failure.outputs.issue-number }}
+      failure-class: ${{ needs.verify-deploy.outputs.failure-class }}
     secrets: inherit

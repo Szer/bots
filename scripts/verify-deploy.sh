@@ -36,6 +36,26 @@ summary() {
     echo "$@" >> "$summary_file"
 }
 
+# emit_failure_class() — classify a failure as infra|app|unknown so callers
+# (the deploy-failure issue, the SRE agent) know up front whether this is a
+# control-plane connectivity problem or an actually-unhealthy app, WITHOUT
+# changing pass/fail semantics: every existing `exit 1` still fails exactly as
+# before, this only labels *why*. Guarded so local runs (no GITHUB_OUTPUT) and
+# repeat calls don't break.
+#   infra    — could not reach ArgoCD/Loki/Prometheus (network/DNS/timeout)
+#   app      — control plane was reachable and reports the app is unhealthy
+#              (bad readiness, error logs, 5xx)
+#   unknown  — reachable but inconclusive (e.g. sync never completed in time
+#              for reasons that could be either side, such as GHCR push /
+#              image-reloader lag)
+emit_failure_class() {
+    local class="$1"
+    log "Failure class: ${class}"
+    if [ -n "${GITHUB_OUTPUT:-}" ]; then
+        echo "failure-class=${class}" >> "$GITHUB_OUTPUT"
+    fi
+}
+
 # Initialize summary
 summary "## 🚀 Deployment Verification"
 summary ""
@@ -103,6 +123,7 @@ fail_connectivity() {
     summary "- **Reason:** Could not reach ArgoCD API at \`${ARGOCD_URL}\` (${streak} consecutive failures)"
     summary "- **Likely cause:** VPN / DNS / network between the runner and the cluster — not necessarily a bad deploy"
     summary "- **Action:** Check ArgoCD directly; if the app is Synced/Healthy this is a CI connectivity flake."
+    emit_failure_class "infra"
     exit 1
 }
 
@@ -160,6 +181,10 @@ if [ "$synced" = false ]; then
     summary "\`\`\`"
     summary "${IMAGES}"
     summary "\`\`\`"
+    # Reachable throughout, but never converged in time — could be a stuck
+    # rollout (app) or a slow image-reloader/GHCR propagation (infra); we
+    # can't tell which from here, so don't guess.
+    emit_failure_class "unknown"
     exit 1
 fi
 
@@ -220,6 +245,7 @@ if [ "$healthy" = false ]; then
         summary "\`\`\`json"
         summary "${CONDITIONS}"
         summary "\`\`\`"
+        emit_failure_class "app"
         exit 1
     fi
     log "Phase 2 PASSED: Pod became healthy at the end of the grace period."
@@ -256,6 +282,7 @@ if [ "$ERROR_COUNT" -gt 0 ]; then
         summary "$line"
     done
     summary "\`\`\`"
+    emit_failure_class "app"
     exit 1
 fi
 log "  Loki: no error-level logs found."
@@ -283,6 +310,7 @@ if [ "$(echo "$ERROR_5XX_RATE > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
     summary "### ❌ Phase 3: Log & Metrics Check FAILED"
     summary "- **5xx Error Rate:** ${ERROR_5XX_RATE} (expected: 0)"
     summary "- **Container Restarts:** ${RESTART_COUNT}"
+    emit_failure_class "app"
     exit 1
 fi
 
