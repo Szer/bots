@@ -243,6 +243,25 @@ if botConfOptions.Value.TestMode then
 
 let app = builder.Build()
 
+// ============================================================================
+// SRE_DRILL_INTENTIONAL_STARTUP_FAILURE (2026-07-27)
+// Deliberate, owner-authorized SRE-agent validation drill: forces AlitaBot's
+// container to fail during application startup (after DI/host build, before
+// it starts serving) so the new ReplicaSet crashloops while the previous pod
+// keeps serving, exercising `_bot-deploy.yml` -> `verify-deploy.sh` ->
+// `_sre-agent.yml` against a real production deploy failure. Gated on
+// `not TestMode` — TEST_MODE is "true" for tests/AlitaBot.Tests (both the
+// container env var and the seeded bot_setting row) and "false" in prod
+// bot_setting (verified live), so this never fires under test and always
+// fires in prod. This is NOT a real bug. REVERT IMMEDIATELY AFTER THE DRILL —
+// `git revert` this single commit.
+// ============================================================================
+if not botConfOptions.Value.TestMode then
+    failwith
+        "SRE_DRILL_INTENTIONAL_STARTUP_FAILURE: this is a deliberate, owner-authorized \
+         SRE-agent validation drill forcing AlitaBot to crashloop on startup — it must be \
+         reverted immediately after the drill completes."
+
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
 
 // Test-only hook to advance the FakeTimeProvider, deterministically firing any
