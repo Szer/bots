@@ -1,0 +1,2 @@
+{"bot":"alita","ts":"2026-06-29T23:59:59Z","run_id":"backfill","origin":"backfill","series":{"log_lines_24h":0,"log_errors_24h":0,"log_warnings_24h":0},"error_groups":{},"pods":{},"sources":{"postgres":"ok","loki":"ok","argocd":"not_backfilled","prometheus":"not_backfilled"}}
+{"bot":"alita","ts":"2026-06-30T23:59:59Z","run_id":"backfill","origin":"backfill","series":{"log_lines_24h":0,"log_errors_24h":0,"log_warnings_24h":0},"error_groups":{},"pods":{},"sources":{"postgres":"ok","loki":"ok","argocd":"not_backfilled","prometheus":"not_backfilled"}}
