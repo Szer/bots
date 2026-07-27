@@ -179,10 +179,12 @@ curl -s http://argo.internal/api/v1/applications/APP_NAME \
 #### Option A: ArgoCD rollback (preferred for P1 code regressions)
 
 ```bash
-# Get deployment history
-curl -s "http://argo.internal/api/v1/applications/APP_NAME/history" \
+# Get deployment history — there is no separate /history endpoint; it lives
+# at .status.history[] INSIDE the application object (same object the sync
+# check above and verify-deploy.sh read .status.sync/.status.health from).
+curl -s "http://argo.internal/api/v1/applications/APP_NAME" \
   -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" \
-  | jq '[.items[] | {id: .id, revision: .revision, deployedAt: .deployedAt, initiatedBy: .initiatedBy}]'
+  | jq '[.status.history[]? | {id: .id, revision: .revision, deployedAt: .deployedAt, initiatedBy: .initiatedBy}]'
 ```
 
 ```bash

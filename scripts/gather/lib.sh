@@ -76,6 +76,33 @@ probe() {
     return 1
 }
 
+# probe_optional NAME cmd [args...]
+# Same mechanics as probe() (never aborts, echoes a single-line status), but
+# for a source that is OPTIONAL evidence — enrichment, not core evidence. A
+# failure here must never skip the bot the way a REQUIRED probe() failure
+# does. The `degraded(optional): ...` prefix (vs. probe()'s `unreachable:
+# ...`) is the load-bearing, data-driven distinction: a guard's "is this bot
+# clean?" check can `select(.value != "ok" and (.value | startswith
+# ("degraded(optional):") | not))` to skip on any REQUIRED failure while
+# deliberately ignoring any OPTIONAL one, regardless of which source key it
+# is — see monitor.yml's guard step and monitor.md. Currently used for the
+# ArgoCD deploy-*history* fetch only (fixed 2026-07-27 after run 30233211533
+# made this source's failure wrongly fail-loud and skip every bot).
+probe_optional() {
+    local name="$1"
+    shift
+    local err status
+    if err=$("$@" 2>&1 >/dev/null); then
+        echo "ok"
+        return 0
+    else
+        status=$?
+    fi
+    log "PROBE DEGRADED (optional) [${name}] (exit ${status}): ${err}"
+    echo "degraded(optional): $(printf '%s' "$err" | head -1 | cut -c1-200)"
+    return 1
+}
+
 # emit_manifest BOT name1=status1 [name2=status2 ...]
 # Prints one JSON line: {"bot":"...","generated_at":"...","sources":{...}}.
 # Built with jq (not string concatenation) so status text containing quotes
@@ -105,10 +132,13 @@ emit_manifest() {
 }
 
 # manifest_has_bad_source MANIFEST_JSON
-# Returns 0 (true) if any source in the manifest is not "ok".
+# Returns 0 (true) if any REQUIRED source in the manifest is not "ok". A
+# source whose status starts with `degraded(optional):` (see probe_optional()
+# above) is deliberately ignored here — it is enrichment evidence, and its
+# failure must degrade, not skip, the bot.
 manifest_has_bad_source() {
     local bad
-    bad=$(echo "$1" | jq -r '.sources | to_entries[] | select(.value != "ok") | .key')
+    bad=$(echo "$1" | jq -r '.sources | to_entries[] | select(.value != "ok") | select((.value | startswith("degraded(optional):")) | not) | .key')
     [ -n "$bad" ]
 }
 
