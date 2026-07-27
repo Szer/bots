@@ -41,6 +41,16 @@
 #       property of this script — a wrong z-score silently produces false
 #       anomalies forever). Prints ONE JSON object to stdout.
 #
+#       `dormant_exempt` (2026-07-26 drill postmortem — a genuinely broken
+#       alita deploy read as "clean" partly because the monitor agent
+#       treated `log_errors_24h` as covered by the dormant carve-out): false
+#       for error/failure series (`log_errors_24h`, `log_warnings_24h` —
+#       rules 3/4 ALWAYS apply to these, regardless of traffic_class), true
+#       for every other (traffic/volume) series. monitor.md's dormant
+#       carve-out must gate on this flag, never on "is this bot dormant"
+#       alone — see the `error_series_keys` jq def below for the full
+#       rationale.
+#
 #       `emerged_from_zero` (2026-07-27, issue #289 postmortem): true only
 #       when BOTH the 7d AND 28d median are zero/null and `current > 0` — a
 #       non-zero 7d median is, by definition, not "emerging from zero", it's
@@ -348,6 +358,32 @@ _stats_jq() {
         # these names collide with an unrelated series on another bot.
         def informational_only_keys: ["message_marked_spam_24h", "message_marked_ham_24h", "vahter_acted_24h"];
 
+        # Dormant carve-out scope (2026-07-26 drill postmortem — a genuinely
+        # broken alita deploy was reported "clean" partly because the monitor
+        # agent read the dormant carve-out as disabling rules 3/4 for EVERY
+        # series on a dormant bot, including `log_errors_24h` itself: it was
+        # handed current=13 median_28d=0 z_score_28d=33.59 emerged_from_zero=
+        # true emerged_from_zero_significant=true and suppressed it because
+        # "traffic_class: dormant — rules 3 and 4 are disabled for this bot").
+        # The carve-out exists ONLY to stop zero-inflated TRAFFIC/VOLUME
+        # series (message/log-line/user counts) from firing constantly on a
+        # bot that is silent most days — it must never blind rule 3/4 to an
+        # actual error/failure series. This flag makes that distinction
+        # mechanical instead of relying on the agent (or a prompt author) to
+        # infer "volume" vs "error" from a key name every time:
+        #   dormant_exempt: false — error/failure series. Rules 3 and 4
+        #     ALWAYS apply, regardless of traffic_class. Currently
+        #     log_errors_24h and log_warnings_24h (every bot has these).
+        #   dormant_exempt: true  — everything else (traffic/volume series:
+        #     message/event counts, log_lines_24h, user counts, etc). For
+        #     dormant bots (see the monitor.md "Dormant carve-out" section),
+        #     rules 3 and 4 are disabled ONLY for series where this is true.
+        # Deliberately a denylist of error-series keys (not an allowlist of
+        # volume-series keys) — the per-bot tracked-series list in cmd_gather
+        # differs by bot, but log_errors_24h/log_warnings_24h are common to
+        # every bot and are the two keys that must never be exempted.
+        def error_series_keys: ["log_errors_24h", "log_warnings_24h"];
+
         # "Emerged from zero" magnitude floor (2026-07-27, issue #289: fired on
         # message_marked_spam_24h going 0 -> 1 at z=1.34 — a routine, low-
         # frequency human moderation action, not an anomaly). Every other
@@ -431,7 +467,8 @@ _stats_jq() {
                                     emerged_from_zero: $emerged,
                                     emerged_from_zero_magnitude_floor: $floor,
                                     emerged_from_zero_significant: ($emerged and $cur >= $floor),
-                                    informational_only: ((informational_only_keys | index($k)) != null)
+                                    informational_only: ((informational_only_keys | index($k)) != null),
+                                    dormant_exempt: ((error_series_keys | index($k)) == null)
                                 }
                             )
                         }
