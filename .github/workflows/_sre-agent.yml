@@ -40,6 +40,11 @@ on:
         required: false
         type: string
         description: "infra|app|unknown — classification from verify-deploy.sh, if available"
+      trigger:
+        required: false
+        type: string
+        default: "deploy-failure"
+        description: "deploy-failure|monitor-p1 — where this investigation came from (additive, Phase 2 monitor P1 escalation; see AGENT-FLOWS-REDESIGN.md §6.1/§6.4). Purely informational context for the prompt below — does not change the runbook."
     secrets:
       WIREGUARD_CONFIG:
         required: true
@@ -96,7 +101,7 @@ jobs:
           ${{ env.AGENT_PROMPT }}
           </instructions>
 
-          A deploy pipeline has failed. Bot identity and incident context:
+          ${{ inputs.trigger == 'monitor-p1' && 'The monitor agent (running on its own 4h/daily schedule) detected a P1-severity runtime anomaly — no healthy replicas, or a sustained error burst far outside this bot''s own baseline — and mechanically triggered this investigation (not a deploy failure). Bot identity and incident context:' || 'A deploy pipeline has failed. Bot identity and incident context:' }}
 
           - **Bot:** ${{ inputs.bot }}
           - **ArgoCD app:** ${{ inputs.argocd-app-name }}
@@ -104,8 +109,10 @@ jobs:
           - **GHCR image:** ${{ inputs.docker-image }}
           - **Commit:** ${{ inputs.commit }}
           - **Workflow run:** ${{ inputs.run-url }}
+          - **Trigger:** ${{ inputs.trigger }}
           - **Failure class:** ${{ inputs.failure-class != '' && inputs.failure-class || 'unknown' }}
-          ${{ inputs.issue-number != '' && format('- **Deploy-failure issue:** #{0} — comment your incident report on it and close it once resolved.', inputs.issue-number) || '- No deploy-failure issue number was provided for this run; skip issue comment/close steps in the runbook.' }}
+          ${{ inputs.issue-number != '' && format('- **Incident issue:** #{0} — comment your incident report on it and close it once resolved.', inputs.issue-number) || '- No incident issue number was provided for this run; skip issue comment/close steps in the runbook.' }}
+          ${{ inputs.trigger == 'monitor-p1' && '- Note: this was NOT triggered by a failed deploy — verify current ArgoCD/Loki state yourself from Step 1 before assuming a recent deploy is the cause; it may be unrelated to any deploy at all.' || '' }}
 
           Use these values for APP_NAME, CONTAINER, and IMAGE_NAME throughout the runbook.
           Investigate following the runbook.
