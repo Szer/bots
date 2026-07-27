@@ -1,0 +1,87 @@
+# Bot registry — single source of truth for the agentic workflows
+# (product.yml, project.yml, and the future monitor/sre wiring).
+#
+# Every gatherer, workflow and prompt reads this file. Adding a fourth bot is
+# one entry here, not a workflow edit. See .github/AGENT-FLOWS-REDESIGN.md
+# §3.1 for the design rationale.
+#
+# Field notes / deviations from the design doc's draft (§3.1):
+#   - vahter.db_name is `vahter_db_v2`, not `vahter_bot` as drafted in the
+#     redesign doc — verified against AGENTS.md ("VahterBanBot DB:
+#     vahter_db_v2") and .github/workflows/vahter-deploy.yml's
+#     `db-name: vahter_db_v2` input to _bot-deploy.yml.
+#   - No `db_secret_prefix` field: the fleet does not use per-bot DB secrets.
+#     _bot-deploy.yml, vahter/coupon/alita-deploy.yml and both existing
+#     gatherers all connect using ONE shared set of secrets
+#     (DB_PROD_HOST / DB_PROD_USERNAME / DB_PROD_PASSWORD) and vary only the
+#     database name (this file's `db_name`) — there is no DB_VAHTER_HOST /
+#     DB_COUPON_HOST / DB_ALITA_HOST. Scripts build the DSN from the shared
+#     secrets + `db_name`.
+#   - Added `community_hashes`: per-bot list of known community-member
+#     identity hashes with elevated-trust context, moved out of
+#     .github/prompts/product.md (was hardcoded there for coupon only) so the
+#     prompt is bot-agnostic. Empty for bots with no known members yet.
+
+bots:
+  vahter:
+    display_name: VahterBanBot
+    argocd_app: vahter-bot
+    container: vahter-bot
+    namespace: vahter-bot
+    metric_prefix: vahter_
+    source_dir: src/VahterBanBot/
+    migrations_dir: src/vahter-bot/migrations/
+    db_name: vahter_db_v2
+    product_vision: null # no vision doc yet — see redesign doc §5 open decision 2
+    roles: [monitor, product, sre]
+    traffic_class: high # drives baseline windows + alert sensitivity
+    query_set: vahter # -> scripts/queries/vahter/*.sql
+    community_hashes: []
+    notes: |
+      Legacy tables (message, user, banned, banned_by_bot, callback, vahter_actions,
+      llm_triage) FROZEN at 2026-04-02 (event-sourcing cutover, Flyway V23).
+      Query `event` / `snapshot_message` / `snapshot_user` only.
+
+  coupon:
+    display_name: CouponHubBot
+    argocd_app: coupon-bot
+    container: coupon-bot
+    namespace: coupon-bot
+    metric_prefix: couponhubbot_
+    source_dir: src/CouponHubBot/
+    migrations_dir: src/coupon-hub-bot/migrations/
+    db_name: coupon_hub_bot
+    product_vision: src/CouponHubBot/docs/PRODUCT-VISION.md
+    roles: [monitor, product, sre]
+    traffic_class: low
+    query_set: coupon
+    community_hashes:
+      - hash: 9983047c
+        role: technical admin/owner
+        note: >-
+          Has direct database access and shares system stats manually in chat.
+          When they post statistics or internal data, assume it is accurate.
+      - hash: 42b77ec2
+        role: non-technical admin
+        note: >-
+          Community moderator; their messages reflect user perspective, not
+          technical knowledge.
+    notes: null
+
+  alita:
+    display_name: AlitaBot
+    argocd_app: alita-bot
+    container: alita-bot
+    namespace: alita-bot
+    metric_prefix: alitabot_
+    source_dir: src/AlitaBot/
+    migrations_dir: src/alita-bot/migrations/
+    db_name: alita_bot
+    product_vision: null
+    roles: [monitor, sre] # product skipped: insufficient signal (13 messages ever)
+    traffic_class: dormant # liveness-based detection, never volume-based
+    query_set: alita
+    community_hashes: []
+    notes: >-
+      Dormant by design — 0 log lines on 8 of 14 days is normal, not an
+      anomaly. Never run the product agent for this bot.
