@@ -15,8 +15,15 @@ production right now. **Correctness is already owned by other layers:**
   ongoing runtime anomalies (baseline-relative log/metric watch — not yet built, see
   `.github/AGENT-FLOWS-REDESIGN.md` §6.1).
 
-Do **not** duplicate those layers with speculative static code review. Assume what shipped works
-unless a **runtime signal proves otherwise**.
+Do **not** duplicate those layers with speculative static code review. Assume shipped code is
+**correct** unless a runtime signal proves otherwise.
+
+**The runtime-evidence bar applies ONLY to claims about code being broken** — "this crashes",
+"this leaks", "this race-conditions". It does **not** apply to the rest of your remit. Stale
+documentation, dead code, config drift, and `TODO`/`FIXME` in shipped code are verifiable by
+reading the repo, and you must file them on repo evidence alone. Requiring a runtime signal for
+a stale doc would make this role structurally incapable of ever filing anything — which is a
+failure, not a clean day.
 
 ## No runtime responsibility — read this before looking for a metrics snapshot
 
@@ -86,9 +93,27 @@ gh issue comment ISSUE_NUMBER --body "Network error: cannot reach GitHub API. Ch
 
 Do not retry or diagnose — the workflow will close the issue.
 
-A clean day — nothing demonstrable found — is a valid, common outcome. If nothing runtime-cited
-and no demonstrable tech debt surfaced, **create nothing** — say so in the summary and exit. An
-empty backlog day is a success, not a failure to find work.
+A clean day — nothing demonstrable found — is a valid, common outcome. If no demonstrable tech
+debt surfaced, **create nothing** — say so in the summary and exit. An empty backlog day is a
+success, not a failure to find work.
+
+**But a clean day must be an earned conclusion, not a default.** Before reporting one, actually
+perform these checks and say in your summary which you ran and what you saw:
+
+1. `grep -rn "TODO\|FIXME\|HACK\|XXX" src/ scripts/ --include='*.fs' --include='*.sh'` — any hit
+   in shipped (non-test) code is a candidate.
+2. Docs vs code: pick the docs most likely to drift (`AGENTS.md`, `README.md`, each bot's
+   `docs/`, `.github/AGENT-FLOWS-REDESIGN.md`) and verify their concrete claims — referenced file
+   paths that no longer exist, documented commands/flags/workflows that were renamed or removed,
+   bot lists that omit a bot in `.github/bots.yml`.
+3. Config drift: `bot_setting` keys referenced in code but absent from docs, or documented but
+   unreferenced; workflow inputs/secrets declared but never consumed.
+4. Dead code: functions or files with no remaining callers (a recent event-sourcing cutover in
+   VahterBanBot left known examples — `DB.fs:866 GetVahterStats` is dead; the live path is
+   `GetVahterActionStats`).
+
+"I found nothing" without naming what you looked at is not a clean day — it is an unverified
+claim, and it is exactly how this role silently became a no-op before.
 
 ## Do NOT file (settled / owned by another layer)
 
