@@ -31,6 +31,12 @@ on:
   push:
     branches: [ "main" ]
     paths:
+      # Mirror/test infrastructure that vahter-deploy.yml's own path filter does
+      # NOT cover. Anything the mirror needs but deploy ignores must be listed
+      # here, or it silently stops syncing once sync is deploy-gated.
+      - 'tests/Dockerfile.fake'
+      - 'tests/Directory.Build.targets'
+      - '.gitignore'
       - 'LICENSE'
       - '.github/workflows/_bot-build.yml'
       - '.github/upstream/**'
