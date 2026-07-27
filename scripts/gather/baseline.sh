@@ -41,6 +41,23 @@
 #       property of this script — a wrong z-score silently produces false
 #       anomalies forever). Prints ONE JSON object to stdout.
 #
+#       `emerged_from_zero` (2026-07-27, issue #289 postmortem): true only
+#       when BOTH the 7d AND 28d median are zero/null and `current > 0` — a
+#       non-zero 7d median is, by definition, not "emerging from zero", it's
+#       just a sparse/zero-inflated series (issue #289: median_7d=1,
+#       median_28d=0 wrongly fired before this fix). Also exposes `max_28d`
+#       (this series' own 28-day peak single-run value, null if none) and
+#       `emerged_from_zero_magnitude_floor` / `emerged_from_zero_significant`
+#       — a magnitude bar (greater of an absolute floor of 5, or 50% of
+#       `max_28d`) so a jump from zero to a trivially small count (e.g. the
+#       issue #289 count of 1) doesn't qualify as fileable on its own; see
+#       the `magnitude_floor` jq def below and monitor.md's "Emerged from
+#       zero" rule for the full rationale. `informational_only` flags series
+#       that measure moderator activity, not bot health (currently
+#       `message_marked_spam_24h`, `message_marked_ham_24h`,
+#       `vahter_acted_24h`) — still computed/stored like any other series,
+#       but monitor.md excludes them from filing an anomaly on their own.
+#
 #       Defensive guard (added after the 2026-07-27 incident — see
 #       backfill-baseline.sh's header comment for the root cause): before
 #       any of the above, lines with `run_id == "backfill"` whose `ts` falls
@@ -321,6 +338,35 @@ _stats_jq() {
               | ($variance | sqrt)
               end;
 
+        # Series that measure MODERATOR ACTIVITY, not bot health (2026-07-27,
+        # issue #289 postmortem — see AGENT-FLOWS-REDESIGN.md and monitor.md
+        # "Informational-only series" section). Still gathered/appended/computed
+        # like every other series (trend context is genuinely useful), but
+        # flagged here so monitor.md can mechanically exclude them from firing
+        # an anomaly on their own, instead of relying on the agent to remember
+        # a prose list. Key names only — no bot context needed, and none of
+        # these names collide with an unrelated series on another bot.
+        def informational_only_keys: ["message_marked_spam_24h", "message_marked_ham_24h", "vahter_acted_24h"];
+
+        # "Emerged from zero" magnitude floor (2026-07-27, issue #289: fired on
+        # message_marked_spam_24h going 0 -> 1 at z=1.34 — a routine, low-
+        # frequency human moderation action, not an anomaly). Every other
+        # detection rule in monitor.md respects a 3-sigma/ratio bar; this one
+        # did not. Floor is the greater of:
+        #   - an absolute floor of 5 (rules out single/double/triple-event
+        #     noise regardless of which series it is — deliberately far below
+        #     the mechanical P1 error-burst absolute floor of 20 in monitor.yml,
+        #     since this is a plain priority-medium filing bar, not a P1)
+        #   - 50% of this series own 28-day peak single-run value (max28,
+        #     null/0 if it has none) — so a series whose scale is naturally in
+        #     the tens/hundreds needs a proportionally bigger jump before a
+        #     0-median regime re-emergence counts as new, while a series
+        #     that has never shown any real activity (max28 null/0) falls back
+        #     to the plain absolute floor.
+        # See AGENT-FLOWS-REDESIGN.md and monitor.md "Emerged from zero" for
+        # the full rationale (single global constant vs. relative-to-scale).
+        def magnitude_floor(max28): ([5, ((max28 // 0) * 0.5)] | max);
+
         # Defensive guard (2026-07-27 incident, see header comment above):
         # drop backfill-origin lines dated "today" BEFORE anything else can
         # see them — they can never become $current nor enter $hist/medians.
@@ -361,7 +407,18 @@ _stats_jq() {
                                 | (median($v28)) as $med28
                                 | (mean($v28)) as $mean28
                                 | (sample_stdev($v28)) as $sd28
+                                | (if ($v28 | length) == 0 then null else ($v28 | max) end) as $max28
                                 | ($current.series[$k]) as $cur
+                                # Both the 7d AND 28d median must be zero (or
+                                # null, i.e. no history) for a series to count
+                                # as "emerging from zero" — a non-zero 7d
+                                # median means it is NOT emerging from zero,
+                                # it is just a series that happens to be
+                                # sparse/zero-inflated over the longer 28d
+                                # window (issue #289: median_7d=1, median_28d=0
+                                # wrongly fired before this fix).
+                                | ((($med28 == 0 or $med28 == null) and ($med7 == 0 or $med7 == null) and $cur > 0)) as $emerged
+                                | (magnitude_floor($max28)) as $floor
                                 | {
                                     current: $cur,
                                     median_7d: $med7,
@@ -370,7 +427,11 @@ _stats_jq() {
                                     z_score_28d: (if ($sd28 == null or $sd28 == 0) then null else (($cur - $mean28) / $sd28) end),
                                     history_days_28d: $history_days,
                                     low_confidence: ($history_days < 14),
-                                    emerged_from_zero: (($med28 == 0 or $med28 == null) and $cur > 0)
+                                    max_28d: $max28,
+                                    emerged_from_zero: $emerged,
+                                    emerged_from_zero_magnitude_floor: $floor,
+                                    emerged_from_zero_significant: ($emerged and $cur >= $floor),
+                                    informational_only: ((informational_only_keys | index($k)) != null)
                                 }
                             )
                         }

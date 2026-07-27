@@ -185,21 +185,36 @@ jobs:
 
           # change_context: source-dir merges to main (already have full
           # history via fetch-depth 0) + ArgoCD deploy history, preceding 72h.
+          # ArgoCD history is a REQUIRED source, same as prometheus/loki/argocd
+          # app status/postgres above — it must fail loud (not swallow a
+          # curl error into "(ArgoCD history unavailable)") and be reflected
+          # in this bot's manifest, so the guard step below can mark the bot
+          # degraded instead of the agent silently reasoning from a bundle
+          # that is missing half its change-correlation evidence.
           SOURCE_DIR="$(bot_field "$bot" '.source_dir')"
           APP_NAME="$(bot_field "$bot" '.argocd_app')"
+
+          ARGOCD_HISTORY_STATUS=$(probe "argocd_history" curl -sSf --connect-timeout 5 --max-time 20 \
+              "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/history" -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}") || true
+          jq -cn --arg s "$ARGOCD_HISTORY_STATUS" '{argocd_history: $s}' > "/tmp/evidence/${bot}.change_context_manifest.json"
+
           {
             echo "### Merges to main touching ${SOURCE_DIR} (preceding 72h)"
             git log --since="72 hours ago" --oneline -- "$SOURCE_DIR" | sed 's/^/- /' || true
             echo
             echo "### ArgoCD deploy history (preceding 72h)"
-            curl -sSf --connect-timeout 5 --max-time 20 "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/history" \
-              -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" 2>/dev/null \
-              | jq -r --arg since "$START_72H" '
-                  [.items[]? | select(.deployedAt >= $since)]
-                  | if length == 0 then "(none in the last 72h)"
-                    else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt)"
-                    end
-                ' 2>/dev/null || echo "(ArgoCD history unavailable)"
+            if [ "$ARGOCD_HISTORY_STATUS" = "ok" ]; then
+              curl -sSf --connect-timeout 5 --max-time 20 "${ARGOCD_URL}/api/v1/applications/${APP_NAME}/history" \
+                -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+                | jq -r --arg since "$START_72H" '
+                    [.items[]? | select(.deployedAt >= $since)]
+                    | if length == 0 then "(none in the last 72h)"
+                      else .[] | "- id=\(.id) revision=\(.revision) deployedAt=\(.deployedAt)"
+                      end
+                  '
+            else
+              echo "ERROR: ArgoCD deploy history unreachable: ${ARGOCD_HISTORY_STATUS} — see this bot's manifest, the guard step will mark it degraded."
+            fi
           } > "/tmp/evidence/${bot}.change_context.md"
 
           echo "::endgroup::"
@@ -231,6 +246,7 @@ jobs:
           # the same malformed input was swallowed and read as healthy.)
           RUNTIME_MANIFEST=$(head -n1 "/tmp/evidence/${bot}.runtime.md" 2>/dev/null || echo '')
           GATHER_JSON=$(cat "/tmp/evidence/${bot}.gather.json" 2>/dev/null || echo '')
+          CC_MANIFEST=$(cat "/tmp/evidence/${bot}.change_context_manifest.json" 2>/dev/null || echo '')
           MANIFEST_BAD=""
           if ! echo "$RUNTIME_MANIFEST" | jq -e 'type == "object"' >/dev/null 2>&1; then
             RUNTIME_MANIFEST='{"sources":{"runtime_manifest":"unreadable — runtime.sh emitted no valid manifest line"}}'
@@ -240,17 +256,23 @@ jobs:
             GATHER_JSON='{"sources":{"baseline_manifest":"unreadable — baseline.sh gather emitted no valid manifest"}}'
             MANIFEST_BAD="yes"
           fi
+          if ! echo "$CC_MANIFEST" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            CC_MANIFEST='{"argocd_history":"unreadable — change_context ArgoCD-history probe emitted no valid manifest"}'
+            MANIFEST_BAD="yes"
+          fi
 
-          # Merge BOTH manifests (runtime.sh's prometheus/loki/argocd probe +
-          # baseline.sh gather's prometheus/loki/argocd/postgres probe) into
-          # ONE combined manifest — report-degraded.sh reads `.sources` from
-          # whatever file it's given, so a postgres-only failure (which only
-          # baseline.sh gather probes) must still show up there, not just in
-          # a runtime-only manifest that would misleadingly read all-"ok".
+          # Merge ALL THREE manifests (runtime.sh's prometheus/loki/argocd
+          # probe + baseline.sh gather's prometheus/loki/argocd/postgres probe
+          # + the change_context step's argocd_history probe) into ONE
+          # combined manifest — report-degraded.sh reads `.sources` from
+          # whatever file it's given, so a postgres-only or argocd-history-only
+          # failure (each probed by only one of the three) must still show up
+          # there, not just in a manifest that would misleadingly read all-"ok".
           COMBINED_MANIFEST=$(jq -n --arg bot "$bot" \
               --argjson rt "$(echo "$RUNTIME_MANIFEST" | jq '.sources? // {}')" \
               --argjson bl "$(echo "$GATHER_JSON" | jq '.sources? // {}')" \
-              '{bot: $bot, sources: ($rt + $bl)}')
+              --argjson cc "$(echo "$CC_MANIFEST" | jq '. // {}')" \
+              '{bot: $bot, sources: ($rt + $bl + $cc)}')
           echo "$COMBINED_MANIFEST" > "/tmp/evidence/${bot}.combined-manifest.json"
 
           BAD=$(echo "$COMBINED_MANIFEST" | jq -r '.sources | to_entries[] | select(.value != "ok") | .key' 2>/dev/null || true)
