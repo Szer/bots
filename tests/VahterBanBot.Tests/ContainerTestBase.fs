@@ -30,6 +30,16 @@ type TestMessage =
       raw_message: string
       created_at: DateTime }
 
+/// Lightweight DTO for test assertions on AdminChannelMessage events.
+[<CLIMutable>]
+type TestAdminChannelMessage =
+    { chat_id: int64
+      message_id: int64
+      user_id: int64
+      username: string
+      text: string
+      created_at: DateTime }
+
 /// Snapshot read-model rows (generated columns), for snapshot_* assertions.
 [<CLIMutable>]
 type SnapshotUserRow =
@@ -723,6 +733,27 @@ WHERE event_type = 'MessageMarkedSpam'
             """
         let! count = conn.QuerySingleAsync<int>(sql, {| chatId = chatId; messageId = messageId |})
         return count > 0
+    }
+
+    /// Reads the AdminChannelMessage event for (chatId, messageId), if one was persisted.
+    member this.TryGetAdminChannelMessage(chatId: int64, messageId: int64) = task {
+        use conn = new NpgsqlConnection(this.DbConnectionString)
+        //language=postgresql
+        let sql =
+            """
+SELECT (data->>'chatId')::BIGINT    AS chat_id,
+       (data->>'messageId')::BIGINT AS message_id,
+       (data->>'userId')::BIGINT    AS user_id,
+       data->>'username'            AS username,
+       data->>'text'                AS text,
+       created_at
+FROM event
+WHERE event_type = 'AdminChannelMessage'
+  AND (data->>'chatId')::BIGINT = @chatId
+  AND (data->>'messageId')::BIGINT = @messageId
+            """
+        let! rows = conn.QueryAsync<TestAdminChannelMessage>(sql, {| chatId = chatId; messageId = messageId |})
+        return rows |> Seq.tryHead
     }
 
     /// Reads the snapshot_user row (None if absent).
