@@ -1,0 +1,159 @@
+name: "Vahter: Mirror Reconcile"
+
+# Alarm for sync PRs on fsharplang-ru/vahter-bot that never merged.
+#
+# vahter-upstream-sync.yml hands merging to GitHub native auto-merge and exits
+# immediately, so nothing in the monorepo observes the outcome. This job is that
+# observer. It runs daily and costs seconds.
+#
+# It exists because the mirror's CI was broken for ~3 MONTHS without anyone
+# noticing: the generated build.yml was invalid YAML, so GitHub produced a
+# jobless `startup_failure` and the sync PR reported *zero* checks. "No checks"
+# looked like "no CI configured", not "CI is broken" — and the next sync silently
+# closed the stale PR as superseded, resetting the evidence every time.
+#
+# Hence the three states below are reported SEPARATELY. In particular
+# NO-CHECKS is called out on its own: an absent check is blindness, not health,
+# and it is the exact signature of the original bug.
+
+on:
+  schedule:
+    # 07:10 UTC daily — after the nightly ML retrain (23:30 UTC) so a sync
+    # triggered by an overnight deploy has had time to build and merge.
+    - cron: '10 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Inspect open sync PRs on the mirror
+      id: inspect
+      env:
+        GH_TOKEN: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
+        # A sync PR older than this that still hasn't merged is stuck, not slow.
+        # The mirror's build takes ~4 min; 6 h is generous.
+        STALE_HOURS: '6'
+      run: |
+        gh pr list \
+          --repo fsharplang-ru/vahter-bot \
+          --state open \
+          --limit 100 \
+          --json number,url,headRefName,createdAt,statusCheckRollup \
+          --jq '[.[] | select(.headRefName | startswith("sync/monorepo-"))]' \
+          > prs.json
+
+        python3 - <<'PY'
+        import json, os, datetime
+
+        stale_hours = float(os.environ["STALE_HOURS"])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        prs = json.load(open("prs.json"))
+
+        findings = []
+        for pr in prs:
+            created = datetime.datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+            age_h = (now - created).total_seconds() / 3600.0
+            checks = pr.get("statusCheckRollup") or []
+            conclusions = {(c.get("conclusion") or "PENDING") for c in checks}
+
+            if not checks:
+                # The 3-month bug's signature. Distinguish it loudly from "red".
+                state = ("NO-CHECKS", "the mirror reported no checks at all — its CI "
+                                      "almost certainly failed to LOAD (invalid workflow "
+                                      "YAML produces a jobless startup_failure)")
+            elif conclusions & {"FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}:
+                detail = ", ".join(f'{c["name"]}={c.get("conclusion")}' for c in checks)
+                state = ("RED", f"the mirror's build failed: {detail}")
+            elif conclusions == {"SUCCESS"}:
+                state = ("GREEN-UNMERGED", "checks are green but the PR never merged — "
+                                           "auto-merge is probably not enabled, or branch "
+                                           "protection requires a context no check reports "
+                                           "(it must be `build / build`, not `build`)")
+            elif age_h > stale_hours:
+                state = ("STUCK-PENDING", f"checks still pending after {age_h:.0f}h")
+            else:
+                # Young and still building — the only genuinely fine case.
+                # NO-CHECKS / RED / GREEN-UNMERGED are wrong at ANY age, so they
+                # skip the grace period and fall through to be reported.
+                continue
+
+            findings.append({
+                "number": pr["number"], "url": pr["url"],
+                "age_h": round(age_h, 1), "state": state[0], "detail": state[1],
+            })
+
+        with open("findings.json", "w") as f:
+            json.dump(findings, f, indent=2)
+
+        out = os.environ["GITHUB_OUTPUT"]
+        with open(out, "a") as f:
+            f.write(f"count={len(findings)}\n")
+
+        if findings:
+            lines = [
+                f"- **{x['state']}** [#{x['number']}]({x['url']}) "
+                f"(open {x['age_h']}h) — {x['detail']}"
+                for x in findings
+            ]
+            body = "\n".join(lines)
+            with open("body.md", "w") as f:
+                f.write(body)
+            print(body)
+        else:
+            print(f"All clear: {len(prs)} open sync PR(s), none stuck.")
+        PY
+
+    - name: Open or update the alarm issue
+      if: steps.inspect.outputs.count != '0'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TITLE: "Vahter mirror sync is not merging"
+      run: |
+        {
+          echo "The upstream mirror (fsharplang-ru/vahter-bot) has sync PRs that did not merge:"
+          echo
+          cat body.md
+          echo
+          echo "Mirror CI must stay green and auto-merging, or the community mirror silently"
+          echo "drifts from the monorepo — it did so for ~3 months (see Szer/bots#315)."
+          echo
+          echo "_Reported by \`vahter-mirror-reconcile.yml\` — [run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})._"
+        } > issue.md
+
+        # Create the label BEFORE listing by it — `gh issue list --label` errors
+        # on a label that doesn't exist yet, which would abort the alarm.
+        gh label create mirror-sync \
+          --repo "$GITHUB_REPOSITORY" \
+          --description "Upstream mirror sync problems" \
+          --color B60205 2>/dev/null || true
+
+        EXISTING=$(gh issue list \
+          --repo "$GITHUB_REPOSITORY" \
+          --state open \
+          --label mirror-sync \
+          --limit 1 \
+          --json number \
+          --jq '.[0].number // empty')
+
+        if [ -n "$EXISTING" ]; then
+          echo "Updating existing issue #${EXISTING}"
+          gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue.md
+        else
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --label mirror-sync \
+            --body-file issue.md
+        fi
+
+    - name: Fail the run so the alarm is visible in the Actions list too
+      if: steps.inspect.outputs.count != '0'
+      run: |
+        echo "::error::${{ steps.inspect.outputs.count }} mirror sync PR(s) not merging — see the mirror-sync issue"
+        exit 1

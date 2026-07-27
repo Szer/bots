@@ -3,29 +3,34 @@ name: "Vahter: Upstream Sync"
 # Syncs VahterBanBot source to fsharplang-ru/vahter-bot via pull request.
 # The upstream repo is a read-only mirror for community visibility.
 # Deploy happens exclusively from this monorepo.
+#
+# Triggers, deliberately split:
+#
+#   workflow_call  — the normal path. `vahter-deploy.yml` calls this as a
+#                    `needs: [deploy]` job, so the mirror only ever receives
+#                    code that actually deployed, and sync stops racing deploy
+#                    on push-to-main. CODE paths are therefore NOT listed under
+#                    `push` below — deploy's own path filter governs them.
+#   push           — mirror-infrastructure-only paths (the mirror's CI workflow,
+#                    its README, LICENSE). These never reach prod, so gating
+#                    them behind a deploy would mean they never sync at all.
+#   workflow_dispatch — manual re-sync.
+#
+# The sync enables GitHub native auto-merge on the PR and exits immediately
+# rather than idling a runner for the mirror's ~4 min build. Sync PRs that then
+# fail, stall, or report no checks at all are caught by
+# `vahter-mirror-reconcile.yml`, because an unmerged PR nobody looks at is how
+# the mirror's CI stayed broken for ~3 months.
 
 on:
+  workflow_call:
+    secrets:
+      VAHTER_UPSTREAM_TOKEN:
+        required: true
+        description: "PAT with contents+PR write on fsharplang-ru/vahter-bot. Must be a PAT, not GITHUB_TOKEN — GITHUB_TOKEN-created PRs do not trigger the mirror's workflows."
   push:
     branches: [ "main" ]
     paths:
-      - 'src/BotInfra/**'
-      - '!src/BotInfra/**/*.md'
-      - 'src/VahterBanBot/**'
-      - '!src/VahterBanBot/**/*.md'
-      - 'src/vahter-bot/**'
-      - '!src/vahter-bot/**/*.md'
-      - 'src/Dockerfile.bot'
-      - 'tests/VahterBanBot.Tests/**'
-      - 'tests/VahterBanBot.Unit.Tests/**'
-      - 'tests/SerializationCompat.Tests/**'
-      - 'tests/BotTestInfra/**'
-      - 'tests/FakeTgApi/**'
-      - 'tests/FakeAzureOcrApi/**'
-      - 'tests/Dockerfile.fake'
-      - 'tests/Directory.Build.targets'
-      - 'Directory.Build.props'
-      - 'Directory.Packages.props'
-      - 'global.json'
       - 'LICENSE'
       - '.github/workflows/_bot-build.yml'
       - '.github/upstream/**'
@@ -149,6 +154,20 @@ jobs:
           --body "Automated sync from monorepo commit ${GITHUB_SHA}.")
         echo "Created: $NEW_PR_URL"
 
+        # Hand the merge to GitHub instead of idling a runner for the mirror's
+        # ~4 min build: auto-merge fires the moment the required `build / build`
+        # check goes green. If it goes red the PR just stays open, which
+        # vahter-mirror-reconcile.yml turns into an issue.
+        #
+        # NOTE: this requires the mirror's branch protection to require the
+        # context `build / build` (the reusable-workflow check name), NOT `build`.
+        # It was `build` until 2026-07-27, which is unsatisfiable — every sync PR
+        # was permanently BLOCKED and auto-merge would queue forever.
+        gh pr merge "$NEW_PR_URL" \
+          --repo fsharplang-ru/vahter-bot \
+          --auto --squash --delete-branch
+        echo "Auto-merge enabled on $NEW_PR_URL"
+
         # Close previous sync PRs (keep only the new one).
         # Note: gh's --head flag requires an exact branch name, so filter by prefix in jq.
         gh pr list \
@@ -158,11 +177,21 @@ jobs:
           --json number,headRefName \
           --jq ".[] | select(.headRefName | startswith(\"sync/monorepo-\")) | select(.headRefName != \"$BRANCH\") | .number" \
         | while read -r old_pr; do
-            echo "Closing old sync PR #${old_pr}"
+            # Report WHY the old PR never merged before burying it. Silently
+            # closing a red-or-checkless sync PR is how a broken mirror stays
+            # invisible: the next sync always looks like a fresh start.
+            OLD_STATE=$(gh pr view "$old_pr" \
+              --repo fsharplang-ru/vahter-bot \
+              --json statusCheckRollup \
+              --jq 'if (.statusCheckRollup | length) == 0
+                    then "NO CHECKS REPORTED (mirror CI failed to load)"
+                    else ([.statusCheckRollup[] | "\(.name)=\(.conclusion)"] | join(", "))
+                    end')
+            echo "::warning::Superseding unmerged sync PR #${old_pr} — checks: ${OLD_STATE}"
             gh pr close "$old_pr" \
               --repo fsharplang-ru/vahter-bot \
               --delete-branch \
-              --comment "Superseded by ${NEW_PR_URL}"
+              --comment "Superseded by ${NEW_PR_URL}. This PR never merged; its checks were: ${OLD_STATE}"
           done
       env:
         GH_TOKEN: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
