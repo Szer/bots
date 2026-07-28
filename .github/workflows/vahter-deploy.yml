@@ -13,6 +13,7 @@ on:
       - 'src/Dockerfile.bot'
       - 'tests/VahterBanBot.Tests/**'
       - 'tests/VahterBanBot.Unit.Tests/**'
+      - 'tests/SerializationCompat.Tests/**'
       - 'tests/BotTestInfra/**'
       - 'tests/FakeTgApi/**'
       - 'tests/FakeAzureOcrApi/**'
@@ -41,6 +42,9 @@ jobs:
         dotnet test tests/VahterBanBot.Unit.Tests/VahterBanBot.Unit.Tests.fsproj
         -c Release --logger "trx;LogFileName=unit-test-results.trx"
         --logger "console;verbosity=detailed" &&
+        dotnet test tests/SerializationCompat.Tests/SerializationCompat.Tests.fsproj
+        -c Release --logger "trx;LogFileName=compat-test-results.trx"
+        --logger "console;verbosity=detailed" &&
         dotnet test tests/VahterBanBot.Tests/VahterBanBot.Tests.fsproj
         -c Release --logger "trx;LogFileName=test-results.trx"
         --logger "console;verbosity=detailed"
@@ -58,3 +62,13 @@ jobs:
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
       AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
       AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+
+  # Mirror the deployed code to fsharplang-ru/vahter-bot. Gated on `deploy` so
+  # the community mirror only ever receives code that actually reached prod.
+  # The sync opens a PR, enables auto-merge, and exits — it does NOT wait for
+  # the mirror's build (vahter-mirror-reconcile.yml alarms on stuck PRs instead).
+  sync-mirror:
+    needs: [ deploy ]
+    uses: ./.github/workflows/vahter-upstream-sync.yml
+    secrets:
+      VAHTER_UPSTREAM_TOKEN: ${{ secrets.VAHTER_UPSTREAM_TOKEN }}
