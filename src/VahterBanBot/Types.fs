@@ -449,9 +449,9 @@ type BotConfiguration =
       /// in the chat after /ban, /sban, /unban. Visible only to the issuer.
       EphemeralConfirmationEnabled: bool
       // Ban-seeded spam-text cache (SPAM_TEXT_CACHE_MODE / _TTL_HOURS / _MIN_LENGTH) — see
-      // SpamTextCache.fs. All three are env fallbacks (not bot_setting), same rationale as
-      // MlRepeatWeightEnabled / LlmVerdictCacheGlobalEnabled above: silently missing from
-      // `bot_setting` must never mean "wrong config" — see AGENTS.md's Settings configuration.
+      // SpamTextCache.fs. All three are bot_setting-backed, tunable by SQL and hot-reloadable
+      // via POST /reload-settings, so the intended rollout (off -> shadow -> enforce) doesn't
+      // require a redeploy — see AGENTS.md's Settings configuration section.
       SpamTextCacheMode: SpamTextCacheMode
       SpamTextCacheTtl: TimeSpan
       SpamTextCacheMinLength: int }
