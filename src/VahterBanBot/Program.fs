@@ -114,10 +114,8 @@ let buildBotConf () =
       MlCustomEmojiThreshold = getSettingOr "ML_CUSTOM_EMOJI_THRESHOLD" "20" |> int
       MlStopWordsInChats = getSettingOr "ML_STOP_WORDS_IN_CHATS" "{}" |> fromJson
       MlWeightDecayK = getSettingOr "ML_WEIGHT_DECAY_K" "0" |> float
-      // Env fallback (not bot_setting) so these can never be silently wrong from a missing DB
-      // row — see the Settings configuration section of AGENTS.md. Default enabled, cap 100.
-      MlRepeatWeightEnabled = getEnvOr "ML_REPEAT_WEIGHT_ENABLED" "true" |> bool.Parse
-      MlRepeatWeightCap = getEnvOr "ML_REPEAT_WEIGHT_CAP" "100" |> int
+      MlRepeatWeightEnabled = getSettingOr "ML_REPEAT_WEIGHT_ENABLED" "true" |> bool.Parse
+      MlRepeatWeightCap = getSettingOr "ML_REPEAT_WEIGHT_CAP" "100" |> int
       MlOldUserMsgCount = getSettingOr "ML_OLD_USER_MSG_COUNT" "50" |> int
       // Reaction spam detection
       ReactionSpamEnabled = getSettingOr "REACTION_SPAM_ENABLED" "false" |> bool.Parse
@@ -136,9 +134,7 @@ let buildBotConf () =
       AzureOpenAiDeployment = getSettingOr "AZURE_OPENAI_DEPLOYMENT" "gpt-4o-mini"
       LlmChatDescriptions   = getSettingOr "CHAT_DESCRIPTIONS_JSON" "{}" |> fromJson
       LlmVerdictCacheTtlMinutes = getSettingOr "LLM_VERDICT_CACHE_TTL_MINUTES" "60" |> int
-      // Env fallback (not bot_setting) so this can never be silently wrong from a missing DB row —
-      // see the Settings configuration section of AGENTS.md. Default enabled.
-      LlmVerdictCacheGlobalEnabled = getEnvOr "LLM_VERDICT_CACHE_GLOBAL_ENABLED" "true" |> bool.Parse
+      LlmVerdictCacheGlobalEnabled = getSettingOr "LLM_VERDICT_CACHE_GLOBAL_ENABLED" "true" |> bool.Parse
       // Reaction-spam triage (vision LLM)
       LlmReactionTriageAutoAct       = getSettingOr "LLM_REACTION_TRIAGE_AUTO_ACT" "false" |> bool.Parse
       LlmReactionTriageShadowDisable = getSettingOr "LLM_REACTION_TRIAGE_SHADOW_DISABLE" "false" |> bool.Parse

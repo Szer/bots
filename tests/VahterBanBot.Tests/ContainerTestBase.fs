@@ -869,11 +869,13 @@ let private waitForReady (http: HttpClient) (timeout: TimeSpan) : Task<unit> = t
 }
 
 /// Shared base for ML-enabled containers that preload the pinned model fixture (fast /ready) —
-/// factored out so a variant needing a different app env var (e.g. the LLM verdict cache global
-/// flag off) doesn't have to duplicate the preload/extract plumbing below.
+/// factored out so a variant needing a different bot_setting override (e.g. the LLM verdict
+/// cache global flag off) doesn't have to duplicate the preload/extract plumbing below.
 [<AbstractClass>]
-type MlPreloadedVahterTestContainers(extraEnvVars: (string * string) list) =
+type MlPreloadedVahterTestContainers(extraEnvVars: (string * string) list, extraSettings: (string * string * string * string) list) =
     inherit VahterTestContainers(mlEnabled = true, extraEnvVars = extraEnvVars)
+
+    new(extraEnvVars: (string * string) list) = MlPreloadedVahterTestContainers(extraEnvVars, [])
 
     override this.SeedDatabase(connString: string) =
         // F# disallows `base` references inside computation expressions, so kick off the base
@@ -881,6 +883,20 @@ type MlPreloadedVahterTestContainers(extraEnvVars: (string * string) list) =
         let baseSeed = base.SeedDatabase(connString)
         task {
             do! baseSeed
+
+            // Per-fixture bot_setting overrides (key, value, type, feature_group) — same upsert
+            // pattern as commonSettings/mlSettings above, so DB-backed settings can be tuned per
+            // test container the same way extraEnvVars tunes app env vars.
+            if not (List.isEmpty extraSettings) then
+                use conn = new NpgsqlConnection(connString)
+                do! conn.OpenAsync()
+                for (key, value, typ, group) in extraSettings do
+                    let! _ =
+                        conn.ExecuteAsync(
+                            "INSERT INTO bot_setting(key,value,type,feature_group) VALUES(@k,@v,@t,@g) \
+                             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, type = EXCLUDED.type, feature_group = EXCLUDED.feature_group",
+                            {| k = key; v = value; t = typ; g = group |})
+                    ()
 
             // Preload the pre-trained ML model fixture so the bot's StartAsync skips training.
             // SDCA training is non-deterministic across CPU architectures (Windows/x86_64 vs
@@ -938,9 +954,10 @@ type MlEnabledVahterTestContainers() =
 
 /// Same container/settings as MlEnabledVahterTestContainers, except LLM_VERDICT_CACHE_GLOBAL_ENABLED
 /// is forced off — used to assert the escape hatch reverts the verdict cache fully to its pre-PR
-/// per-sender-for-every-verdict behavior (LlmVerdictCacheGlobalFlagTests).
+/// per-sender-for-every-verdict behavior (LlmVerdictCacheGlobalFlagTests). Now a bot_setting
+/// override (not an app env var) — LLM_VERDICT_CACHE_GLOBAL_ENABLED reads via getSettingOr.
 type LlmVerdictCacheGlobalDisabledTestContainers() =
-    inherit MlPreloadedVahterTestContainers(["LLM_VERDICT_CACHE_GLOBAL_ENABLED", "false"])
+    inherit MlPreloadedVahterTestContainers([], ["LLM_VERDICT_CACHE_GLOBAL_ENABLED", "false", "FEATURE_FLAG", "LLM"])
 
 /// Ban-seeded spam-text cache in `enforce` mode (SPAM_TEXT_CACHE_MODE is env-only — see
 /// AGENTS.md's Settings configuration — so, like LLM_VERDICT_CACHE_GLOBAL_ENABLED above, it can
