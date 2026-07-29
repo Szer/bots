@@ -144,12 +144,12 @@ let buildBotConf () =
       // Ephemeral commands & confirmations (Bot API 10.2)
       EphemeralCommandsEnabled     = getSettingOr "EPHEMERAL_COMMANDS_ENABLED" "false" |> bool.Parse
       EphemeralConfirmationEnabled = getSettingOr "EPHEMERAL_CONFIRMATION_ENABLED" "false" |> bool.Parse
-      // Ban-seeded spam-text cache. Env fallbacks (not bot_setting) — see AGENTS.md's Settings
-      // configuration section and SpamTextCache.fs. Default "off": inert until explicitly turned
-      // on; recommended rollout is shadow first, review the reported would-be kills, then enforce.
-      SpamTextCacheMode = getEnvOr "SPAM_TEXT_CACHE_MODE" "off" |> SpamTextCacheMode.FromString
-      SpamTextCacheTtl = getEnvOr "SPAM_TEXT_CACHE_TTL_HOURS" "24" |> float |> TimeSpan.FromHours
-      SpamTextCacheMinLength = getEnvOr "SPAM_TEXT_CACHE_MIN_LENGTH" "40" |> int }
+      // Ban-seeded spam-text cache. Default "off": inert until explicitly turned on; recommended
+      // rollout is off -> shadow -> enforce, tuned live via bot_setting (no redeploy needed) —
+      // see AGENTS.md's Settings configuration section and SpamTextCache.fs.
+      SpamTextCacheMode = getSettingOr "SPAM_TEXT_CACHE_MODE" "off" |> SpamTextCacheMode.FromString
+      SpamTextCacheTtl = getSettingOr "SPAM_TEXT_CACHE_TTL_HOURS" "24" |> float |> TimeSpan.FromHours
+      SpamTextCacheMinLength = getSettingOr "SPAM_TEXT_CACHE_MIN_LENGTH" "40" |> int }
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
