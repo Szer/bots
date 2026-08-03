@@ -76,14 +76,38 @@ type CommandHandler(
                     do! sendText chatId $"Последнее действие нельзя откатить ({other})."
                 | UndoResult.StateChanged ->
                     do! sendText chatId "Состояние купона изменилось, попробуй ещё раз."
-                | UndoResult.Undone (coupon, revertedEvent, backToPocket) ->
+                | UndoResult.Undone (coupon, revertedEvent, pocketChange) ->
                     logger.LogInformation(
                         "Admin {AdminUserId} undid '{Event}' on coupon {CouponId}; new status {Status}",
                         adminId, revertedEvent, couponId, coupon.status)
-                    let pocketLine =
-                        match backToPocket with
-                        | Some uid -> $"Купон снова в кармане у пользователя {uid}."
-                        | None -> if coupon.status = "available" then "Купон снова в общей копилке." else ""
+                    // An undo that moves a coupon into or out of somebody's pocket is invisible to
+                    // that member unless we tell them — the admin saying "done" in a private chat is
+                    // exactly the miscommunication this DM exists to close. Self-undo needs no DM:
+                    // the admin is already reading the reply below.
+                    let notifyPocketOwner (uid: int64) =
+                        task {
+                            if uid = adminId then
+                                return ""
+                            else
+                                let! notified = notifications.NotifyUndoPocketChange(uid, coupon, revertedEvent, pocketChange)
+                                return
+                                    if notified then " Пользователь уведомлён."
+                                    else " (⚠️ Не удалось уведомить пользователя)"
+                        }
+                    let! pocketLine =
+                        match pocketChange with
+                        | UndoPocketChange.BackToPocket uid ->
+                            task {
+                                let! note = notifyPocketOwner uid
+                                return $"Купон снова в кармане у пользователя {uid}.{note}"
+                            }
+                        | UndoPocketChange.RemovedFromPocket uid ->
+                            task {
+                                let! note = notifyPocketOwner uid
+                                return $"Купон забран из кармана пользователя {uid} и вернулся в общую копилку.{note}"
+                            }
+                        | UndoPocketChange.Untouched ->
+                            task { return if coupon.status = "available" then "Купон снова в общей копилке." else "" }
                     let header =
                         $"Откат купона ID:{couponId}: {revertedEvent} → {coupon.status}.\n"
                         + (if pocketLine = "" then "" else pocketLine + "\n")

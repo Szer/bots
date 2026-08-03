@@ -37,12 +37,23 @@ type ReportCouponResult =
     /// Coupon is 'taken', but not by the reporting user.
     | NotHolder
 
+/// How an admin /undo moved the coupon relative to a member's pocket. An undo that silently
+/// changes what somebody holds is invisible to that member, so this drives the DM they get.
+[<RequireQualifiedAccess>]
+type UndoPocketChange =
+    /// The coupon landed back in this member's pocket ('taken', taken_by = them).
+    | BackToPocket of userId: int64
+    /// The coupon left this member's pocket and went back to the common pool.
+    | RemovedFromPocket of userId: int64
+    /// No member's pocket changed (undo of a void: the pre-void holder is deliberately not restored).
+    | Untouched
+
 [<RequireQualifiedAccess>]
 type UndoResult =
     /// The latest live action was reverted. `coupon` is the row after the undo,
     /// `revertedEvent` is the original event_type that was rolled back,
-    /// `backToPocketUserId` is the member whose pocket the coupon landed back in (if any).
-    | Undone of coupon: Coupon * revertedEvent: string * backToPocketUserId: int64 option
+    /// `pocketChange` is whose pocket the undo moved the coupon into or out of.
+    | Undone of coupon: Coupon * revertedEvent: string * pocketChange: UndoPocketChange
     /// Coupon has no live (not-yet-reverted) action left to undo.
     | NothingToUndo
     /// The latest live action cannot be reverted (e.g. "added"): carries its event_type.
@@ -1063,7 +1074,7 @@ ORDER BY created_at DESC, id DESC;
                 | Some ev ->
                     // Apply a guarded revert (WHERE status = expected post-state), append the
                     // compensating event, and return the post-undo snapshot.
-                    let finish (updateSql: string) (parms: 'p) (backToPocket: int64 option) =
+                    let finish (updateSql: string) (parms: 'p) (pocketChange: UndoPocketChange) =
                         task {
                             let! rows = conn.ExecuteAsync(updateSql, parms, tx)
                             if rows <> 1 then
@@ -1073,7 +1084,7 @@ ORDER BY created_at DESC, id DESC;
                                 do! insertEvent conn tx couponId ev.user_id (ev.event_type + "_reverted")
                                 let! updated = conn.QueryAsync<Coupon>("SELECT * FROM coupon WHERE id = @coupon_id;", {| coupon_id = couponId |}, tx)
                                 do! tx.CommitAsync()
-                                return UndoResult.Undone(updated |> Seq.head, ev.event_type, backToPocket)
+                                return UndoResult.Undone(updated |> Seq.head, ev.event_type, pocketChange)
                         }
 
                     match ev.event_type with
@@ -1081,11 +1092,11 @@ ORDER BY created_at DESC, id DESC;
                         // taken_by/taken_at were never cleared on use; just flip status back.
                         //language=postgresql
                         let sql = "UPDATE coupon SET status = 'taken' WHERE id = @coupon_id AND status = 'used';"
-                        return! finish sql {| coupon_id = couponId |} (Some ev.user_id)
+                        return! finish sql {| coupon_id = couponId |} (UndoPocketChange.BackToPocket ev.user_id)
                     | "taken" ->
                         //language=postgresql
                         let sql = "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id AND status = 'taken';"
-                        return! finish sql {| coupon_id = couponId |} None
+                        return! finish sql {| coupon_id = couponId |} (UndoPocketChange.RemovedFromPocket ev.user_id)
                     | "returned" ->
                         // Restore the holder; recover taken_at from the most recent prior take.
                         //language=postgresql
@@ -1097,12 +1108,12 @@ SET status = 'taken',
     taken_at = COALESCE((SELECT MAX(created_at) FROM coupon_event WHERE coupon_id = @coupon_id AND event_type = 'taken'), @now)
 WHERE id = @coupon_id AND status = 'available';
 """
-                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (Some ev.user_id)
+                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (UndoPocketChange.BackToPocket ev.user_id)
                     | "voided" ->
                         // Back to the common pool; prior holder is not restored.
                         //language=postgresql
                         let sql = "UPDATE coupon SET status = 'available', taken_by = NULL, taken_at = NULL WHERE id = @coupon_id AND status = 'voided';"
-                        return! finish sql {| coupon_id = couponId |} None
+                        return! finish sql {| coupon_id = couponId |} UndoPocketChange.Untouched
                     | "reported" ->
                         // Restore the reporter's pocket; recover taken_at from the most recent prior take
                         // (mirrors the "returned" case above). Reporter is recovered from the 'reported'
@@ -1116,7 +1127,7 @@ SET status = 'taken',
     taken_at = COALESCE((SELECT MAX(created_at) FROM coupon_event WHERE coupon_id = @coupon_id AND event_type = 'taken'), @now)
 WHERE id = @coupon_id AND status = 'reported';
 """
-                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (Some ev.user_id)
+                        return! finish sql {| coupon_id = couponId; taken_by = ev.user_id; now = utcNow () |} (UndoPocketChange.BackToPocket ev.user_id)
                     | other ->
                         // "added" (terminal — use /void) or anything unrecognised.
                         do! tx.RollbackAsync()
