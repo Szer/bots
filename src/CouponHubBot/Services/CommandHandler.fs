@@ -33,14 +33,30 @@ type CommandHandler(
                 match header with
                 | Some h -> h + "\n"
                 | None -> ""
-            let html = $"{headerPart}<pre>{table}</pre>"
+            // Usernames land inside the <pre>; escape so a `<` in a name can't break the block.
+            let html = $"{headerPart}<pre>{BotHelpers.htmlEscape table}</pre>"
             do! BotHelpers.sendHtml tg chatId html
         }
 
+    // Admin-only: everything stored about a coupon (value, dates, barcode, status, owner,
+    // holder) followed by its event history. No photo — the fields are what's being debugged.
     let handleDebug (userId: int64) (chatId: int64) (couponId: int) =
         task {
             if options.Value.FeedbackAdminIds |> Array.contains userId then
-                do! sendCouponHistory chatId couponId None
+                match! db.GetCouponById couponId with
+                | None ->
+                    do! sendText chatId $"Купон ID:{couponId} не найден."
+                | Some coupon ->
+                    let! owner = db.GetUserById coupon.owner_id
+                    let! taker =
+                        task {
+                            if coupon.taken_by.HasValue then
+                                return! db.GetUserById coupon.taken_by.Value
+                            else
+                                return None
+                        }
+                    let details = BotHelpers.formatCouponDebugDetails coupon owner taker
+                    do! sendCouponHistory chatId couponId (Some details)
             // else silently ignore for non-admins
         }
 

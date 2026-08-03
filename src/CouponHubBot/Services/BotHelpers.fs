@@ -165,6 +165,39 @@ let formatUserHandle (userId: int64) (username: string | null) (firstName: strin
     elif not (String.IsNullOrWhiteSpace firstName) then firstName
     else string userId
 
+/// Escapes the three characters Telegram's HTML parse mode treats as markup, so free-form
+/// text (barcodes, names) can never break — or inject into — a message we send as HTML.
+let htmlEscape (s: string | null) =
+    if isNull s then ""
+    else s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+
+/// Admin /debug dump of a coupon: every stored field except the photo file id.
+/// Dates are rendered ISO (not the UI's day-of-week form) — this is a debugging view,
+/// so exactness beats prettiness. Timestamps are UTC, as stored.
+let formatCouponDebugDetails (c: Coupon) (owner: DbUser option) (taker: DbUser option) =
+    let inv = System.Globalization.CultureInfo.InvariantCulture
+    let isoDate (d: DateOnly) = d.ToString("yyyy-MM-dd", inv)
+    let isoTime (t: DateTime) = t.ToString("yyyy-MM-dd HH:mm:ss", inv)
+    let userLine (userId: int64) (u: DbUser option) =
+        match u with
+        | Some u -> $"{htmlEscape (formatUserHandle u.id u.username u.first_name)} (id:{userId})"
+        | None -> $"id:{userId}"
+    let lines = [
+        $"<b>Купон ID:{c.id}</b>"
+        $"Номинал: {formatCouponValue c.value c.min_check}"
+        "Действует с: " + (if c.valid_from.HasValue then isoDate c.valid_from.Value else "—")
+        $"Годен до: {isoDate c.expires_at}"
+        "Штрихкод: " + (if String.IsNullOrWhiteSpace c.barcode_text then "—" else htmlEscape c.barcode_text)
+        $"Статус: {c.status}"
+        $"Владелец: {userLine c.owner_id owner}"
+        if c.taken_by.HasValue then
+            let takenAt =
+                if c.taken_at.HasValue then $", {isoTime c.taken_at.Value} UTC" else ""
+            $"Взят: {userLine c.taken_by.Value taker}{takenAt}"
+        $"Добавлен: {isoTime c.created_at} UTC"
+    ]
+    String.concat "\n" lines
+
 let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
     let headers = [| "date"; "user"; "event_type" |]
     let widths =
