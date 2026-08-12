@@ -358,3 +358,55 @@ type OcrTests(output: ITestOutputHelper) =
                 // Single, correct path — not the doubled ".../imageanalysis:analyze/computervision/..." that 404s.
                 Assert.Equal("/computervision/imageanalysis:analyze", uri.AbsolutePath)
         }
+
+    // Regression for prod trace 03c18ceac4f43ff2209ab92ccf002276 (2026-08-12): a 60x42 Telegram photo
+    // (height 42 < Azure's documented 50px minimum) made Azure return HTTP 400 InvalidImageSize.
+    // AzureBotOcr must degrade gracefully to "no OCR text" without an Error-level log, since a tiny
+    // image is an expected, foreseeable input — not a broken OCR backend.
+    [<Fact>]
+    member _.``Below-minimum image dimension is skipped gracefully, not logged as an error``() =
+        task {
+            let handler = { new HttpMessageHandler() with
+                                member _.SendAsync(_req, _ct) =
+                                    task {
+                                        // Exact body Azure returned in the production incident.
+                                        let body = """{"error":{"code":"InvalidRequest","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000.","innererror":{"code":"InvalidImageSize","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000."}}}"""
+                                        let resp = new HttpResponseMessage(HttpStatusCode.BadRequest)
+                                        resp.Content <- new StringContent(body, Encoding.UTF8, "application/json")
+                                        return resp
+                                    } }
+            use http = new HttpClient(handler)
+            let ocrOptions: IOptions<BotOcrConfig> =
+                LiveOptions(
+                    { OcrEnabled = true
+                      OcrMaxFileSizeBytes = 50L * 1024L * 1024L
+                      AzureOcrEndpoint = "https://example.cognitiveservices.azure.com"
+                      AzureOcrKey = "test-key" })
+            let transport = new Azure.Core.Pipeline.HttpClientTransport(http)
+            let logs = ResizeArray<string * LogLevel>()
+            let logger =
+                { new ILogger<AzureBotOcr> with
+                    member _.BeginScope<'TState>(_state: 'TState) = { new IDisposable with member _.Dispose() = () }
+                    member _.IsEnabled(_level: LogLevel) = true
+                    member _.Log<'TState>(logLevel, _eventId, state: 'TState, ex: exn, formatter: Func<'TState, exn, string>) =
+                        let msg = formatter.Invoke(state, ex)
+                        logs.Add(msg, logLevel)
+                        output.WriteLine($"[{logLevel}] {msg}") }
+            let azure = AzureBotOcr(ocrOptions, logger, transport) :> IBotOcr
+
+            let! result = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy; 2uy; 3uy |]))
+
+            // Degrades to "no usable OCR text", same contract as every other non-2xx path.
+            Assert.Null(result)
+
+            // The whole point of the fix: no Error-level noise for a foreseeable, expected condition.
+            let errorLogs = logs |> Seq.filter (fun (_, lvl) -> lvl = LogLevel.Error) |> Seq.toList
+            Assert.True(List.isEmpty errorLogs, $"Expected no Error-level logs, got: {errorLogs}")
+
+            // But it must still be observable at a lower level.
+            let skipLogs =
+                logs
+                |> Seq.filter (fun (msg, lvl) -> lvl <= LogLevel.Information && msg.Contains("skip", StringComparison.OrdinalIgnoreCase))
+                |> Seq.toList
+            Assert.False(List.isEmpty skipLogs, $"Expected a Debug/Information skip log, got: {logs |> Seq.toList}")
+        }
