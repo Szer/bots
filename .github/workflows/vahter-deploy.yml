@@ -33,6 +33,9 @@ permissions:
   issues: write
   pull-requests: write
   id-token: write
+  # actions: read is for the aks-vpn turnstile step in _bot-deploy.yml, which
+  # polls `gh api .../actions/runs` for other bots' in-flight deploys.
+  actions: read
 
 jobs:
   deploy:
