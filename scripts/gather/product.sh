@@ -119,27 +119,46 @@ log "Postgres: ok, Prometheus: ok, Loki: ${LOKI_STATUS}"
 
 log "Querying bot usage metrics..."
 
-CMD_7D_JSON=$(prom_query "sort_desc(sum by (command)(increase(${METRIC_PREFIX}command_total[7d])))")
-CMD_7D=$(echo "$CMD_7D_JSON" | jq -r '
-    [.data.result[] | {cmd: .metric.command, count: (.value[1] | tonumber | floor)}]
-    | sort_by(-.count)
-    | .[] | "| \(.cmd) | \(.count) |"
-' 2>/dev/null || true)
-[ -z "$CMD_7D" ] && CMD_7D="| (no data) | - |"
+# Metric-existence probe — an empty 7d `increase()` vector is
+# indistinguishable from "this bot never emits these metrics at all" unless
+# checked separately. VahterBanBot (a passive listener, no Telemetry.fs)
+# never emits `vahter_command_total`/`vahter_callback_total`; the old code
+# below coerced that empty vector to `0` via `// 0`, which read to the
+# product agent exactly like a real "interactions = 0" and produced issue
+# #324. `count({__name__=~...})` tells absent-metric apart from true-zero:
+# it returns a non-empty result iff the metric name has EVER been scraped.
+METRIC_EXISTS_JSON=$(prom_query "count({__name__=~\"^${METRIC_PREFIX}(command_total|callback_total)\$\"})")
+METRICS_EMITTED=$(echo "$METRIC_EXISTS_JSON" | jq -r '(.data.result | length) > 0' 2>/dev/null || echo "false")
 
-CB_7D_JSON=$(prom_query "sort_desc(sum by (action)(increase(${METRIC_PREFIX}callback_total[7d])))")
-CB_7D=$(echo "$CB_7D_JSON" | jq -r '
-    [.data.result[] | {action: .metric.action, count: (.value[1] | tonumber | floor)}]
-    | sort_by(-.count)
-    | .[] | "| \(.action) | \(.count) |"
-' 2>/dev/null || true)
-[ -z "$CB_7D" ] && CB_7D="| (no data) | - |"
+if [ "$METRICS_EMITTED" = "true" ]; then
+    CMD_7D_JSON=$(prom_query "sort_desc(sum by (command)(increase(${METRIC_PREFIX}command_total[7d])))")
+    CMD_7D=$(echo "$CMD_7D_JSON" | jq -r '
+        [.data.result[] | {cmd: .metric.command, count: (.value[1] | tonumber | floor)}]
+        | sort_by(-.count)
+        | .[] | "| \(.cmd) | \(.count) |"
+    ' 2>/dev/null || true)
+    [ -z "$CMD_7D" ] && CMD_7D="| (no data) | - |"
 
-INTERACTIONS_7D_JSON=$(prom_query "sum(increase(${METRIC_PREFIX}command_total[7d])) + sum(increase(${METRIC_PREFIX}callback_total[7d]))")
-INTERACTIONS_7D=$(echo "$INTERACTIONS_7D_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+    CB_7D_JSON=$(prom_query "sort_desc(sum by (action)(increase(${METRIC_PREFIX}callback_total[7d])))")
+    CB_7D=$(echo "$CB_7D_JSON" | jq -r '
+        [.data.result[] | {action: .metric.action, count: (.value[1] | tonumber | floor)}]
+        | sort_by(-.count)
+        | .[] | "| \(.action) | \(.count) |"
+    ' 2>/dev/null || true)
+    [ -z "$CB_7D" ] && CB_7D="| (no data) | - |"
 
-INTERACTIONS_PREV_JSON=$(prom_query "sum(increase(${METRIC_PREFIX}command_total[14d])) - sum(increase(${METRIC_PREFIX}command_total[7d])) + sum(increase(${METRIC_PREFIX}callback_total[14d])) - sum(increase(${METRIC_PREFIX}callback_total[7d]))")
-INTERACTIONS_PREV=$(echo "$INTERACTIONS_PREV_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+    INTERACTIONS_7D_JSON=$(prom_query "sum(increase(${METRIC_PREFIX}command_total[7d])) + sum(increase(${METRIC_PREFIX}callback_total[7d]))")
+    INTERACTIONS_7D=$(echo "$INTERACTIONS_7D_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+
+    INTERACTIONS_PREV_JSON=$(prom_query "sum(increase(${METRIC_PREFIX}command_total[14d])) - sum(increase(${METRIC_PREFIX}command_total[7d])) + sum(increase(${METRIC_PREFIX}callback_total[14d])) - sum(increase(${METRIC_PREFIX}callback_total[7d]))")
+    INTERACTIONS_PREV=$(echo "$INTERACTIONS_PREV_JSON" | jq -r '[.data.result[].value[1] | tonumber | floor] | add // 0' 2>/dev/null || echo "0")
+else
+    log "WARNING: ${METRIC_PREFIX}command_total / ${METRIC_PREFIX}callback_total do not exist in Prometheus for bot=${BOT} — reporting n/a instead of a coerced 0 (see issue #324)."
+    CMD_7D="| n/a — bot emits no ${METRIC_PREFIX}command_total metric | - |"
+    CB_7D="| n/a — bot emits no ${METRIC_PREFIX}callback_total metric | - |"
+    INTERACTIONS_7D="n/a — bot emits no command/callback metrics (not 0 — do not read this as a usage drop; see #324)"
+    INTERACTIONS_PREV="n/a — see above"
+fi
 
 # ─── Domain query set (per-bot .sql files — see scripts/queries/<query_set>/) ──
 
