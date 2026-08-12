@@ -1124,7 +1124,14 @@ type BotService(
                     return Some (AutoVerdict.Spam (float prediction.Score, actor))
                 | LlmVerdict.NotSpam ->
                     return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}))
-                | LlmVerdict.Skip | LlmVerdict.Error ->
+                | LlmVerdict.ContentFiltered when botConfig.Value.LlmContentFilterIsSpam ->
+                    // Azure's RAI policy rejected the prompt as severely harmful, on a message the
+                    // ML model already flagged as suspicious — treat it the same as an LLM SPAM
+                    // verdict. Escape hatch: LLM_CONTENT_FILTER_IS_SPAM=false falls through to the
+                    // Skip/Error/ContentFiltered branch below instead.
+                    let actor = Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}
+                    return Some (AutoVerdict.Spam (float prediction.Score, actor))
+                | LlmVerdict.Skip | LlmVerdict.Error | LlmVerdict.ContentFiltered ->
                     return Some (AutoVerdict.Uncertain (float prediction.Score))
             else
                 return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.ML))

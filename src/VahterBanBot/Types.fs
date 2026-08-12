@@ -57,6 +57,14 @@ type LlmVerdict =
     | NotSpam
     | Skip    // LLM "SPAM" verdict — message goes to human triage
     | Error   // HTTP failure or parse error — falls back to human triage
+    /// Azure OpenAI rejected the triage request itself with HTTP 400 `content_filter` — its RAI
+    /// policy judged the (already ML-flagged) prompt severely harmful, e.g. incident
+    /// aea4d561848519ad948d5d54eaea1b38 (2026-08-12): OCR text advertising CSAM categories.
+    /// Never written to the LLM verdict cache (see LlmTriage.fs's classifyUncached — this is an
+    /// exception path, not a model response). Bot.fs's GetAutoVerdict maps this to
+    /// AutoVerdict.Spam when LLM_CONTENT_FILTER_IS_SPAM is true (default); false reverts to the
+    /// same Uncertain fallback as Error.
+    | ContentFiltered
     static member FromString(verdictStr: string) =
         match verdictStr with
         | "SPAM"     -> LlmVerdict.Kill
@@ -430,6 +438,14 @@ type BotConfiguration =
       /// it is tunable by SQL and hot-reloadable, and a missing row falls back to the default
       /// rather than being silently wrong — see Program.fs's buildBotConf.
       LlmVerdictCacheGlobalEnabled: bool
+      /// When true (default), an Azure OpenAI `content_filter` rejection of the triage request
+      /// (LlmVerdict.ContentFiltered — see LlmTriage.fs) is treated as a high-confidence SPAM
+      /// signal by Bot.fs's GetAutoVerdict, since it only fires on messages the ML model already
+      /// flagged as suspicious AND Azure judged severely harmful. Escape hatch to revert to the
+      /// pre-fix Uncertain/human-review fallback without a redeploy; bot_setting-backed with a
+      /// code default, so it is tunable by SQL and hot-reloadable, and a missing row falls back
+      /// to the default rather than being silently wrong — see Program.fs's buildBotConf.
+      LlmContentFilterIsSpam: bool
       // Reaction-spam triage (vision LLM)
       /// When true, LLM verdict acts autonomously (UNSURE falls through to vahter).
       /// When false (default — shadow mode), LLM runs but verdict is recorded only; vahter always decides.
