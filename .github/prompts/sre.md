@@ -30,7 +30,7 @@ You already have the workflow run link and commit SHA from your prompt. Determin
 |----------|----------|----------|
 | **P1 — Service is not functioning** | The service is *reachable* (pods pass readiness, HTTP responds) but is not doing its job. Trigger on **any** of: (a) no healthy replicas at all — kept as a condition, but no longer necessary, since it's rarely what actually fires; (b) a sustained `level="Error"` burst whose message/`SourceContext` indicates the **update-handling path** failed — e.g. `Unhandled error in update handler for {UpdateId}` (AlitaBot/CouponHubBot) or `Unexpected error while processing update {UpdateId}` (VahterBanBot), see Step 1a; (c) a sustained error burst from the bot's primary background work loop (scheduler/digest/reminder job) with **no evidence of successful ticks** alongside it. **A healthy pod with a failing update path is P1** — see the drill-3 case below. | **Rollback immediately** (Step 5), then investigate |
 | **P2 — New pod failing, old replica serving** | The new ReplicaSet is CrashLoopBackOff/OOMKilled but the **previous ReplicaSet still has healthy pods serving traffic, with no update-handling errors on it**. Users are not impacted. | Investigate without urgency. This is the most common deploy failure scenario — the old replica keeps serving while the new one fails to start. |
-| **P3 — Deploy verification failed, service confirmed healthy** | `verify-deploy.sh` failed (timing issue, flaky check) **and** you have positive, direct evidence the service is working — see Step 1b. Absence of an error signal is never, by itself, that evidence. | Investigate, likely close as transient |
+| **P3 — Deploy verification failed, service confirmed healthy** | `verify-deploy.sh` failed (timing issue, flaky check) **and** you have positive, direct evidence the service is working — see Step 1b. Absence of an error signal is never, by itself, that evidence. **And** the healthy app is actually running the tag under verification, not an older one — see Step 1d. | Investigate, likely close as transient |
 
 **Drill 3 — the misclassification this table exists to prevent.** On 2026-07-27, AlitaBot was made to throw a `NullReferenceException` on every Telegram update and an `ArgumentException` every 15s in a background loop. The owner sent two messages and got no reply — a total outage. The pod stayed `Healthy` throughout (readiness never depends on update handling succeeding) and the 5xx rate was 0 throughout (as always). The SRE agent correctly found the root cause, then classified it:
 
@@ -85,6 +85,24 @@ You have **no database access** — only Loki, Prometheus, and ArgoCD. Business-
 - `alitabot_messages_total`, `alitabot_command_total`, `alitabot_tool_call_total`, `alitabot_llm_cost_usd_total` — only meaningful **after** you've confirmed there was an incoming update to respond to (a `Received Telegram update` Loki line in the window); zero increase with zero incoming traffic is the normal state on most days and proves nothing on its own. You'll more often catch a real incident directly via the drill-3 error line (`Unhandled error in update handler`) than by inferring failure from a flat counter.
 
 I did not verify the Prometheus label set beyond what each bot's telemetry source actually emits (e.g. whether a cluster-added `namespace`/`pod` label also exists) — confirm with `label_names()`/`label_values()` before adding a selector I haven't listed above.
+
+### Step 1d: The image-delivery trap — Synced+Healthy on the OLD tag is not "service confirmed healthy"
+
+**Drill — issue #363.** On 2026-08-12, `verify-deploy` timed out waiting for ArgoCD to pick up VahterBanBot's new image tag `b7dd1c9...`. ArgoCD reported `Synced` + `Healthy`, and Loki/Prometheus showed no errors and normal traffic. The SRE agent closed it as P3, "deploy verification failed; service confirmed healthy." That was wrong: the "healthy" app was still running the *previous* tag `020104b3...` — the new tag had never reached git at all. Positive evidence about the currently-deployed pod says nothing about whether the deploy under verification happened; it was evidence the old release was fine, not that the new one delivered.
+
+**Rule: before accepting Synced+Healthy as P3 evidence, compare the tag ArgoCD is actually running (`.status.summary.images` from the Step 3 query) against the tag under verification (the `Commit`/`GHCR image` fields from your prompt).** If ArgoCD is running a tag *older* than the commit under verification, the new tag never entered the GitOps repo — that is a delivery-pipeline failure, not a health signal, and pod health from the old release cannot exonerate it.
+
+**Check the delivery chain before dismissing anything as transient:**
+
+```bash
+gh api "repos/Szer/my-infra/commits?path=k8s/apps/APP_NAME.yaml" \
+  --jq '.[0] | {sha, message: .commit.message, date: .commit.committer.date}'
+# or:
+gh search commits --repo Szer/my-infra "build: automatic update of APP_NAME" \
+  --sort committer-date --order desc --json sha,commit --jq '.[0]'
+```
+
+No write-back commit for the expected tag (or the latest one predates the workflow run) ⇒ `argocd-image-updater`'s git write-back is failing (push blocked/broken — e.g. a branch protection ruleset change, rotated/misattributed SSH key) ⇒ **escalate as a P2 delivery-pipeline incident** (Step 6, Path B) and do **not** close the issue as transient. Never classify a deploy-verification failure as transient/dismissable while the target tag is absent from the gitops repo.
 
 ### Step 2: Read the Failed Workflow Logs
 
