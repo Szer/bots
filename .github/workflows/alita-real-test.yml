@@ -74,7 +74,10 @@ jobs:
         chmod +x scripts/setup-vpn.sh
         ./scripts/setup-vpn.sh
       env:
-        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+        # Dedicated single-occupancy peer (Szer/my-infra#111) — do not point
+        # this back at the shared WIREGUARD_CONFIG secret; a real-test run
+        # overlapping a deploy over one peer flaps the WG endpoint (issue #368).
+        WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG_ALITA }}
 
     - name: Write kubeconfig
       run: |

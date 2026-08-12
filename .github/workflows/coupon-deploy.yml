@@ -50,7 +50,10 @@ jobs:
       argocd-app-name: coupon-bot
       container-name: coupon-bot
     secrets:
-      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
+      # Dedicated single-occupancy peer (Szer/my-infra#111) — do not point
+      # this back at the shared WIREGUARD_CONFIG secret; concurrent bot
+      # deploys over one peer flap the WG endpoint (issue #368).
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG_COUPON }}
       DB_PROD_HOST: ${{ secrets.DB_PROD_HOST }}
       DB_PROD_USERNAME: ${{ secrets.DB_PROD_USERNAME }}
       DB_PROD_PASSWORD: ${{ secrets.DB_PROD_PASSWORD }}
