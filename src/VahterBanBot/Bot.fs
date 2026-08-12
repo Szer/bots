@@ -1920,7 +1920,7 @@ type BotService(
                 .StartActivity("vahterMarkedAsNotSpam")
                 .SetTag("messageId", msgId)
                 .SetTag("chatId", chatId)
-        do! db.RecordMessageMarkedHam(chatId, msgId, (if isNull tgMsg.Text then "" else tgMsg.Text), None)
+        do! db.RecordMessageMarkedHam(chatId, msgId, (if isNull tgMsg.Text then "" else tgMsg.Text), Some vahter.Id)
 
         let vahterUsername = vahter.Username |> Option.defaultValue null
 
