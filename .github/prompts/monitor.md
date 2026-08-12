@@ -56,10 +56,20 @@ tables that actually exist for it — see AGENT-FLOWS-REDESIGN.md §6.1):
 - **vahter** (`event` table only — the legacy tables froze 2026-04-02, see `bots.yml` notes):
   `messages_received_24h`, `unique_senders_24h`, `user_banned_24h`, `vahter_acted_24h`
   (**informational-only**, see below), `llm_classified_spam_24h`, `ml_scored_spam_24h`,
-  `callback_created_24h` / `callback_resolved_24h` (a growing gap between these two is stuck
-  confirmation callbacks), `message_marked_ham_24h` + `message_marked_spam_24h`
-  (**informational-only**, see below; ML correction rate), plus `log_lines_24h` /
-  `log_errors_24h` / `log_warnings_24h` for every bot.
+  `callback_created_24h` / `callback_resolved_24h` — **`callback_resolved_24h` counts ONLY a
+  human clicking the button (`CallbackResolved`); it deliberately does NOT count
+  `CallbackExpired`, a second terminal state that ~2 of 3 sibling confirmation buttons hit BY
+  DESIGN (most prompts ship 2-3 mutually-exclusive buttons; only one can ever be clicked). A
+  `created_24h` vs `resolved_24h` gap in this series is therefore NOT by itself a backlog
+  signal — issue #322 read exactly that gap as a growing callback backlog when the 30-day
+  reconciliation was actually 10,124 created vs 10,159 resolved+expired (no backlog at all).
+  Before filing a callback-backlog finding from this series, cross-check
+  `scripts/queries/vahter/04-callbacks.sql`'s `outstanding` column (created − resolved −
+  expired, per day) if it's in your evidence bundle, or otherwise treat a
+  `created_24h`/`resolved_24h` gap alone as inconclusive rather than a queue length. See
+  "Backlog/queue claims" discipline below. Also tracked: `message_marked_ham_24h` +
+  `message_marked_spam_24h` (**informational-only**, see below; ML correction rate), plus
+  `log_lines_24h` / `log_errors_24h` / `log_warnings_24h` for every bot.
 - **coupon** (`coupon_event`, the dense signal — not `chat_message`, which is bursty and has
   zero-days): `added_24h`, `taken_24h`, `used_24h`, `returned_24h`, `voided_24h`,
   `unique_users_24h`, plus `chat_message_24h` and `user_feedback_7d`.
@@ -174,6 +184,30 @@ huge z-score for a trivial deviation). **Do not file.** Note it in your summary 
 every other rule — a low-confidence series never generates a finding, however alarming its
 numbers look.
 
+### Backlog/queue claims — enumerate every terminal state first
+
+Before filing a "backlog"/"stuck"/"growing queue" finding about any entity that moves through
+states (callbacks, coupons, batches, etc.), list every terminal state that entity can reach —
+not just the one that sounds like a problem. `callback_created_24h` vs `callback_resolved_24h`
+looks like a backlog if you only know about `CallbackResolved`; it is not one once you also
+count `CallbackExpired`, a second terminal state ~2 of 3 sibling confirmation buttons hit BY
+DESIGN (see the `callback_resolved_24h` note above — issue #322). A `created` count exceeding
+one terminal-state count is not evidence of a backlog; it is only evidence once it exceeds the
+**sum of every terminal state**, sustained across multiple days.
+
+### Single-action fan-out is not a systemic burst
+
+Before filing rule 1 (new failure mode) or rule 2 (error-group z-score) as a recurring/systemic
+problem, check whether every occurrence in the window traces back to ONE traced action —
+a single admin command, a single button click, a single cross-chat operation fanning out into
+many expected per-target calls. Issue #358 read 33 `PARTICIPANT_ID_INVALID` errors as an error
+spike; all 33 were the expected per-chat fan-out of ONE admin `/kill`-style click that banned a
+user across every monitored chat — not 33 independent failures. If you can trace a burst to a
+single action or a single TraceId lineage, **say so explicitly and describe it as a one-time
+fan-out from that action**, not a systemic/recurring error mode — even if you still file it
+(an error-rate finding is still filed per the rules below; the description must not overstate
+it as recurring or systemic).
+
 ## Mandatory Change Correlation
 
 **Every candidate finding — from any rule above — must be checked against `change_context`
@@ -278,8 +312,13 @@ not use judgment to override them:**
    issue for the same fingerprint. Include the new evidence (fresh log line/timestamp, updated
    ratio/z-score) in your comment.
 3. **Fingerprint is in `known.closed`, not suppressed** → this is a **regression** of a
-   previously-resolved problem. Re-open it (`gh issue reopen`) with a comment explaining the
-   new occurrence, rather than filing a fresh issue.
+   previously-resolved problem — but ONLY if THIS run's evidence bundle independently shows the
+   underlying signal recurring (a fresh error-group hit, a series back outside baseline). A
+   fingerprint match by itself is not a new occurrence. Re-open it (`gh issue reopen`) with a
+   comment quoting the new evidence, rather than filing a fresh issue. **Do not reopen on the
+   strength of the fingerprint existing in `known.closed` alone** — a known drill fingerprint
+   sitting in history is not itself evidence of a fresh incident; this exact mistake reopened a
+   dormant fingerprint from the 2026-07-27 drills weeks after they were reverted.
 4. **Fingerprint matches nothing** → a new finding is allowed. **Your summary must say why
    this is not a variant of an existing open/closed fingerprint** — compare against the
    `known` list by root cause, not just by title text, before concluding it's new.
@@ -288,6 +327,28 @@ not use judgment to override them:**
 `SourceContext`, the series name, the ArgoCD app name) — never include a date, run id, or
 exact count in the fingerprint itself, or every run would mint a new "unique" fingerprint and
 dedup would never trigger.
+
+### Close stale findings — every run, not only when you have a new candidate
+
+Every run, before (or alongside) evaluating new candidates, walk `known.open` for this bot and
+ask of each one: **is the signal that fingerprint was filed for still active in THIS run's
+evidence?** Two deliberate SRE drill issues (#316, #308 — the 2026-07-27 drills, reverted
+within the hour, zero errors for the two weeks since) sat open long after the monitor agent's
+own runs had already confirmed `current=0`/back-to-baseline on them **twice**, and one was even
+reopened later (see rule 3 above) instead of ever being closed. Do not repeat this:
+
+- If the fingerprinted series/error-group has been back within baseline (or, for a
+  drill/deploy-correlated finding, `change_context` or the issue thread shows the triggering
+  change was reverted) for **7 or more consecutive days** as evidenced by this run and your
+  visible history of prior comments on the issue, post a closing comment citing the current
+  evidence (current value, how many days back to baseline, or the revert commit) and
+  `gh issue close` it.
+- If you cannot tell from this run's evidence alone whether it has been 7+ days (e.g. you have
+  no visibility into prior runs' values), say so in your summary rather than closing on a
+  guess — but still flag the fingerprint as a closure candidate for a human to confirm.
+- This check runs **every scheduled invocation**, independent of whether this run produced any
+  new candidate finding — a clean run with nothing new to file is exactly when stale open
+  issues are most likely to go unnoticed.
 
 ### Creating a finding issue
 
@@ -353,7 +414,11 @@ attributed (not filed) or unexplained (filed/commented/reopened, with issue numb
 fingerprint), or suppressed]
 
 ### Actions taken
-[issues created/commented/reopened, with numbers and fingerprints, or "none — clean run"]
+[issues created/commented/reopened/closed, with numbers and fingerprints, or "none — clean run"]
+
+### Stale-finding sweep
+[every open fingerprint checked this run per "Close stale findings" above, and the outcome —
+closed (with evidence), still active, or "insufficient history to judge 7-day baseline"]
 ```
 
 A clean run — nothing unexplained this cycle — is a valid, common outcome. Say so plainly;
