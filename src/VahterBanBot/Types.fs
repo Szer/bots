@@ -60,11 +60,15 @@ type LlmVerdict =
     /// Azure OpenAI rejected the triage request itself with HTTP 400 `content_filter` — its RAI
     /// policy judged the (already ML-flagged) prompt severely harmful, e.g. incident
     /// aea4d561848519ad948d5d54eaea1b38 (2026-08-12): OCR text advertising CSAM categories.
-    /// Never written to the LLM verdict cache (see LlmTriage.fs's classifyUncached — this is an
-    /// exception path, not a model response). Bot.fs's GetAutoVerdict maps this to
-    /// AutoVerdict.Spam when LLM_CONTENT_FILTER_IS_SPAM is true (default); false reverts to the
-    /// same Uncertain fallback as Error.
-    | ContentFiltered
+    /// `triggers` is the compact human-readable summary of which category/severity/jailbreak
+    /// flag fired (LlmTriage.fs's `extractContentFilterTriggers`), e.g. "sexual=high, jailbreak".
+    /// Never written to the LLM verdict cache and never produced by FromString below (see
+    /// LlmTriage.fs's classifyUncached — this is an exception path, not a model response), so
+    /// carrying a payload here is safe: nothing ever round-trips it through the cache's
+    /// string-keyed storage. Bot.fs's GetAutoVerdict maps this to AutoVerdict.ContentFilterSpam
+    /// when LLM_CONTENT_FILTER_IS_SPAM is true (default); false reverts to the same Uncertain
+    /// fallback as Error.
+    | ContentFiltered of triggers: string
     static member FromString(verdictStr: string) =
         match verdictStr with
         | "SPAM"     -> LlmVerdict.Kill
@@ -212,6 +216,12 @@ type AutoDeleteReason =
     /// matches a message a vahter manually /banned within the last TTL window. Carries the
     /// (chatId, messageId) of the seeding ban so a hit can be traced back to its cause.
     | SpamTextCacheHit of {| seedChatId: int64; seedMessageId: int64 |}
+    /// AutoVerdict.ContentFilterSpam's reason — an Azure content_filter rejection treated as
+    /// SPAM (see LLM_CONTENT_FILTER_IS_SPAM). Distinct from MlSpam so `formatReasonStr` (Bot.fs)
+    /// renders it differently in the DetectedSpam/PotentialSpam/AllLogs channel messages —
+    /// humans need to see this was Azure's content policy, not the ML/LLM triage's own read of
+    /// the text, plus which category/severity/jailbreak flag fired.
+    | ContentFilterSpam of {| score: float; triggers: string |}
 
 /// Mode for the ban-seeded spam-text cache (SPAM_TEXT_CACHE_MODE) — see SpamTextCache.fs.
 ///   Off     — no seeding, no lookup (default).
@@ -237,6 +247,14 @@ type SpamTextCacheMode =
 type AutoVerdict =
     /// Spam detected — delete message, reduce karma, check autoban
     | Spam of score: float * actor: Actor
+    /// Azure OpenAI's content_filter rejected the triage prompt as severely harmful (see
+    /// LlmVerdict.ContentFiltered / LLM_CONTENT_FILTER_IS_SPAM). Takes the EXACT SAME
+    /// delete/report/karma/autoban enforcement action as Spam (same score+actor shape, so
+    /// callers can reuse the Spam handling) — kept as a separate case purely so every
+    /// human-facing rendering and telemetry tag can say "Azure content filter" plus which
+    /// category/severity/jailbreak flag fired (`triggers`), instead of silently looking
+    /// identical to an ML/LLM SPAM verdict.
+    | ContentFilterSpam of score: float * actor: Actor * triggers: string
     /// Not spam — no action
     | NotSpam of score: float * actor: Actor
     /// Uncertain — route to human triage channel

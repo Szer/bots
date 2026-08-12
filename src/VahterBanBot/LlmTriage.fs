@@ -180,14 +180,62 @@ let isContentFilterRejection (status: int) (rawBody: string option) (exMessage: 
     | Some body -> tryParseErrorCode body = Some "content_filter"
     | None      -> exMessage.Contains("content_filter")
 
+/// Compact human-readable summary of which category (per `error.innererror.content_filter_result`)
+/// actually fired, e.g. `"sexual=high, jailbreak"`. Only entries with `filtered=true` or
+/// `detected=true` are included — a category present with `filtered=false` is not a trigger.
+/// Entries carrying a `severity` (the four content categories: hate/self_harm/sexual/violence)
+/// render as `"{category}={severity}"`; entries that only carry `detected` (jailbreak,
+/// protected_material_text/code) render as bare `"{category}"`. Never throws — a missing/
+/// unparsable body or `innererror`/`content_filter_result` falls back to a fixed placeholder
+/// string, since a parse hiccup here must never break the (already-handled) content_filter flow.
+let extractContentFilterTriggers (rawBody: string option) : string =
+    let fallback = "unknown (no content_filter_result in response)"
+    try
+        match rawBody with
+        | None -> fallback
+        | Some body ->
+            use doc = JsonDocument.Parse(body)
+            match doc.RootElement.TryGetProperty("error") with
+            | false, _ -> fallback
+            | true, err ->
+                match err.TryGetProperty("innererror") with
+                | false, _ -> fallback
+                | true, inner ->
+                    match inner.TryGetProperty("content_filter_result") with
+                    | false, _ -> fallback
+                    | true, result when result.ValueKind = JsonValueKind.Object ->
+                        let triggers =
+                            result.EnumerateObject()
+                            |> Seq.choose (fun prop ->
+                                let obj = prop.Value
+                                let isFiltered =
+                                    match obj.TryGetProperty("filtered") with
+                                    | true, f when f.ValueKind = JsonValueKind.True -> true
+                                    | _ -> false
+                                let isDetected =
+                                    match obj.TryGetProperty("detected") with
+                                    | true, d when d.ValueKind = JsonValueKind.True -> true
+                                    | _ -> false
+                                if not (isFiltered || isDetected) then None
+                                else
+                                    match obj.TryGetProperty("severity") with
+                                    | true, s when s.ValueKind = JsonValueKind.String -> Some $"{prop.Name}={s.GetString()}"
+                                    | _ -> Some prop.Name)
+                            |> String.concat ", "
+                        if triggers = "" then fallback else triggers
+                    | true, _ -> fallback
+    with _ -> fallback
+
 /// Logs the raw Azure error-response body once, at Warning (this is now a handled signal, not
 /// an unexpected fault) — joined to the rest of the request's logs by TraceId, per the "log the
 /// payload once" house pattern. `pathLabel` distinguishes text triage from reaction triage in
-/// the log line/Loki without needing two near-identical call sites.
-let private logContentFilterRejection (logger: ILogger) (pathLabel: string) (rawBody: string option) =
+/// the log line/Loki without needing two near-identical call sites. `triggers` is the
+/// `extractContentFilterTriggers` summary — carried as its own structured property so it's
+/// grep/filterable in Loki without parsing the raw body every time.
+let private logContentFilterRejection (logger: ILogger) (pathLabel: string) (triggers: string) (rawBody: string option) =
     logger.LogWarning(
-        "{TriagePath} content_filter rejection (HTTP 400): Azure RAI policy flagged the prompt as harmful. Raw response: {RawResponseBody}",
-        pathLabel, defaultArg rawBody "(raw response body unavailable)")
+        "{TriagePath} content_filter rejection (HTTP 400): Azure RAI policy flagged the prompt as harmful. Triggers: {ContentFilterTriggers}. Raw response: {RawResponseBody}",
+        pathLabel, triggers, defaultArg rawBody "(raw response body unavailable)")
 
 // ── Interface + implementation ────────────────────────────────────────────────
 
@@ -323,8 +371,9 @@ Message:
                 // at Warning with the raw Azure response body verbatim (that's where
                 // content_filter_result/innererror — per-category severity, jailbreak/
                 // protected-material flags — live; the exception Message alone omits them).
-                logContentFilterRejection logger "LLM triage" rawBody
-                return LlmVerdict.ContentFiltered
+                let triggers = extractContentFilterTriggers rawBody
+                logContentFilterRejection logger "LLM triage" triggers rawBody
+                return LlmVerdict.ContentFiltered triggers
             else
                 // Unexpected: other 400s, 401, 5xx, … — a real fault that needs attention, not a
                 // routine throttle or a handled content-filter case. Surface it at Error so it
@@ -563,7 +612,7 @@ Respond with strict JSON: {"verdict":"BAN"|"SPAM"|"NOT_SPAM"|"UNSURE", "reason":
                     // UNCHANGED here (still falls through to LlmReactionVerdict.Error below, same
                     // as any other failure); only the logging improves, so a future incident shows
                     // which category/severity/jailbreak flag fired instead of a bare "HTTP 400".
-                    logContentFilterRejection logger "Reaction triage" rawBody
+                    logContentFilterRejection logger "Reaction triage" (extractContentFilterTriggers rawBody) rawBody
                 else
                     // Unexpected: other 400s, 401, 5xx, … — needs attention.
                     logger.LogError(ex, "Reaction triage UNEXPECTED ERROR: HTTP {Status} after {LatencyMs}ms", ex.Status, sw.ElapsedMilliseconds)
