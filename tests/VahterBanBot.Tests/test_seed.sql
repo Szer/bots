@@ -1,9 +1,14 @@
-INSERT INTO public."user"(id, username, banned_by, banned_at, ban_reason)
+-- NOTE: user/message/banned/false_positive_*/false_negative_* are the pre-event-sourcing
+-- tables deprecated (renamed) by V41__deprecate_dead_pre_event_sourcing_tables.sql (issue
+-- #330). They're seeded here under their deprecated_ names purely as scratch input for the
+-- event backfill below (mirrors what V23's one-time prod backfill did) — nothing reads them
+-- back under their old names.
+INSERT INTO public.deprecated_user(id, username, banned_by, banned_at, ban_reason)
 VALUES (34, 'vahter_1', NULL, NULL, NULL),
        (69, 'vahter_2', NULL, NULL, NULL);
 
 -- insert some fake data for ML training
-INSERT INTO public."user"(id, username, banned_by, banned_at, ban_reason)
+INSERT INTO public.deprecated_user(id, username, banned_by, banned_at, ban_reason)
 VALUES (1001, 'a', NULL, NULL, NULL),
        (1002, 'b', NULL, NULL, NULL),
        (1003, 'c', NULL, NULL, NULL),
@@ -15,7 +20,7 @@ VALUES (1001, 'a', NULL, NULL, NULL),
        (1009, 'i', NULL, NULL, NULL),
        (1010, 'j', NULL, NULL, NULL);
 
-INSERT INTO public.message(chat_id, message_id, user_id, created_at, text, raw_message)
+INSERT INTO public.deprecated_message(chat_id, message_id, user_id, created_at, text, raw_message)
 VALUES (-666, 10001, 1001, now() - '1 day'::INTERVAL + '1 seconds'::INTERVAL, 'a', '{}'), -- false positive user banned
        (-666, 10002, 1001, now() - '1 day'::INTERVAL + '2 seconds'::INTERVAL, 'aa', '{}'),
        (-666, 10003, 1001, now() - '1 day'::INTERVAL + '3 seconds'::INTERVAL, 'aaa', '{}'),
@@ -536,19 +541,19 @@ VALUES (-666, 10001, 1001, now() - '1 day'::INTERVAL + '1 seconds'::INTERVAL, 'a
        (-666, 10498, 1001, now() - '1 day'::INTERVAL + '508 seconds'::INTERVAL, '7', '{}'),
        (-666, 10499, 1001, now() - '1 day'::INTERVAL + '509 seconds'::INTERVAL, '7', '{}');
 
-INSERT INTO public.banned(id, message_id, message_text, banned_user_id, banned_at, banned_in_chat_id, banned_in_chat_username, banned_by)
+INSERT INTO public.deprecated_banned(id, message_id, message_text, banned_user_id, banned_at, banned_in_chat_id, banned_in_chat_username, banned_by)
 VALUES (100001, 10001, 'a', 1001, now() - '1 day'::INTERVAL + '510 seconds'::INTERVAL, -666, 'pro.hell', 34),
        (100002, 10008, 'a', 1004, now() - '1 day'::INTERVAL + '511 seconds'::INTERVAL, -666, 'pro.hell', 69),
        (100003, 10009, '1', 1005, now() - '1 day'::INTERVAL + '512 seconds'::INTERVAL, -666, 'pro.hell', 34),
        (100004, 10010, '2', 1006, now() - '1 day'::INTERVAL + '513 seconds'::INTERVAL, -42, 'dotnetru', 69);
 
-INSERT INTO public.false_positive_users(user_id)
+INSERT INTO public.deprecated_false_positive_users(user_id)
 VALUES (1001);
 
-INSERT INTO public.false_positive_messages(text)
+INSERT INTO public.deprecated_false_positive_messages(text)
 VALUES ('a');
 
-INSERT INTO public.false_negative_messages(chat_id, message_id)
+INSERT INTO public.deprecated_false_negative_messages(chat_id, message_id)
 VALUES (-42, 10008),
        (-42, 10011),
        (-42, 10012),
@@ -909,7 +914,7 @@ SELECT
     ROW_NUMBER() OVER (PARTITION BY id ORDER BY created_at),
     jsonb_build_object('Case', 'UsernameChanged', 'userId', id, 'username', username),
     created_at
-FROM "user"
+FROM deprecated_user
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
 -- 2. MessageReceived — from message table.
@@ -923,7 +928,7 @@ SELECT
     jsonb_build_object('Case', 'MessageReceived', 'chatId', chat_id, 'messageId', message_id,
                        'userId', user_id, 'text', text, 'rawMessage', to_jsonb(raw_message::text)),
     created_at
-FROM message
+FROM deprecated_message
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
 -- 2b. One hand-written string-shaped MessageReceived kept for fold/rebuild coverage.
@@ -945,7 +950,7 @@ WITH all_bans AS (
            banned_in_chat_id,
            message_id,
            message_text
-    FROM banned
+    FROM deprecated_banned
 ),
 numbered AS (
     SELECT *,
@@ -976,13 +981,13 @@ SELECT
     2,
     jsonb_build_object('Case', 'MessageMarkedSpam', 'chatId', chat_id, 'messageId', message_id, 'markedBy', NULL),
     NOW()
-FROM false_negative_messages
+FROM deprecated_false_negative_messages
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
 -- 5. MessageMarkedHam — from false_positive_messages matched to message table
 CREATE TEMP TABLE seed_msg_hash_lookup AS
     SELECT chat_id, message_id, md5(text)::uuid AS text_hash
-    FROM message
+    FROM deprecated_message
     WHERE text IS NOT NULL;
 CREATE INDEX ON seed_msg_hash_lookup(text_hash);
 
@@ -992,7 +997,7 @@ SELECT
     2,
     jsonb_build_object('Case', 'MessageMarkedHam', 'chatId', m.chat_id, 'messageId', m.message_id, 'text', fp.text, 'markedBy', NULL),
     NOW()
-FROM false_positive_messages fp
+FROM deprecated_false_positive_messages fp
 JOIN seed_msg_hash_lookup m ON m.text_hash = fp.text_hash
 ON CONFLICT (stream_id, stream_version) DO NOTHING;
 
