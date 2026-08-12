@@ -13,12 +13,14 @@
 # is a value, only the key name of what the Secret must provide.
 #
 # GITHUB_TOKEN is deliberately NOT one of those keys: GitHubService.IsConfigured
-# requires a non-empty GITHUB_TOKEN, and the seeded GITHUB_REPO bot_setting
-# fallback is the real `Szer/coupon-bot` repo — with a token present, a
-# `/feedback` real test would open a REAL GitHub issue and assign a real
-# Copilot agent. Do not "fix" this by adding a token; the real suite covers
-# `/feedback` only up to the admin-forward step (see the contract's
-# "Containment of external side effects" section).
+# requires a non-empty GITHUB_TOKEN, and this CI run's bot_setting seed (see
+# "Seed bot_setting" in coupon-real-test.yml) has no GITHUB_REPO row, so
+# Program.fs's hardcoded fallback (the real `Szer/bots` monorepo) applies —
+# with a token present, a `/feedback` real test would open a REAL GitHub
+# issue in this very repo and assign a real Copilot agent. Do not "fix" this
+# by adding a token; the real suite covers `/feedback` only up to the
+# admin-forward step (see the contract's "Containment of external side
+# effects" section).
 #
 # `coupon-ci: transient` (never `app.kubernetes.io/instance`) is the only
 # label CI teardown keys off — see postgres.yaml for why.

@@ -17,7 +17,7 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('MAX_TAKEN_COUPONS',      '6',                                                    'FREE_FORM',    'coupons',     'Max coupons a single user can hold at once'),
     ('TEST_MODE',              'false',                                                'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/run-reminder)'),
     ('FEEDBACK_ADMINS',        '432506904;509847134',                                  'FREE_FORM',    'feedback',    'Telegram user ids (; , or space separated) who receive /feedback reports'),
-    ('GITHUB_REPO',            'Szer/coupon-bot',                                      'FREE_FORM',    'feedback',    'owner/repo used by /feedback to open GitHub issues'),
+    ('GITHUB_REPO',            'Szer/bots',                                            'FREE_FORM',    'feedback',    'owner/repo used by /feedback to open GitHub issues'),
     ('AZURE_OCR_ENDPOINT',     'https://szer-vision-ocr.cognitiveservices.azure.com', 'FREE_FORM',    'ocr',         'Azure Computer Vision resource base URL'),
     ('OCR_ENABLED',            'true',                                                 'FEATURE_FLAG', 'ocr',         'Master toggle for Azure OCR pre-fill of coupon fields'),
     ('OCR_MAX_FILE_SIZE_BYTES','20971520',                                             'FREE_FORM',    'ocr',         'Maximum photo size in bytes that will be sent to Azure OCR'),
