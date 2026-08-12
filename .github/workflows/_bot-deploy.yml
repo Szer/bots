@@ -38,6 +38,12 @@ on:
     secrets:
       WIREGUARD_CONFIG:
         required: true
+        description: >-
+          Per-bot dedicated WireGuard peer config, e.g. the caller's
+          WIREGUARD_CONFIG_VAHTER/COUPON/ALITA secret (Szer/my-infra#111) —
+          NOT the shared WIREGUARD_CONFIG secret. The peer is
+          single-occupancy; sharing it across bots flaps the WG endpoint
+          for concurrent deploys (issue #368).
       DB_PROD_HOST:
         required: true
       DB_PROD_USERNAME:
