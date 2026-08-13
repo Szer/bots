@@ -5,10 +5,17 @@ on:
     branches: [ "main" ]
     paths:
       - 'src/BotInfra/**'
+      - '!src/BotInfra/**/*.md'
       - 'src/AlitaBot/**'
       - 'src/alita-bot/**'
       - 'src/Dockerfile.bot'
       - 'tests/AlitaBot.Tests/**'
+      - 'tests/BotTestInfra/**'
+      - 'tests/FakeTgApi/**'
+      - 'tests/FakeAzureOcrApi/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
       - '.github/workflows/alita-deploy.yml'
   workflow_dispatch:
 
