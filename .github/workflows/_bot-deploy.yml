@@ -62,60 +62,66 @@ on:
 env:
   DOCKER_IMAGE: flyway/flyway
   SCHEMAS: public
-  # Display names of every workflow that shares the VPN turnstile below.
-  # Keep in sync with the `name:` at the top of coupon-deploy.yml /
-  # vahter-deploy.yml / alita-deploy.yml.
-  DEPLOY_WORKFLOW_NAMES: "Coupon: Deploy,Vahter: Deploy,Alita: Deploy"
 
 jobs:
   deploy:
     runs-on: ubuntu-22.04-arm
-    # VPN peer is single-occupancy; concurrent connections break DNS (2026-07-23
-    # incident). This group is now scoped per caller workflow (aks-vpn-<name>)
-    # instead of a single shared "aks-vpn": duplicate runs of the SAME bot still
-    # serialize/dedupe here, but different bots no longer fight over one shared
-    # group. They used to — GitHub concurrency groups hold only one PENDING job,
-    # so a fan-out of all three bots' deploys canceled the older waiter(s)
-    # instead of queuing them (silently leaving those bots on stale images).
-    # Cross-bot serialization for the VPN itself is now handled explicitly by
-    # the "Wait for aks-vpn turnstile" step below, which polls and queues
-    # (never cancels) until this run is the oldest one waiting.
+    # VPN peer is single-occupancy per bot (PR #369 / my-infra#111 gave every
+    # bot its own dedicated WireGuard peer — WIREGUARD_CONFIG_VAHTER/_COUPON/
+    # _ALITA — so bots no longer share one peer). This group is scoped per
+    # caller workflow (aks-vpn-<name>) so duplicate runs of the SAME bot still
+    # serialize/dedupe here. GitHub concurrency groups hold only one PENDING
+    # job, so two triggers of the same bot's deploy landing close together
+    # would cancel the older waiter instead of queuing it — the "Wait for
+    # aks-vpn turnstile" step below closes that gap by polling and queuing
+    # (never cancelling) until this run is the oldest same-bot waiter. There
+    # is no cross-bot turnstile any more: since #369 every bot has its own
+    # peer, so different bots' deploys no longer contend for a shared VPN
+    # resource (they used to, back when this group and the turnstile query
+    # below were both scoped globally across all three bots — see #367 for
+    # why that was correct at the time).
     concurrency:
       group: aks-vpn-${{ github.workflow }}
       cancel-in-progress: false
 
     steps:
+    # Per-bot FIFO turnstile: waits until this run is the oldest queued/
+    # in_progress run of THIS caller workflow (github.workflow — e.g. "Vahter:
+    # Deploy"), then proceeds. It used to poll across all three deploy
+    # workflows (DEPLOY_WORKFLOW_NAMES) because every bot shared one
+    # single-occupancy WireGuard peer; PR #369 / my-infra#111 gave each bot
+    # its own peer, so that cross-bot serialization is no longer needed —
+    # only same-bot FIFO fairness remains (a plain `concurrency:` group alone
+    # would cancel an older queued run instead of queuing it, see above).
     - name: Wait for aks-vpn turnstile
       id: turnstile
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         RUN_ID: ${{ github.run_id }}
+        WORKFLOW_NAME: ${{ github.workflow }}
       run: |
         set -euo pipefail
         TIMEOUT_SECONDS=1800
         START_TS=$(date +%s)
-        IFS=',' read -r -a DEPLOY_WORKFLOWS <<< "${DEPLOY_WORKFLOW_NAMES}"
 
         while true; do
           WAITERS=()
           for STATUS in queued in_progress; do
-            for WF in "${DEPLOY_WORKFLOWS[@]}"; do
-              while IFS=$'\t' read -r CREATED ID; do
-                [ -n "$ID" ] && WAITERS+=("${CREATED}"$'\t'"${ID}")
-              done < <(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=${STATUS}&per_page=100" \
-                --jq ".workflow_runs[] | select(.name==\"${WF}\") | \"\(.created_at)\t\(.id)\"")
-            done
+            while IFS=$'\t' read -r CREATED ID; do
+              [ -n "$ID" ] && WAITERS+=("${CREATED}"$'\t'"${ID}")
+            done < <(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?status=${STATUS}&per_page=100" \
+              --jq ".workflow_runs[] | select(.name==\"${WORKFLOW_NAME}\") | \"\(.created_at)\t\(.id)\"")
           done
 
-          # Oldest by created_at wins; run id is only a tie-breaker. A single
-          # push can fan out to all three deploy workflows within the same
-          # second (real 2026-08-12 data: three runs shared one created_at
-          # value), so created_at alone isn't unique. created_at is the
-          # primary key (not run id) because a rerun of an old, still-waiting
-          # run gets a fresh created_at but keeps its original (low) run id —
-          # ordering by run id would let that rerun cut ahead of every run
-          # that arrived while it sat broken; ordering by created_at makes it
-          # re-queue fairly at the back, like a new arrival.
+          # Oldest by created_at wins; run id is only a tie-breaker. Two runs
+          # of THIS workflow can still share a created_at (e.g. a push landing
+          # the same second as a manual workflow_dispatch), so created_at
+          # alone isn't unique. created_at is the primary key (not run id)
+          # because a rerun of an old, still-waiting run gets a fresh
+          # created_at but keeps its original (low) run id — ordering by run
+          # id would let that rerun cut ahead of every run that arrived while
+          # it sat broken; ordering by created_at makes it re-queue fairly at
+          # the back, like a new arrival.
           OLDEST_LINE=""
           if [ "${#WAITERS[@]}" -gt 0 ]; then
             OLDEST_LINE=$(printf '%s\n' "${WAITERS[@]}" | sort -k1,1 -k2,2n | head -n1)
@@ -123,22 +129,22 @@ jobs:
           OLDEST_ID=$(printf '%s' "$OLDEST_LINE" | awk -F'\t' '{print $2}')
 
           if [ -z "$OLDEST_ID" ]; then
-            echo "::warning::aks-vpn turnstile saw no queued/in_progress deploy runs, not even this one — proceeding"
+            echo "::warning::aks-vpn turnstile saw no queued/in_progress ${WORKFLOW_NAME} runs, not even this one — proceeding"
             break
           fi
           if [ "$OLDEST_ID" = "$RUN_ID" ]; then
-            echo "aks-vpn turnstile: this run (${RUN_ID}) is the oldest waiter — proceeding"
+            echo "aks-vpn turnstile: this run (${RUN_ID}) is the oldest ${WORKFLOW_NAME} waiter — proceeding"
             break
           fi
 
           ELAPSED=$(( $(date +%s) - START_TS ))
           if [ "$ELAPSED" -ge "$TIMEOUT_SECONDS" ]; then
-            echo "::error::Timed out after ${TIMEOUT_SECONDS}s waiting for the aks-vpn turnstile — run ${OLDEST_ID} is still ahead of this run (${RUN_ID}). The VPN peer is single-occupancy; rerun this job once that deploy finishes."
+            echo "::error::Timed out after ${TIMEOUT_SECONDS}s waiting for the aks-vpn turnstile — run ${OLDEST_ID} is still ahead of this run (${RUN_ID}) for ${WORKFLOW_NAME}. The VPN peer is single-occupancy; rerun this job once that deploy finishes."
             exit 1
           fi
 
           SLEEP=$(( 20 + RANDOM % 11 ))
-          echo "aks-vpn turnstile: waiting — oldest queued/in_progress deploy run is ${OLDEST_ID}, this run is ${RUN_ID}. Sleeping ${SLEEP}s (elapsed ${ELAPSED}s/${TIMEOUT_SECONDS}s)."
+          echo "aks-vpn turnstile: waiting — oldest queued/in_progress ${WORKFLOW_NAME} run is ${OLDEST_ID}, this run is ${RUN_ID}. Sleeping ${SLEEP}s (elapsed ${ELAPSED}s/${TIMEOUT_SECONDS}s)."
           sleep "$SLEEP"
         done
 
