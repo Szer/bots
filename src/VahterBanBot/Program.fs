@@ -145,6 +145,9 @@ let buildBotConf () =
       // Ephemeral commands & confirmations (Bot API 10.2)
       EphemeralCommandsEnabled     = getSettingOr "EPHEMERAL_COMMANDS_ENABLED" "false" |> bool.Parse
       EphemeralConfirmationEnabled = getSettingOr "EPHEMERAL_CONFIRMATION_ENABLED" "false" |> bool.Parse
+      // Public /vahter_report command. Off by default — see BotConfiguration's doc comment.
+      ReportCommandEnabled  = getSettingOr "REPORT_COMMAND_ENABLED" "false" |> bool.Parse
+      ReportCacheTtlSeconds = getSettingOr "REPORT_CACHE_TTL_SECONDS" "300" |> int
       // Ban-seeded spam-text cache. Default "off": inert until explicitly turned on; recommended
       // rollout is off -> shadow -> enforce, tuned live via bot_setting (no redeploy needed) —
       // see AGENTS.md's Settings configuration section and SpamTextCache.fs.

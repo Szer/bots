@@ -29,7 +29,8 @@ type BotCommandsSetupService(
                             let commands =
                                 [| BotCommand.Create("ban", "Забанить (ответом на сообщение спамера)", isEphemeral = true)
                                    BotCommand.Create("sban", "Софтбан (ответом на сообщение спамера)", isEphemeral = true)
-                                   BotCommand.Create("unban", "Разбанить юзера по ID", isEphemeral = true) |]
+                                   BotCommand.Create("unban", "Разбанить юзера по ID", isEphemeral = true)
+                                   BotCommand.Create("vahter_report", "Отчёт: сколько спама поймал бот (виден только вам)", isEphemeral = true) |]
                             do! tg.CallExn(Funogram.Telegram.Req.SetMyCommands.Make(commands, scope = scope)) |> taskIgnore
                             logger.LogInformation "Registered ephemeral group commands (/ban, /sban, /unban)"
                         else
