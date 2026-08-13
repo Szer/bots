@@ -477,10 +477,7 @@ type BotConfiguration =
       ReactionTriageDebounce: TimeSpan
       /// Bans older than this many days are considered expired. Default: 7.
       BanExpiryDays: int
-      // Ephemeral commands & confirmations (Bot API 10.2)
-      /// When true, public commands (/ban, /unban, /sban) are registered with is_ephemeral,
-      /// so clients send them invisibly to other chat members. Re-registration happens on restart.
-      EphemeralCommandsEnabled: bool
+      // Ephemeral confirmations (Bot API 10.2)
       /// When true, the issuing vahter gets a short self-dismissing ephemeral confirmation
       /// in the chat after /ban, /sban, /unban. Visible only to the issuer.
       EphemeralConfirmationEnabled: bool
@@ -489,7 +486,10 @@ type BotConfiguration =
       // this is its first public (non-vahter-gated) command, so REPORT_COMMAND_ENABLED
       // defaults to "false" and is bot_setting-backed / hot-reloadable like every other flag
       // here — see AGENTS.md's Settings configuration section. Flag rollout is a hand-run SQL
-      // seed (settings are never Flyway-seeded — see AGENTS.md).
+      // seed (settings are never Flyway-seeded — see AGENTS.md). Also gates whether
+      // BotCommandsSetup registers /vahter_report as Telegram's group-scope command-menu entry
+      // — see that file's doc comment for why /ban, /sban, /unban are deliberately NEVER
+      // registered in any scope (is_ephemeral does not hide menu entries, only command bubbles).
       ReportCommandEnabled: bool
       /// TTL (seconds) for the in-process per-chat cache of /vahter_report stats — the abuse
       /// bound for a command any chat member can trigger with no rate limiting of its own.
