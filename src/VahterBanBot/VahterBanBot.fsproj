@@ -20,6 +20,7 @@
     <Compile Include="ML.fs" />
     <Compile Include="ComputerVision.fs" />
     <Compile Include="ProfileFetcher.fs" />
+    <Compile Include="InjectionHeuristics.fs" />
     <Compile Include="LlmTriage.fs" />
     <Compile Include="UpdateChatAdmins.fs" />
     <Compile Include="Bot.fs" />

@@ -1140,6 +1140,10 @@ type BotService(
                     let actor = Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}
                     return Some (AutoVerdict.Spam (float prediction.Score, actor))
                 | LlmVerdict.NotSpam ->
+                    let msgLength = if isNull msg.Text then 0 else msg.Text.Length
+                    logger.LogInformation(
+                        "LLM triage NOT_SPAM in ML warning band — message passes (chat {ChatId}, user {UserId}, ML score {MlScore}, msg length {MsgLength})",
+                        msg.ChatId, msg.SenderId, prediction.Score, msgLength)
                     return Some (AutoVerdict.NotSpam (float prediction.Score, Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}))
                 | LlmVerdict.ContentFiltered triggers when botConfig.Value.LlmContentFilterIsSpam ->
                     // Azure's RAI policy rejected the prompt as severely harmful, on a message the
