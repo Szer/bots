@@ -30,6 +30,7 @@
     <Compile Include="AdminDebugTests.fs" />
     <Compile Include="VoidFlowTests.fs" />
     <Compile Include="ReportFlowTests.fs" />
+    <Compile Include="AddedStatusTests.fs" />
     <Compile Include="UndoFlowTests.fs" />
     <Compile Include="StatsTests.fs" />
     <Compile Include="HealthCheckTests.fs" />
