@@ -166,6 +166,7 @@ let buildBotConf () =
                + "⚠️ Your message was removed automatically because it looks like spam. Please do not "
                + "post it again — repeated removals may lead to a ban. Moderators can see all removals "
                + "and will sort it out if this was a mistake.")
+      SpamWarningMaxScore = getSettingOr "SPAM_WARNING_MAX_SCORE" "3.0" |> double
       // Temporary "vetted" protection after a vahter ham-mark. Off by default — see
       // BotConfiguration's doc comment.
       SpamProtectionEnabled = getSettingOr "SPAM_PROTECTION_ENABLED" "false" |> bool.Parse

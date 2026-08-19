@@ -554,6 +554,12 @@ type BotConfiguration =
       /// /reload-settings without a redeploy. Deliberately generic — no scores, no ML/LLM
       /// distinction, no strike counts — so it doesn't teach spammers how detection works.
       SpamWarningText: string
+      /// Only warn when the deletion's ML score is below this cutoff (strict <), i.e. the
+      /// likely-false-positive band — blatant spam (high score) is deleted silently, no warning.
+      /// bot_setting-backed (not a constant) because the score scale drifts under daily ML
+      /// retraining. Default 3.0 is prod-data-derived (93.8% ham-deletion coverage, 43-point
+      /// spammer-warning reduction) — see Bot.fs's DeleteSpam.
+      SpamWarningMaxScore: float
       // Temporary "vetted" protection after a vahter ham-mark (see Bot.fs's EnforceOrDemote /
       // MaybeGrantSpamProtection). Master flag for BOTH the grant (VahterMarkedAsNotSpam /
       // `/vahter unmarkspam`) and the demotion (would-be MlSpam/LlmSpam/ContentFilterSpam
