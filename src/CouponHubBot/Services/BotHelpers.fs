@@ -278,6 +278,74 @@ let pickCouponsForList (today: DateOnly) (coupons: Coupon array) =
 
         filled |> Array.sortBy (fun c -> c.expires_at, c.id)
 
+/// Visibility status of an owner's coupon relative to /list, used by /added to explain
+/// why an "available" coupon may or may not currently be shown.
+[<RequireQualifiedAccess>]
+type CouponListStatus =
+    | Shown
+    | Taken
+    | Reported
+    | NotYetValid of validFrom: DateOnly
+    | Waiting of ahead: int * minCheck: decimal
+    | WaitingGeneric
+    /// Defensive: "available" but absent from the /list candidate pool for a reason other
+    /// than valid_from — should be unreachable given how GetAvailableCoupons/
+    /// GetVoidableCouponsByOwner are queried, but never crash /added over it.
+    | WaitingUnknown
+
+/// How many /list slots a denomination's dedicated queue has: 2 for the "fivers" (min_check=25),
+/// 1 each for min_check 40/50/100, 0 for anything else (those only ever get in via fill-to-6).
+let private bucketSlotCapacity (minCheck: decimal) =
+    if minCheck = 25m then 2
+    elif minCheck = 40m || minCheck = 50m || minCheck = 100m then 1
+    else 0
+
+/// Determines an owner's coupon's /added visibility status, mirroring pickCouponsForList's
+/// logic so the verdict always matches what /list actually shows.
+/// `pool` is the same coupon set /list picks from (db.GetAvailableCoupons()), `shown` is
+/// pickCouponsForList today pool.
+let couponListStatus (today: DateOnly) (pool: Coupon array) (shown: Coupon array) (c: Coupon) : CouponListStatus =
+    match c.status with
+    | "taken" -> CouponListStatus.Taken
+    | "reported" -> CouponListStatus.Reported
+    | "available" ->
+        if c.valid_from.HasValue && c.valid_from.Value > today then
+            CouponListStatus.NotYetValid c.valid_from.Value
+        elif shown |> Array.exists (fun s -> s.id = c.id) then
+            CouponListStatus.Shown
+        elif not (pool |> Array.exists (fun p -> p.id = c.id)) then
+            CouponListStatus.WaitingUnknown
+        elif bucketSlotCapacity c.min_check = 0 then
+            CouponListStatus.WaitingGeneric
+        else
+            let ahead =
+                pool
+                |> Array.filter (fun p -> p.min_check = c.min_check)
+                |> Array.sortBy (fun p -> p.expires_at, p.id)
+                |> Array.findIndex (fun p -> p.id = c.id)
+            CouponListStatus.Waiting(ahead, c.min_check)
+    | _ -> CouponListStatus.WaitingUnknown
+
+/// Renders couponListStatus as a parenthetical suffix, in the style of the existing
+/// " (взят)"/" (отмечен использованным)" strings. Never repeats the expiry date —
+/// the /added line already prints expires_at.
+let formatCouponListStatusSuffix (status: CouponListStatus) : string =
+    match status with
+    | CouponListStatus.Shown -> " (в списке)"
+    | CouponListStatus.Taken -> " (взят)"
+    | CouponListStatus.Reported -> " (отмечен использованным)"
+    | CouponListStatus.NotYetValid vf -> $" (начнёт действовать с {formatUiDate vf})"
+    | CouponListStatus.Waiting(0, _) ->
+        // ahead=0 but still not Shown is a contradictory-looking state (its own dedicated slot
+        // should have picked it up) — fall back to the generic wording rather than claim "0 ahead".
+        " (в очереди, точно будет в списке в день истечения)"
+    | CouponListStatus.Waiting(ahead, mc) ->
+        let word = Utils.RussianPlural.choose ahead "купон" "купона" "купонов"
+        let mcStr = mc.ToString("0.##")
+        $" (в очереди: впереди {ahead} {word} из {mcStr}€, точно будет в списке в день истечения)"
+    | CouponListStatus.WaitingGeneric -> " (в очереди, точно будет в списке в день истечения)"
+    | CouponListStatus.WaitingUnknown -> " (в очереди)"
+
 let couponsKeyboard (coupons: Coupon array) =
     coupons
     |> Array.mapi (fun i c -> [| btn $"Взять {formatOrdinalShort (i + 1)}" $"take:{c.id}" |])

@@ -310,6 +310,10 @@ type CommandHandler(
             if allCoupons.Length = 0 then
                 do! sendText chatId "У тебя нет активных добавленных купонов."
             else
+                let today = Utils.TimeZones.dublinToday time
+                let! pool = db.GetAvailableCoupons()
+                let shown = BotHelpers.pickCouponsForList today pool
+
                 let maxShown = 20
                 let coupons = allCoupons |> Array.truncate maxShown
                 let remaining = allCoupons.Length - coupons.Length
@@ -324,10 +328,8 @@ type CommandHandler(
                                 if String.IsNullOrEmpty(c.barcode_text) || c.barcode_text.Length < 4 then ""
                                 else $" ···{c.barcode_text[c.barcode_text.Length - 4 ..]}"
                             let statusText =
-                                match c.status with
-                                | "taken" -> " (взят)"
-                                | "reported" -> " (отмечен использованным)"
-                                | _ -> ""
+                                BotHelpers.couponListStatus today pool shown c
+                                |> BotHelpers.formatCouponListStatusSuffix
                             $"{n}. ID:{c.id} — {BotHelpers.formatCouponValue c.value c.min_check}, {d}{barcodeSuffix}{statusText}")
                         |> String.concat "\n"
                     if remaining > 0 then
