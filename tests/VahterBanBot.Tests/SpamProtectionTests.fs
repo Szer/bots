@@ -223,6 +223,17 @@ type SpamProtectionBudgetTests(fixture: MlEnabledVahterTestContainers, _unused: 
 
 /// Test item 4: SpamTextCacheHit is a carve-out — a protected user's cache-hit deletion is
 /// NEVER demoted, even with protection active.
+///
+/// IMPORTANT: SpamTextCacheEnforceTestContainers is an ASSEMBLY-SHARED fixture (see Program.fs's
+/// `[<assembly: AssemblyFixture(typeof<SpamTextCacheEnforceTestContainers>)>]`) — ONE database
+/// shared by every test CLASS that takes it as a constructor param (this class, plus
+/// SpamTextCacheTests' own SpamTextCacheEnforceTests and SpamWarningTests' SpamWarningCacheHitTests).
+/// DB.fs's GetUserStatsByLastNMessages computes `is_ham` by matching MessageMarkedHam.text
+/// GLOBALLY (not scoped to chat/user) — ham-marking a fixed, reused literal like "2222222" here
+/// would poison SpamTextCacheTests' karma-autoban test for every OTHER user who ever sends that
+/// exact text (confirmed root cause of a real CI failure — see PR history). Grant protection via
+/// direct event injection (GrantSpamProtection) instead of a real ham-mark round trip, so this
+/// test never writes a MessageMarkedHam event for any shared/reused text at all.
 type SpamProtectionCarveOutTests(fixture: SpamTextCacheEnforceTestContainers, _unused: MlAwaitFixture) =
 
     [<Fact>]
@@ -238,14 +249,11 @@ type SpamProtectionCarveOutTests(fixture: SpamTextCacheEnforceTestContainers, _u
         let! seedUserBanned = fixture.UserBanned originalMsg.Message.Value.From.Value.Id
         Assert.True(seedUserBanned, "Sanity: original spammer should be banned, seeding the cache")
 
-        // Grant protection to a DIFFERENT user via an unrelated auto-deleted message.
+        // Grant protection to a DIFFERENT user directly (no real message, no ham mark) —
+        // see the type doc comment for why this must never round-trip through a shared literal.
         let repeatUser = Tg.user()
-        let seedSpam = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "2222222", from = repeatUser)
-        let! _ = fixture.SendMessage seedSpam
-        let! seedDeleted = fixture.MessageIsAutoDeleted seedSpam.Message.Value
-        Assert.True(seedDeleted, "Sanity: repeatUser's unrelated message should auto-delete")
-        let! callbackId = fixture.GetCallbackId seedSpam.Message.Value "NotASpam"
-        let! _ = fixture.SendMessage(Tg.callback(string callbackId, from = vahter))
+        let until = DateTime.UtcNow.AddHours(48.0)
+        do! fixture.GrantSpamProtection(repeatUser.Id, until, fixture.ChatsToMonitor[0].Id, 0L, vahter.Id, version = 1)
         let! granted = fixture.SpamProtectionGranted repeatUser.Id
         Assert.True(granted, "Sanity: repeatUser should now be protected")
 
