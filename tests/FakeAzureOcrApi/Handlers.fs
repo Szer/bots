@@ -5,6 +5,7 @@ open System.Net
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Http
 
@@ -292,8 +293,19 @@ module Handlers =
                                     | _ -> None)
                                 |> Option.bind Option.ofObj
                                 |> Option.defaultValue ""
-                            if userContent.Contains("kill", StringComparison.OrdinalIgnoreCase) then "SPAM"
-                            elif userContent.Contains("spam", StringComparison.OrdinalIgnoreCase) then "SKIP"
+                            // VahterBanBot's spotlighting fences the untrusted username/display
+                            // name/message text between <untrusted-XXXXXXXX>...</untrusted-XXXXXXXX>
+                            // markers (LlmTriage.fs) and appends its own trusted classify-only
+                            // instruction AFTER the fence — that instruction text legitimately says
+                            // the words "SPAM"/"NOT_SPAM" (it's describing the hardening rule, not
+                            // spam content itself). Route only on the fenced block when present, so
+                            // the fixed instruction wording can never itself flip the keyword match;
+                            // falls back to the whole content when no fence is found (unrelated caller).
+                            let routingContent =
+                                let m = Regex.Match(userContent, @"<untrusted-[0-9a-f]{8}>(.*)</untrusted-[0-9a-f]{8}>", RegexOptions.Singleline)
+                                if m.Success then m.Groups[1].Value else userContent
+                            if routingContent.Contains("kill", StringComparison.OrdinalIgnoreCase) then "SPAM"
+                            elif routingContent.Contains("spam", StringComparison.OrdinalIgnoreCase) then "SKIP"
                             else "NOT_SPAM"
                         with _ -> "NOT_SPAM"
                     $"""{{
