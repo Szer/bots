@@ -1,5 +1,11 @@
 module VahterBanBot.LlmTriage
 
+// gpt-5-family reasoning effort (OpenAI.Chat.ChatReasoningEffortLevel / ChatCompletionOptions
+// .ReasoningEffortLevel) is marked [Experimental("OPENAI001")] by the SDK — F# surfaces that as
+// FS0057. It is deliberately used below (see selectLlmRequestParams's doc comment); suppressed
+// file-wide rather than per call-site since it is only ever touched in one place.
+#nowarn "57"
+
 open System
 open System.ClientModel
 open System.ClientModel.Primitives
@@ -297,6 +303,70 @@ let hasStableTextCacheKey (msg: TgMessage) : bool =
 let formatBioLine (bio: string) : string =
     if String.IsNullOrWhiteSpace bio then "(none)" else bio
 
+// ── Prompt v2 — repetition signal ──────────────────────────────────────────────
+//
+// A/B testing (gpt-5.6-sol, reasoning_effort "none", prompt v2) cut triage hard-error rate from
+// 37% (prod gpt-4o-mini + prompt v1) to 2.9%, with a 90.9% fix rate on the false negatives prompt
+// v1 missed — the repetition signal (below) and the reworded system prompt (see AzureLlmTriage's
+// staticSystemPrompt) were the two levers. Mirrors harness/reconstruct.py's
+// format_repetition_line and build_user_prompt_v2 byte-for-byte — that harness is what was
+// actually A/B-tested, so this must not "improve" on its wording independently.
+
+/// Whether a message's text is long enough for the repetition lookup to be worth a DB query —
+/// short/media-placeholder messages (< 30 chars, matching the harness's threshold) always render
+/// as "not checked" without one. `textLength` is the RAW `msg.Text` length (0 for null/empty,
+/// i.e. media-only messages) — NOT the media-placeholder-rendered prompt body's length; the
+/// harness's `format_repetition_line` keys off the same raw field.
+let needsRepetitionLookup (textLength: int) : bool =
+    textLength >= 30
+
+/// Renders prompt v2's "Identical message seen earlier: ..." line, inserted directly after
+/// "Total messages seen from this user: N" in the user prompt. `repetition` is `None` only when
+/// `needsRepetitionLookup` said no lookup was needed (short/media message) — it is never `None`
+/// when a lookup WAS made, since GetTextRepetition always returns a row (zero-filled on no
+/// matches). Pulled out as a pure function (int + option in, string out) for unit testing without
+/// a live DB connection.
+let formatRepetitionLine (textLength: int) (repetition: MessageRepetition option) : string =
+    if not (needsRepetitionLookup textLength) then
+        "Identical message seen earlier: not checked (short message)"
+    else
+        match repetition with
+        | None -> "Identical message seen earlier: never"
+        | Some r when r.total = 0 -> "Identical message seen earlier: never"
+        | Some r ->
+            $"Identical message seen earlier: {r.total} times in the last 30 days ({r.distinct_other_users} other users, {r.distinct_chats} chats)"
+
+// ── gpt-5-family request parameters ─────────────────────────────────────────────
+
+/// The request-shape decisions `classifyUncached` needs from `LLM_REASONING_EFFORT` — pulled out
+/// as a plain record (rather than mutating a `ChatCompletionOptions` directly) so the selection
+/// logic is unit-testable without constructing a live SDK options object.
+type LlmRequestParams =
+    { Temperature: float32 option
+      /// Bumped from the old fixed 20 to 100 UNCONDITIONALLY (independent of ReasoningEffort) —
+      /// observed gpt-5.6-sol (reasoning_effort "none") completions average 16.5 tokens, uncomfortably
+      /// close to the old 20-token cap. 100 is safe headroom for every model this deployment could
+      /// point at, including the current gpt-4o-mini, so there is no reason to gate it on the flag.
+      MaxOutputTokenCount: int
+      ReasoningEffort: string option }
+
+/// Selects gpt-5-family-aware request parameters from `LLM_REASONING_EFFORT`
+/// (BotConfiguration.LlmReasoningEffort). Empty (the default, and the value until the endpoint/
+/// deployment SQL switch) reproduces the exact pre-gpt-5 request shape: Temperature=0,
+/// no reasoning_effort. Any non-empty value both sends that value as `reasoning_effort` AND omits
+/// Temperature — gpt-5-family reasoning models reject/ignore `temperature`, matching AlitaBot's
+/// AzureFoundryProvider.fs (~188) precedent for the same class of model on a different provider.
+/// `ChatReasoningEffortLevel` (used at the one call site that consumes `ReasoningEffort` below,
+/// in `classifyUncached`) already supports "none" — gpt-5.6's renamed "minimal", the A/B-tested
+/// value — via the currently-pinned Azure.AI.OpenAI 2.9.0-beta.1 (which pulls in OpenAI 2.9.1);
+/// no SDK bump or protocol-level workaround was needed. That type is marked `[Experimental
+/// ("OPENAI001")]` by the SDK (see this file's top-level `#nowarn "57"`).
+let selectLlmRequestParams (reasoningEffort: string) : LlmRequestParams =
+    if String.IsNullOrEmpty reasoningEffort then
+        { Temperature = Some 0.0f; MaxOutputTokenCount = 100; ReasoningEffort = None }
+    else
+        { Temperature = None; MaxOutputTokenCount = 100; ReasoningEffort = Some reasoningEffort }
+
 // ── Interface + implementation ────────────────────────────────────────────────
 
 type ILlmTriage =
@@ -313,14 +383,38 @@ type AzureLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLl
 
     // Static part of the system prompt — used to compute the prompt hash once at startup.
     // Per-chat descriptions are configuration, not the prompt itself.
+    //
+    // Prompt v2 (A/B-tested against gpt-5.6-sol, reasoning_effort "none": 2.9% hard-error rate
+    // vs 37% for prod's v1 + gpt-4o-mini, 90.9% fix rate on v1's false negatives). Copied
+    // byte-for-byte from the A/B harness's STATIC_SYSTEM_PROMPT_V2 (reconstruct.py) — every
+    // space/newline here is load-bearing for prompt-hash/token-count fidelity with what was
+    // actually tested; do not "clean up" the wording independently of that source of truth.
     let staticSystemPrompt =
         """You are a spam detection assistant for a Telegram community.
-Watch for advertising-style display names (e.g. "Зайди в мой био") as a strong spam signal.
 
-Message count context (provided as "Total messages seen from this user"):
+Judge each message using ALL of these signals together:
+
+1. Sender profile:
+ - Advertising-style display names (e.g. "Зайди в мой био") are a strong spam signal.
+ - A bio containing links, prices, or advertising is a spam signal.
+ - Accounts with no @username, a generic display name and very few messages are the most common spammer profile.
+ - A normal-looking @username and a history of messages (20+) are strong legitimacy signals.
+
+2. Message count context (provided as "Total messages seen from this user"):
  - < 10 messages: new user — almost all spammers fall in this range
  - 10-20 messages: could be a hidden spammer who posted random stuff to blend in
  - 20-50 messages: most probably not a spammer — message must be really advertising something or be malicious
+
+3. Repetition (provided as "Identical message seen earlier"):
+ - If this exact text was already posted in our communities before — especially by OTHER users or in multiple chats — it is almost certainly a coordinated spam campaign. Treat 2+ prior sightings from a new user as SPAM even when the text looks like an innocent question.
+ - Scammers disguise campaigns as ordinary personal questions (advice about documents, licenses, jobs, quick money) posted verbatim across many chats.
+
+4. Chat topicality (see the "Chat:" line below when present):
+ - Messages ON-TOPIC for this chat are almost never spam, even when long, technical, promotional-looking, or containing links. If the chat description explicitly allows a content type (job postings, event ads, selling parts, ticket resale), that content is legitimate — do not flag it.
+ - An innocent-looking but clearly OFF-TOPIC personal question from a new user without @username is a known engagement-bait scam pattern — lean SPAM, or SKIP if unsure.
+
+5. Contentless bait:
+ - A contentless greeting ("Привет", "как дела?" and similar) carrying no actual question or content, sent as one of the first messages by a new user, is bait from bot accounts — the spam arrives later or gets edited in. Chat policy: such useless greetings are SPAM.
 
 A media-only message with no readable text (rendered below as e.g. "[sticker ..., no readable
 text]" or "[photo, no readable text]") is NOT, by itself, a spam signal — real spammers do this,
@@ -329,7 +423,7 @@ messages, judge only the sender signals (username, display name, bio); when thos
 prefer NOT_SPAM/SKIP.
 
 Classify the message as exactly one of:
- - SPAM     : obvious advertising/bot/malicious content — delete and reduce user karma
+ - SPAM     : obvious advertising/bot/malicious content, or a campaign/bait pattern described above — delete and reduce user karma
  - SKIP     : not sure — route to human moderators for review
  - NOT_SPAM : legitimate message, false positive
 
@@ -375,21 +469,48 @@ Respond with exactly: {"verdict":"SPAM"} or {"verdict":"SKIP"} or {"verdict":"NO
         // (empty) text.
         let messageBody = mediaPlaceholder msg |> Option.defaultValue msg.Text
 
+        // Prompt v2 repetition signal (see formatRepetitionLine's doc comment) — keyed off the
+        // RAW msg.Text length, same as the A/B harness, NOT messageBody's placeholder-rendered
+        // length. The DB round-trip only happens here, i.e. only when triage is actually about
+        // to run and the text is long enough to matter — never on every message.
+        let textLength = if isNull msg.Text then 0 else msg.Text.Length
+        let! repetition =
+            if needsRepetitionLookup textLength then
+                task {
+                    let! r = db.GetTextRepetition(msg.ChatId, msg.MessageId, msg.SenderId, msg.Text, 30)
+                    return Some r
+                }
+            else
+                Task.FromResult None
+        let repetitionLine = formatRepetitionLine textLength repetition
+
         let userPrompt  =
             $"""Username: {username}
 Display name: {displayName}
 Bio: {bio}
 Total messages seen from this user: {userMsgCount}
+{repetitionLine}
 
 Message:
 {messageBody}"""
 
+        // gpt-5-family request parameters — see selectLlmRequestParams's doc comment. Empty
+        // LLM_REASONING_EFFORT (the default, and the value until the endpoint/deployment SQL
+        // switch) reproduces the exact pre-gpt-5 request shape below.
+        let reqParams = selectLlmRequestParams botConf.Value.LlmReasoningEffort
         let options =
-            ChatCompletionOptions(
-                Temperature         = Nullable 0.0f,
-                MaxOutputTokenCount = Nullable 20,
-                ResponseFormat      = ChatResponseFormat.CreateJsonSchemaFormat(
-                                        "spam_verdict", spamVerdictSchema, jsonSchemaIsStrict = Nullable true))
+            let o =
+                ChatCompletionOptions(
+                    MaxOutputTokenCount = Nullable reqParams.MaxOutputTokenCount,
+                    ResponseFormat      = ChatResponseFormat.CreateJsonSchemaFormat(
+                                            "spam_verdict", spamVerdictSchema, jsonSchemaIsStrict = Nullable true))
+            match reqParams.Temperature with
+            | Some t -> o.Temperature <- Nullable t
+            | None -> ()   // gpt-5-family rejects/ignores Temperature — omitted entirely, not sent as 0.
+            match reqParams.ReasoningEffort with
+            | Some effort -> o.ReasoningEffortLevel <- Nullable(ChatReasoningEffortLevel effort)
+            | None -> ()
+            o
         let messages : ChatMessage[] =
             [| SystemChatMessage(systemPrompt)
                UserChatMessage(userPrompt) |]

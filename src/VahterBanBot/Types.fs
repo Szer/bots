@@ -487,6 +487,23 @@ type BotConfiguration =
       AzureOpenAiKey: string
       AzureOpenAiDeployment: string
       LlmChatDescriptions: Dictionary<int64, string>
+      /// LLM_REASONING_EFFORT bot_setting: reasoning effort for the message-triage path only
+      /// (LlmTriage.fs's AzureLlmTriage — never AzureReactionTriage). Default "" — the
+      /// `reasoning_effort` request parameter is omitted entirely, matching pre-gpt-5 behavior
+      /// (Temperature=0 stays set; MaxOutputTokenCount is bumped to 100 unconditionally
+      /// regardless of this setting — see selectLlmRequestParams's doc comment). Any non-empty
+      /// value (e.g. "none", "minimal", "low") is sent verbatim as `reasoning_effort` AND drops
+      /// Temperature from the request — gpt-5-family reasoning models reject/ignore it (see
+      /// AlitaBot's AzureFoundryProvider.fs ~188 for the same precedent on a different
+      /// provider). "none" is gpt-5.6's renamed "minimal" — the A/B-tested value for
+      /// gpt-5.6-sol — and IS representable: the pinned Azure.AI.OpenAI 2.9.0-beta.1 pulls in
+      /// OpenAI 2.9.1, whose `ChatReasoningEffortLevel` already exposes a `None` level (wire
+      /// value "none"); no SDK bump or protocol-level workaround was needed. Stays "" (inert)
+      /// until the endpoint/deployment SQL switch flips it — see this PR's body for the deploy
+      /// ordering. bot_setting-backed with a code default, so it is tunable by SQL and
+      /// hot-reloadable, and a missing row falls back to the default rather than being silently
+      /// wrong — see AGENTS.md's Settings configuration section.
+      LlmReasoningEffort: string
       /// Minutes a cached LLM verdict (text or reaction triage) is reused before re-asking
       /// the model. Dedups identical spam across channels and absorbs rate-limit bursts.
       LlmVerdictCacheTtlMinutes: int

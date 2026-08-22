@@ -44,6 +44,15 @@ type ManualBanSeed =
       message_text: string
       banned_at: DateTime }
 
+/// Prior-sightings signal for prompt v2's repetition line — see GetTextRepetition and
+/// LlmTriage.fs's formatRepetitionLine (which mirrors the A/B-tested harness's
+/// format_repetition_line byte-for-byte).
+[<CLIMutable>]
+type MessageRepetition =
+    { total: int
+      distinct_other_users: int
+      distinct_chats: int }
+
 [<CLIMutable>]
 type SpamOrHamDb =
     { text: string
@@ -404,6 +413,48 @@ WHERE event_type = 'MessageReceived'
 
             let! messages = conn.QueryAsync<UserMessage>(sql, {| userId = userId |})
             return Array.ofSeq messages
+        }
+
+    /// Prompt-v2 repetition signal (see LlmTriage.fs's formatRepetitionLine): how many times
+    /// this exact text (by msg_text_md5) was posted in the last `sinceDays` days, by how many
+    /// OTHER distinct users, and across how many distinct chats. Only called for messages long
+    /// enough to matter (>= 30 chars — see the caller) and only when LLM triage is actually
+    /// about to run, so this never adds a query to every message.
+    ///
+    /// ALWAYS excludes the message being classified itself: by the time LLM triage runs,
+    /// ProcessMessage's recordMsg() has already appended THIS message's own MessageReceived
+    /// event (see Bot.fs — recordMsg() is called before GetAutoVerdict on every path that
+    /// reaches LLM triage), so a naive count-by-text-hash would double-count the very message
+    /// being judged as "1 prior sighting of itself". `stream_id` is the message's own event
+    /// stream key (`message:{chatId}:{messageId}`, always version 1 for MessageReceived — see
+    /// EventStore/recordMessageReceived), so excluding it excludes exactly that one row.
+    ///
+    /// `distinct_other_users` excludes `senderId` (only OTHER senders count as corroborating
+    /// repetition); `distinct_chats` counts across all matches, including the sender's own
+    /// repeats elsewhere. Backed by idx_event_msg_text_md5_created_at (V44).
+    member _.GetTextRepetition(chatId: int64, messageId: int64, senderId: int64, text: string, sinceDays: int) : Task<MessageRepetition> =
+        task {
+            use conn = new NpgsqlConnection(connString)
+
+            //language=postgresql
+            let sql =
+                """
+SELECT
+    COUNT(*)::INT AS total,
+    COUNT(DISTINCT (data->>'userId')::BIGINT)
+        FILTER (WHERE (data->>'userId')::BIGINT <> @senderId)::INT AS distinct_other_users,
+    COUNT(DISTINCT (data->>'chatId')::BIGINT)::INT AS distinct_chats
+FROM event
+WHERE event_type = 'MessageReceived'
+  AND msg_text_md5 = md5(@text)
+  AND created_at >= @since
+  AND stream_id <> @excludeStreamId
+                """
+
+            let since = utcNow().AddDays(-float sinceDays)
+            let excludeStreamId = $"message:{chatId}:{messageId}"
+            return! conn.QuerySingleAsync<MessageRepetition>(
+                        sql, {| senderId = senderId; text = text; since = since; excludeStreamId = excludeStreamId |})
         }
 
     /// Inserts or updates a single bot_setting value (used by admin commands).
