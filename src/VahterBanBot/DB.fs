@@ -45,8 +45,7 @@ type ManualBanSeed =
       banned_at: DateTime }
 
 /// Prior-sightings signal for prompt v2's repetition line — see GetTextRepetition and
-/// LlmTriage.fs's formatRepetitionLine (which mirrors the A/B-tested harness's
-/// format_repetition_line byte-for-byte).
+/// LlmTriage.fs's formatRepetitionLine.
 [<CLIMutable>]
 type MessageRepetition =
     { total: int
@@ -415,23 +414,10 @@ WHERE event_type = 'MessageReceived'
             return Array.ofSeq messages
         }
 
-    /// Prompt-v2 repetition signal (see LlmTriage.fs's formatRepetitionLine): how many times
-    /// this exact text (by msg_text_md5) was posted in the last `sinceDays` days, by how many
-    /// OTHER distinct users, and across how many distinct chats. Only called for messages long
-    /// enough to matter (>= 30 chars — see the caller) and only when LLM triage is actually
-    /// about to run, so this never adds a query to every message.
-    ///
-    /// ALWAYS excludes the message being classified itself: by the time LLM triage runs,
-    /// ProcessMessage's recordMsg() has already appended THIS message's own MessageReceived
-    /// event (see Bot.fs — recordMsg() is called before GetAutoVerdict on every path that
-    /// reaches LLM triage), so a naive count-by-text-hash would double-count the very message
-    /// being judged as "1 prior sighting of itself". `stream_id` is the message's own event
-    /// stream key (`message:{chatId}:{messageId}`, always version 1 for MessageReceived — see
-    /// EventStore/recordMessageReceived), so excluding it excludes exactly that one row.
-    ///
-    /// `distinct_other_users` excludes `senderId` (only OTHER senders count as corroborating
-    /// repetition); `distinct_chats` counts across all matches, including the sender's own
-    /// repeats elsewhere. Backed by idx_event_msg_text_md5_created_at (V44).
+    /// Prompt-v2 repetition signal (see LlmTriage.fs's formatRepetitionLine): count of this exact
+    /// text posted in the last `sinceDays` days, by other users, across chats. Excludes the
+    /// message's own `stream_id` — its MessageReceived event is already recorded by the time this
+    /// runs, so a naive count would double-count itself. Backed by idx_event_msg_text_md5_created_at (V44).
     member _.GetTextRepetition(chatId: int64, messageId: int64, senderId: int64, text: string, sinceDays: int) : Task<MessageRepetition> =
         task {
             use conn = new NpgsqlConnection(connString)

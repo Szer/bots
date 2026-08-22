@@ -1,32 +1,7 @@
--- Partial index supporting prompt v2's repetition signal (see LlmTriage.fs's
--- formatRepetitionLine / DB.fs's GetTextRepetition): "has this exact text been posted before —
--- by whom, in how many chats, in the last 30 days?"
---
--- This is a GLOBAL (all-users, all-chats) lookup keyed by msg_text_md5 + created_at, unlike
--- V32/V33's per-user index (idx_event_msg_received_user_text, on (userId, msg_text_md5)) — V33
--- deliberately DROPPED that one because nothing queried it globally at the time (only the
--- per-user distinct-text count did, which user_msg_text_index now serves instead). This index is
--- new and needed because prompt-v2 triage now runs exactly that kind of global query, on the
--- ~2.3M-row event table, in the hot LLM-triage path.
---
--- PLAIN transactional CREATE INDEX IF NOT EXISTS, not CONCURRENTLY:
--- Flyway OSS 12.8.1 cannot scope `postgresql.transactional.lock=false` per-script (confirmed by
--- decompiling the Flyway jar and by the runtime "Unknown configuration property" error when it
--- is attempted via a per-script .conf file), and a global Flyway config change to enable it is
--- explicitly REJECTED for this PR. Without that setting, Flyway holds its own cross-run migration
--- lock as an `idle in transaction` session for the entire `migrate` invocation, which a
--- CONCURRENTLY build then waits on forever — a guaranteed self-deadlock, independent of whether
--- this script's own transaction is disabled via `executeInTransaction=false`.
---
--- MERGE PREREQUISITE: on fresh/test databases the `event` table for this migration is empty (or
--- near-empty), so the blocking, transactional build below is instant there. In PRODUCTION, the
--- owner pre-creates this exact index (same name, same definition) by hand with
--- `CREATE INDEX CONCURRENTLY` BEFORE this PR is merged — see the PR body for the exact command.
--- Once that hand-run index exists, this migration's `IF NOT EXISTS` makes it a no-op in prod:
--- zero locking, zero blocking, zero Flyway config changes. The index name and definition here
--- MUST match the hand-run SQL verbatim, or the no-op contract breaks and this migration will
--- attempt (and block on) a full transactional build against the live, constantly-written `event`
--- table.
+-- Partial index for prompt v2's repetition signal (LlmTriage.fs/DB.fs GetTextRepetition);
+-- replaces the global md5 index V33 dropped. PLAIN transactional CREATE INDEX IF NOT EXISTS, not
+-- CONCURRENTLY — CIC inside Flyway deadlocks, see issue #407. PRODUCTION pre-creates this exact
+-- index by hand via CONCURRENTLY before merge (same name/definition, byte-identical), so IF NOT EXISTS no-ops here.
 CREATE INDEX IF NOT EXISTS idx_event_msg_text_md5_created_at
     ON event (msg_text_md5, created_at)
     WHERE event_type = 'MessageReceived' AND msg_text_md5 IS NOT NULL;

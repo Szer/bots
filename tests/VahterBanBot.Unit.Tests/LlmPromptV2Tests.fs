@@ -25,8 +25,7 @@ let ``short message (under 30 chars): "not checked" regardless of repetition dat
     Assert.Equal(
         "Identical message seen earlier: not checked (short message)",
         formatRepetitionLine 29 None)
-    // Even if a repetition WAS looked up (shouldn't happen for a short message, but the function
-    // itself must still prefer the length gate — matches the harness's own precedence).
+    // The length gate wins even if a repetition WAS looked up (shouldn't happen for a short message).
     let hit : MessageRepetition = { total = 5; distinct_other_users = 2; distinct_chats = 1 }
     Assert.Equal(
         "Identical message seen earlier: not checked (short message)",
@@ -97,6 +96,4 @@ let ``any other non-empty LLM_REASONING_EFFORT value: same omit-Temperature/pass
 
 [<Fact>]
 let ``MaxOutputTokenCount is 100 unconditionally — not gated on whether reasoning effort is set`` () =
-    // Explicit regression guard for the brief's "bump ... 100 unconditionally": both branches of
-    // selectLlmRequestParams must agree on the cap, independent of ReasoningEffort.
     Assert.Equal((selectLlmRequestParams "").MaxOutputTokenCount, (selectLlmRequestParams "none").MaxOutputTokenCount)
