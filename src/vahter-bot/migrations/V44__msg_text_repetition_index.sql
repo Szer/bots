@@ -7,53 +7,26 @@
 -- deliberately DROPPED that one because nothing queried it globally at the time (only the
 -- per-user distinct-text count did, which user_msg_text_index now serves instead). This index is
 -- new and needed because prompt-v2 triage now runs exactly that kind of global query, on the
--- ~2.3M-row event table, in the hot LLM-triage path — a plain (blocking) CREATE INDEX is not
--- acceptable here given constant production writes to `event`, so this uses CONCURRENTLY.
+-- ~2.3M-row event table, in the hot LLM-triage path.
 --
--- CREATE INDEX CONCURRENTLY cannot run inside a transaction block at all (Postgres errors
--- immediately). This script is marked non-transactional via
--- V44__msg_text_repetition_index.sql.conf (executeInTransaction=false) — the only sanctioned
--- mechanism for this PR (a per-script Flyway config file, scoped to this one migration; no global
--- Flyway config change, no test-infra transaction hacks, no CI/deploy workflow edits).
+-- PLAIN transactional CREATE INDEX IF NOT EXISTS, not CONCURRENTLY:
+-- Flyway OSS 12.8.1 cannot scope `postgresql.transactional.lock=false` per-script (confirmed by
+-- decompiling the Flyway jar and by the runtime "Unknown configuration property" error when it
+-- is attempted via a per-script .conf file), and a global Flyway config change to enable it is
+-- explicitly REJECTED for this PR. Without that setting, Flyway holds its own cross-run migration
+-- lock as an `idle in transaction` session for the entire `migrate` invocation, which a
+-- CONCURRENTLY build then waits on forever — a guaranteed self-deadlock, independent of whether
+-- this script's own transaction is disabled via `executeInTransaction=false`.
 --
--- KNOWN ISSUE (reproduced 2026-08-22, Flyway OSS 12.8.1, against this repo's own hermetic
--- Testcontainers suite — `dotnet test tests/VahterBanBot.Tests -c Release --filter
--- FullyQualifiedName~PingTests`, which triggers the shared assembly fixture that runs every
--- migration): with ONLY the per-script conf in place, this migration DEADLOCKS every time.
--- Flyway holds its own cross-run migration lock as a session kept `idle in transaction` for the
--- entire `migrate` invocation — confirmed via `pg_stat_activity`: a second backend running
--- `SELECT COUNT(*) FROM pg_namespace WHERE nspname=$1`, `idle in transaction`, open since
--- effectively the same instant this migration started, never committing. `CREATE INDEX
--- CONCURRENTLY` has to wait for every transaction that was already open when it started —
--- including that unrelated one — to finish (observed via `pg_stat_activity`: the CIC backend
--- sitting in `state=active, wait_event_type=Lock, wait_event=virtualxid`), and Flyway's lock
--- transaction won't finish until `migrate` itself finishes. Self-deadlock, independent of whether
--- THIS script runs inside its own transaction (it deliberately does not).
---
--- A prior attempt at this migration "fixed" the deadlock with
--- `FLYWAY_POSTGRESQL_TRANSACTIONAL_LOCK=false` set globally on the Flyway container/CLI (switching
--- Flyway's cross-run lock to a session-level `pg_advisory_lock`, held without an open transaction).
--- That is explicitly REJECTED for this PR: it is a global Flyway config change (and would also
--- require a production deploy-workflow edit), not the per-script mechanism this PR is scoped to.
--- No workaround beyond the per-script `.conf` is applied here — per this PR's binding constraints,
--- this sub-task is being STOPPED and reported rather than worked around. See the PR body for the
--- honest status: this migration is included in the PR for review, but is NOT verified to apply
--- cleanly against this repo's current Flyway/Testcontainers setup, and applying it in production
--- (which uses the same default Flyway lock mode) carries the same deadlock risk until a
--- maintainer decides how to change Flyway's cross-run locking behavior (a decision this PR
--- deliberately does not make unilaterally).
---
--- DROP INDEX CONCURRENTLY IF EXISTS first: non-transactional scripts are NOT rolled back by Flyway
--- on failure, and a CREATE INDEX CONCURRENTLY that fails partway through leaves an INVALID index
--- behind under the same name — `CREATE INDEX CONCURRENTLY IF NOT EXISTS` alone would then see
--- "already exists" and silently skip it forever without ever fixing it. Dropping first makes a
--- retry after a partial failure self-healing. DROP INDEX CONCURRENTLY IF EXISTS is a cheap no-op
--- (and does not need to wait on old snapshots the way CREATE does) when the index doesn't exist or
--- is already valid... this DOES still drop and rebuild a valid index on every re-run of this
--- script, but Flyway only re-runs an already-applied versioned migration on `repair`/checksum
--- mismatch, not on a normal `migrate`, so that cost is not paid in the common case.
-DROP INDEX CONCURRENTLY IF EXISTS idx_event_msg_text_md5_created_at;
-
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_event_msg_text_md5_created_at
-    ON event(msg_text_md5, created_at)
+-- MERGE PREREQUISITE: on fresh/test databases the `event` table for this migration is empty (or
+-- near-empty), so the blocking, transactional build below is instant there. In PRODUCTION, the
+-- owner pre-creates this exact index (same name, same definition) by hand with
+-- `CREATE INDEX CONCURRENTLY` BEFORE this PR is merged — see the PR body for the exact command.
+-- Once that hand-run index exists, this migration's `IF NOT EXISTS` makes it a no-op in prod:
+-- zero locking, zero blocking, zero Flyway config changes. The index name and definition here
+-- MUST match the hand-run SQL verbatim, or the no-op contract breaks and this migration will
+-- attempt (and block on) a full transactional build against the live, constantly-written `event`
+-- table.
+CREATE INDEX IF NOT EXISTS idx_event_msg_text_md5_created_at
+    ON event (msg_text_md5, created_at)
     WHERE event_type = 'MessageReceived' AND msg_text_md5 IS NOT NULL;
