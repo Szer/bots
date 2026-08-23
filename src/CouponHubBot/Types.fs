@@ -101,6 +101,27 @@ type UserActionRow =
       value: Nullable<decimal>
       min_check: Nullable<decimal> }
 
+/// /balances sort modes: worst-balance-first (default), top-contributors-first,
+/// top-takers-first. Tie-break is always user id ascending.
+[<RequireQualifiedAccess>]
+type BalanceSortMode =
+    | Balance
+    | Added
+    | Taken
+
+/// One "user" row's all-time added/taken aggregates for /balances. Same netting
+/// semantics as UserContributionStats, but for every user in one page.
+[<CLIMutable>]
+type UserBalanceRow =
+    { user_id: int64
+      username: string | null
+      first_name: string | null
+      last_name: string | null
+      added_count: int64
+      added_value: decimal
+      taken_count: int64
+      taken_value: decimal }
+
 [<CLIMutable>]
 type UserFeedbackRow =
     { id: int64

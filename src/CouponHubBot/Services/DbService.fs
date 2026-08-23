@@ -516,6 +516,71 @@ LIMIT @limit;
             return rows |> Seq.toArray
         }
 
+    /// Total distinct users, for /balances pagination math — recomputed every render.
+    member _.GetUserCount() =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = """SELECT COUNT(*)::bigint FROM "user";"""
+            return! conn.QuerySingleAsync<int64>(sql)
+        }
+
+    /// One /balances page: all-user added/taken aggregates (netting "<type>_reverted" like
+    /// GetUserContributionStats), one page at a time. sortMode is a DU matched to one of
+    /// three fixed ORDER BY literals below — never built from a raw string.
+    member _.GetUserBalances(sortMode: BalanceSortMode, limit: int, offset: int) =
+        task {
+            use! conn = openConn()
+            let orderBy =
+                match sortMode with
+                | BalanceSortMode.Balance -> "(added_value - taken_value) ASC, user_id ASC"
+                | BalanceSortMode.Added -> "added_value DESC, user_id ASC"
+                | BalanceSortMode.Taken -> "taken_value DESC, user_id ASC"
+            //language=postgresql
+            let sql =
+                $"""
+WITH added AS (
+    SELECT e.user_id,
+           (COUNT(*) FILTER (WHERE e.event_type = 'added')
+            - COUNT(*) FILTER (WHERE e.event_type = 'added_reverted'))::bigint AS cnt,
+           COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'added'), 0)
+            - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'added_reverted'), 0) AS val
+    FROM coupon_event e
+    JOIN coupon c ON c.id = e.coupon_id
+    WHERE e.event_type IN ('added', 'added_reverted')
+    GROUP BY e.user_id
+), taken AS (
+    SELECT e.user_id,
+           (COUNT(*) FILTER (WHERE e.event_type = 'taken')
+            - COUNT(*) FILTER (WHERE e.event_type = 'taken_reverted'))::bigint AS cnt,
+           COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken'), 0)
+            - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken_reverted'), 0) AS val
+    FROM coupon_event e
+    JOIN coupon c ON c.id = e.coupon_id
+    WHERE e.event_type IN ('taken', 'taken_reverted')
+    GROUP BY e.user_id
+), stats AS (
+    SELECT
+        u.id AS user_id,
+        u.username,
+        u.first_name,
+        u.last_name,
+        COALESCE(added.cnt, 0) AS added_count,
+        COALESCE(added.val, 0) AS added_value,
+        COALESCE(taken.cnt, 0) AS taken_count,
+        COALESCE(taken.val, 0) AS taken_value
+    FROM "user" u
+    LEFT JOIN added ON added.user_id = u.id
+    LEFT JOIN taken ON taken.user_id = u.id
+)
+SELECT * FROM stats
+ORDER BY {orderBy}
+LIMIT @limit OFFSET @offset;
+"""
+            let! rows = conn.QueryAsync<UserBalanceRow>(sql, {| limit = limit; offset = offset |})
+            return rows |> Seq.toArray
+        }
+
     member _.GetPersonalCouponOutcomes(userId: int64) =
         task {
             use! conn = openConn()

@@ -34,6 +34,10 @@ let sendTextMarkup (tg: ITelegramApi) (chatId: int64) (text: string) (kb: Inline
 let sendHtml (tg: ITelegramApi) (chatId: int64) (text: string) =
     tg.CallExn(Req.SendMessage.Make(chatId, text, parseMode = ParseMode.HTML)) |> taskIgnore
 
+/// Sends an HTML-formatted text message with an inline keyboard (/balances' first page).
+let sendHtmlMarkup (tg: ITelegramApi) (chatId: int64) (text: string) (kb: InlineKeyboardMarkup) =
+    tg.CallExn(Req.SendMessage.Make(chatId, text, parseMode = ParseMode.HTML, replyMarkup = Markup.InlineKeyboardMarkup kb)) |> taskIgnore
+
 /// Sends a text message as a reply to another message (best-effort target:
 /// falls back to a plain send server-side when the target is gone).
 let sendTextReply (tg: ITelegramApi) (chatId: int64) (text: string) (replyToMessageId: int64) =
@@ -45,6 +49,10 @@ let editMessageText (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text:
 
 let editMessageTextMarkup (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) (kb: InlineKeyboardMarkup) =
     tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text, replyMarkup = kb)) |> taskIgnore
+
+/// Edits a message's text (HTML parse mode) and keyboard — /balances' ◀/▶/sort in-place page flips.
+let editHtmlMarkup (tg: ITelegramApi) (chatId: int64) (messageId: int64) (text: string) (kb: InlineKeyboardMarkup) =
+    tg.CallExn(Req.EditMessageText.Make(chatId = ChatId.Int chatId, messageId = messageId, text = text, parseMode = ParseMode.HTML, replyMarkup = kb)) |> taskIgnore
 
 let deleteMessage (tg: ITelegramApi) (chatId: int64) (messageId: int64) =
     tg.CallExn(Req.DeleteMessage.Make(chatId, messageId)) |> taskIgnore
@@ -350,6 +358,102 @@ let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
         sep
     ]
     String.concat "\n" lines
+
+// ── /balances (admin all-user coupon balance report) ────────────────────
+
+/// Page size for /balances.
+let balancesPageSize = 15
+
+/// Fixed width for the name column — keeps rows narrow regardless of name length.
+let balancesNameWidth = 18
+
+/// Callback-data token per sort mode; round-robins balance → added → taken → balance.
+let balancesSortToken (m: BalanceSortMode) =
+    match m with
+    | BalanceSortMode.Balance -> "balance"
+    | BalanceSortMode.Added -> "added"
+    | BalanceSortMode.Taken -> "taken"
+
+/// Unknown/garbled tokens default to Balance rather than failing the callback.
+let balancesSortFromToken (s: string) =
+    match s with
+    | "added" -> BalanceSortMode.Added
+    | "taken" -> BalanceSortMode.Taken
+    | _ -> BalanceSortMode.Balance
+
+let balancesNextSort (m: BalanceSortMode) =
+    match m with
+    | BalanceSortMode.Balance -> BalanceSortMode.Added
+    | BalanceSortMode.Added -> BalanceSortMode.Taken
+    | BalanceSortMode.Taken -> BalanceSortMode.Balance
+
+let balancesSortLabel (m: BalanceSortMode) =
+    match m with
+    | BalanceSortMode.Balance -> "баланс"
+    | BalanceSortMode.Added -> "залил"
+    | BalanceSortMode.Taken -> "взял"
+
+let private truncateFixed (w: int) (s: string) =
+    if s.Length <= w then s.PadRight(w)
+    else s.Substring(0, w - 1) + "…"
+
+let private balancesUserName (r: UserBalanceRow) =
+    if not (String.IsNullOrWhiteSpace r.username) then "@" + r.username
+    else
+        let full = [ Option.ofObj r.first_name; Option.ofObj r.last_name ] |> List.choose id |> String.concat " "
+        if full = "" then string r.user_id else full
+
+let private balancesCell (cnt: int64) (v: decimal) =
+    let vStr = v.ToString("0.##")
+    $"{cnt}·{vStr}€"
+
+/// Markdown-style table (header + `|---|` separator) for /balances' <pre> block.
+/// `nameWidth` is a parameter (not the balancesNameWidth constant) so the message-size
+/// guard in formatBalancesMessage can shrink it for a pathological page.
+let formatBalancesTable (nameWidth: int) (rows: UserBalanceRow array) =
+    let idOf (r: UserBalanceRow) = string r.user_id
+    let addedOf (r: UserBalanceRow) = balancesCell r.added_count r.added_value
+    let takenOf (r: UserBalanceRow) = balancesCell r.taken_count r.taken_value
+    let balanceOf (r: UserBalanceRow) = balancesCell (r.added_count - r.taken_count) (r.added_value - r.taken_value)
+    let hId, hUser, hAdded, hTaken, hBalance = "id", "user", "залил", "взял", "баланс"
+    let wId = rows |> Array.fold (fun mx r -> max mx (idOf r).Length) hId.Length
+    let wAdded = rows |> Array.fold (fun mx r -> max mx (addedOf r).Length) hAdded.Length
+    let wTaken = rows |> Array.fold (fun mx r -> max mx (takenOf r).Length) hTaken.Length
+    let wBalance = rows |> Array.fold (fun mx r -> max mx (balanceOf r).Length) hBalance.Length
+    // System.String qualified: `open Funogram.Telegram.Types` shadows `String` with the ChatId.String DU case.
+    // +2 per column: each data cell sits between a leading/trailing space inside its "| … |" segment.
+    let sep = "|" + ([ wId; nameWidth; wAdded; wTaken; wBalance ] |> List.map (fun w -> System.String('-', w + 2)) |> String.concat "|") + "|"
+    let fmtRow (idCell: string) (userCell: string) (addedCell: string) (takenCell: string) (balanceCell: string) =
+        "| " + ([ idCell.PadRight(wId); truncateFixed nameWidth userCell; addedCell.PadRight(wAdded); takenCell.PadRight(wTaken); balanceCell.PadRight(wBalance) ] |> String.concat " | ") + " |"
+    let lines = [
+        fmtRow hId hUser hAdded hTaken hBalance
+        sep
+        yield! rows |> Array.map (fun r -> fmtRow (idOf r) (balancesUserName r) (addedOf r) (takenOf r) (balanceOf r))
+    ]
+    String.concat "\n" lines
+
+/// "Стр. X/Y · всего: N · сортировка: <mode>" — the plain status line above /balances' table.
+let formatBalancesStatusLine (page: int) (totalPages: int) (totalCount: int64) (sort: BalanceSortMode) =
+    $"Стр. {page}/{totalPages} · всего: {totalCount} · сортировка: {balancesSortLabel sort}"
+
+/// Full /balances message: status line + <pre> table. Falls back to a narrower name column
+/// if the default rendering would exceed Telegram's 4096-char cap (15 rows never should, but
+/// this is a cheap guard rather than elaborate truncation machinery).
+let formatBalancesMessage (rows: UserBalanceRow array) (statusLine: string) =
+    let build nameWidth = $"{statusLine}\n<pre>{htmlEscape (formatBalancesTable nameWidth rows)}</pre>"
+    let full = build balancesNameWidth
+    if full.Length <= 4096 then full else build 6
+
+/// ◀ / sort-cycle / ▶ row. ◀ omitted on page 1, ▶ omitted on the last page. The sort
+/// button shows the CURRENT mode; its callback data carries the NEXT mode and resets to page 1.
+let balancesKeyboard (page: int) (totalPages: int) (sort: BalanceSortMode) =
+    let sortToken = balancesSortToken sort
+    let nextToken = balancesSortToken (balancesNextSort sort)
+    let prevBtn = if page > 1 then Some(btn "◀" $"balances:{page - 1}:{sortToken}") else None
+    let sortBtn = Some(btn $"⇅ {balancesSortLabel sort}" $"balances:1:{nextToken}")
+    let nextBtn = if page < totalPages then Some(btn "▶" $"balances:{page + 1}:{sortToken}") else None
+    let row = [ prevBtn; sortBtn; nextBtn ] |> List.choose id |> List.toArray
+    inlineKb [| row |]
 
 /// Picks coupons for /list:
 /// 1) all expiring today (Dublin),

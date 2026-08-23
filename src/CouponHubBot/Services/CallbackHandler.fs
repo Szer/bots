@@ -429,6 +429,19 @@ type CallbackHandler(
                     elif isPrivateChat && hasData && data = "myAdded" then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "myAdded"))
                         do! commandHandler.HandleAdded user chatId
+                    elif isPrivateChat && hasData && data.StartsWith("balances:") then
+                        // parts: [| "balances"; "<page>"; "<sortToken>" |]. Admin-only, silent
+                        // otherwise — AnswerCallbackQuery below still fires for both.
+                        if options.Value.FeedbackAdminIds |> Array.contains user.id then
+                            Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "balances"))
+                            let parts = data.Split(':', StringSplitOptions.RemoveEmptyEntries)
+                            if parts.Length >= 3 then
+                                match Int32.TryParse(parts[1]) with
+                                | true, page ->
+                                    let sort = BotHelpers.balancesSortFromToken parts[2]
+                                    let! html, kb = commandHandler.RenderBalancesPage page sort
+                                    do! BotHelpers.editHtmlMarkup tg chatId messageId html kb
+                                | _ -> ()
             with ex ->
                 caughtExn <- ValueSome (ExceptionDispatchInfo.Capture(ex))
             try
