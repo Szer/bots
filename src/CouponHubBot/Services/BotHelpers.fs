@@ -367,6 +367,13 @@ let balancesPageSize = 15
 /// Fixed width for the name column — keeps rows narrow regardless of name length.
 let balancesNameWidth = 18
 
+/// Fixed width for the id column — real user ids are well under 10 digits.
+let balancesIdWidth = 10
+
+/// Fixed width for each "cnt·sum€" column (added/taken/balance) — sized for realistic
+/// per-user activity; a wider value overflows its cell rather than resizing the table.
+let balancesCellWidth = 9
+
 /// Callback-data token per sort mode; round-robins balance → added → taken → balance.
 let balancesSortToken (m: BalanceSortMode) =
     match m with
@@ -407,24 +414,20 @@ let private balancesCell (cnt: int64) (v: decimal) =
     let vStr = v.ToString("0.##")
     $"{cnt}·{vStr}€"
 
-/// Markdown-style table (header + `|---|` separator) for /balances' <pre> block.
-/// `nameWidth` is a parameter (not the balancesNameWidth constant) so the message-size
-/// guard in formatBalancesMessage can shrink it for a pathological page.
-let formatBalancesTable (nameWidth: int) (rows: UserBalanceRow array) =
+/// Markdown-style table (header + `|---|` separator) for /balances' <pre> block. Column widths
+/// are the FIXED constants above (never derived from `rows`), so the table's shape is identical
+/// on every page/sort; a cell wider than its column overflows that single row instead of resizing.
+let formatBalancesTable (rows: UserBalanceRow array) =
     let idOf (r: UserBalanceRow) = string r.user_id
     let addedOf (r: UserBalanceRow) = balancesCell r.added_count r.added_value
     let takenOf (r: UserBalanceRow) = balancesCell r.taken_count r.taken_value
     let balanceOf (r: UserBalanceRow) = balancesCell (r.added_count - r.taken_count) (r.added_value - r.taken_value)
     let hId, hUser, hAdded, hTaken, hBalance = "id", "user", "залил", "взял", "баланс"
-    let wId = rows |> Array.fold (fun mx r -> max mx (idOf r).Length) hId.Length
-    let wAdded = rows |> Array.fold (fun mx r -> max mx (addedOf r).Length) hAdded.Length
-    let wTaken = rows |> Array.fold (fun mx r -> max mx (takenOf r).Length) hTaken.Length
-    let wBalance = rows |> Array.fold (fun mx r -> max mx (balanceOf r).Length) hBalance.Length
     // System.String qualified: `open Funogram.Telegram.Types` shadows `String` with the ChatId.String DU case.
     // +2 per column: each data cell sits between a leading/trailing space inside its "| … |" segment.
-    let sep = "|" + ([ wId; nameWidth; wAdded; wTaken; wBalance ] |> List.map (fun w -> System.String('-', w + 2)) |> String.concat "|") + "|"
+    let sep = "|" + ([ balancesIdWidth; balancesNameWidth; balancesCellWidth; balancesCellWidth; balancesCellWidth ] |> List.map (fun w -> System.String('-', w + 2)) |> String.concat "|") + "|"
     let fmtRow (idCell: string) (userCell: string) (addedCell: string) (takenCell: string) (balanceCell: string) =
-        "| " + ([ idCell.PadRight(wId); truncateFixed nameWidth userCell; addedCell.PadRight(wAdded); takenCell.PadRight(wTaken); balanceCell.PadRight(wBalance) ] |> String.concat " | ") + " |"
+        "| " + ([ idCell.PadRight(balancesIdWidth); truncateFixed balancesNameWidth userCell; addedCell.PadRight(balancesCellWidth); takenCell.PadRight(balancesCellWidth); balanceCell.PadRight(balancesCellWidth) ] |> String.concat " | ") + " |"
     let lines = [
         fmtRow hId hUser hAdded hTaken hBalance
         sep
@@ -436,23 +439,22 @@ let formatBalancesTable (nameWidth: int) (rows: UserBalanceRow array) =
 let formatBalancesStatusLine (page: int) (totalPages: int) (totalCount: int64) (sort: BalanceSortMode) =
     $"Стр. {page}/{totalPages} · всего: {totalCount} · сортировка: {balancesSortLabel sort}"
 
-/// Full /balances message: status line + <pre> table. Falls back to a narrower name column
-/// if the default rendering would exceed Telegram's 4096-char cap (15 rows never should, but
-/// this is a cheap guard rather than elaborate truncation machinery).
+/// Full /balances message: status line + <pre> table. Column widths are fixed constants, so the
+/// worst case (15 rows, no cell overflow) stays well under Telegram's 4096-char cap — no dynamic
+/// shrink fallback needed (see PR description for the computed worst-case length).
 let formatBalancesMessage (rows: UserBalanceRow array) (statusLine: string) =
-    let build nameWidth = $"{statusLine}\n<pre>{htmlEscape (formatBalancesTable nameWidth rows)}</pre>"
-    let full = build balancesNameWidth
-    if full.Length <= 4096 then full else build 6
+    $"{statusLine}\n<pre>{htmlEscape (formatBalancesTable rows)}</pre>"
 
-/// ◀ / sort-cycle / ▶ row. ◀ omitted on page 1, ▶ omitted on the last page. The sort
-/// button shows the CURRENT mode; its callback data carries the NEXT mode and resets to page 1.
+/// ◀ / sort-cycle / ▶ row: ALWAYS exactly 3 buttons, same order, on every page — so tap
+/// positions never shift. At an edge, ◀/▶ carry "balances:noop" instead of being omitted;
+/// CallbackHandler answers that callback without editing (an identical edit 400s on Telegram).
+/// The sort button shows the CURRENT mode; its callback data carries the NEXT mode + page 1.
 let balancesKeyboard (page: int) (totalPages: int) (sort: BalanceSortMode) =
     let sortToken = balancesSortToken sort
     let nextToken = balancesSortToken (balancesNextSort sort)
-    let prevBtn = if page > 1 then Some(btn "◀" $"balances:{page - 1}:{sortToken}") else None
-    let sortBtn = Some(btn $"⇅ {balancesSortLabel sort}" $"balances:1:{nextToken}")
-    let nextBtn = if page < totalPages then Some(btn "▶" $"balances:{page + 1}:{sortToken}") else None
-    let row = [ prevBtn; sortBtn; nextBtn ] |> List.choose id |> List.toArray
+    let prevData = if page > 1 then $"balances:{page - 1}:{sortToken}" else "balances:noop"
+    let nextData = if page < totalPages then $"balances:{page + 1}:{sortToken}" else "balances:noop"
+    let row = [| btn "◀" prevData; btn $"⇅ {balancesSortLabel sort}" $"balances:1:{nextToken}"; btn "▶" nextData |]
     inlineKb [| row |]
 
 /// Picks coupons for /list:
