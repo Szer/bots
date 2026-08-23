@@ -7,7 +7,7 @@ open Xunit
 /// CI group."
 ///
 /// TelegramMembershipService (MembershipService.fs:14-60) caches IsMember(userId) for
-/// 1 day, keyed only by userId. This suite only ever drives ONE real Telegram account
+/// 1 hour, keyed only by userId. This suite only ever drives ONE real Telegram account
 /// (there is exactly one MTProto session — contract: "the session is NOT reused"), so
 /// that SAME account is both "the member" every other real test in this assembly
 /// depends on AND the only account available to prove the non-member refusal path.

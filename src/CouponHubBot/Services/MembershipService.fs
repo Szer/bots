@@ -19,7 +19,9 @@ type TelegramMembershipService(
 ) =
     // userId -> (isMember, cachedAtUtc)
     let cache = ConcurrentDictionary<int64, bool * DateTime>()
-    let expiry = TimeSpan.FromDays(1.0)
+    // 1h cache TTL bounds the stale window if a chat_member push is missed;
+    // the daily full-cache invalidation below is a backstop, not the main defense.
+    let expiry = TimeSpan.FromHours(1.0)
 
     let isFresh (cachedAt: DateTime) =
         time.GetUtcNow().UtcDateTime - cachedAt < expiry
@@ -31,7 +33,10 @@ type TelegramMembershipService(
 
     member _.InvalidateCache() = cache.Clear()
 
-    member _.OnChatMemberUpdated(update: ChatMemberUpdated) =
+    /// Returns Some isMember when the update is for the community chat (None otherwise),
+    /// so callers (BotService) can upsert the user on a join without re-deriving the
+    /// membership verdict or duplicating the community-chat check.
+    member _.OnChatMemberUpdated(update: ChatMemberUpdated) : bool option =
         use span =
             botActivity
                 .StartActivity("onChatMemberUpdated")
@@ -43,6 +48,13 @@ type TelegramMembershipService(
             %span.SetTag("userId", uid)
             %span.SetTag("isMember", isMember)
             %span.SetTag("status", status)
+            if isMember then
+                logger.LogInformation("Community member added: user {UserId} (status {Status})", uid, status)
+            else
+                logger.LogInformation("Community member removed: user {UserId} (status {Status})", uid, status)
+            Some isMember
+        else
+            None
 
     member _.IsMember(userId) =
         task {

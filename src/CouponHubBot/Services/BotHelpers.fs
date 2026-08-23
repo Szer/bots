@@ -3,6 +3,7 @@ module CouponHubBot.Services.BotHelpers
 open System
 open System.Collections.Generic
 open System.Threading.Tasks
+open Microsoft.Extensions.Logging
 open Funogram.Telegram.Types
 open CouponHubBot
 open CouponHubBot.Services
@@ -414,10 +415,11 @@ let getLargestPhotoFileId (msg: Message) =
         Some p.FileId
     | _ -> None
 
-let ensureCommunityMember (membership: TelegramMembershipService) (sendText: int64 -> string -> System.Threading.Tasks.Task<unit>) (userId: int64) (chatId: int64) =
+let ensureCommunityMember (membership: TelegramMembershipService) (logger: ILogger) (sendText: int64 -> string -> System.Threading.Tasks.Task<unit>) (userId: int64) (chatId: int64) =
     task {
         let! isMember = membership.IsMember(userId)
         if not isMember then
+            logger.LogWarning("Membership denied for user {UserId}", userId)
             do! sendText chatId "Бот доступен только членам сообщества. Если ты точно в чате — напиши /start ещё раз."
         return isMember
     }

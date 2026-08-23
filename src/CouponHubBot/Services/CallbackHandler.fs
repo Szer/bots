@@ -24,7 +24,7 @@ type CallbackHandler(
     logger: ILogger<CallbackHandler>
 ) =
     let sendText = BotHelpers.sendText tg
-    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership sendText
+    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership logger sendText
 
     member private _.EditBulkOrSend (batch: PendingAddBatch) (text: string) =
         task {
