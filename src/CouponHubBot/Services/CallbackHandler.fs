@@ -429,6 +429,10 @@ type CallbackHandler(
                     elif isPrivateChat && hasData && data = "myAdded" then
                         Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "myAdded"))
                         do! commandHandler.HandleAdded user chatId
+                    elif isPrivateChat && hasData && data = "balances:noop" then
+                        // Edge ◀/▶ tap: just stop the spinner (below) — no edit, since the
+                        // page/sort is already what's rendered and Telegram 400s on a no-op edit.
+                        Metrics.callbackTotal.Add(1L, KeyValuePair("action", box "balances_noop"))
                     elif isPrivateChat && hasData && data.StartsWith("balances:") then
                         // parts: [| "balances"; "<page>"; "<sortToken>" |]. Admin-only, silent
                         // otherwise — AnswerCallbackQuery below still fires for both.

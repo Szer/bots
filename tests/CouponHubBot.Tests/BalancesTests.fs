@@ -140,10 +140,13 @@ ON CONFLICT (id) DO NOTHING;
 
             let sendCall = calls |> Array.find (fun c -> (parseCallBody c.Body |> Option.bind (fun p -> p.Text)) = Some text)
             let buttons = inlineButtons sendCall.Body
-            Assert.True(buttons |> Array.forall (fun (t, _) -> t <> "◀"), "No ◀ button on page 1")
-            if totalPages > 1 then
-                Assert.True(buttons |> Array.exists (fun (t, _) -> t = "▶"), "▶ expected: more than one page")
+            // Keyboard is ALWAYS exactly 3 buttons [◀] [⇅ sort] [▶], even on page 1 — the
+            // edge ◀ carries the no-op callback data instead of being omitted.
+            Assert.Equal(3, buttons.Length)
+            Assert.Equal(("◀", "balances:noop"), buttons[0])
             Assert.True(buttons |> Array.exists (fun (t, _) -> t = "⇅ баланс"), "Sort button should show current mode")
+            if totalPages > 1 then
+                Assert.True(buttons |> Array.exists (fun (t, d) -> t = "▶" && d <> "balances:noop"), "▶ expected to be a real page-2 link: more than one page")
         }
 
     [<Fact>]
@@ -208,6 +211,89 @@ ON CONFLICT (id) DO NOTHING;
             let buttons = inlineButtons (edits[0].Body)
             Assert.True(buttons |> Array.exists (fun (t, d) -> t = "⇅ залил" && d = "balances:1:taken"),
                 "Sort button should show 'залил' and cycle next to 'taken'")
+        }
+
+    [<Fact>]
+    let ``Last-page balances keyboard still has all three buttons, with a no-op arrow`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let! _ = seedFillerUsers()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+
+            let! resp = fixture.SendUpdate(Tg.dmMessage("/balances", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+            let! sends = fixture.GetFakeCalls("sendMessage")
+            let reply = findBalancesReply sends
+            Assert.True(reply.IsSome, "Admin should get a /balances reply with a <pre> table")
+            let statusMatch = Regex.Match(reply.Value, @"Стр\. 1/(\d+)")
+            Assert.True(statusMatch.Success, $"Status line not found in: {reply.Value}")
+            let totalPages = int statusMatch.Groups[1].Value
+            Assert.True(totalPages > 1, "20 seeded filler users guarantee a page 2+")
+
+            do! fixture.ClearFakeCalls()
+            let msgId = 555_444_333L
+            let! resp2 = fixture.SendUpdate(dmCallbackAt $"balances:{totalPages}:balance" admin msgId)
+            Assert.Equal(HttpStatusCode.OK, resp2.StatusCode)
+            let! edits = fixture.GetFakeCalls("editMessageText")
+            Assert.Equal(1, edits.Length)
+
+            let buttons = inlineButtons edits[0].Body
+            Assert.Equal(3, buttons.Length)
+            Assert.Equal(("▶", "balances:noop"), buttons[2])
+            Assert.True(buttons |> Array.exists (fun (t, d) -> t = "◀" && d <> "balances:noop"), "◀ should be a real back link on the last page")
+        }
+
+    [<Fact>]
+    let ``Pressing the no-op edge button stops the spinner without editing`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+
+            let! resp = fixture.SendUpdate(dmCallbackAt "balances:noop" admin 222_333_444L)
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! sends = fixture.GetFakeCalls("sendMessage")
+            let! edits = fixture.GetFakeCalls("editMessageText")
+            Assert.Equal(0, sends.Length)
+            Assert.Equal(0, edits.Length)
+        }
+
+    [<Fact>]
+    let ``Table shape (header, separator, row lengths) is identical across pages`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let! _ = seedFillerUsers()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+
+            let! resp1 = fixture.SendUpdate(dmCallbackAt "balances:1:balance" admin 111_000_111L)
+            Assert.Equal(HttpStatusCode.OK, resp1.StatusCode)
+            let! resp2 = fixture.SendUpdate(dmCallbackAt "balances:2:balance" admin 222_000_222L)
+            Assert.Equal(HttpStatusCode.OK, resp2.StatusCode)
+
+            let! edits = fixture.GetFakeCalls("editMessageText")
+            Assert.Equal(2, edits.Length)
+            let textOf (call: FakeCall) =
+                use doc = JsonDocument.Parse(call.Body)
+                doc.RootElement.GetProperty("text").GetString()
+            // Drop the "Стр. X/Y · ..." status line; remaining lines are header/sep/data rows.
+            let tableLines (text: string) =
+                (text.Replace("<pre>", "").Replace("</pre>", "").Split('\n')) |> Array.skip 1
+
+            let lines1 = tableLines (textOf edits[0])
+            let lines2 = tableLines (textOf edits[1])
+            Assert.Equal(lines1[0], lines2[0]) // header
+            Assert.Equal(lines1[1], lines2[1]) // separator
+            Assert.Equal(lines1.Length, lines2.Length)
+            for i in 2 .. lines1.Length - 1 do
+                Assert.Equal(lines1[i].Length, lines2[i].Length)
         }
 
     [<Fact>]
