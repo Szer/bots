@@ -3,13 +3,15 @@ namespace CouponHubBot.Tests
 open System
 open System.Net
 open System.Text.Json
+open System.Text.RegularExpressions
 open BotTestInfra
 open Funogram.Telegram.Types
 open Xunit
 open FakeCallHelpers
 
 /// /balances is admin-only, paginated over ALL "user" rows (see the assembly-wide DB
-/// fixture gotcha: never assert absolute page counts — derive Y from a live COUNT query).
+/// fixture gotcha: the total is unbounded and racy even against a same-test COUNT query
+/// — read it back from the bot's own reply instead of asserting an absolute number).
 type BalancesTests(fixture: DefaultCouponHubTestContainers) =
 
     // Admin user ID 900 is configured in FEEDBACK_ADMINS for the test container.
@@ -52,9 +54,6 @@ SELECT 900_000_000 + n, 'bal_filler_' || n, 'Filler' || n, NOW(), NOW()
 FROM generate_series(1, 20) AS n
 ON CONFLICT (id) DO NOTHING;
 """, null)
-
-    let getUserCount () =
-        fixture.QuerySingle<int64>("""SELECT COUNT(*)::bigint FROM "user";""", null)
 
     // The admin-facing /balances reply: status line + <pre> table, one message.
     let findBalancesReply (calls: FakeCall array) =
@@ -110,9 +109,6 @@ ON CONFLICT (id) DO NOTHING;
             let! helperCouponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o", {| o = ownerHelper.Id |})
             let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {helperCouponId}", midUser))
 
-            let! userCount = getUserCount ()
-            let totalPages = max 1 (int (ceil (float userCount / 15.0)))
-
             do! fixture.ClearFakeCalls()
             let! resp = fixture.SendUpdate(Tg.dmMessage("/balances", admin))
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
@@ -122,7 +118,15 @@ ON CONFLICT (id) DO NOTHING;
             Assert.True(reply.IsSome, "Admin should get a /balances reply with a <pre> table")
             let text = reply.Value
 
-            Assert.Contains($"Стр. 1/{totalPages} · всего: {userCount} · сортировка: баланс", text)
+            // The absolute user total accumulates across the whole assembly and even a
+            // same-test pre-query races background work from earlier tests — read N back
+            // from the bot's own reply and check ITS pagination math instead.
+            let statusMatch = Regex.Match(text, @"Стр\. 1/(\d+) · всего: (\d+) · сортировка: баланс")
+            Assert.True(statusMatch.Success, $"Status line not found in: {text}")
+            let totalPages = int statusMatch.Groups[1].Value
+            let userCount = int statusMatch.Groups[2].Value
+            Assert.True(userCount >= 25, "At least the 5 seeded + 20 filler users must be counted")
+            Assert.Equal(max 1 (int (ceil (float userCount / 15.0))), totalPages)
 
             // Worst debtor (takerPoor, -90000) must render before a smaller debtor (midUser, -30).
             let idxWorst = text.IndexOf(string takerPoor.Id)
