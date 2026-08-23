@@ -110,7 +110,9 @@ type BalanceSortMode =
     | Taken
 
 /// One "user" row's all-time added/taken aggregates for /balances. Same netting
-/// semantics as UserContributionStats, but for every user in one page.
+/// semantics as UserContributionStats, but for every user in one page. voided_count/
+/// reported_count are informational-only (owner-attributed counts, no value sum) and
+/// never feed the balance formula.
 [<CLIMutable>]
 type UserBalanceRow =
     { user_id: int64
@@ -120,7 +122,9 @@ type UserBalanceRow =
       added_count: int64
       added_value: decimal
       taken_count: int64
-      taken_value: decimal }
+      taken_value: decimal
+      voided_count: int64
+      reported_count: int64 }
 
 [<CLIMutable>]
 type UserFeedbackRow =

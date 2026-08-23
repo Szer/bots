@@ -364,15 +364,22 @@ let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
 /// Page size for /balances.
 let balancesPageSize = 15
 
-/// Fixed width for the name column — keeps rows narrow regardless of name length.
-let balancesNameWidth = 18
+/// Fixed width for the name column — shrunk from 18 to make room for the split count/sum
+/// columns while keeping the row length reasonable (final fixed row length: 95 chars — see
+/// formatBalancesTable).
+let balancesNameWidth = 13
 
 /// Fixed width for the id column — real user ids are well under 10 digits.
 let balancesIdWidth = 10
 
-/// Fixed width for each "cnt·sum€" column (added/taken/balance) — sized for realistic
-/// per-user activity; a wider value overflows its cell rather than resizing the table.
-let balancesCellWidth = 9
+/// Fixed width for each count column (з#/в#/б#/анн/реп) — plain integers, б# can be negative
+/// (e.g. "-28").
+let balancesCountWidth = 4
+
+/// Fixed width for each sum column (з€/в€/б€) — no trailing "€" per cell (the currency is
+/// named once, in the header/legend); б€ can be negative (e.g. "-270"). A wider value
+/// overflows its cell rather than resizing the table.
+let balancesSumWidth = 7
 
 /// Callback-data token per sort mode; round-robins balance → added → taken → balance.
 let balancesSortToken (m: BalanceSortMode) =
@@ -410,28 +417,47 @@ let private balancesUserName (r: UserBalanceRow) =
         let full = [ Option.ofObj r.first_name; Option.ofObj r.last_name ] |> List.choose id |> String.concat " "
         if full = "" then string r.user_id else full
 
-let private balancesCell (cnt: int64) (v: decimal) =
-    let vStr = v.ToString("0.##")
-    $"{cnt}·{vStr}€"
+let private countCell (n: int64) = string n
+let private sumCell (v: decimal) = v.ToString("0.##")
 
 /// Markdown-style table (header + `|---|` separator) for /balances' <pre> block. Column widths
 /// are the FIXED constants above (never derived from `rows`), so the table's shape is identical
 /// on every page/sort; a cell wider than its column overflows that single row instead of resizing.
+/// Count and sum are separate columns (no "cnt·sum" composite cells); анн/реп are owner-attributed
+/// counts only, no value sum — see GetUserBalances' doc comment.
 let formatBalancesTable (rows: UserBalanceRow array) =
     let idOf (r: UserBalanceRow) = string r.user_id
-    let addedOf (r: UserBalanceRow) = balancesCell r.added_count r.added_value
-    let takenOf (r: UserBalanceRow) = balancesCell r.taken_count r.taken_value
-    let balanceOf (r: UserBalanceRow) = balancesCell (r.added_count - r.taken_count) (r.added_value - r.taken_value)
-    let hId, hUser, hAdded, hTaken, hBalance = "id", "user", "залил", "взял", "баланс"
+    let balanceCount (r: UserBalanceRow) = r.added_count - r.taken_count
+    let balanceValue (r: UserBalanceRow) = r.added_value - r.taken_value
+    let hId, hUser = "id", "user"
+    let hZCount, hZSum = "з#", "з€"
+    let hVCount, hVSum = "в#", "в€"
+    let hBCount, hBSum = "б#", "б€"
+    let hVoided, hReported = "ан", "рп"
     // System.String qualified: `open Funogram.Telegram.Types` shadows `String` with the ChatId.String DU case.
     // +2 per column: each data cell sits between a leading/trailing space inside its "| … |" segment.
-    let sep = "|" + ([ balancesIdWidth; balancesNameWidth; balancesCellWidth; balancesCellWidth; balancesCellWidth ] |> List.map (fun w -> System.String('-', w + 2)) |> String.concat "|") + "|"
-    let fmtRow (idCell: string) (userCell: string) (addedCell: string) (takenCell: string) (balanceCell: string) =
-        "| " + ([ idCell.PadRight(balancesIdWidth); truncateFixed balancesNameWidth userCell; addedCell.PadRight(balancesCellWidth); takenCell.PadRight(balancesCellWidth); balanceCell.PadRight(balancesCellWidth) ] |> String.concat " | ") + " |"
+    let widths =
+        [ balancesIdWidth; balancesNameWidth
+          balancesCountWidth; balancesSumWidth
+          balancesCountWidth; balancesSumWidth
+          balancesCountWidth; balancesSumWidth
+          balancesCountWidth; balancesCountWidth ]
+    let sep = "|" + (widths |> List.map (fun w -> System.String('-', w + 2)) |> String.concat "|") + "|"
+    let fmtRow (cells: string list) =
+        let padded =
+            List.zip widths cells
+            |> List.mapi (fun i (w, (c: string)) -> if i = 1 then truncateFixed w c else c.PadRight(w))
+        "| " + (padded |> String.concat " | ") + " |"
+    let rowCells (r: UserBalanceRow) =
+        [ idOf r; balancesUserName r
+          countCell r.added_count; sumCell r.added_value
+          countCell r.taken_count; sumCell r.taken_value
+          countCell (balanceCount r); sumCell (balanceValue r)
+          countCell r.voided_count; countCell r.reported_count ]
     let lines = [
-        fmtRow hId hUser hAdded hTaken hBalance
+        fmtRow [ hId; hUser; hZCount; hZSum; hVCount; hVSum; hBCount; hBSum; hVoided; hReported ]
         sep
-        yield! rows |> Array.map (fun r -> fmtRow (idOf r) (balancesUserName r) (addedOf r) (takenOf r) (balanceOf r))
+        yield! rows |> Array.map (rowCells >> fmtRow)
     ]
     String.concat "\n" lines
 
@@ -439,11 +465,17 @@ let formatBalancesTable (rows: UserBalanceRow array) =
 let formatBalancesStatusLine (page: int) (totalPages: int) (totalCount: int64) (sort: BalanceSortMode) =
     $"Стр. {page}/{totalPages} · всего: {totalCount} · сортировка: {balancesSortLabel sort}"
 
-/// Full /balances message: status line + <pre> table. Column widths are fixed constants, so the
-/// worst case (15 rows, no cell overflow) stays well under Telegram's 4096-char cap — no dynamic
-/// shrink fallback needed (see PR description for the computed worst-case length).
+/// Plain-text legend for the table's abbreviated headers, rendered below the <pre> block
+/// (outside it, so it isn't padded/truncated by the fixed column widths).
+let balancesLegend =
+    "з=залито · в=взято (минус возвраты) · б=баланс · #=шт · €=сумма · ан=аннулировано · рп=зарепорчено"
+
+/// Full /balances message: status line + <pre> table + legend. Column widths are fixed
+/// constants, so the worst case (15 rows, no cell overflow) stays well under Telegram's
+/// 4096-char cap — no dynamic shrink fallback needed (see PR description for the computed
+/// worst-case length).
 let formatBalancesMessage (rows: UserBalanceRow array) (statusLine: string) =
-    $"{statusLine}\n<pre>{htmlEscape (formatBalancesTable rows)}</pre>"
+    $"{statusLine}\n<pre>{htmlEscape (formatBalancesTable rows)}</pre>\n{balancesLegend}"
 
 /// ◀ / sort-cycle / ▶ row: ALWAYS exactly 3 buttons, same order, on every page — so tap
 /// positions never shift. At an edge, ◀/▶ carry "balances:noop" instead of being omitted;
