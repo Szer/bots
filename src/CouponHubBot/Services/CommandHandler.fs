@@ -153,6 +153,29 @@ type CommandHandler(
             // else silently ignore for non-admins
         }
 
+    // Admin-only paginated all-user balance report (/balances). Shared by the initial send
+    // and CallbackHandler's ◀/▶/sort edits so both render identically off fresh data.
+    let renderBalancesPage (page: int) (sort: BalanceSortMode) =
+        task {
+            let! totalCount = db.GetUserCount()
+            let totalPages = max 1 (int (ceil (float totalCount / float BotHelpers.balancesPageSize)))
+            let clampedPage = page |> max 1 |> min totalPages
+            let offset = (clampedPage - 1) * BotHelpers.balancesPageSize
+            let! rows = db.GetUserBalances(sort, BotHelpers.balancesPageSize, offset)
+            let statusLine = BotHelpers.formatBalancesStatusLine clampedPage totalPages totalCount sort
+            let html = BotHelpers.formatBalancesMessage rows statusLine
+            let kb = BotHelpers.balancesKeyboard clampedPage totalPages sort
+            return html, kb
+        }
+
+    let handleBalances (adminId: int64) (chatId: int64) =
+        task {
+            if options.Value.FeedbackAdminIds |> Array.contains adminId then
+                let! html, kb = renderBalancesPage 1 BalanceSortMode.Balance
+                do! BotHelpers.sendHtmlMarkup tg chatId html kb
+            // else silently ignore for non-admins
+        }
+
     let handleStart (chatId: int64) =
         sendText chatId
             "Привет! Я бот для совместного управления купонами Dunnes.\n\nКоманды:\n/add (или /a) — добавить купон\n/list (или /l) — доступные купоны\n/my (или /m) — мои купоны\n/added (или /ad) — мои добавленные\n/stats (или /s) — моя статистика\n/feedback (или /f) — фидбэк авторам\n\nДополнительно (не в меню):\n/take <id>\n/used <id>\n/return <id>\n/void <id>\n/report <id> — сообщить, что купон уже использован кем-то другим\n/help"
@@ -465,6 +488,8 @@ type CommandHandler(
     member _.HandleReportedUsed (user: DbUser) (chatId: int64) (couponId: int) = handleReportedUsed user chatId couponId
     member _.HandleAdded (user: DbUser) (chatId: int64) = handleAdded user chatId
     member _.HandleUndo (adminId: int64) (chatId: int64) (couponId: int) = handleUndo adminId chatId couponId
+    /// Admin-only; CallbackHandler is responsible for the admin check on its own callback path.
+    member _.RenderBalancesPage (page: int) (sort: BalanceSortMode) = renderBalancesPage page sort
 
     member _.Dispatch (user: DbUser) (msg: Message) =
         task {
@@ -566,6 +591,9 @@ type CommandHandler(
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId -> do! handleUndo user.id msg.Chat.Id couponId
                 | None -> ()
+            | Some "/balances" ->
+                recordCommand "balances"
+                do! handleBalances user.id msg.Chat.Id
             | Some t when t.StartsWith("/whois ") ->
                 recordCommand "whois"
                 let arg = t.Substring("/whois ".Length).Trim()

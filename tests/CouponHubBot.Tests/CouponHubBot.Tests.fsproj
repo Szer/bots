@@ -35,6 +35,7 @@
     <Compile Include="StatsTests.fs" />
     <Compile Include="WhoisFuzzyScoringTests.fs" />
     <Compile Include="WhoisTests.fs" />
+    <Compile Include="BalancesTests.fs" />
     <Compile Include="HealthCheckTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
