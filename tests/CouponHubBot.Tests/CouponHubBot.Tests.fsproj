@@ -33,6 +33,7 @@
     <Compile Include="AddedStatusTests.fs" />
     <Compile Include="UndoFlowTests.fs" />
     <Compile Include="StatsTests.fs" />
+    <Compile Include="WhoisFuzzyScoringTests.fs" />
     <Compile Include="WhoisTests.fs" />
     <Compile Include="HealthCheckTests.fs" />
     <Compile Include="Program.fs" />

@@ -400,6 +400,16 @@ ORDER BY expires_at, id;
             return users |> Seq.tryHead
         }
 
+    /// All users, for the /whois fuzzy fallback's in-memory scoring (~70 rows, fine to load whole).
+    member _.GetAllUsers() =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = """SELECT * FROM "user" """
+            let! users = conn.QueryAsync<DbUser>(sql)
+            return users |> Seq.toArray
+        }
+
     member _.GetCouponsByOwner(ownerId) =
         task {
             use! conn = openConn()

@@ -199,6 +199,80 @@ let formatCouponDebugDetails (c: Coupon) (owner: DbUser option) (taker: DbUser o
     ]
     String.concat "\n" lines
 
+/// Bounded Levenshtein distance between two already-normalized tokens.
+let private levenshtein (a: string) (b: string) =
+    let n, m = a.Length, b.Length
+    let dp = Array2D.create (n + 1) (m + 1) 0
+    for i in 0 .. n do dp[i, 0] <- i
+    for j in 0 .. m do dp[0, j] <- j
+    for i in 1 .. n do
+        for j in 1 .. m do
+            let cost = if a[i - 1] = b[j - 1] then 0 else 1
+            dp[i, j] <- min (min (dp[i - 1, j] + 1) (dp[i, j - 1] + 1)) (dp[i - 1, j - 1] + cost)
+    dp[n, m]
+
+/// Similarity in [0,1] between a query token and a candidate name/username token: exact/
+/// substring hits score high, else a Levenshtein ratio (below 0.4 counts as no match at all).
+let private tokenSimilarity (t: string) (c: string) =
+    if t = "" || c = "" then 0.0
+    elif t = c then 1.0
+    elif t.Length >= 2 && (c.Contains(t) || t.Contains(c)) then 0.85
+    else
+        let d = levenshtein t c
+        let sim = 1.0 - float d / float (max t.Length c.Length)
+        if sim > 0.4 then sim else 0.0
+
+/// Id matching is substring-only — Levenshtein "typo tolerance" isn't meaningful for an
+/// opaque numeric id, and applying it lets an unrelated query coincidentally out-score
+/// the threshold against someone else's id once there are enough users to compare against.
+let private idSimilarity (t: string) (idStr: string) =
+    if t = idStr then 1.0
+    elif t.Length >= 2 && idStr.Contains(t) then 0.85
+    else 0.0
+
+/// Lowercased, whitespace-split query tokens for the /whois fuzzy fallback.
+let private whoisQueryTokens (query: string) =
+    query.Trim().ToLowerInvariant().Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+    |> Array.toList
+
+/// Normalized username/name tokens of a user, matched against a fuzzy /whois query.
+let private whoisNameTokens (u: DbUser) =
+    [ Option.ofObj u.username |> Option.map (fun s -> s.Trim().ToLowerInvariant())
+      Option.ofObj u.first_name |> Option.map (fun s -> s.Trim().ToLowerInvariant())
+      Option.ofObj u.last_name |> Option.map (fun s -> s.Trim().ToLowerInvariant()) ]
+    |> List.choose id
+    |> List.filter (fun s -> s <> "")
+
+/// Candidates scoring at or above this average are shown by the /whois fuzzy fallback.
+let whoisFuzzyThreshold = 0.35
+
+/// Average, over query tokens, of each token's best similarity against a user's id
+/// (substring-only) or username/name tokens (fuzzy). Pure and unit-testable — no DB access.
+let scoreWhoisCandidate (query: string) (u: DbUser) =
+    let qTokens = whoisQueryTokens query
+    let nameTokens = whoisNameTokens u
+    let idStr = string u.id
+    if qTokens.IsEmpty then
+        0.0
+    else
+        qTokens
+        |> List.map (fun t ->
+            let idScore = idSimilarity t idStr
+            let nameScore =
+                if nameTokens.IsEmpty then 0.0
+                else nameTokens |> List.map (tokenSimilarity t) |> List.max
+            max idScore nameScore)
+        |> List.average
+
+/// The /whois fuzzy fallback: candidates above whoisFuzzyThreshold, best first, capped at 5.
+let searchWhoisFuzzy (query: string) (users: DbUser array) =
+    users
+    |> Array.map (fun u -> u, scoreWhoisCandidate query u)
+    |> Array.filter (fun (_, score) -> score >= whoisFuzzyThreshold)
+    |> Array.sortByDescending snd
+    |> Array.truncate 5
+    |> Array.map fst
+
 /// Admin /whois identity + membership + all-time give/take header. Value is
 /// NUMERIC(10,2) NOT NULL, so sums are always real numbers — no "unparsed" caveat needed.
 let formatWhoisHeader (u: DbUser) (isMember: bool) (stats: UserContributionStats) =
@@ -243,6 +317,18 @@ let formatWhoisActionsTable (rows: UserActionRow array) =
         yield! rows |> Array.map (fun r -> fmtRow [| r.date; r.event_type; couponDesc r |])
         sep
     ]
+    String.concat "\n" lines
+
+/// /whois fuzzy fallback list: one "id:<id> @<username> <first> <last>" line per candidate
+/// (username part omitted when NULL). Callers only reach here when the list is non-empty.
+let formatWhoisCandidateList (users: DbUser array) =
+    let line (u: DbUser) =
+        let namePart =
+            [ Option.ofObj u.first_name; Option.ofObj u.last_name ] |> List.choose id |> String.concat " "
+        let userPart = if String.IsNullOrWhiteSpace u.username then "" else $" @{htmlEscape u.username}"
+        let namePartHtml = if namePart = "" then "" else $" {htmlEscape namePart}"
+        $"id:{u.id}{userPart}{namePartHtml}"
+    let lines = "Найдены похожие юзеры:" :: (users |> Array.map line |> Array.toList)
     String.concat "\n" lines
 
 let formatEventHistoryTable (rows: CouponEventHistoryRow array) =

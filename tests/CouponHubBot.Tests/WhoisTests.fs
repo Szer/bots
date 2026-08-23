@@ -113,3 +113,88 @@ type WhoisTests(fixture: DefaultCouponHubTestContainers) =
                         "Admin should be told the user does not exist")
             Assert.True((findWhoisReply calls).IsNone, "No <pre> block for an unknown user")
         }
+
+    [<Fact>]
+    let ``Whois multi word name query returns a fuzzy candidate list`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let target = Tg.user(id = 744L, username = "elena_s", firstName = "Elena")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", target))
+            let! _ = fixture.Execute("""UPDATE "user" SET last_name = @ln WHERE id = @id""", {| ln = "Sokolenko"; id = target.Id |})
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage("/whois Elena Sokolova", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "Найдены похожие юзеры",
+                        "A close-but-not-exact name should surface the fuzzy candidate list")
+            Assert.True(findCallWithText calls adminId $"id:{target.Id}",
+                        "Elena Sokolenko should be listed as a fuzzy candidate for 'Elena Sokolova'")
+            Assert.True((findWhoisReply calls).IsNone, "Fuzzy fallback is a list, not the full <pre> profile")
+        }
+
+    [<Fact>]
+    let ``Whois digit substring query returns a fuzzy candidate list`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            // Long, distinctive digit run so this can't collide with other tests' ids
+            // sharing the assembly-wide DB fixture.
+            let target = Tg.user(id = 918273645L, username = "id_target", firstName = "IdTarget")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", target))
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage("/whois 182736", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "Найдены похожие юзеры",
+                        "A digit substring of a user id should surface the fuzzy candidate list")
+            Assert.True(findCallWithText calls adminId $"id:{target.Id}")
+        }
+
+    [<Fact>]
+    let ``Whois garbage query reports not found`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let target = Tg.user(id = 745L, username = "elena_s2", firstName = "Elena")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", target))
+            let! _ = fixture.Execute("""UPDATE "user" SET last_name = @ln WHERE id = @id""", {| ln = "Sokolenko"; id = target.Id |})
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage("/whois zzzzqqq", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls adminId "Пользователь не найден")
+        }
+
+    [<Fact>]
+    let ``Non-admin fuzzy whois name query gets no response`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let user = Tg.user(id = 746L, username = "regular_whois2", firstName = "Regular")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+
+            let! resp = fixture.SendUpdate(Tg.dmMessage("/whois Elena Sokolova", user))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.Equal(0, calls.Length)
+        }
