@@ -390,6 +390,16 @@ ORDER BY expires_at, id;
             return users |> Seq.tryHead
         }
 
+    /// Case-insensitive; callers strip any leading '@' before calling.
+    member _.GetUserByUsername(username: string) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = """SELECT * FROM "user" WHERE lower(username) = lower(@username)"""
+            let! users = conn.QueryAsync<DbUser>(sql, {| username = username |})
+            return users |> Seq.tryHead
+        }
+
     member _.GetCouponsByOwner(ownerId) =
         task {
             use! conn = openConn()
@@ -447,6 +457,53 @@ GROUP BY event_type;
             // Net out admin /undo compensations so counts reflect reality.
             let net pos = max 0L (get pos - get (pos + "_reverted"))
             return get "added", net "taken", net "returned", net "used", net "voided", net "reported"
+        }
+
+    /// All-time give/take totals for /whois: 'added' = contributed a coupon to the pool,
+    /// 'taken' = took one from it. Nets "<type>_reverted" the same way GetUserStats does.
+    member _.GetUserContributionStats(userId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT
+    (COUNT(*) FILTER (WHERE e.event_type = 'added')
+     - COUNT(*) FILTER (WHERE e.event_type = 'added_reverted'))::bigint AS added_count,
+    COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'added'), 0)
+     - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'added_reverted'), 0) AS added_value,
+    (COUNT(*) FILTER (WHERE e.event_type = 'taken')
+     - COUNT(*) FILTER (WHERE e.event_type = 'taken_reverted'))::bigint AS taken_count,
+    COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken'), 0)
+     - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken_reverted'), 0) AS taken_value
+FROM coupon_event e
+JOIN coupon c ON c.id = e.coupon_id
+WHERE e.user_id = @user_id
+  AND e.event_type IN ('added', 'added_reverted', 'taken', 'taken_reverted');
+"""
+            return! conn.QuerySingleAsync<UserContributionStats>(sql, {| user_id = userId |})
+        }
+
+    /// Last `limit` coupon_event rows for a user (any event_type), newest first, for /whois.
+    member _.GetUserRecentActions(userId: int64, limit: int) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT TO_CHAR(ce.created_at, 'YYYY-MM-DD HH24:MI:SS') AS date,
+       ce.event_type,
+       ce.coupon_id,
+       c.value,
+       c.min_check
+FROM coupon_event ce
+LEFT JOIN coupon c ON c.id = ce.coupon_id
+WHERE ce.user_id = @user_id
+ORDER BY ce.created_at DESC
+LIMIT @limit;
+"""
+            let! rows = conn.QueryAsync<UserActionRow>(sql, {| user_id = userId; limit = limit |})
+            return rows |> Seq.toArray
         }
 
     member _.GetPersonalCouponOutcomes(userId: int64) =

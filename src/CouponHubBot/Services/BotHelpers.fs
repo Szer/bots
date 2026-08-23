@@ -199,6 +199,52 @@ let formatCouponDebugDetails (c: Coupon) (owner: DbUser option) (taker: DbUser o
     ]
     String.concat "\n" lines
 
+/// Admin /whois identity + membership + all-time give/take header. Value is
+/// NUMERIC(10,2) NOT NULL, so sums are always real numbers — no "unparsed" caveat needed.
+let formatWhoisHeader (u: DbUser) (isMember: bool) (stats: UserContributionStats) =
+    let inv = System.Globalization.CultureInfo.InvariantCulture
+    let isoDate (d: DateTime) = d.ToString("yyyy-MM-dd", inv)
+    let euro (v: decimal) = v.ToString("0.##", inv) + "€"
+    let fullName =
+        [ Option.ofObj u.first_name; Option.ofObj u.last_name ] |> List.choose id |> String.concat " "
+    let nameSuffix = if String.IsNullOrWhiteSpace fullName then "" else $", {htmlEscape fullName}"
+    let memberLine = if isMember then "да" else "нет"
+    let lines = [
+        $"<b>{htmlEscape (formatUserHandle u.id u.username u.first_name)}</b> (id:{u.id}){nameSuffix}"
+        $"В базе с: {isoDate u.created_at}"
+        $"В комьюнити: {memberLine}"
+        ""
+        $"Добавлено: {stats.added_count} · {euro stats.added_value}"
+        $"Взято: {stats.taken_count} · {euro stats.taken_value}"
+        $"Баланс: {stats.added_count - stats.taken_count} · {euro (stats.added_value - stats.taken_value)}"
+    ]
+    String.concat "\n" lines
+
+/// Plain-text 3-column table for /whois's "last 10 actions" <pre> block.
+let formatWhoisActionsTable (rows: UserActionRow array) =
+    let couponDesc (r: UserActionRow) =
+        if r.value.HasValue && r.min_check.HasValue then
+            $"ID:{r.coupon_id} {formatCouponValue r.value.Value r.min_check.Value}"
+        else
+            $"ID:{r.coupon_id}"
+    let headers = [| "date"; "event"; "coupon" |]
+    let widths =
+        headers |> Array.mapi (fun i h ->
+            rows |> Array.fold (fun mx r ->
+                let v = match i with | 0 -> r.date | 1 -> r.event_type | _ -> couponDesc r
+                max mx v.Length) h.Length)
+    let sep = "+" + (widths |> Array.map (fun w -> System.String('-', w)) |> String.concat "+") + "+"
+    let fmtRow vals =
+        "|" + (Array.zip widths vals |> Array.map (fun (w, v: string) -> v.PadRight(w)) |> String.concat "|") + "|"
+    let lines = [
+        sep
+        fmtRow headers
+        sep
+        yield! rows |> Array.map (fun r -> fmtRow [| r.date; r.event_type; couponDesc r |])
+        sep
+    ]
+    String.concat "\n" lines
+
 let formatEventHistoryTable (rows: CouponEventHistoryRow array) =
     let headers = [| "date"; "user"; "event_type" |]
     let widths =

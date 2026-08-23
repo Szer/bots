@@ -81,6 +81,26 @@ type CouponEventHistoryRow =
       user: string
       event_type: string }
 
+/// Per-user all-time give/take totals for /whois. Both counts/sums net out
+/// "<type>_reverted" the same way GetUserStats does.
+[<CLIMutable>]
+type UserContributionStats =
+    { added_count: int64
+      added_value: decimal
+      taken_count: int64
+      taken_value: decimal }
+
+/// One coupon_event row for /whois's "last 10 actions". value/min_check are nullable
+/// because the join to coupon is a LEFT JOIN (defensive: coupon_id's FK is ON DELETE
+/// CASCADE, so nothing in the app can orphan an event today, but the row shape survives it).
+[<CLIMutable>]
+type UserActionRow =
+    { date: string
+      event_type: string
+      coupon_id: int
+      value: Nullable<decimal>
+      min_check: Nullable<decimal> }
+
 [<CLIMutable>]
 type UserFeedbackRow =
     { id: int64

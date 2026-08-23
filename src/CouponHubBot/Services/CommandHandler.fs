@@ -16,6 +16,7 @@ type CommandHandler(
     db: DbService,
     notifications: TelegramNotificationService,
     couponFlow: CouponFlowHandler,
+    membership: TelegramMembershipService,
     time: TimeProvider,
     logger: ILogger<CommandHandler>
 ) =
@@ -113,6 +114,32 @@ type CommandHandler(
                         + (if pocketLine = "" then "" else pocketLine + "\n")
                         + $"Текущее состояние: {coupon.status}, до {BotHelpers.formatUiDate coupon.expires_at}."
                     do! sendCouponHistory chatId couponId (Some header)
+            // else silently ignore for non-admins
+        }
+
+    // Admin-only per-user profile: identity/membership header, all-time give/take totals
+    // (count + value sum), and the last 10 coupon_event rows. `arg` is a numeric user id or
+    // a username (leading '@' optional, matched case-insensitively).
+    let handleWhois (adminId: int64) (chatId: int64) (arg: string) =
+        task {
+            if options.Value.FeedbackAdminIds |> Array.contains adminId then
+                let! target =
+                    match Int64.TryParse(arg) with
+                    | true, uid -> db.GetUserById uid
+                    | _ -> db.GetUserByUsername(arg.TrimStart('@'))
+                match target with
+                | None ->
+                    do! sendText chatId "Пользователь не найден"
+                | Some user ->
+                    let! isMember = membership.IsMember(user.id)
+                    let! stats = db.GetUserContributionStats(user.id)
+                    let! actions = db.GetUserRecentActions(user.id, 10)
+                    let header = BotHelpers.formatWhoisHeader user isMember stats
+                    let actionsTable =
+                        if actions.Length = 0 then "Нет действий."
+                        else BotHelpers.formatWhoisActionsTable actions
+                    let html = $"{header}\n<pre>{BotHelpers.htmlEscape actionsTable}</pre>"
+                    do! BotHelpers.sendHtml tg chatId html
             // else silently ignore for non-admins
         }
 
@@ -529,6 +556,11 @@ type CommandHandler(
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId -> do! handleUndo user.id msg.Chat.Id couponId
                 | None -> ()
+            | Some t when t.StartsWith("/whois ") ->
+                recordCommand "whois"
+                let parts = t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries)
+                if parts.Length >= 2 then
+                    do! handleWhois user.id msg.Chat.Id (Array.last parts)
             | _ ->
                 let hasPhoto = msg.Photo |> Option.exists (fun p -> p.Length > 0)
                 let captionIsAdd =
