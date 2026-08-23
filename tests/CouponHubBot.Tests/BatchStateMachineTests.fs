@@ -342,3 +342,30 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             // both would have been inserted despite the message saying "1".
             Assert.Equal(1L, couponCount)
         }
+
+    // ── Membership gate at finalize ────────────────────────────────────
+
+    [<Fact>]
+    let ``Finalize drops the batch if the user left the community before debounce fires`` () =
+        task {
+            do! setupBatchTest ()
+            let user = Tg.user(id = 7250L, username = "left_before_finalize", firstName = "Left")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+            let mgid = $"mg-leftmember-{DateTime.UtcNow.Ticks}"
+            do! sendOnePhotoAlbum user mgid "left-1" 9960
+
+            let! batchId = waitForBatchByUser fixture user.Id 5000
+            do! waitForAllItemsTerminal fixture batchId 10000
+
+            // User leaves the community after uploading, before finalize re-checks membership.
+            do! fixture.SetChatMemberStatus(user.Id, "left")
+            do! fixture.InvalidateMembershipCache()
+
+            do! advancePastDebounce fixture
+            do! waitForBatchCleared fixture batchId 5000
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.False(
+                (bulkConfirmCalls calls user.Id).Length > 0,
+                "Expected no bulk-confirm sent to a user who left the community before finalize.")
+        }

@@ -204,8 +204,8 @@ let app = builder.Build()
     }))
 
 // Test-only hook to clear TelegramMembershipService's in-memory cache immediately.
-// Without this, IsMember(userId) keeps returning a stale cached verdict for up to a
-// day after COMMUNITY_CHAT_ID changes underneath it (MembershipService.fs's 1-day
+// Without this, IsMember(userId) keeps returning a stale cached verdict for up to
+// an hour after COMMUNITY_CHAT_ID changes underneath it (MembershipService.fs's
 // `expiry`), which made the membership-gate real test unable to observe a fresh
 // verdict without a full pod restart. 404 outside TestMode.
 %app.MapPost("/test/membership/invalidate", Func<HttpContext, IResult>(fun ctx ->

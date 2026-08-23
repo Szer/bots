@@ -22,6 +22,7 @@ type CouponFlowHandler(
     db: DbService,
     couponOcr: CouponOcrEngine,
     batchDebounce: BatchDebounce,
+    membership: TelegramMembershipService,
     time: TimeProvider,
     logger: ILogger<CouponFlowHandler>
 ) =
@@ -658,6 +659,12 @@ type CouponFlowHandler(
             match batchOpt with
             | None -> ()
             | Some batch ->
+                let! isMember = membership.IsMember(batch.user_id)
+                if not isMember then
+                    logger.LogWarning("Batch {BatchId} dropped: user {UserId} is not a community member", batchId, batch.user_id)
+                    do! db.ClearBatch batchId
+                else
+
                 let! items = db.GetBatchItems batchId
                 let itemCount = items.Length
                 if not (isNull a) then %a.SetTag("itemCount", itemCount)

@@ -26,7 +26,7 @@ type BotService(
     time: TimeProvider
 ) =
     let sendText = BotHelpers.sendText tg
-    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership sendText
+    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership logger sendText
 
     let handleCommunityMessage (msg: Message) =
         task {
@@ -181,7 +181,20 @@ type BotService(
                     update.UpdateId, update.Message.IsSome, update.CallbackQuery.IsSome)
                 match update.ChatMember, update.CallbackQuery, update.Message with
                 | Some chatMemberUpdated, _, _ ->
-                    membership.OnChatMemberUpdated(chatMemberUpdated)
+                    match membership.OnChatMemberUpdated(chatMemberUpdated) with
+                    | Some true ->
+                        // Registers the joining user so coupon history has a "user" row —
+                        // mirrors handlePrivateMessage's UpsertUser. Never done on leave/ban.
+                        let joinedUser = Tg.chatMemberUser chatMemberUpdated.NewChatMember
+                        do!
+                            { id = joinedUser.Id
+                              username = Option.toObj joinedUser.Username
+                              first_name = joinedUser.FirstName
+                              last_name = Option.toObj joinedUser.LastName
+                              created_at = time.GetUtcNow().UtcDateTime
+                              updated_at = time.GetUtcNow().UtcDateTime }
+                            |> db.UpsertUser |> taskIgnore
+                    | _ -> ()
                 | None, Some cq, _ ->
                     do! callbackHandler.HandleCallbackQuery cq
                 | None, None, Some msg ->

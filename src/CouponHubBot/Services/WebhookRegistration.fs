@@ -35,9 +35,15 @@ type WebhookRegistrationService
                 if not (String.IsNullOrWhiteSpace url) then
                     // drop_pending_updates=true: a prior run's queued updates must not
                     // leak into a fresh run's real-Telegram assertions.
+                    // allowedUpdates: codifies the current live production value so it
+                    // no longer depends on an out-of-band Telegram setting.
+                    let allowedUpdates =
+                        [| "message"; "edited_message"; "inline_query"; "chosen_inline_result"
+                           "callback_query"; "my_chat_member"; "chat_member"; "chat_join_request" |]
                     let req =
                         Funogram.Telegram.Req.SetWebhook.Make(
                             url,
+                            allowedUpdates = allowedUpdates,
                             dropPendingUpdates = true,
                             secretToken = options.Value.SecretToken)
 
