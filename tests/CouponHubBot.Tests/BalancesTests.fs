@@ -69,6 +69,45 @@ ON CONFLICT (id) DO NOTHING;
         let sepIdx = lines |> Array.findIndex (fun l -> l.Length > 0 && l |> Seq.forall (fun c -> c = '-' || c = '|'))
         lines[sepIdx + 1]
 
+    /// Splits a rendered row "| a | b | c |" into trimmed per-column cell contents
+    /// (columns are split, not composite "cnt·sum" cells — see formatBalancesTable).
+    let cellsOfRow (row: string) =
+        let parts = row.Split('|')
+        parts.[1 .. parts.Length - 2] |> Array.map (fun (s: string) -> s.Trim())
+
+    /// Column order: id, user, з#, з€, в#, в€, б#, б€, ан, рп.
+    let findRowForUser (text: string) (userId: int64) =
+        let lines = text.Replace("<pre>", "").Replace("</pre>", "").Split('\n')
+        lines
+        |> Array.tryFind (fun l -> l.StartsWith("| ") && (cellsOfRow l).[0] = string userId)
+        |> Option.map cellsOfRow
+
+    /// Fetches a rendered /balances page via the ◀/▶/sort callback path.
+    let getBalancesPageText (admin: User) (page: int) (sortToken: string) =
+        task {
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(dmCallbackAt $"balances:{page}:{sortToken}" admin (nextUpdateId()))
+            let! edits = fixture.GetFakeCalls("editMessageText")
+            use doc = JsonDocument.Parse(edits[0].Body)
+            return doc.RootElement.GetProperty("text").GetString()
+        }
+
+    /// Scans every /balances page for `userId`'s row — the shared assembly-wide fixture makes
+    /// the target's page number unpredictable, so this walks pages instead of assuming page 1.
+    let findRowAcrossPages (admin: User) (sortToken: string) (userId: int64) =
+        task {
+            let! page1 = getBalancesPageText admin 1 sortToken
+            let totalMatch = Regex.Match(page1, @"Стр\. 1/(\d+)")
+            let totalPages = if totalMatch.Success then int totalMatch.Groups[1].Value else 1
+            let mutable found = findRowForUser page1 userId
+            let mutable p = 2
+            while found.IsNone && p <= totalPages do
+                let! text = getBalancesPageText admin p sortToken
+                found <- findRowForUser text userId
+                p <- p + 1
+            return found
+        }
+
     let inlineButtons (body: string) =
         use doc = JsonDocument.Parse(body)
         match doc.RootElement.TryGetProperty("reply_markup") with
@@ -134,9 +173,14 @@ ON CONFLICT (id) DO NOTHING;
             Assert.True(idxWorst >= 0 && idxMid >= 0, "Both seeded debtors should appear on page 1")
             Assert.True(idxWorst < idxMid, "Bigger debtor should render before a smaller debtor")
 
-            // Values rendered as "cnt·sum€".
-            Assert.Contains("1·90000€", text) // takerPoor: taken 1x90000
-            Assert.Contains("-1·-90000€", text) // takerPoor: balance = 0 added - 1 taken, 0 - 90000€
+            // Count and sum are separate columns (в#/в€, б#/б€), not composite "cnt·sum" cells.
+            match findRowForUser text takerPoor.Id with
+            | Some cells ->
+                Assert.Equal("1", cells[4])       // в# — taken 1x90000
+                Assert.Equal("90000", cells[5])    // в€
+                Assert.Equal("-1", cells[6])       // б# = 0 added - 1 taken
+                Assert.Equal("-90000", cells[7])   // б€ = 0 - 90000
+            | None -> Assert.True(false, "takerPoor row not found on page 1")
 
             let sendCall = calls |> Array.find (fun c -> (parseCallBody c.Body |> Option.bind (fun p -> p.Text)) = Some text)
             let buttons = inlineButtons sendCall.Body
@@ -294,6 +338,81 @@ ON CONFLICT (id) DO NOTHING;
             Assert.Equal(lines1.Length, lines2.Length)
             for i in 2 .. lines1.Length - 1 do
                 Assert.Equal(lines1[i].Length, lines2[i].Length)
+        }
+
+    [<Fact>]
+    let ``Take-then-return nets to zero in /balances (в#/в€/б#/б€) and /whois`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(username = "bal_return_owner", firstName = "ReturnOwner")
+            let taker = Tg.user(username = "bal_return_taker", firstName = "ReturnTaker")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/return {couponId}", taker))
+
+            let! rowOpt = findRowAcrossPages admin "balance" taker.Id
+            match rowOpt with
+            | Some cells ->
+                Assert.Equal("0", cells[4]) // в# — 1 take, 1 return, nets to 0
+                Assert.Equal("0", cells[5]) // в€
+                Assert.Equal("0", cells[6]) // б# — taker never added anything either
+                Assert.Equal("0", cells[7]) // б€
+            | None -> Assert.True(false, "taker row not found across any /balances page")
+
+            do! fixture.ClearFakeCalls()
+            let! whoisResp = fixture.SendUpdate(Tg.dmMessage($"/whois {taker.Id}", admin))
+            Assert.Equal(HttpStatusCode.OK, whoisResp.StatusCode)
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let whoisText =
+                calls
+                |> Array.tryPick (fun c ->
+                    match parseCallBody c.Body with
+                    | Some parsed when parsed.ChatId = Some adminId && parsed.Text.IsSome && parsed.Text.Value.Contains("<pre>") -> parsed.Text
+                    | _ -> None)
+            Assert.True(whoisText.IsSome, "Admin should get a /whois reply for the taker")
+            Assert.Contains("Взято: 0 · 0€", whoisText.Value)
+            Assert.Contains("Баланс: 0 · 0€", whoisText.Value)
+        }
+
+    [<Fact>]
+    let ``Voided/reported coupons count against the OWNER, not the voiding admin or the reporter`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(username = "bal_owner_flags", firstName = "OwnerFlags")
+            let taker = Tg.user(username = "bal_taker_flags", firstName = "TakerFlags")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            // owner adds two coupons: one gets voided by the ADMIN (not the owner), one gets
+            // taken then reported by the TAKER.
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! voidedCouponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 20 60 2026-01-25", owner))
+            let! reportedCouponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/void {voidedCouponId}", admin))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {reportedCouponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/report {reportedCouponId}", taker))
+
+            let! rowOpt = findRowAcrossPages admin "balance" owner.Id
+            match rowOpt with
+            | Some cells ->
+                Assert.Equal("1", cells[8]) // ан — 'voided' event carries the owner's user_id already, even though the admin acted
+                Assert.Equal("1", cells[9]) // рп — 'reported' event carries the taker's user_id; joined via coupon.owner_id to land on the owner
+            | None -> Assert.True(false, "owner row not found across any /balances page")
         }
 
     [<Fact>]

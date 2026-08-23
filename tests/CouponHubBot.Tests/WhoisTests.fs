@@ -59,6 +59,39 @@ type WhoisTests(fixture: DefaultCouponHubTestContainers) =
         }
 
     [<Fact>]
+    let ``Whois Взято nets to zero for a take-then-return (matches /balances semantics)`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(id = 747L, username = "whois_return_owner", firstName = "Owner")
+            let target = Tg.user(id = 748L, username = "whois_return_taker", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", target))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/return {couponId}", target))
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage($"/whois {target.Id}", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let whoisResponse = findWhoisReply calls
+            Assert.True(whoisResponse.IsSome, "Admin should get a /whois reply with a <pre> block")
+            let text = whoisResponse.Value
+
+            // 'returned' nets the 'taken' event out (both count and sum) — a take-then-return
+            // must not show up as a debt, here or in /balances.
+            Assert.Contains("Взято: 0 · 0€", text)
+            Assert.Contains("Баланс: 0 · 0€", text)
+        }
+
+    [<Fact>]
     let ``Admin whois by username resolves case-insensitively`` () =
         task {
             do! fixture.ClearFakeCalls()
