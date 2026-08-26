@@ -40,6 +40,7 @@
         <Compile Include="SpamTextCacheTests.fs" />
         <Compile Include="SpamWarningTests.fs" />
         <Compile Include="SpamProtectionTests.fs" />
+        <Compile Include="SettingsNotifyTests.fs" />
         <Compile Include="Program.fs"/>
     </ItemGroup>
 

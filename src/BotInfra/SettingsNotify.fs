@@ -1,0 +1,88 @@
+namespace BotInfra
+
+open System
+open System.Threading
+open System.Threading.Tasks
+open Npgsql
+open Microsoft.Extensions.Hosting
+open Microsoft.Extensions.Logging
+
+/// Cross-pod settings propagation via Postgres LISTEN/NOTIFY. Each bot has its own database
+/// (Azure Flexible Server), so one constant channel name is safe per bot. No payload — every
+/// listener just re-runs the bot's own `reloadSettings` and re-reads `bot_setting` fresh.
+module SettingsNotify =
+
+    [<Literal>]
+    let Channel = "bot_settings_changed"
+
+    /// Fires `NOTIFY bot_settings_changed` on the bot's own connection string. Callers run
+    /// this after their local `reloadSettings()` has already applied the change, so a
+    /// notifying pod reloading twice (once locally, once via its own notification) is fine.
+    let notifySettingsChanged (connString: string) : Task =
+        task {
+            use conn = new NpgsqlConnection(connString)
+            do! conn.OpenAsync()
+            use cmd = new NpgsqlCommand($"NOTIFY {Channel}", conn)
+            let! _ = cmd.ExecuteNonQueryAsync()
+            ()
+        }
+        :> Task
+
+/// Hosted background service holding a dedicated LISTEN connection. Runs `reload` once right
+/// after every successful (re)connect — closing the window between a connection drop and the
+/// next NOTIFY — and again on every notification received while connected. Never crashes the
+/// host on a DB blip: connection failures are caught and retried with capped exponential
+/// backoff; the up/down transition is logged once (Information), not per retry attempt.
+type SettingsListenerHostedService
+    (
+        connString: string,
+        reload: unit -> Task,
+        logger: ILogger<SettingsListenerHostedService>,
+        ?minBackoff: TimeSpan,
+        ?maxBackoff: TimeSpan
+    ) =
+    inherit BackgroundService()
+
+    let minBackoff = defaultArg minBackoff (TimeSpan.FromSeconds 1.0)
+    let maxBackoff = defaultArg maxBackoff (TimeSpan.FromSeconds 30.0)
+
+    /// One connect-LISTEN-loop lifecycle; returns (via exception) when the connection drops
+    /// or `ct` is cancelled. `wasDown` picks the log line's wording for the transition.
+    let runOnce (ct: CancellationToken) (wasDown: bool) : Task =
+        task {
+            use conn = new NpgsqlConnection(connString)
+            do! conn.OpenAsync(ct)
+            use listenCmd = new NpgsqlCommand($"LISTEN {SettingsNotify.Channel}", conn)
+            let! _ = listenCmd.ExecuteNonQueryAsync(ct)
+            if wasDown then
+                logger.LogInformation("SettingsListener: reconnected, listening on {Channel}", SettingsNotify.Channel)
+            else
+                logger.LogInformation("SettingsListener: listening on {Channel}", SettingsNotify.Channel)
+            // Closes the missed-notification window: a NOTIFY sent while this pod was
+            // disconnected would otherwise never be observed.
+            do! reload()
+            while not ct.IsCancellationRequested do
+                do! conn.WaitAsync(ct)
+                do! reload()
+        }
+        :> Task
+
+    override _.ExecuteAsync(ct: CancellationToken) =
+        task {
+            let mutable backoff = minBackoff
+            let mutable isDown = false
+            while not ct.IsCancellationRequested do
+                try
+                    do! runOnce ct isDown
+                    isDown <- false
+                    backoff <- minBackoff
+                with
+                | :? OperationCanceledException -> ()
+                | ex when not ct.IsCancellationRequested ->
+                    if not isDown then
+                        logger.LogWarning(ex, "SettingsListener: connection lost, reconnecting with backoff")
+                        isDown <- true
+                    do! Task.Delay(backoff, ct)
+                    backoff <- TimeSpan.FromSeconds(min maxBackoff.TotalSeconds (backoff.TotalSeconds * 2.0))
+        }
+        :> Task

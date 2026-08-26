@@ -86,6 +86,11 @@ let reloadSettings () =
     botConfOptions.Set(fresh)
     botOcrOptions.Set(ocrConfigOf fresh)
 
+/// Publishes the local reload to every other pod via Postgres LISTEN/NOTIFY. Callers run
+/// this AFTER reloadSettings() has already applied the change locally — this pod's own
+/// listener re-running reloadSettings() a second time on its own notification is harmless.
+let notifyOtherPods () = SettingsNotify.notifySettingsChanged connString
+
 let webhookCfg: WebhookConfig =
     let c = botConfOptions.Value
     { BotToken = c.BotToken
@@ -153,6 +158,13 @@ if botConfOptions.Value.TestMode then
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
+    // Cross-pod propagation: LISTEN on a dedicated connection, re-running reloadSettings()
+    // on every NOTIFY and after every (re)connect.
+    .AddHostedService<SettingsListenerHostedService>(fun sp ->
+        new SettingsListenerHostedService(
+            connString,
+            (fun () -> task { reloadSettings() }),
+            sp.GetRequiredService<ILogger<SettingsListenerHostedService>>()))
 
 let app = builder.Build()
 
@@ -235,13 +247,17 @@ SettingsDump.mapConfigDumpEndpoint
     app
 
 // Reload settings endpoint
-%app.MapPost("/reload-settings", Func<HttpContext, IResult>(fun ctx ->
-    if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
-        Results.Text("Access Denied", statusCode = 401)
-    else
-        reloadSettings()
-        ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
-        Results.Ok "Settings reloaded"
+%app.MapPost("/reload-settings", Func<HttpContext, Task<IResult>>(fun ctx ->
+    task {
+        if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
+            return Results.Text("Access Denied", statusCode = 401)
+        else
+            reloadSettings()
+            // NOTIFY other pods so a single /reload-settings call takes effect bot-wide.
+            do! notifyOtherPods()
+            ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
+            return Results.Ok "Settings reloaded"
+    }
 ))
 
 // Main webhook endpoint with bot-specific update handling
