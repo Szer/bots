@@ -18,6 +18,18 @@ module CouponScheduledJobs =
     [<Literal>]
     let ReminderJobName = "reminder_daily"
 
+    /// One-shot TEST_MODE override for the reminder job's "now" — set by
+    /// `/test/run-reminder`'s optional `?nowUtc=` immediately before triggering
+    /// `RunJobNow`, consumed (and cleared) by the very next run of this job.
+    /// Deliberately NOT a shared-clock move (no `FakeTimeProvider.AdjustTime`):
+    /// that would persist across every later test sharing the same fixture,
+    /// silently breaking any test whose "today" assumption (`fixture.
+    /// FixedToday`) no longer matches the moved clock. Safe under TEST_MODE's
+    /// sequential test execution only — concurrent triggers would race.
+    let mutable testNowOverride: DateTime option = None
+
+    let setTestNowOverride (value: DateTime option) = testNowOverride <- value
+
     /// `REMINDER_HOUR_DUBLIN` is hot-reloadable, so this is recomputed fresh on
     /// every tick/acquire rather than captured once. Dublin's UTC offset (GMT
     /// vs IST) depends on today's date, not a fixed value, so the conversion
@@ -37,7 +49,12 @@ module CouponScheduledJobs =
         : ScheduledJobs.JobDefinition list =
         [ { Name = ReminderJobName
             ScheduledTimeUtc = reminderScheduledTimeUtc time options
-            Run = fun () -> reminder.RunOnce() :> Task } ]
+            Run = fun () ->
+                task {
+                    let nowUtc = testNowOverride
+                    testNowOverride <- None
+                    do! reminder.RunOnce(?nowUtc = nowUtc) :> Task
+                } :> Task } ]
 
 /// `REMINDER_RUN_ON_START` catch-up: on pod startup, tries the SAME
 /// `reminder_daily` lease the scheduled tick uses (via the low-level

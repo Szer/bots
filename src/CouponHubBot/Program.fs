@@ -222,9 +222,10 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
 // uses). Fire-and-forget on the bot side: this returns as soon as the job is
 // kicked off, not once it's finished — callers poll for the job's effects
 // (GetFakeCalls / scheduled_job.last_completed_at), same as AlitaBot's tests.
-// An optional ?nowUtc= moves the shared FakeTimeProvider via AdjustTime
-// (leaves outstanding timers alone, unlike Advance/SetUtcNow) so date-sensitive
-// assertions (Monday leaderboard, overdue-coupon boundaries) stay controllable.
+// An optional ?nowUtc= sets CouponScheduledJobs' one-shot test override
+// (consumed by the very next run) rather than moving the shared
+// FakeTimeProvider — moving the shared clock would persist across every LATER
+// test sharing this fixture, silently breaking their "today" assumptions.
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
@@ -232,13 +233,11 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
             return Results.NotFound()
         else
             if ctx.Request.Query.ContainsKey("nowUtc") then
-                let fake = ctx.RequestServices.GetService<FakeTimeProvider>()
-                if not (isNull (box fake)) then
-                    try
-                        let raw = string ctx.Request.Query["nowUtc"]
-                        let nowUtc = DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
-                        fake.AdjustTime(DateTimeOffset(nowUtc, TimeSpan.Zero))
-                    with _ -> ()
+                try
+                    let raw = string ctx.Request.Query["nowUtc"]
+                    let nowUtc = DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
+                    CouponScheduledJobs.setTestNowOverride (Some nowUtc)
+                with _ -> ()
 
             let scheduler = ctx.RequestServices.GetRequiredService<SchedulerHostedService>()
             do! scheduler.RunJobNow(CouponScheduledJobs.ReminderJobName)

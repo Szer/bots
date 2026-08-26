@@ -19,15 +19,23 @@ open FakeCallHelpers
 /// instead of trusting the POST to have completed synchronously.
 type ReminderTests(fixture: DefaultCouponHubTestContainers) =
 
-    let waitForReminderCompletion (beforeUtc: DateTime) (timeoutMs: int) =
+    let lastCompletedAt () =
+        fixture.QuerySingleOrDefault<Nullable<DateTime>>(
+            "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'", null)
+
+    /// Polls until `last_completed_at` differs from the snapshot taken before
+    /// triggering — a value CHANGE, not "greater than a host-side timestamp":
+    /// the poller runs on the test host while the write happens inside the bot
+    /// container, and comparing across those two clocks is exactly the kind of
+    /// cross-clock assumption that bit BatchDebounce (see FinalizeBatch's own
+    /// comment) — don't repeat it here.
+    let waitForReminderCompletion (before: Nullable<DateTime>) (timeoutMs: int) =
         task {
             let sw = Stopwatch.StartNew()
             let mutable completed = false
             while not completed && sw.ElapsedMilliseconds < int64 timeoutMs do
-                let! completedAt =
-                    fixture.QuerySingleOrDefault<Nullable<DateTime>>(
-                        "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'", null)
-                completed <- completedAt.HasValue && completedAt.Value > beforeUtc
+                let! completedAt = lastCompletedAt ()
+                completed <- completedAt.HasValue && completedAt <> before
                 if not completed then do! Task.Delay 25
             if not completed then
                 failwith $"Timeout: reminder_daily did not complete after {timeoutMs}ms"
@@ -40,7 +48,7 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
     /// reported "now" moves, so date-sensitive assertions stay controllable.
     let runReminder (nowUtc: string option) =
         task {
-            let beforeUtc = DateTime.UtcNow
+            let! before = lastCompletedAt ()
             let path =
                 match nowUtc with
                 | Some raw -> $"/test/run-reminder?nowUtc={raw}"
@@ -50,7 +58,7 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
             if not resp.IsSuccessStatusCode then
                 let! text = resp.Content.ReadAsStringAsync()
                 failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
-            do! waitForReminderCompletion beforeUtc 5000
+            do! waitForReminderCompletion before 5000
         }
 
     [<Theory>]
