@@ -156,7 +156,29 @@ if botConfOptions.Value.TestMode then
     .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
-    .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
+    // The reminder's daily run is gated by BotInfra's scheduled_job lease (see
+    // coupon-hub-bot/migrations) so exactly one pod sends it, not one per pod.
+    // SchedulerHostedService needs `connString` directly (ScheduledJobs' lease functions are
+    // plain functions over a connection string, like DbService itself), so it's built via a
+    // factory closure rather than constructor-parameter DI.
+    .AddSingleton<SchedulerHostedService>(fun sp ->
+        new SchedulerHostedService(
+            connString,
+            sp.GetRequiredService<TimeProvider>(),
+            CouponScheduledJobs.jobDefinitions
+                (sp.GetRequiredService<ReminderService>())
+                (sp.GetRequiredService<IOptions<BotConfiguration>>())
+                (sp.GetRequiredService<TimeProvider>()),
+            TimeSpan.FromMinutes 5.0,
+            sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
+    .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
+    .AddHostedService<ReminderRunOnStartService>(fun sp ->
+        ReminderRunOnStartService(
+            connString,
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<IOptions<BotConfiguration>>(),
+            sp.GetRequiredService<ReminderService>(),
+            sp.GetRequiredService<ILogger<ReminderRunOnStartService>>()))
     .AddHostedService<SettingsListenerHostedService>(fun sp ->
         new SettingsListenerHostedService(
             connString,
@@ -195,27 +217,32 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
                 return Results.Json({| ok = true; advancedMs = ms |})
     }))
 
-// Test-only hook to trigger reminder immediately
+// Test-only hook to trigger the reminder job immediately, bypassing the lease
+// (SchedulerHostedService.RunJobNow — same bypass AlitaBot's /test/run-job
+// uses). Fire-and-forget on the bot side: this returns as soon as the job is
+// kicked off, not once it's finished — callers poll for the job's effects
+// (GetFakeCalls / scheduled_job.last_completed_at), same as AlitaBot's tests.
+// An optional ?nowUtc= moves the shared FakeTimeProvider via AdjustTime
+// (leaves outstanding timers alone, unlike Advance/SetUtcNow) so date-sensitive
+// assertions (Monday leaderboard, overdue-coupon boundaries) stay controllable.
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
         if not opts.Value.TestMode then
             return Results.NotFound()
         else
-            let runner = ctx.RequestServices.GetRequiredService<ReminderService>()
-            let timeProvider = ctx.RequestServices.GetRequiredService<TimeProvider>()
-            let nowUtc =
-                if ctx.Request.Query.ContainsKey("nowUtc") then
+            if ctx.Request.Query.ContainsKey("nowUtc") then
+                let fake = ctx.RequestServices.GetService<FakeTimeProvider>()
+                if not (isNull (box fake)) then
                     try
                         let raw = string ctx.Request.Query["nowUtc"]
-                        DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
-                    with _ ->
-                        timeProvider.GetUtcNow().UtcDateTime
-                else
-                    timeProvider.GetUtcNow().UtcDateTime
+                        let nowUtc = DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
+                        fake.AdjustTime(DateTimeOffset(nowUtc, TimeSpan.Zero))
+                    with _ -> ()
 
-            let! sent = runner.RunOnce(nowUtc)
-            return Results.Json({| ok = true; sent = sent |})
+            let scheduler = ctx.RequestServices.GetRequiredService<SchedulerHostedService>()
+            do! scheduler.RunJobNow(CouponScheduledJobs.ReminderJobName)
+            return Results.Json({| started = CouponScheduledJobs.ReminderJobName |}, statusCode = 202)
     }))
 
 // Test-only hook to clear TelegramMembershipService's in-memory cache immediately.
