@@ -1,0 +1,87 @@
+namespace MultiPodTests
+
+open System
+open System.Diagnostics
+open System.Threading.Tasks
+open BotTestInfra
+open MultiPodTests.FakeCallHelpers
+open Npgsql
+open Dapper
+open Xunit
+
+/// Proves ReminderService's multi-pod lease at the process level: TWO real
+/// CouponHubBot instances, each running their own BotInfra.SchedulerHostedService,
+/// race the SAME `reminder_daily` row when their clocks cross the scheduled slot —
+/// not `/test/run-reminder`'s RunJobNow, which bypasses the lease entirely and
+/// would prove nothing about it.
+///
+/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin) rather than pinned to
+/// a determinism-proof value — the scheduled UTC time-of-day this produces is
+/// satisfiable for most of the UTC day (~09:00 UTC onward in summer, ~10:00 UTC
+/// onward in winter) but not literally 24/7; this test assumes it runs outside
+/// that early-UTC-morning window, same as CI/dev traffic patterns normally do.
+type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
+
+    [<Fact>]
+    let ``Reminder lease: two instances ticking past the scheduled slot produce exactly one community post`` () = task {
+        do! fixture.ClearFakeCalls()
+
+        use conn = new NpgsqlConnection(fixture.DbConnectionString)
+        do! conn.OpenAsync()
+
+        // "Today" per each instance's own FakeTimeProvider, which starts at real
+        // wall-clock "now" (this fixture seeds no BOT_FIXED_UTC_NOW) — the test
+        // host's UTC date matches as long as the run doesn't straddle midnight UTC.
+        let todayIso = DateTime.UtcNow.Date.ToString("yyyy-MM-dd")
+        let! _ =
+            conn.ExecuteAsync(
+                """INSERT INTO "user"(id, username, first_name, created_at, updated_at)
+                   VALUES (960001,'lease_owner','LeaseOwner',NOW(),NOW()) ON CONFLICT (id) DO NOTHING;""")
+        let! _ =
+            conn.ExecuteAsync(
+                """INSERT INTO coupon(owner_id, photo_file_id, value, min_check, expires_at, status)
+                   VALUES (960001,'lease-photo-1',10.00,50.00,@today::date,'available')
+                   ON CONFLICT DO NOTHING;""",
+                {| today = todayIso |})
+
+        // Reset the lease row so this test doesn't depend on run order relative to
+        // other tests sharing this fixture (e.g. an earlier /test/run-reminder call).
+        let! _ =
+            conn.ExecuteAsync(
+                "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
+
+        // Push BOTH instances' clocks past CouponScheduledJobs' 5-minute tick
+        // interval (Program.fs's SchedulerHostedService registration) so both
+        // SchedulerHostedServices actually tick and both attempt tryAcquire against
+        // the same row — this is the natural production race, not a bypass.
+        do! fixture.AdvanceAllClocks(6 * 60 * 1000)
+
+        let expectedText = "Сегодня истекает 1 купон на сумму"
+        let sw = Stopwatch.StartNew()
+        let mutable matchCount = 0
+        while matchCount = 0 && sw.ElapsedMilliseconds < 15000L do
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            matchCount <- countCallsWithText calls fixture.CommunityChatId expectedText
+            if matchCount = 0 then do! Task.Delay 200
+        Assert.True(matchCount > 0, $"Timeout: no reminder post matching '{expectedText}' after 15000ms")
+
+        // Dedupe by content: if BOTH pods had won the lease, this would be 2.
+        Assert.Equal(1, matchCount)
+
+        // DB evidence: the lease was completed (last_completed_at set from NULL).
+        let! completedAt =
+            conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(
+                "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
+        Assert.True(completedAt.HasValue, "Expected reminder_daily.last_completed_at to be set after the tick")
+
+        // Process-level evidence: exactly one instance's own log shows it won
+        // tryAcquire (BotInfra.ScheduledJobs' "ScheduledJobs: acquired {Job}" line) —
+        // the other instance's tick must have seen the lease already held/expired-not.
+        let! log0 = fixture.GetBotLogs(0)
+        let! log1 = fixture.GetBotLogs(1)
+        let acquiredCount =
+            [ log0; log1 ]
+            |> List.filter (fun l -> l.Contains "ScheduledJobs: acquired reminder_daily")
+            |> List.length
+        Assert.Equal(1, acquiredCount)
+    }

@@ -16,6 +16,8 @@
         <Compile Include="VahterMultiPodSmokeTests.fs" />
         <Compile Include="VahterMultiPodFeatureTests.fs" />
         <Compile Include="CouponMultiPodSmokeTests.fs" />
+        <Compile Include="CouponMultiPodReminderLeaseTests.fs" />
+        <Compile Include="CouponMultiPodDebounceTests.fs" />
         <Compile Include="VahterSettingsPropagationTests.fs" />
         <Compile Include="CouponSettingsPropagationTests.fs" />
         <Compile Include="CouponSettingsReconnectTests.fs" />

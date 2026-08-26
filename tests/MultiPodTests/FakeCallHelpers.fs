@@ -28,3 +28,33 @@ module FakeCallHelpers =
                 && (tryGetString root "text" |> Option.exists (fun t -> t.Contains substring)
                     || tryGetString root "caption" |> Option.exists (fun c -> c.Contains substring))
             with _ -> false)
+
+    /// Count of calls whose body has the given chat_id and text/caption containing
+    /// `substring` — used to dedupe cross-pod sends by content, since FakeTgApi's call
+    /// log carries no instance identity (both pods' HTTP calls land in the same log).
+    let countCallsWithText (calls: FakeCall array) (chatId: int64) (substring: string) : int =
+        calls
+        |> Array.filter (fun call ->
+            try
+                use doc = JsonDocument.Parse(call.Body)
+                let root = doc.RootElement
+                tryGetInt64 root "chat_id" = Some chatId
+                && (tryGetString root "text" |> Option.exists (fun t -> t.Contains substring)
+                    || tryGetString root "caption" |> Option.exists (fun c -> c.Contains substring))
+            with _ -> false)
+        |> Array.length
+
+    /// Calls that look like the album bulk-confirm message (either "Подтвердить N купонов:"
+    /// or the all-failed "Не смог распознать ни одного") to a given chat — same convention
+    /// as CouponHubBot.Tests/BatchTestHelpers.fs's bulkConfirmCalls.
+    let bulkConfirmCallCount (calls: FakeCall array) (chatId: int64) : int =
+        calls
+        |> Array.filter (fun call ->
+            try
+                use doc = JsonDocument.Parse(call.Body)
+                let root = doc.RootElement
+                tryGetInt64 root "chat_id" = Some chatId
+                && (tryGetString root "text"
+                    |> Option.exists (fun t -> t.Contains "Подтвердить" || t.Contains "Не смог распознать ни одного"))
+            with _ -> false)
+        |> Array.length
