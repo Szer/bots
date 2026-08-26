@@ -1,6 +1,7 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -222,6 +223,16 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
         membership.InvalidateCache()
         Results.Json({| ok = true |})
 ))
+
+// Config dump: live effective BotConfiguration as JSON, secret fields (token/key) redacted
+// via BotInfra.SettingsDump. Gated the same as /reload-settings (auth-token header) — coupon
+// has no route-level admin/user auth beyond that shared secret.
+SettingsDump.mapConfigDumpEndpoint
+    (WebhookHost.validateApiKey webhookCfg.SecretToken)
+    (fun () ->
+        let opts = app.Services.GetRequiredService<IOptions<BotConfiguration>>()
+        SettingsDump.toJson (JsonSerializerOptions()) opts.Value)
+    app
 
 // Reload settings endpoint
 %app.MapPost("/reload-settings", Func<HttpContext, IResult>(fun ctx ->
