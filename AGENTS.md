@@ -67,6 +67,7 @@ scripts/
 - **Prefer black-box integration tests** — send HTTP to bot pod, observe behavior (messages sent/deleted, bans applied). Do NOT write unit tests against internal implementation.
 - Tests use xUnit v3 with assembly fixtures and Testcontainers (PostgreSQL, Flyway, FakeTgApi, bot)
 - When debugging runtime errors, write a minimal repro test FIRST, then fix. Don't exhaustively query databases.
+- `tests/MultiPodTests` (PR gate, `multipod-build.yml`) proves the multi-instance harness (`BotTestInfra.MultiPodContainerBase`) that cross-pod feature tests (settings propagation, reminder lease, debounce, spam-text) build on — one 2-instance VahterBanBot fixture and one 2-instance CouponHubBot fixture, smoke-tested only. Run with `dotnet test tests/MultiPodTests -c Release`.
 
 ### Real/paid tests — explicit opt-in required, never automated
 

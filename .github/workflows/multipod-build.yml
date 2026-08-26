@@ -1,0 +1,14 @@
+name: "MultiPod: Build"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/_bot-build.yml
+    with:
+      test-command: |
+        dotnet test tests/MultiPodTests/MultiPodTests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
+      bot-paths-regex: '^(src/(BotInfra|VahterBanBot|CouponHubBot)/|src/Dockerfile\.bot$|tests/(MultiPodTests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'

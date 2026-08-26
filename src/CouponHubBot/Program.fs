@@ -1,6 +1,7 @@
 // CouponHubBot — Telegram coupon management bot
 open System
 open System.Globalization
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
@@ -221,6 +222,16 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
         let membership = ctx.RequestServices.GetRequiredService<TelegramMembershipService>()
         membership.InvalidateCache()
         Results.Json({| ok = true |})
+))
+
+// Test-only settings dump: live effective BotConfiguration as JSON, secret fields (token/key)
+// redacted via BotInfra.SettingsDump. 404 outside TestMode, same gate as the other /test/* routes.
+%app.MapGet("/test/settings/dump", Func<HttpContext, IResult>(fun ctx ->
+    let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+    if not opts.Value.TestMode then
+        Results.NotFound()
+    else
+        Results.Text(SettingsDump.toJson (JsonSerializerOptions()) opts.Value, "application/json")
 ))
 
 // Reload settings endpoint
