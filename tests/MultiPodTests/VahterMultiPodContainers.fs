@@ -92,7 +92,7 @@ type VahterMultiPodContainers() =
             let pollInterval = TimeSpan.FromMilliseconds 500.0
             let deadline = DateTime.UtcNow.Add(TimeSpan.FromMinutes 3.0)
             for i in 0 .. this.InstanceCount - 1 do
-                let http = this.BotHttp(i)
+                let http = this.BotHttpAt(i)
                 let mutable ready = false
                 while not ready && DateTime.UtcNow < deadline do
                     try

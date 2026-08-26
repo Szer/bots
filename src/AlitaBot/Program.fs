@@ -2,6 +2,7 @@
 open System
 open System.Diagnostics
 open System.Globalization
+open System.Text.Json
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Http
@@ -303,6 +304,13 @@ let app = builder.Build()
         ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
         Results.Ok "Settings reloaded"
 ))
+
+// Config dump: live effective BotConfiguration as JSON, secret fields (token/key) redacted
+// via BotInfra.SettingsDump. Gated the same as /reload-settings (auth-token header).
+SettingsDump.mapConfigDumpEndpoint
+    (WebhookHost.validateApiKey webhookCfg.SecretToken)
+    (fun () -> SettingsDump.toJson (JsonSerializerOptions()) (app.Services.GetRequiredService<IOptions<BotConfiguration>>().Value))
+    app
 
 // Main webhook endpoint with bot-specific update handling
 WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx rawBody update ->

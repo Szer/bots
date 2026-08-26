@@ -224,15 +224,15 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
         Results.Json({| ok = true |})
 ))
 
-// Test-only settings dump: live effective BotConfiguration as JSON, secret fields (token/key)
-// redacted via BotInfra.SettingsDump. 404 outside TestMode, same gate as the other /test/* routes.
-%app.MapGet("/test/settings/dump", Func<HttpContext, IResult>(fun ctx ->
-    let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
-    if not opts.Value.TestMode then
-        Results.NotFound()
-    else
-        Results.Text(SettingsDump.toJson (JsonSerializerOptions()) opts.Value, "application/json")
-))
+// Config dump: live effective BotConfiguration as JSON, secret fields (token/key) redacted
+// via BotInfra.SettingsDump. Gated the same as /reload-settings (auth-token header) — coupon
+// has no route-level admin/user auth beyond that shared secret.
+SettingsDump.mapConfigDumpEndpoint
+    (WebhookHost.validateApiKey webhookCfg.SecretToken)
+    (fun () ->
+        let opts = app.Services.GetRequiredService<IOptions<BotConfiguration>>()
+        SettingsDump.toJson (JsonSerializerOptions()) opts.Value)
+    app
 
 // Reload settings endpoint
 %app.MapPost("/reload-settings", Func<HttpContext, IResult>(fun ctx ->

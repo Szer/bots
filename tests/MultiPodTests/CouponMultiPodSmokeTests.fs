@@ -1,7 +1,6 @@
 namespace MultiPodTests
 
 open System.Net
-open System.Text.Json
 open BotTestInfra
 open MultiPodTests.FakeCallHelpers
 open Xunit
@@ -12,11 +11,7 @@ open Xunit
 type CouponMultiPodSmokeTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]
-    let ``Both instances become ready`` () = task {
-        for i in 0 .. fixture.InstanceCount - 1 do
-            let! resp = fixture.BotHttp(i).GetAsync("/ready")
-            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
-    }
+    let ``Both instances become ready`` () = SmokeHelpers.assertAllInstancesReady fixture
 
     [<Fact>]
     let ``Webhook update to each instance produces FakeTgApi traffic`` () = task {
@@ -38,15 +33,9 @@ type CouponMultiPodSmokeTests(fixture: CouponMultiPodContainers) =
     }
 
     [<Fact>]
-    let ``Settings dump is 200, parses, and never leaks the secret token on either instance`` () = task {
-        for i in 0 .. fixture.InstanceCount - 1 do
-            let! json = fixture.GetSettingsDump(i)
-            use doc = JsonDocument.Parse(json)
-            let root = doc.RootElement
-            Assert.Equal(fixture.CommunityChatId, root.GetProperty("CommunityChatId").GetInt64())
-            Assert.True(root.GetProperty("BotToken").GetProperty("present").GetBoolean())
-            Assert.DoesNotContain("123:456", json)
-    }
+    let ``Settings dump is 200, parses, and never leaks the secret token on either instance`` () =
+        SmokeHelpers.assertSettingsDumpAuthorizedAndRedacted fixture "123:456" (fun root ->
+            Assert.Equal(fixture.CommunityChatId, root.GetProperty("CommunityChatId").GetInt64()))
 
     [<Fact>]
     let ``AdvanceAllClocks round-trips on both instances`` () = task {
@@ -54,6 +43,6 @@ type CouponMultiPodSmokeTests(fixture: CouponMultiPodContainers) =
         // advance — reaching the assertions below proves both accepted it in lockstep.
         do! fixture.AdvanceAllClocks(5000)
         for i in 0 .. fixture.InstanceCount - 1 do
-            let! resp = fixture.BotHttp(i).GetAsync("/health")
+            let! resp = fixture.BotHttpAt(i).GetAsync("/health")
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
     }

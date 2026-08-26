@@ -313,17 +313,15 @@ Readiness.mapReadyEndpoint
         Results.Ok "Settings reloaded"
 ))
 
-// Test-only settings dump: live effective BotConfiguration as JSON, secret fields (token/key)
-// redacted via BotInfra.SettingsDump. Vahter has no TestMode flag, so this is gated the same
-// way as /reload-settings and /rebuild-snapshots above (auth-token header) — the strongest
-// existing precedent for admin-only surface on this bot.
-%app.MapGet("/test/settings/dump", Func<HttpContext, IResult>(fun ctx ->
-    if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
-        Results.Text("Access Denied", statusCode = 401)
-    else
-        let live = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>().Value
-        Results.Text(SettingsDump.toJson eventJsonOpts live, "application/json")
-))
+// Config dump: live effective BotConfiguration as JSON, secret fields (token/key) redacted
+// via BotInfra.SettingsDump. Gated the same as /reload-settings and /rebuild-snapshots above
+// (auth-token header) — the strongest existing precedent for admin-only surface on this bot.
+SettingsDump.mapConfigDumpEndpoint
+    (WebhookHost.validateApiKey webhookCfg.SecretToken)
+    (fun () ->
+        let live = app.Services.GetRequiredService<IOptions<BotConfiguration>>().Value
+        SettingsDump.toJson eventJsonOpts live)
+    app
 
 // One-off backfill of the snapshot_* read models from the event log. Idempotent; run manually
 // after deploy. Not auto-run on boot — the event table is too large to rescan every start.
