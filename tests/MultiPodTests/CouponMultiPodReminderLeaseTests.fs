@@ -69,19 +69,30 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         Assert.Equal(1, matchCount)
 
         // DB evidence: the lease was completed (last_completed_at set from NULL).
-        let! completedAt =
-            conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(
-                "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
+        // `complete` writes this in the line AFTER the message send job.Run() awaits,
+        // so it can still be in flight the instant the sendMessage poll above finds its
+        // match — poll here too rather than reading once.
+        let sw2 = Stopwatch.StartNew()
+        let mutable completedAt = Nullable<DateTime>()
+        while not completedAt.HasValue && sw2.ElapsedMilliseconds < 5000L do
+            let! v =
+                conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(
+                    "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
+            completedAt <- v
+            if not completedAt.HasValue then do! Task.Delay 200
         Assert.True(completedAt.HasValue, "Expected reminder_daily.last_completed_at to be set after the tick")
 
         // Process-level evidence: exactly one instance's own log shows it won
         // tryAcquire (BotInfra.ScheduledJobs' "ScheduledJobs: acquired {Job}" line) —
         // the other instance's tick must have seen the lease already held/expired-not.
+        // Logs are raw Serilog JSON (GetBotLogs dumps container stdout), so the message
+        // template's {Job} renders as a quoted "reminder_daily" — match both substrings
+        // rather than the literal unquoted phrase.
         let! log0 = fixture.GetBotLogs(0)
         let! log1 = fixture.GetBotLogs(1)
         let acquiredCount =
             [ log0; log1 ]
-            |> List.filter (fun l -> l.Contains "ScheduledJobs: acquired reminder_daily")
+            |> List.filter (fun l -> l.Contains "ScheduledJobs: acquired" && l.Contains "reminder_daily")
             |> List.length
         Assert.Equal(1, acquiredCount)
     }

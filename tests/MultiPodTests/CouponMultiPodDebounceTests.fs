@@ -106,9 +106,16 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
         // Exactly one finalize's worth of bulk-confirm UI landed in the (shared)
         // FakeTgApi log — proves TryFlipBatchToAwaiting's single-winner held even
         // though BOTH pods' independently-armed timers came due around the same
-        // simulated moment.
-        let! calls = fixture.GetFakeCalls("sendMessage")
-        Assert.Equal(1, bulkConfirmCallCount calls user.Id)
+        // simulated moment. TryFlipBatchToAwaiting's DB status write and its
+        // Telegram send are two separate steps, so poll rather than reading once
+        // right after observing the status flip above.
+        let deadline3 = DateTime.UtcNow.AddSeconds(5.0)
+        let mutable confirmCount = 0
+        while confirmCount = 0 && DateTime.UtcNow < deadline3 do
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            confirmCount <- bulkConfirmCallCount calls user.Id
+            if confirmCount = 0 then do! Task.Delay 200
+        Assert.Equal(1, confirmCount)
     }
 
     /// Optional extension of the split-album scenario: a straggler photo for the
