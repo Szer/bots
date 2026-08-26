@@ -157,6 +157,11 @@ let app = builder.Build()
 
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
 
+// Readiness: DB ping (cached). Not yet wired into any k8s probe — see PR description
+// for the required deploy-before-probe-wiring ordering.
+let dbPingCheck = DbPingCheck(connString, app.Services.GetRequiredService<TimeProvider>())
+Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
+
 // Test-only hook to advance the FakeTimeProvider, deterministically firing any
 // pending TimeProvider-driven timers (notably BatchDebounce). Query: ?ms=N
 // (default 1000). 404 outside TestMode; 400 if FakeTimeProvider wasn't registered.
