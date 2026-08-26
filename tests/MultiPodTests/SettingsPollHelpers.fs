@@ -1,0 +1,38 @@
+namespace MultiPodTests
+
+open System
+open System.Text.Json
+open System.Threading.Tasks
+
+/// Shared polling helper for PR #425's LISTEN/NOTIFY settings-propagation tests — not shared
+/// via a project reference for the same reason as FakeCallHelpers.fs.
+module SettingsPollHelpers =
+    let private fieldAsString (root: JsonElement) (field: string) : string option =
+        match root.TryGetProperty field with
+        | true, v ->
+            match v.ValueKind with
+            | JsonValueKind.String -> Some(v.GetString())
+            | JsonValueKind.True | JsonValueKind.False -> Some(string (v.GetBoolean()))
+            | JsonValueKind.Number -> Some(v.GetRawText())
+            | _ -> Some(v.GetRawText())
+        | false, _ -> None
+
+    /// Polls `dump()` (a `fixture.GetSettingsDump(i)` call) every 250ms until `field` equals
+    /// `expected` or 5 seconds elapse — the owner's acceptance window for cross-pod settings
+    /// propagation via Postgres LISTEN/NOTIFY. Returns (reached, lastDumpSeen) so callers can
+    /// print both dumps on a timeout instead of failing blind.
+    let waitForField (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
+        task {
+            let deadline = DateTime.UtcNow.AddSeconds 5.0
+            let mutable last = ""
+            let mutable reached = false
+            while not reached && DateTime.UtcNow < deadline do
+                let! json = dump()
+                last <- json
+                reached <-
+                    use doc = JsonDocument.Parse json
+                    fieldAsString doc.RootElement field = Some expected
+                if not reached then
+                    do! Task.Delay 250
+            return reached, last
+        }

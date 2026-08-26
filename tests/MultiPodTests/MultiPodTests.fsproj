@@ -10,10 +10,13 @@
     <ItemGroup>
         <Compile Include="FakeCallHelpers.fs" />
         <Compile Include="SmokeHelpers.fs" />
+        <Compile Include="SettingsPollHelpers.fs" />
         <Compile Include="VahterMultiPodContainers.fs" />
         <Compile Include="CouponMultiPodContainers.fs" />
         <Compile Include="VahterMultiPodSmokeTests.fs" />
         <Compile Include="CouponMultiPodSmokeTests.fs" />
+        <Compile Include="VahterSettingsPropagationTests.fs" />
+        <Compile Include="CouponSettingsPropagationTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
