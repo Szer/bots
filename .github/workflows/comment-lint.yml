@@ -19,9 +19,11 @@ jobs:
       run: git fetch origin "${{ github.base_ref }}"
 
     - name: Check comment ratio
-      if: ${{ !contains(github.event.pull_request.labels.*.name, 'comment-ratio-exempt') }}
-      run: scripts/check-comment-ratio.sh --range "origin/${{ github.base_ref }}...HEAD"
-
-    - name: Skipped — comment-ratio-exempt label present
-      if: ${{ contains(github.event.pull_request.labels.*.name, 'comment-ratio-exempt') }}
-      run: echo "::warning::comment-ratio-gate SKIPPED — 'comment-ratio-exempt' label present on this PR"
+      env:
+        EXEMPT: ${{ contains(github.event.pull_request.labels.*.name, 'comment-ratio-exempt') }}
+      run: |
+        if [ "$EXEMPT" = "true" ]; then
+          echo "::warning::comment-ratio-gate SKIPPED — 'comment-ratio-exempt' label present on this PR"
+          exit 0
+        fi
+        scripts/check-comment-ratio.sh --range "origin/${{ github.base_ref }}...HEAD"
