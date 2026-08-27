@@ -92,3 +92,8 @@ coupon-tg-login:
 
 coupon-tg-chats:
 	dotnet run --project tests/CouponHubBot.RealTests -c Release -- list-dialogs
+
+.PHONY: install-hooks
+
+install-hooks:
+	git config core.hooksPath .githooks

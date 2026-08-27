@@ -1,0 +1,27 @@
+name: "Lint: Comment ratio"
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  comment-ratio:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Fetch base ref
+      run: git fetch origin "${{ github.base_ref }}"
+
+    - name: Check comment ratio
+      if: ${{ !contains(github.event.pull_request.labels.*.name, 'comment-ratio-exempt') }}
+      run: scripts/check-comment-ratio.sh --range "origin/${{ github.base_ref }}...HEAD"
+
+    - name: Skipped — comment-ratio-exempt label present
+      if: ${{ contains(github.event.pull_request.labels.*.name, 'comment-ratio-exempt') }}
+      run: echo "::warning::comment-ratio-gate SKIPPED — 'comment-ratio-exempt' label present on this PR"
