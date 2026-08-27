@@ -8,11 +8,10 @@ open BotInfra
 open BotTestInfra
 open Xunit
 
-/// Owner's exact acceptance scenario for PR #425 (Postgres LISTEN/NOTIFY cross-pod settings
-/// propagation): a `bot_setting` row changed directly in the DB and picked up by ONE
-/// instance's /reload-settings must reach every OTHER instance's live BotConfiguration too,
-/// without that instance ever calling /reload-settings itself — the gap the single-pod
-/// suite's /reload-settings never had to close.
+/// A `bot_setting` row changed directly in the DB and picked up by ONE instance's
+/// /reload-settings must reach every OTHER instance's live BotConfiguration too, without that
+/// instance ever calling /reload-settings itself — the gap single-pod /reload-settings tests
+/// never have to close.
 type VahterSettingsPropagationTests(fixture: VahterMultiPodContainers) =
 
     [<Fact>]

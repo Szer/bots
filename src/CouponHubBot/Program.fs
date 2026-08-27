@@ -158,8 +158,6 @@ if botConfOptions.Value.TestMode then
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
     .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
-    // Cross-pod propagation: LISTEN on a dedicated connection, re-running reloadSettings()
-    // on every NOTIFY and after every (re)connect.
     .AddHostedService<SettingsListenerHostedService>(fun sp ->
         new SettingsListenerHostedService(
             connString,
@@ -253,7 +251,6 @@ SettingsDump.mapConfigDumpEndpoint
             return Results.Text("Access Denied", statusCode = 401)
         else
             reloadSettings()
-            // NOTIFY other pods so a single /reload-settings call takes effect bot-wide.
             do! notifyOtherPods()
             ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
             return Results.Ok "Settings reloaded"

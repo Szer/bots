@@ -8,9 +8,8 @@ open BotInfra
 open BotTestInfra
 open Xunit
 
-/// Owner's exact acceptance scenario for PR #425 (Postgres LISTEN/NOTIFY cross-pod settings
-/// propagation) — CouponHubBot side. See VahterSettingsPropagationTests for the full rationale;
-/// this mirrors it against CouponHubBot's own bot_setting/BotConfiguration.
+/// CouponHubBot side of VahterSettingsPropagationTests — same scenario, against CouponHubBot's
+/// own bot_setting/BotConfiguration.
 type CouponSettingsPropagationTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]

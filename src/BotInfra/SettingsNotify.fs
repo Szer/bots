@@ -28,11 +28,9 @@ module SettingsNotify =
         }
         :> Task
 
-/// Hosted background service holding a dedicated LISTEN connection. Runs `reload` once right
-/// after every successful (re)connect — closing the window between a connection drop and the
-/// next NOTIFY — and again on every notification received while connected. Never crashes the
-/// host on a DB blip: connection failures are caught and retried with capped exponential
-/// backoff; the up/down transition is logged once (Information), not per retry attempt.
+/// Reloads once after every (re)connect — closing the window between a connection drop and the
+/// next NOTIFY — and again on each NOTIFY received while connected. Retries connection loss with
+/// capped exponential backoff; the up/down transition is logged once, not per retry attempt.
 type SettingsListenerHostedService
     (
         connString: string,
@@ -46,8 +44,7 @@ type SettingsListenerHostedService
     let minBackoff = defaultArg minBackoff (TimeSpan.FromSeconds 1.0)
     let maxBackoff = defaultArg maxBackoff (TimeSpan.FromSeconds 30.0)
 
-    /// One connect-LISTEN-loop lifecycle; returns (via exception) when the connection drops
-    /// or `ct` is cancelled. `wasDown` picks the log line's wording for the transition.
+    /// `wasDown` selects the reconnect-vs-initial-connect log wording.
     let runOnce (ct: CancellationToken) (wasDown: bool) : Task =
         task {
             use conn = new NpgsqlConnection(connString)

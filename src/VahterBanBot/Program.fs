@@ -231,8 +231,6 @@ WebhookHost.configureSharedServices webhookCfg builder
             reloadSettings()
             do! notifyOtherPods()
         } })
-    // Cross-pod propagation: LISTEN on a dedicated connection, re-running reloadSettings()
-    // on every NOTIFY and after every (re)connect.
     .AddHostedService<SettingsListenerHostedService>(fun sp ->
         new SettingsListenerHostedService(
             connString,
@@ -326,7 +324,6 @@ Readiness.mapReadyEndpoint
             // tests advance time without restarting the container.
             let mtp = ctx.RequestServices.GetRequiredService<Time.MutableTimeProvider>()
             mtp.SetInner(Time.fromString (getSettingOr "BOT_FIXED_UTC_NOW" ""))
-            // NOTIFY other pods so a single /reload-settings call takes effect bot-wide.
             do! notifyOtherPods()
             ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
             return Results.Ok "Settings reloaded"

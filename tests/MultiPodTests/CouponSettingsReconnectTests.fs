@@ -8,10 +8,9 @@ open BotTestInfra
 open Npgsql
 open Xunit
 
-/// API-level reconnect coverage for SettingsListenerHostedService, replacing the internal-level
-/// tests deleted from VahterBanBot.Tests/SettingsNotifyTests.fs (PR #425 review). Picked the
-/// Coupon fixture over Vahter's: no ML cold-start model file/advisory-lock race to wait out, so
-/// the fixture boots faster and the reconnect scenario stays the only variable under test.
+/// API-level reconnect coverage for SettingsListenerHostedService. Uses the Coupon fixture: no
+/// ML cold-start model/advisory-lock race to wait out, so it boots faster and the reconnect
+/// scenario stays the only variable under test.
 type CouponSettingsReconnectTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]

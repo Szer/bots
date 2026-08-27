@@ -4,8 +4,8 @@ open System
 open System.Text.Json
 open System.Threading.Tasks
 
-/// Shared polling helper for PR #425's LISTEN/NOTIFY settings-propagation tests — not shared
-/// via a project reference for the same reason as FakeCallHelpers.fs.
+/// Shared polling helper for the LISTEN/NOTIFY settings-propagation tests — not shared via a
+/// project reference for the same reason as FakeCallHelpers.fs.
 module SettingsPollHelpers =
     let private fieldAsString (root: JsonElement) (field: string) : string option =
         match root.TryGetProperty field with
@@ -36,7 +36,7 @@ module SettingsPollHelpers =
             return reached, last
         }
 
-    /// 5s bound — the owner's acceptance window for cross-pod settings propagation via
-    /// Postgres LISTEN/NOTIFY without a reconnect in play.
+    /// 5s bound — cross-pod settings propagation via Postgres LISTEN/NOTIFY without a
+    /// reconnect in play.
     let waitForField (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
         waitForFieldWithin 5.0 dump field expected
