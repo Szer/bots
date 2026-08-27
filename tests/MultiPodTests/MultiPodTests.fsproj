@@ -10,10 +10,14 @@
     <ItemGroup>
         <Compile Include="FakeCallHelpers.fs" />
         <Compile Include="SmokeHelpers.fs" />
+        <Compile Include="SettingsPollHelpers.fs" />
         <Compile Include="VahterMultiPodContainers.fs" />
         <Compile Include="CouponMultiPodContainers.fs" />
         <Compile Include="VahterMultiPodSmokeTests.fs" />
         <Compile Include="CouponMultiPodSmokeTests.fs" />
+        <Compile Include="VahterSettingsPropagationTests.fs" />
+        <Compile Include="CouponSettingsPropagationTests.fs" />
+        <Compile Include="CouponSettingsReconnectTests.fs" />
         <Compile Include="Program.fs" />
     </ItemGroup>
 
@@ -35,6 +39,7 @@
              containers over HTTP + raw SQL (Dapper/Npgsql, via BotTestInfra), never their
              in-process types, same as the other *.Tests projects' ContainerTestBase. -->
         <ProjectReference Include="..\BotTestInfra\BotTestInfra.fsproj" />
+        <ProjectReference Include="..\..\src\BotInfra\BotInfra.fsproj" />
     </ItemGroup>
 
 </Project>
