@@ -2,8 +2,8 @@ namespace MultiPodTests
 
 open System
 open System.Diagnostics
-open System.Net.Http
 open System.Threading.Tasks
+open BotInfra
 open BotTestInfra
 open MultiPodTests.FakeCallHelpers
 open Npgsql
@@ -50,21 +50,20 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
 
-        // TEMPORARY sanity check (debugging a CI-only failure): confirms ReminderService.RunOnce
-        // actually produces the expected message for this exact data via the RunJobNow bypass,
-        // isolating "RunOnce/data problem" from "tick/tryAcquire never fires" before the real
-        // lease-race assertions below. Removed once the root cause is found.
-        use sanityBody = new StringContent("", Text.Encoding.UTF8, "application/json")
-        let! sanityResp = fixture.BotHttpAt(0).PostAsync($"/test/run-reminder?nowUtc={todayIso}T12:06:00Z", sanityBody)
-        Assert.Equal(Net.HttpStatusCode.Accepted, sanityResp.StatusCode)
-        let sanitySw = Stopwatch.StartNew()
-        let mutable sanityMatch = 0
-        while sanityMatch = 0 && sanitySw.ElapsedMilliseconds < 15000L do
-            let! calls = fixture.GetFakeCalls("sendMessage")
-            sanityMatch <- countCallsWithText calls fixture.CommunityChatId "Сегодня истекает 1 купон на сумму"
-            if sanityMatch = 0 then do! Task.Delay 200
-        Assert.True(sanityMatch > 0, "SANITY (RunJobNow bypass) FAILED: ReminderService.RunOnce did not send the expected message for this data — bug is in RunOnce/data setup, not the lease/tick path.")
-        do! fixture.ClearFakeCalls()
+        // TEMPORARY diagnostic (debugging a CI-only failure): calls BotInfra.ScheduledJobs.
+        // tryAcquire directly from the TEST process against the SAME running Postgres, with a
+        // "now" matching what the app's FakeTimeProvider will show after the AdvanceAllClocks
+        // below (noon + 6min) and REMINDER_HOUR_DUBLIN's default (10) UTC-converted slot. If
+        // THIS succeeds, tryAcquire/Postgres/CURRENT_DATE are all fine in this exact container,
+        // and the bug is specifically in the app's own tick never reaching tryAcquire with a
+        // matching "now" — narrows the search before the real lease-race assertions below.
+        let diagNow = fixture.FixedUtcNow.AddMinutes 6.0
+        let diagTime = Time.FixedTimeProvider(diagNow) :> TimeProvider
+        let! diagAcquired = ScheduledJobs.tryAcquire fixture.DbConnectionString diagTime "reminder_daily" (TimeSpan(9, 0, 0)) "test-diag-direct"
+        Assert.True(
+            diagAcquired,
+            $"DIAGNOSTIC: direct tryAcquire call from the TEST (now={diagNow}, scheduledTime=09:00:00) did not \
+              acquire reminder_daily — the SQL/Postgres/CURRENT_DATE state itself is the problem, not just the app's tick.")
         let! _ =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
