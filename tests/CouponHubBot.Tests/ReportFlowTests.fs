@@ -45,11 +45,8 @@ type ReportFlowTests(fixture: DefaultCouponHubTestContainers) =
             "SELECT COUNT(*)::bigint FROM coupon_event WHERE coupon_id = @id AND event_type = @t AND user_id = @u",
             {| id = couponId; t = eventType; u = userId |})
 
-    /// `/test/run-reminder` is fire-and-forget (BotInfra.SchedulerHostedService.
-    /// RunJobNow) — the HTTP response returns before the job's DB reads/
-    /// SendMessage calls land, so this polls `scheduled_job.last_completed_at`
-    /// for a CHANGE (not "greater than a host timestamp" — see ReminderTests.fs's
-    /// waitForReminderCompletion for why) before returning.
+    /// `/test/run-reminder` is fire-and-forget, so this polls `last_completed_at` for a CHANGE
+    /// (not "greater than a host timestamp" — see ReminderTests.fs's waitForReminderCompletion).
     let runReminderAt (nowUtc: string) =
         task {
             let! before =

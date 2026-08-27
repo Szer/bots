@@ -3,16 +3,8 @@ namespace MultiPodTests
 open System
 open System.Threading.Tasks
 
-/// Robust clock-advance helper for cross-pod hosted-service tests. A single big
-/// `AdvanceAllClocks` call races the app's own host startup: `Host.StartAsync` awaits each
-/// `IHostedService.StartAsync` in registration order, but Kestrel (and this fixture's
-/// port-open wait strategy) is satisfied by the FIRST one — so a later-registered service's
-/// `PeriodicTimer` (e.g. `BotInfra.SchedulerHostedService`) can still be constructed AFTER a
-/// single upfront advance has already landed. Since `PeriodicTimer(period, timeProvider)`
-/// captures "now" at construction and schedules its first due-tick at `now + period`, a timer
-/// built after the only advance never sees a later `now` and never fires. Advancing in small
-/// steps with real-time yields between them means a timer constructed at ANY point during the
-/// loop still accumulates a full tick period of advances afterward.
+/// A single big `AdvanceAllClocks` call races host startup: a `PeriodicTimer` constructed AFTER
+/// it (Kestrel is ready before every `IHostedService` starts) captures a stale "now" and never fires.
 module ClockAdvanceHelpers =
     /// Repeatedly calls `advance stepMs` then sleeps `realSleepMs` of real time and checks
     /// `isDone`, until `isDone` returns true or `maxWaitMs` of real time elapses.

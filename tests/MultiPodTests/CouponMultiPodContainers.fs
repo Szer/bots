@@ -7,12 +7,8 @@ open Npgsql
 open Dapper
 
 module private CouponMultiPodTimeConfig =
-    /// Noon UTC on TODAY, not a fixed calendar date like the single-pod fixture's
-    /// ContainerTestBase.fs — CouponMultiPodReminderLeaseTests races the real
-    /// tryAcquire lease against Postgres's own (unfaked) CURRENT_DATE, so the pinned
-    /// instant must track today's actual date. Noon UTC is safely past
-    /// REMINDER_HOUR_DUBLIN's UTC-converted slot (09:00 summer / 10:00 winter) no
-    /// matter what hour CI happens to run at.
+    /// Noon UTC on TODAY (not a fixed date) -- races the real tryAcquire lease against Postgres's
+    /// own unfaked CURRENT_DATE, safely past REMINDER_HOUR_DUBLIN's UTC slot regardless of CI's hour.
     let fixedUtcNow = DateTimeOffset(DateTime.UtcNow.Date.AddHours 12.0, TimeSpan.Zero)
 
 /// 2-instance CouponHubBot fixture. TEST_MODE gives EACH instance its own FakeTimeProvider

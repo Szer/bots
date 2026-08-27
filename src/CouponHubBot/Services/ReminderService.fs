@@ -7,11 +7,8 @@ open Microsoft.Extensions.Options
 open BotInfra
 open CouponHubBot
 
-/// Daily reminder run: community expiring-coupons post, Monday all-time
-/// leaderboard, per-user overdue-taken/used-not-added DMs, chat-message
-/// retention cleanup. Scheduling/exactly-once-per-pod is owned by
-/// `CouponScheduledJobs`/`BotInfra.SchedulerHostedService` — this type is just
-/// the work, no longer a `BackgroundService` itself.
+/// Daily reminder run: expiring-coupons post, leaderboard, overdue DMs, retention cleanup.
+/// Scheduling/exactly-once-per-pod is owned by `CouponScheduledJobs` — this type is just the work.
 type ReminderService(
     tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
@@ -146,10 +143,8 @@ type ReminderService(
             return anySent
         }
 
-    /// Runs the reminder work once. Called by `CouponScheduledJobs`' job
-    /// definition (production: gated by the `reminder_daily` lease) and by the
-    /// TEST_MODE `/test/run-reminder` endpoint (bypasses the lease via
-    /// `SchedulerHostedService.RunJobNow`).
+    /// Runs the reminder work once. Called by the lease-gated job definition in production,
+    /// and by TEST_MODE `/test/run-reminder` (bypasses the lease via RunJobNow).
     member _.RunOnce(?nowUtc: DateTime) =
         let now = defaultArg nowUtc (time.GetUtcNow().UtcDateTime)
         runOnce now

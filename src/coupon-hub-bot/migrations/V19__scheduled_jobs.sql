@@ -1,7 +1,5 @@
--- Distributed scheduled-job locking (BotInfra.ScheduledJobs) — same
--- UPDATE...RETURNING lease pattern as AlitaBot's/VahterBanBot's scheduled_job
--- table. Gates ReminderService's daily run so exactly one pod (of 2+) sends
--- each day's reminders instead of one per pod.
+-- Distributed scheduled-job locking (BotInfra.ScheduledJobs) — gates ReminderService's daily
+-- run so exactly one pod (of 2+) sends each day's reminders, not one per pod.
 CREATE TABLE scheduled_job (
     job_name          TEXT        PRIMARY KEY,
     last_completed_at TIMESTAMPTZ,

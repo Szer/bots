@@ -8,18 +8,8 @@ open Npgsql
 open Dapper
 open Xunit
 
-/// Proves BatchDebounce's cross-pod fix at the process level: photos for ONE album
-/// arrive on alternating instances, each arming its OWN in-memory timer. Only the
-/// DB-authoritative check in FinalizeBatch (CouponFlowHandler.fs) — not the timers
-/// themselves — decides when to actually finalize. Clocks only ever move via
-/// AdvanceAllClocks (lockstep); a single-instance clock move would desync the two
-/// FakeTimeProviders that FinalizeBatch's elapsedMs math compares against each
-/// other's DB-persisted `updated_at`.
-///
-/// OCR is disabled on this fixture (CouponMultiPodContainers), so every item lands
-/// on 'needs_input' near-instantly with no external HTTP call — irrelevant to what's
-/// under test here (the BATCH-level flip timing, not per-item OCR outcome), and it
-/// keeps the timeline free of OCR-latency noise.
+/// Proves BatchDebounce's cross-pod fix: photos for ONE album arrive on alternating instances,
+/// each arming its OWN timer -- only FinalizeBatch's DB-authoritative check decides when to finalize.
 type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
 
     let batchIdFor (conn: NpgsqlConnection) (userId: int64) =
@@ -55,20 +45,14 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
         let! status1 = batchStatus conn batchId
         Assert.Equal("open", status1)
 
-        // Photo 2 on instance 1 (a DIFFERENT process/pod) — same media_group_id, so
-        // CreateBatchAtomically reuses the same batch. AddBatchItem's touchSql bumps
-        // updated_at using instance 1's OWN (lockstep) clock, and instance 1 arms its
-        // OWN separate in-memory timer for the same batchId.
+        // Photo 2 on instance 1 (different pod) reuses the same batch and arms its OWN timer.
         let! resp2 = fixture.SendUpdateTo(1, Tg.dmAlbumPhoto(user, mgid, fileId = "split-2", messageId = 9702L))
         Assert.True(resp2.IsSuccessStatusCode)
         let! itemsAfter2 = itemCount conn batchId
         Assert.Equal(2L, itemsAfter2)
 
-        // Elapsed since photo 1: 3000+3000=6000ms — PAST the 5000ms debounce that
-        // instance 0's ORIGINAL timer (armed at photo 1) was counting down. Without
-        // the DB-authoritative check this would flip the batch right here. With it,
-        // instance 0 re-reads updated_at (bumped by photo 2 on instance 1 ~3000ms
-        // ago) and defers instead.
+        // Elapsed since photo 1 is now past instance 0's 5000ms debounce -- without the
+        // DB-authoritative check this would flip early; instead it re-reads updated_at and defers.
         do! fixture.AdvanceAllClocks(3000)
         do! Task.Delay 700
         let! status2 = batchStatus conn batchId
@@ -87,9 +71,7 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
         let! status3 = batchStatus conn batchId
         Assert.Equal("open", status3)
 
-        // Clear the quiet period for real (well past 5000ms since photo 3's bump) —
-        // both instances' outstanding timers should now find the window genuinely
-        // elapsed and race TryFlipBatchToAwaiting; exactly one wins.
+        // Well past 5000ms since photo 3's bump -- both timers race TryFlipBatchToAwaiting, one wins.
         do! fixture.AdvanceAllClocks(6000)
 
         let deadline = DateTime.UtcNow.AddSeconds(15.0)
@@ -103,12 +85,8 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
         let! finalItemCount = itemCount conn batchId
         Assert.Equal(3L, finalItemCount)
 
-        // Exactly one finalize's worth of bulk-confirm UI landed in the (shared)
-        // FakeTgApi log — proves TryFlipBatchToAwaiting's single-winner held even
-        // though BOTH pods' independently-armed timers came due around the same
-        // simulated moment. TryFlipBatchToAwaiting's DB status write and its
-        // Telegram send are two separate steps, so poll rather than reading once
-        // right after observing the status flip above.
+        // Exactly one bulk-confirm UI landed -- proves the single-winner held even though both
+        // pods' timers came due together. DB write and Telegram send are separate steps, so poll.
         let deadline3 = DateTime.UtcNow.AddSeconds(5.0)
         let mutable confirmCount = 0
         while confirmCount = 0 && DateTime.UtcNow < deadline3 do
@@ -118,11 +96,8 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
         Assert.Equal(1, confirmCount)
     }
 
-    /// Optional extension of the split-album scenario: a straggler photo for the
-    /// SAME media_group_id lands on the instance that DIDN'T win the finalize race,
-    /// after the batch has already flipped. AddBatchItem's status='open' gate
-    /// (DbService.fs) rejects it regardless of which pod re-used the batch id —
-    /// the user must be notified, not silently dropped.
+    /// A straggler photo lands on the instance that DIDN'T win the finalize race, after the batch
+    /// flipped -- AddBatchItem's status='open' gate rejects it; the user must be notified, not dropped.
     [<Fact>]
     let ``Straggler photo on the non-finalizing instance after flip is rejected and user notified`` () = task {
         do! fixture.ClearFakeCalls()
@@ -146,10 +121,8 @@ type CouponMultiPodDebounceTests(fixture: CouponMultiPodContainers) =
             if status <> "awaiting_user" then do! Task.Delay 200
         Assert.Equal("awaiting_user", status)
 
-        // Straggler arrives on instance 1 (never touched this batch before) after
-        // the flip — CreateBatchAtomically still resolves the same batch id (still
-        // 'awaiting_user', within its partial-unique-index window), but AddBatchItem
-        // must reject it.
+        // Straggler on instance 1 (never touched this batch) after the flip -- still resolves
+        // the same batch id (partial-unique-index window), but AddBatchItem must reject it.
         let! _ = fixture.SendUpdateTo(1, Tg.dmAlbumPhoto(user, mgid, fileId = "straggle-2", messageId = 9712L))
 
         let deadline2 = DateTime.UtcNow.AddSeconds(10.0)

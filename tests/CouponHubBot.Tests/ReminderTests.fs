@@ -11,24 +11,16 @@ open Npgsql
 open Xunit
 open FakeCallHelpers
 
-/// `/test/run-reminder` is fire-and-forget on the bot side (BotInfra.
-/// SchedulerHostedService.RunJobNow — the lease bypass, same mechanism
-/// AlitaBot's `/test/run-job` uses) so the HTTP response returns before the
-/// job's DB reads/SendMessage calls actually land. Every test below polls
-/// `scheduled_job.last_completed_at` for the run to finish before asserting,
-/// instead of trusting the POST to have completed synchronously.
+/// `/test/run-reminder` is fire-and-forget, so the HTTP response returns before the job's DB
+/// writes land. Every test below polls `last_completed_at` instead of trusting the POST timing.
 type ReminderTests(fixture: DefaultCouponHubTestContainers) =
 
     let lastCompletedAt () =
         fixture.QuerySingleOrDefault<Nullable<DateTime>>(
             "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'", null)
 
-    /// Polls until `last_completed_at` differs from the snapshot taken before
-    /// triggering — a value CHANGE, not "greater than a host-side timestamp":
-    /// the poller runs on the test host while the write happens inside the bot
-    /// container, and comparing across those two clocks is exactly the kind of
-    /// cross-clock assumption that bit BatchDebounce (see FinalizeBatch's own
-    /// comment) — don't repeat it here.
+    /// Polls for a value CHANGE, not "greater than a host-side timestamp" -- the poller runs on
+    /// the test host while the write happens in the bot container; cross-clock compares bit BatchDebounce before.
     let waitForReminderCompletion (before: Nullable<DateTime>) (timeoutMs: int) =
         task {
             let sw = Stopwatch.StartNew()
@@ -41,11 +33,8 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
                 failwith $"Timeout: reminder_daily did not complete after {timeoutMs}ms"
         }
 
-    /// Triggers the reminder job and waits for it to finish (see the type doc
-    /// comment) before returning. `nowUtc`, if given, moves the shared
-    /// FakeTimeProvider via `/test/clock/advance`'s sibling `AdjustTime` path
-    /// baked into the endpoint — outstanding timers are left alone, only the
-    /// reported "now" moves, so date-sensitive assertions stay controllable.
+    /// Triggers the reminder job and waits for it to finish. `nowUtc`, if given, moves the shared
+    /// FakeTimeProvider's reported "now" only -- outstanding timers are left alone.
     let runReminder (nowUtc: string option) =
         task {
             let! before = lastCompletedAt ()

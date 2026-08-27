@@ -643,12 +643,8 @@ type CouponFlowHandler(
     /// user via SendFinalizeFallback — a single bug or upstream outage must
     /// never leave the user stuck on the "обрабатываю купоны…" placeholder.
     /// Safe to call concurrently — TryFlipBatchToAwaiting enforces single-winner.
-    /// DB-authoritative fire decision: the local timer only ever TRIGGERS a
-    /// check, it never finalizes on its own say-so. `pending_add_batch.updated_at`
-    /// is bumped by AddBatchItem on whichever pod actually handled the photo, so
-    /// re-reading it here catches activity that happened on a DIFFERENT pod after
-    /// THIS pod armed its timer — closing the premature-finalize race described
-    /// in BatchDebounce.fs's header comment.
+    /// DB-authoritative: the local timer only TRIGGERS a check; re-reading `updated_at` catches
+    /// activity from a DIFFERENT pod after this pod's timer armed, closing the premature-finalize race.
     member this.FinalizeBatch (batchId: int64) : Task =
         task {
             use a = botActivity.StartActivity("finalizeBatch")

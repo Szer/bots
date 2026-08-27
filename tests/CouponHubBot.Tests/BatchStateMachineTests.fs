@@ -306,12 +306,8 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
 
     // ── Cross-pod premature finalize ────────────────────────────────────
 
-    /// Simulates the exact race BatchDebounce.fs's header comment describes:
-    /// photo 1 arms this pod's timer; photo 2 lands on a DIFFERENT pod (here,
-    /// a direct DB insert bypassing this pod's AddBatchItem/batchDebounce, but
-    /// still bumping updated_at the same way AddBatchItem's touchSql would).
-    /// FinalizeBatch's DB-authoritative check must see that bump and re-arm
-    /// instead of flipping the batch early and timing item 2 out.
+    /// Photo 1 arms this pod's timer; photo 2 lands via a direct DB insert bumping updated_at the
+    /// same way AddBatchItem would -- FinalizeBatch must see that and re-arm, not flip early.
     [<Fact>]
     let ``Cross-pod race: item landing via direct DB insert after timer armed defers finalize`` () =
         task {

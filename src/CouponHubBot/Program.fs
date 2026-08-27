@@ -214,9 +214,8 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
                 return Results.Json({| ok = true; advancedMs = ms |})
     }))
 
-// Test-only: bypasses the lease via RunJobNow, fire-and-forget — callers poll for effects
-// (GetFakeCalls / last_completed_at). ?nowUtc= sets a one-shot override instead of moving the
-// shared FakeTimeProvider, which would leak into every later test sharing this fixture.
+// Test-only: bypasses the lease, fire-and-forget (callers poll for effects). ?nowUtc= sets a
+// one-shot override instead of moving the shared FakeTimeProvider, which would leak into later tests.
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()

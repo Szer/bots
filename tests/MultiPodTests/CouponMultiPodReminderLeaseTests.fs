@@ -9,16 +9,8 @@ open Npgsql
 open Dapper
 open Xunit
 
-/// Proves ReminderService's multi-pod lease at the process level: TWO real
-/// CouponHubBot instances, each running their own BotInfra.SchedulerHostedService,
-/// race the SAME `reminder_daily` row when their clocks cross the scheduled slot —
-/// not `/test/run-reminder`'s RunJobNow, which bypasses the lease entirely and
-/// would prove nothing about it.
-///
-/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin); determinism comes from
-/// CouponMultiPodContainers pinning BOT_FIXED_UTC_NOW to noon UTC on today's real
-/// date instead — safely past the scheduled UTC slot (09:00 summer / 10:00 winter)
-/// regardless of what hour CI actually runs at.
+/// Proves ReminderService's multi-pod lease: TWO real instances race the SAME `reminder_daily`
+/// row when their clocks cross the scheduled slot -- not RunJobNow, which bypasses the lease entirely.
 type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]
@@ -28,9 +20,7 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         use conn = new NpgsqlConnection(fixture.DbConnectionString)
         do! conn.OpenAsync()
 
-        // "Today" per the fixture's pinned BOT_FIXED_UTC_NOW (noon UTC on the real
-        // date the fixture was built) — matches Postgres's own unfaked CURRENT_DATE
-        // as long as the run doesn't straddle midnight UTC.
+        // Matches Postgres's own unfaked CURRENT_DATE as long as the run doesn't straddle midnight UTC.
         let todayIso = fixture.FixedUtcNow.UtcDateTime.Date.ToString("yyyy-MM-dd")
         let! _ =
             conn.ExecuteAsync(
@@ -49,15 +39,8 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
 
-        // Advance BOTH instances' clocks past CouponScheduledJobs' 5-minute tick interval
-        // (Program.fs's SchedulerHostedService registration) in small steps rather than one big
-        // jump — a single upfront advance races SchedulerHostedService's own PeriodicTimer
-        // construction during host startup (see ClockAdvanceHelpers), so both
-        // SchedulerHostedServices need repeated nudges to guarantee they actually tick and both
-        // attempt tryAcquire against the same row — this is the natural production race, not a
-        // bypass. Bound (150s) is generous: this fixture's containers share the CI runner with
-        // VahterBanBot's much heavier multi-pod fixture (ML cold-start), and observed
-        // container-startup delay alone has reached ~2m39s under contention on this same runner.
+        // Small-step advance avoids racing SchedulerHostedService's PeriodicTimer construction at
+        // startup (see ClockAdvanceHelpers). 150s bound: CI shares the runner with VahterBanBot's ML fixture.
         let expectedText = "Сегодня истекает 1 купон на сумму"
         let mutable matchCount = 0
         let! _ =
@@ -76,10 +59,8 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         // Dedupe by content: if BOTH pods had won the lease, this would be 2.
         Assert.Equal(1, matchCount)
 
-        // DB evidence: the lease was completed (last_completed_at set from NULL).
-        // `complete` writes this in the line AFTER the message send job.Run() awaits,
-        // so it can still be in flight the instant the sendMessage poll above finds its
-        // match — poll here too rather than reading once.
+        // `complete` writes last_completed_at AFTER the send awaits, so it can still be in
+        // flight the instant the sendMessage poll above matches -- poll here too, not a single read.
         let sw2 = Stopwatch.StartNew()
         let mutable completedAt = Nullable<DateTime>()
         while not completedAt.HasValue && sw2.ElapsedMilliseconds < 60000L do
@@ -90,12 +71,8 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
             if not completedAt.HasValue then do! Task.Delay 200
         Assert.True(completedAt.HasValue, "Expected reminder_daily.last_completed_at to be set after the tick")
 
-        // Process-level evidence: exactly one instance's own log shows it won
-        // tryAcquire (BotInfra.ScheduledJobs' "ScheduledJobs: acquired {Job}" line) —
-        // the other instance's tick must have seen the lease already held/expired-not.
-        // Logs are raw Serilog JSON (GetBotLogs dumps container stdout), so the message
-        // template's {Job} renders as a quoted "reminder_daily" — match both substrings
-        // rather than the literal unquoted phrase.
+        // Logs are raw Serilog JSON, so the {Job} template renders as a quoted "reminder_daily" --
+        // match both substrings rather than the literal unquoted phrase.
         let! log0 = fixture.GetBotLogs(0)
         let! log1 = fixture.GetBotLogs(1)
         let acquiredCount =

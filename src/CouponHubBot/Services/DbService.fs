@@ -27,10 +27,8 @@ type VoidCouponResult =
     | Voided of coupon: Coupon * takenByUserId: int64 option
     | NotFoundOrNotAllowed
 
-/// Result of AddBatchItem. BatchNotOpen is distinct from DuplicatePhoto so the
-/// caller can tell a genuine Telegram redelivery (silent no-op) apart from a
-/// straggler photo arriving after the batch already flipped/closed on some pod
-/// (which must notify the user instead of silently orphaning the item).
+/// Result of AddBatchItem. BatchNotOpen is distinct from DuplicatePhoto so the caller can tell a
+/// Telegram redelivery (silent no-op) apart from a straggler after the batch flipped/closed (notify).
 [<RequireQualifiedAccess>]
 type AddBatchItemResult =
     | ItemAdded of itemId: int64
@@ -1666,15 +1664,8 @@ RETURNING id;
         }
 
     /// Inserts a new item under a batch. Locks the batch row to serialize seq
-    /// assignment under concurrent webhook arrivals for the same album.
-    /// Redelivery (same photo_file_id) is checked BEFORE the open-status lock so
-    /// a Telegram redelivery arriving after finalize still reports DuplicatePhoto
-    /// (silent no-op), not BatchNotOpen — only a genuinely new item landing after
-    /// the batch closed gets BatchNotOpen. status = 'open' only (not
-    /// 'awaiting_user') — accepting items past that flip is the cross-pod orphan
-    /// hole (a straggler could land after the bulk-confirm UI was rendered and
-    /// never appear in it); see FinalizeBatch's DB-authoritative quiet check for
-    /// the other half of that fix.
+    /// assignment under concurrent webhook arrivals. Redelivery is checked BEFORE the open-status
+    /// lock, so it reports DuplicatePhoto even after finalize; status='open' only (not 'awaiting_user').
     member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int64) : Task<AddBatchItemResult> =
         task {
             use! conn = openConn()

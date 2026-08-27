@@ -5,9 +5,8 @@ open System.Threading.Tasks
 open BotInfra
 open Xunit
 
-/// `BotInfra.ScheduledJobs.tryAcquire`'s already-completed-today no-op: a single pod
-/// re-ticking a job already marked done today, not a race — no multi-pod API scenario
-/// exercises it, so it's only reachable by calling `tryAcquire` directly.
+/// `tryAcquire`'s already-completed-today no-op: a single pod re-ticking a job already done
+/// today, not a race -- only reachable by calling `tryAcquire` directly.
 type ScheduledJobLeaseTests(fixture: DefaultCouponHubTestContainers) =
 
     [<Fact>]
