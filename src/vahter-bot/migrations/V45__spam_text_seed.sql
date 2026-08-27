@@ -1,8 +1,5 @@
--- Postgres-backed ban-seeded spam-text cache, shared across pods (SpamTextCache.fs) — a
--- single-pod ConcurrentDictionary can't see a /ban handled by a different pod, halving the
--- exact-repeat catch rate with 2+ replicas. Normalized text is the primary key (normalization in
--- SpamTextCache.fs); TTL is enforced at read time via expires_at, expired rows are swept by the
--- daily cleanup job (Cleanup.fs).
+-- Postgres-backed spam-text cache, shared across pods — a single-pod ConcurrentDictionary
+-- can't see a /ban handled by a different pod. TTL via expires_at, swept by Cleanup.fs.
 CREATE TABLE spam_text_seed (
     normalized_text TEXT        PRIMARY KEY,
     chat_id         BIGINT      NOT NULL,
@@ -11,7 +8,6 @@ CREATE TABLE spam_text_seed (
     expires_at      TIMESTAMPTZ NOT NULL
 );
 
--- Cleanup job sweeps by expires_at; TryGet also filters expires_at > now() as a belt-and-braces check.
 CREATE INDEX idx_spam_text_seed_expires_at ON spam_text_seed (expires_at);
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON spam_text_seed TO vahter_bot_ban_service;
