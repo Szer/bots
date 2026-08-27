@@ -55,6 +55,26 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         // the same row — this is the natural production race, not a bypass.
         do! fixture.AdvanceAllClocks(6 * 60 * 1000)
 
+        // Diagnostic checkpoint BEFORE the message-send assertion: proves whether
+        // tryAcquire ever touched the row at all (locked_by OR last_completed_at set)
+        // versus the tick never reaching tryAcquire in the first place — narrows a
+        // future failure to "lease never attempted" vs. "attempted but RunOnce/send
+        // never completed". Checks last_completed_at too since a fast RunOnce could
+        // already have cleared locked_by via `complete` before this polls.
+        let sw0 = Stopwatch.StartNew()
+        let mutable everTouched = false
+        while not everTouched && sw0.ElapsedMilliseconds < 30000L do
+            let! row =
+                conn.QuerySingleAsync<{| locked_by: string | null; last_completed_at: Nullable<DateTime> |}>(
+                    "SELECT locked_by, last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
+            everTouched <- not (isNull (box row.locked_by)) || row.last_completed_at.HasValue
+            if not everTouched then do! Task.Delay 200
+        Assert.True(
+            everTouched,
+            "Diagnostic: tryAcquire never touched reminder_daily within 30s of AdvanceAllClocks(6min) \
+             (locked_by and last_completed_at both stayed NULL). Either the PeriodicTimer tick never \
+             reached tryAcquire, or tryAcquire's due-check evaluated false.")
+
         // Bounds generous (60s / 30s), not tight: this fixture's containers share the CI
         // runner with VahterBanBot's much heavier multi-pod fixture (ML cold-start), so the
         // real wall-clock delay between the fake-clock tick firing and the DB/Telegram
