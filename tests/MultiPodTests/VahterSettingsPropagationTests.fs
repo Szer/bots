@@ -4,9 +4,8 @@ open System.Net
 open System.Net.Http
 open System.Text
 open System.Text.Json
+open BotInfra
 open BotTestInfra
-open Npgsql
-open Dapper
 open Xunit
 
 /// Owner's exact acceptance scenario for PR #425 (Postgres LISTEN/NOTIFY cross-pod settings
@@ -19,13 +18,7 @@ type VahterSettingsPropagationTests(fixture: VahterMultiPodContainers) =
     [<Fact>]
     let ``reload-settings on instance 0 propagates STATS_SCHEDULED_HOUR_UTC to instance 1 within 5s`` () = task {
         let newHour = 13
-        use conn = new NpgsqlConnection(fixture.DbConnectionString)
-        do! conn.OpenAsync()
-        let! _ =
-            conn.ExecuteAsync(
-                "INSERT INTO bot_setting(key,value,type,feature_group) VALUES('STATS_SCHEDULED_HOUR_UTC', @v, 'FREE_FORM', 'CORE') \
-                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-                {| v = string newHour |})
+        do! DbSettings.upsertBotSetting fixture.DbConnectionString "STATS_SCHEDULED_HOUR_UTC" (string newHour) "FREE_FORM" "CORE"
 
         use content = new StringContent("", Encoding.UTF8, "application/json")
         let! reloadResp = fixture.BotHttpAt(0).PostAsync("/reload-settings", content)

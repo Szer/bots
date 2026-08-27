@@ -18,12 +18,11 @@ module SettingsPollHelpers =
         | false, _ -> None
 
     /// Polls `dump()` (a `fixture.GetSettingsDump(i)` call) every 250ms until `field` equals
-    /// `expected` or 5 seconds elapse — the owner's acceptance window for cross-pod settings
-    /// propagation via Postgres LISTEN/NOTIFY. Returns (reached, lastDumpSeen) so callers can
+    /// `expected` or `boundSeconds` elapse. Returns (reached, lastDumpSeen) so callers can
     /// print both dumps on a timeout instead of failing blind.
-    let waitForField (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
+    let waitForFieldWithin (boundSeconds: float) (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
         task {
-            let deadline = DateTime.UtcNow.AddSeconds 5.0
+            let deadline = DateTime.UtcNow.AddSeconds boundSeconds
             let mutable last = ""
             let mutable reached = false
             while not reached && DateTime.UtcNow < deadline do
@@ -36,3 +35,8 @@ module SettingsPollHelpers =
                     do! Task.Delay 250
             return reached, last
         }
+
+    /// 5s bound — the owner's acceptance window for cross-pod settings propagation via
+    /// Postgres LISTEN/NOTIFY without a reconnect in play.
+    let waitForField (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
+        waitForFieldWithin 5.0 dump field expected
