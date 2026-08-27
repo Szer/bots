@@ -8,16 +8,14 @@ open BotTestInfra
 open Npgsql
 open Xunit
 
-/// API-level reconnect coverage for SettingsListenerHostedService. Uses the Coupon fixture: no
-/// ML cold-start model/advisory-lock race to wait out, so it boots faster and the reconnect
-/// scenario stays the only variable under test.
+/// API-level reconnect coverage for SettingsListenerHostedService. Uses the Coupon fixture (no
+/// ML cold-start race) so the reconnect scenario stays the only variable under test.
 type CouponSettingsReconnectTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]
     let ``instance 1 reloads via reconnect after its LISTEN backend is killed`` () = task {
-        // Harsher than targeting one instance's backend by id/start-time: killing every LISTEN
-        // backend forces BOTH instances through SettingsListenerHostedService's reconnect path,
-        // and the assertion below still only needs instance 1's convergence to hold.
+        // Kills every LISTEN backend (harsher than targeting one instance) — forces BOTH instances
+        // through the reconnect path; the assertion only needs instance 1's convergence to hold.
         use conn = new NpgsqlConnection(fixture.DbConnectionString)
         do! conn.OpenAsync()
         use killCmd = new NpgsqlCommand(
@@ -31,9 +29,8 @@ type CouponSettingsReconnectTests(fixture: CouponMultiPodContainers) =
         let! reloadResp = fixture.BotHttpAt(0).PostAsync("/reload-settings", content)
         Assert.Equal(HttpStatusCode.OK, reloadResp.StatusCode)
 
-        // Bound of 15s: reconnect backoff is 1s min / 30s max cap, first retry lands ~1s in;
-        // SettingsListenerHostedService also reloads unconditionally on reconnect, so this
-        // passes whether instance 1 recovers the NOTIFY or just the reconnect-triggered reload.
+        // 15s bound: reconnect backoff is 1s min/30s max, first retry ~1s in; passes whether
+        // instance 1 recovers the NOTIFY or just the reconnect-triggered reload.
         let! reached, lastDump1 =
             SettingsPollHelpers.waitForFieldWithin 15.0 (fun () -> fixture.GetSettingsDump 1) "ReminderHourDublin" (string newHour)
         Assert.True(

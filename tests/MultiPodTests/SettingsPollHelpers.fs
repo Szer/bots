@@ -17,9 +17,8 @@ module SettingsPollHelpers =
             | _ -> Some(v.GetRawText())
         | false, _ -> None
 
-    /// Polls `dump()` (a `fixture.GetSettingsDump(i)` call) every 250ms until `field` equals
-    /// `expected` or `boundSeconds` elapse. Returns (reached, lastDumpSeen) so callers can
-    /// print both dumps on a timeout instead of failing blind.
+    /// Polls `dump()` every 250ms until `field` equals `expected` or `boundSeconds` elapse.
+    /// Returns (reached, lastDumpSeen) so callers can print both dumps on timeout, not fail blind.
     let waitForFieldWithin (boundSeconds: float) (dump: unit -> Task<string>) (field: string) (expected: string) : Task<bool * string> =
         task {
             let deadline = DateTime.UtcNow.AddSeconds boundSeconds

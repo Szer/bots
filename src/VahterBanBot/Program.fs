@@ -197,9 +197,8 @@ let reloadSettings () =
     botConfOptions.Set(fresh)
     botOcrOptions.Set(ocrConfigOf fresh)
 
-/// Publishes the local reload to every other pod via Postgres LISTEN/NOTIFY. Callers run
-/// this AFTER reloadSettings() has already applied the change locally — this pod's own
-/// listener re-running reloadSettings() a second time on its own notification is harmless.
+/// Publishes the local reload to every other pod via Postgres LISTEN/NOTIFY. Run AFTER
+/// reloadSettings() applied the change locally — this pod's own re-run on notify is harmless.
 let notifyOtherPods () = SettingsNotify.notifySettingsChanged connString
 
 let webhookCfg: WebhookConfig =
@@ -319,9 +318,8 @@ Readiness.mapReadyEndpoint
             return Results.Text("Access Denied", statusCode = 401)
         else
             reloadSettings()
-            // Update the runtime TimeProvider so BOT_FIXED_UTC_NOW changes take effect immediately.
-            // This is a no-op in production (setting is empty → System clock), but lets integration
-            // tests advance time without restarting the container.
+            // No-op in production (setting empty → System clock); lets integration tests advance
+            // time via BOT_FIXED_UTC_NOW without restarting the container.
             let mtp = ctx.RequestServices.GetRequiredService<Time.MutableTimeProvider>()
             mtp.SetInner(Time.fromString (getSettingOr "BOT_FIXED_UTC_NOW" ""))
             do! notifyOtherPods()

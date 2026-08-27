@@ -7,17 +7,15 @@ open Npgsql
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 
-/// Cross-pod settings propagation via Postgres LISTEN/NOTIFY. Each bot has its own database
-/// (Azure Flexible Server), so one constant channel name is safe per bot. No payload — every
-/// listener just re-runs the bot's own `reloadSettings` and re-reads `bot_setting` fresh.
+/// Cross-pod settings propagation via Postgres LISTEN/NOTIFY — one channel name per bot (own DB).
+/// No payload; every listener just re-runs its own `reloadSettings` and re-reads `bot_setting`.
 module SettingsNotify =
 
     [<Literal>]
     let Channel = "bot_settings_changed"
 
-    /// Fires `NOTIFY bot_settings_changed` on the bot's own connection string. Callers run
-    /// this after their local `reloadSettings()` has already applied the change, so a
-    /// notifying pod reloading twice (once locally, once via its own notification) is fine.
+    /// Fires `NOTIFY bot_settings_changed`. Callers run this after their own `reloadSettings()`
+    /// already applied the change, so reloading twice (local + own notification) is harmless.
     let notifySettingsChanged (connString: string) : Task =
         task {
             use conn = new NpgsqlConnection(connString)
@@ -28,9 +26,8 @@ module SettingsNotify =
         }
         :> Task
 
-/// Reloads once after every (re)connect — closing the window between a connection drop and the
-/// next NOTIFY — and again on each NOTIFY received while connected. Retries connection loss with
-/// capped exponential backoff; the up/down transition is logged once, not per retry attempt.
+/// Reloads on every (re)connect (closes the drop→NOTIFY window) and on each NOTIFY. Retries
+/// connection loss with capped exponential backoff; up/down transition logged once, not per retry.
 type SettingsListenerHostedService
     (
         connString: string,

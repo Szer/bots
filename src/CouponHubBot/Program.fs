@@ -86,9 +86,8 @@ let reloadSettings () =
     botConfOptions.Set(fresh)
     botOcrOptions.Set(ocrConfigOf fresh)
 
-/// Publishes the local reload to every other pod via Postgres LISTEN/NOTIFY. Callers run
-/// this AFTER reloadSettings() has already applied the change locally — this pod's own
-/// listener re-running reloadSettings() a second time on its own notification is harmless.
+/// Publishes the local reload to every other pod via Postgres LISTEN/NOTIFY. Run AFTER
+/// reloadSettings() applied the change locally — this pod's own re-run on notify is harmless.
 let notifyOtherPods () = SettingsNotify.notifySettingsChanged connString
 
 let webhookCfg: WebhookConfig =

@@ -8,10 +8,8 @@ open BotInfra
 open BotTestInfra
 open Xunit
 
-/// A `bot_setting` row changed directly in the DB and picked up by ONE instance's
-/// /reload-settings must reach every OTHER instance's live BotConfiguration too, without that
-/// instance ever calling /reload-settings itself — the gap single-pod /reload-settings tests
-/// never have to close.
+/// A `bot_setting` change picked up by ONE instance's /reload-settings must reach every OTHER
+/// instance's live BotConfiguration too, without that instance calling /reload-settings itself.
 type VahterSettingsPropagationTests(fixture: VahterMultiPodContainers) =
 
     [<Fact>]
