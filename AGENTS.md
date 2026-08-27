@@ -52,6 +52,10 @@ scripts/
 - Never use sentinel values (`DateTime.MinValue`) in domain models. If a value might not exist, use `option`. Group co-dependent fields into a single `option` of tuple/record instead of separate optionals.
 - **Always `git fetch origin main && git checkout -b <branch> origin/main`** before creating a feature branch.
 
+## Comment-Ratio Gate
+
+Commits/PRs fail if net new comment lines per language (tokei-based before/after delta, `scripts/check-comment-ratio.sh`) hit both a floor and a ratio of net new non-blank lines — defaults 5 lines / 15%, thresholds and per-language overrides live in `.comment-ratio.conf`. `///` doc comments are exempt. Enforced by `.githooks/pre-commit` and CI (`comment-lint.yml`); run `make install-hooks` once per clone to arm it locally.
+
 ## Development Environment
 
 - **Windows** with PowerShell as default shell
