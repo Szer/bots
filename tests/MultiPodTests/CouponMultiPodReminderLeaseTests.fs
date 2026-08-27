@@ -2,6 +2,7 @@ namespace MultiPodTests
 
 open System
 open System.Diagnostics
+open System.Net.Http
 open System.Threading.Tasks
 open BotTestInfra
 open MultiPodTests.FakeCallHelpers
@@ -45,6 +46,25 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
 
         // Reset the lease row so this test doesn't depend on run order relative to
         // other tests sharing this fixture (e.g. an earlier /test/run-reminder call).
+        let! _ =
+            conn.ExecuteAsync(
+                "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
+
+        // TEMPORARY sanity check (debugging a CI-only failure): confirms ReminderService.RunOnce
+        // actually produces the expected message for this exact data via the RunJobNow bypass,
+        // isolating "RunOnce/data problem" from "tick/tryAcquire never fires" before the real
+        // lease-race assertions below. Removed once the root cause is found.
+        use sanityBody = new StringContent("", Text.Encoding.UTF8, "application/json")
+        let! sanityResp = fixture.BotHttpAt(0).PostAsync($"/test/run-reminder?nowUtc={todayIso}T12:06:00Z", sanityBody)
+        Assert.Equal(Net.HttpStatusCode.OK, sanityResp.StatusCode)
+        let sanitySw = Stopwatch.StartNew()
+        let mutable sanityMatch = 0
+        while sanityMatch = 0 && sanitySw.ElapsedMilliseconds < 15000L do
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            sanityMatch <- countCallsWithText calls fixture.CommunityChatId "Сегодня истекает 1 купон на сумму"
+            if sanityMatch = 0 then do! Task.Delay 200
+        Assert.True(sanityMatch > 0, "SANITY (RunJobNow bypass) FAILED: ReminderService.RunOnce did not send the expected message for this data — bug is in RunOnce/data setup, not the lease/tick path.")
+        do! fixture.ClearFakeCalls()
         let! _ =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
