@@ -9,7 +9,7 @@ open Dapper
 open Xunit
 
 /// DB-integration-level coverage of DB.fs's SaveTrainedModel WHERE guard (ML.fs's loser-timeout
-/// fallback race, design item 3). A full two-pod StartAsync race is impractical to test directly
+/// fallback race). A full two-pod StartAsync race is impractical to test directly
 /// (SDCA training takes minutes; timing two real HostedServices against the 5-minute poll window
 /// would be slow and flaky) -- this exercises the exact SQL guard against a real Postgres instead,
 /// which is what actually prevents the clobber.

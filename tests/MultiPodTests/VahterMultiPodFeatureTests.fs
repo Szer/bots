@@ -57,13 +57,13 @@ WHERE stream_id  = 'user:' || @userId
     }
 
 /// Feature-specific multi-pod behavior stacking on VahterMultiPodSmokeTests.fs's proof that the
-/// harness itself works -- covers PR #426's two DB-shared-state fixes: the spam-text cache
-/// (spam_text_seed) and the chat-admin snapshot (chat_admin). The ML fallback guard (SaveTrainedModel
-/// WHERE clause) is covered at DB-integration level in VahterBanBot.Tests/MLFallbackGuardTests.fs --
-/// a real two-pod cold-start race is impractical here too (SDCA training takes minutes).
+/// harness itself works -- covers two DB-shared-state fixes: the spam-text cache (spam_text_seed)
+/// and the chat-admin snapshot (chat_admin). The ML fallback guard (SaveTrainedModel WHERE clause)
+/// is covered at DB-integration level in VahterBanBot.Tests/MLFallbackGuardTests.fs -- a real
+/// two-pod cold-start race is impractical here too (SDCA training takes minutes).
 type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
 
-    /// THE HEADLINE TEST: a manual /ban delivered to instance 0 seeds spam_text_seed (V45); the
+    /// A manual /ban delivered to instance 0 seeds spam_text_seed (V45); the
     /// exact same normalized text arriving as a FRESH message on instance 1 -- which never saw
     /// the /ban -- is still auto-deleted, because the cache is Postgres-backed, not a per-pod
     /// ConcurrentDictionary. Requires SPAM_TEXT_CACHE_MODE=enforce + ML_SPAM_DELETION_ENABLED=true

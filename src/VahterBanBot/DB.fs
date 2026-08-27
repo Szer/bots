@@ -1314,8 +1314,8 @@ RETURNING job_name;
             do! tx.DisposeAsync()
         }
 
-    /// Flat set of every admin user_id across all monitored chats — matches the shape
-    /// UpdateChatAdmins.Admins has always exposed (chat scoping was never used by consumers).
+    /// Flat set of every admin user_id across all monitored chats; chat_id isn't consumed —
+    /// UpdateChatAdmins.Admins is chat-agnostic.
     member _.GetChatAdminIds() : Task<int64 array> =
         task {
             use conn = new NpgsqlConnection(connString)

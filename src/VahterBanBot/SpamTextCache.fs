@@ -16,8 +16,7 @@
 /// tokenized. An earlier attempt reused a clustering normalizer that mapped URLs -> "<url>" and
 /// digits -> "<num>"; one banned message normalized down to the single character "." and the
 /// cache then killed 70 innocent bare-period replies. Aggressive normalization is the known
-/// failure mode here — do not "improve" this without re-reading that incident (see the PR
-/// description for the full writeup).
+/// failure mode here — do not "improve" this without re-reading that incident.
 module VahterBanBot.SpamTextCache
 
 open System
@@ -41,7 +40,7 @@ let normalize (text: string) : string =
         (whitespaceRun.Replace(nfkcLower, " ")).Trim()
 
 /// Identifies the /ban that seeded a cache hit, so a hit can be traced back to its cause
-/// (chat_id, message_id) for logs/traces — design requirement, not decoration.
+/// (chat_id, message_id) for logs/traces.
 type SpamCacheHit =
     { SeedChatId: int64
       SeedMessageId: int64 }
@@ -55,9 +54,8 @@ type private SpamTextSeedRow =
 type ISpamTextCache =
     /// Seeds the cache from a manually-banned message's text. `bannedAt` is the ban's own
     /// timestamp, not necessarily "now". Returns false (and does not store anything) when the
-    /// normalized text is shorter than `minLength` — see the PR description for why the
-    /// seed-hygiene floor is 40 chars, not 80. Idempotent: an INSERT ... ON CONFLICT upsert, so
-    /// re-seeding the same normalized text just refreshes its expiry.
+    /// normalized text is shorter than `minLength`. Idempotent: an INSERT ... ON CONFLICT upsert,
+    /// so re-seeding the same normalized text just refreshes its expiry.
     abstract member Seed: text: string * minLength: int * ttl: TimeSpan * chatId: int64 * messageId: int64 * bannedAt: DateTime -> Task<bool>
     /// Looks up a normalized-text match that has not expired as of `now`.
     abstract member TryGet: text: string * now: DateTime -> Task<SpamCacheHit option>

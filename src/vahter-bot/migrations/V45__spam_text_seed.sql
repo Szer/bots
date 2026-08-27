@@ -1,8 +1,8 @@
--- Postgres-backed replacement for the in-process ban-seeded spam-text cache (SpamTextCache.fs).
--- A single-pod ConcurrentDictionary can't see a /ban handled by a different pod, halving the
--- exact-repeat catch rate with 2+ replicas. Normalized text is the primary key (same conservative
--- normalization as before — see SpamTextCache.fs); TTL is enforced at read time via expires_at,
--- expired rows are swept by the existing daily cleanup job (Cleanup.fs).
+-- Postgres-backed ban-seeded spam-text cache, shared across pods (SpamTextCache.fs) — a
+-- single-pod ConcurrentDictionary can't see a /ban handled by a different pod, halving the
+-- exact-repeat catch rate with 2+ replicas. Normalized text is the primary key (normalization in
+-- SpamTextCache.fs); TTL is enforced at read time via expires_at, expired rows are swept by the
+-- daily cleanup job (Cleanup.fs).
 CREATE TABLE spam_text_seed (
     normalized_text TEXT        PRIMARY KEY,
     chat_id         BIGINT      NOT NULL,
