@@ -15,11 +15,11 @@ open Xunit
 /// not `/test/run-reminder`'s RunJobNow, which bypasses the lease entirely and
 /// would prove nothing about it.
 ///
-/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin) rather than pinned to
-/// a determinism-proof value — the scheduled UTC time-of-day this produces is
-/// satisfiable for most of the UTC day (~09:00 UTC onward in summer, ~10:00 UTC
-/// onward in winter) but not literally 24/7; this test assumes it runs outside
-/// that early-UTC-morning window, same as CI/dev traffic patterns normally do.
+/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin); determinism instead
+/// comes from CouponMultiPodContainers pinning BOT_FIXED_UTC_NOW to noon UTC on
+/// today's real date — safely past the scheduled UTC slot (09:00 summer / 10:00
+/// winter) regardless of what hour CI actually runs at, so this no longer depends
+/// on an early-UTC-morning window.
 type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]
@@ -29,10 +29,10 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         use conn = new NpgsqlConnection(fixture.DbConnectionString)
         do! conn.OpenAsync()
 
-        // "Today" per each instance's own FakeTimeProvider, which starts at real
-        // wall-clock "now" (this fixture seeds no BOT_FIXED_UTC_NOW) — the test
-        // host's UTC date matches as long as the run doesn't straddle midnight UTC.
-        let todayIso = DateTime.UtcNow.Date.ToString("yyyy-MM-dd")
+        // "Today" per the fixture's pinned BOT_FIXED_UTC_NOW (noon UTC on the real
+        // date the fixture was built) — matches Postgres's own unfaked CURRENT_DATE
+        // as long as the run doesn't straddle midnight UTC.
+        let todayIso = fixture.FixedUtcNow.UtcDateTime.Date.ToString("yyyy-MM-dd")
         let! _ =
             conn.ExecuteAsync(
                 """INSERT INTO "user"(id, username, first_name, created_at, updated_at)
