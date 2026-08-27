@@ -9,7 +9,7 @@ open BatchTestHelpers
 
 /// State-machine transition tests for the album batch flow:
 ///   Open → AwaitingUser → [*]  (confirm / cancel / supersede / command / TTL / stale)
-///   Open → AwaitingUser → AwaitingUser  (late straggler re-arms debounce)
+///   Open → AwaitingUser  (late straggler rejected, user notified — no re-arm)
 type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
 
     let setupBatchTest () =
@@ -269,10 +269,10 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! waitForBatchCleared fixture batchId 5000
         }
 
-    // ── Late straggler in awaiting_user ─────────────────────────────────
+    // ── Late straggler after awaiting_user ──────────────────────────────
 
     [<Fact>]
-    let ``Late straggler in awaiting_user appends an item and re-arms debounce`` () =
+    let ``Late straggler after awaiting_user is rejected and user is notified`` () =
         task {
             do! setupBatchTest ()
             let user = Tg.user(id = 7240L, username = "late_straggler", firstName = "Late")
@@ -286,37 +286,13 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
 
-            // Send another photo with the SAME media_group_id while batch is in
-            // awaiting_user. AddBatchItem (which selects FOR UPDATE on
-            // pending_add_batch rows in ('open','awaiting_user')) should accept it.
+            // Same media_group_id while batch is awaiting_user — AddBatchItem locks FOR UPDATE
+            // on status='open' only, so this straggler is rejected (BatchNotOpen).
             do! fixture.SetTelegramFile("late-2", readImageBytes goodFile)
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = "late-2", messageId = 9951))
 
-            // Wait for the new item to appear and reach a terminal status (OCR).
-            do! waitForItemCount fixture batchId 2 5000
-            do! waitForAllItemsTerminal fixture batchId 10000
+            do! waitForSendMessageMatching fixture user.Id (fun t -> t.Contains "не попал в текущий пакет") 5000
 
-            // Fire debounce again → finalize re-runs.
-            do! advancePastDebounce fixture
-            do! Task.Delay 500
-
-            // CURRENT BEHAVIOR (documenting the UX gap):
-            // FinalizeBatch's first step is TryFlipBatchToAwaiting, which
-            // updates WHERE status='open'. The batch is already 'awaiting_user'
-            // from the first finalize, so this UPDATE matches 0 rows and
-            // returns false → FinalizeBatch early-returns without re-rendering
-            // the bulk-confirm message. The user's chat still shows
-            // "Подтвердить 1 купон" even though 2 items now sit in
-            // status='ok'.
-            //
-            // The leaked late item IS silently included when the user clicks
-            // confirm — BulkBatchConfirm reads all items with status='ok' from
-            // DB, not the snapshot rendered into the message. So the user is
-            // told "1" but gets "2" coupons on confirm. UX surprise but no
-            // data loss.
-            //
-            // If finalize is changed to re-render on late stragglers, tighten
-            // these assertions to (== 2, == 2) — that's the more honest UX.
             let! calls = fixture.GetFakeCalls("sendMessage")
             let bulks = bulkConfirmCalls calls user.Id
             Assert.Equal(1, bulks.Length)
@@ -325,22 +301,55 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
                 fixture.QuerySingle<int64>(
                     "SELECT COUNT(*)::bigint FROM pending_add_batch_item WHERE batch_id=@b",
                     {| b = batchId |})
-            Assert.Equal(2L, itemCount)
+            Assert.Equal(1L, itemCount)
+        }
 
-            // Confirm DOES include both items in the actual coupon insert,
-            // proving the leaked-but-silently-included UX gap.
-            let! _ = fixture.SendUpdate(Tg.dmCallback($"addflow:bulk:confirm:{batchId}", user))
-            do! waitForBatchCleared fixture batchId 5000
-            let! couponCount =
+    // ── Cross-pod premature finalize ────────────────────────────────────
+
+    /// Photo 1 arms this pod's timer; photo 2 lands via a direct DB insert bumping updated_at the
+    /// same way AddBatchItem would -- FinalizeBatch must see that and re-arm, not flip early.
+    [<Fact>]
+    let ``Cross-pod race: item landing via direct DB insert after timer armed defers finalize`` () =
+        task {
+            do! setupBatchTest ()
+            let user = Tg.user(id = 7241L, username = "crosspod", firstName = "XPod")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+            let mgid = $"mg-xpod-{DateTime.UtcNow.Ticks}"
+
+            do! sendOnePhotoAlbum user mgid "xpod-1" 9960
+            let! batchId = waitForBatchByUser fixture user.Id 5000
+            do! waitForAllItemsTerminal fixture batchId 10000
+
+            // t0 is the app's fake clock (AddBatchItem's touchSql), not Postgres NOW() —
+            // the latter runs on the real wall clock, nowhere near the frozen TEST_MODE time.
+            let! t0 = fixture.QuerySingle<DateTime>("SELECT updated_at FROM pending_add_batch WHERE id=@b", {| b = batchId |})
+            let t1 = t0.AddSeconds(5.0)
+            let! _ =
+                fixture.Execute(
+                    "INSERT INTO pending_add_batch_item(batch_id, seq, photo_file_id, photo_message_id, status, value, min_check, expires_at) VALUES (@b, 2, 'xpod-2', 9961, 'ok', 10, 50, '2027-12-31');",
+                    {| b = batchId |})
+            let! _ =
+                fixture.Execute(
+                    "UPDATE pending_add_batch SET updated_at = @t WHERE id = @b;",
+                    {| b = batchId; t = t1 |})
+
+            do! advancePastDebounce fixture
+            do! Task.Delay 500
+
+            // Must NOT have finalized yet — the DB-authoritative check saw
+            // updated_at bumped after the timer was armed and deferred instead.
+            let! statusAfterFirstFire =
+                fixture.QuerySingle<string>("SELECT status FROM pending_add_batch WHERE id=@b", {| b = batchId |})
+            Assert.Equal("open", statusAfterFirstFire)
+
+            do! fixture.AdvanceBotClock(6_000)
+            do! waitForBatchStatus fixture batchId "awaiting_user" 5000
+
+            let! itemCount =
                 fixture.QuerySingle<int64>(
-                    "SELECT COUNT(*)::bigint FROM coupon WHERE owner_id=@u",
-                    {| u = user.Id |})
-            // 1 coupon, not 2, because both items share the SAME barcode (goodFile)
-            // and coupon_barcode_active_uniq (V13) dedupes on confirm. The straggler
-            // is marked 'failed' as DuplicateBarcode. But it WAS attempted — the
-            // confirm loop included it. If the two items had different barcodes,
-            // both would have been inserted despite the message saying "1".
-            Assert.Equal(1L, couponCount)
+                    "SELECT COUNT(*)::bigint FROM pending_add_batch_item WHERE batch_id=@b",
+                    {| b = batchId |})
+            Assert.Equal(2L, itemCount)
         }
 
     // ── Membership gate at finalize ────────────────────────────────────

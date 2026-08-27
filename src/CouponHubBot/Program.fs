@@ -156,7 +156,26 @@ if botConfOptions.Value.TestMode then
     .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
-    .AddHostedService<ReminderService>(fun sp -> sp.GetRequiredService<ReminderService>())
+    // Lease-gated (scheduled_job) so exactly one pod sends the reminder. SchedulerHostedService
+    // needs `connString` directly (like DbService), so it's built via factory closure, not ctor DI.
+    .AddSingleton<SchedulerHostedService>(fun sp ->
+        new SchedulerHostedService(
+            connString,
+            sp.GetRequiredService<TimeProvider>(),
+            CouponScheduledJobs.jobDefinitions
+                (sp.GetRequiredService<ReminderService>())
+                (sp.GetRequiredService<IOptions<BotConfiguration>>())
+                (sp.GetRequiredService<TimeProvider>()),
+            TimeSpan.FromMinutes 5.0,
+            sp.GetRequiredService<ILogger<SchedulerHostedService>>()))
+    .AddHostedService<SchedulerHostedService>(fun sp -> sp.GetRequiredService<SchedulerHostedService>())
+    .AddHostedService<ReminderRunOnStartService>(fun sp ->
+        ReminderRunOnStartService(
+            connString,
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<IOptions<BotConfiguration>>(),
+            sp.GetRequiredService<ReminderService>(),
+            sp.GetRequiredService<ILogger<ReminderRunOnStartService>>()))
     .AddHostedService<SettingsListenerHostedService>(fun sp ->
         new SettingsListenerHostedService(
             connString,
@@ -195,27 +214,24 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
                 return Results.Json({| ok = true; advancedMs = ms |})
     }))
 
-// Test-only hook to trigger reminder immediately
+// Test-only: bypasses the lease, fire-and-forget (callers poll for effects). ?nowUtc= sets a
+// one-shot override instead of moving the shared FakeTimeProvider, which would leak into later tests.
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
         if not opts.Value.TestMode then
             return Results.NotFound()
         else
-            let runner = ctx.RequestServices.GetRequiredService<ReminderService>()
-            let timeProvider = ctx.RequestServices.GetRequiredService<TimeProvider>()
-            let nowUtc =
-                if ctx.Request.Query.ContainsKey("nowUtc") then
-                    try
-                        let raw = string ctx.Request.Query["nowUtc"]
-                        DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
-                    with _ ->
-                        timeProvider.GetUtcNow().UtcDateTime
-                else
-                    timeProvider.GetUtcNow().UtcDateTime
+            if ctx.Request.Query.ContainsKey("nowUtc") then
+                try
+                    let raw = string ctx.Request.Query["nowUtc"]
+                    let nowUtc = DateTime.Parse(raw, CultureInfo.InvariantCulture, DateTimeStyles.AdjustToUniversal ||| DateTimeStyles.AssumeUniversal)
+                    CouponScheduledJobs.setTestNowOverride (Some nowUtc)
+                with _ -> ()
 
-            let! sent = runner.RunOnce(nowUtc)
-            return Results.Json({| ok = true; sent = sent |})
+            let scheduler = ctx.RequestServices.GetRequiredService<SchedulerHostedService>()
+            do! scheduler.RunJobNow(CouponScheduledJobs.ReminderJobName)
+            return Results.Json({| started = CouponScheduledJobs.ReminderJobName |}, statusCode = 202)
     }))
 
 // Test-only hook to clear TelegramMembershipService's in-memory cache immediately.

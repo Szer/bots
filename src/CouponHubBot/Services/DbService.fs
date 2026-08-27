@@ -27,6 +27,14 @@ type VoidCouponResult =
     | Voided of coupon: Coupon * takenByUserId: int64 option
     | NotFoundOrNotAllowed
 
+/// Result of AddBatchItem. BatchNotOpen is distinct from DuplicatePhoto so the caller can tell a
+/// Telegram redelivery (silent no-op) apart from a straggler after the batch flipped/closed (notify).
+[<RequireQualifiedAccess>]
+type AddBatchItemResult =
+    | ItemAdded of itemId: int64
+    | DuplicatePhoto
+    | BatchNotOpen
+
 /// Result of a holder reporting a coupon as already used externally (taken -> reported).
 [<RequireQualifiedAccess>]
 type ReportCouponResult =
@@ -1656,25 +1664,37 @@ RETURNING id;
         }
 
     /// Inserts a new item under a batch. Locks the batch row to serialize seq
-    /// assignment under concurrent webhook arrivals for the same album. Returns
-    /// None on duplicate photo_file_id (Telegram redelivery) or on a closed/missing batch.
-    member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int64) =
+    /// assignment under concurrent webhook arrivals. Redelivery is checked BEFORE the open-status
+    /// lock, so it reports DuplicatePhoto even after finalize; status='open' only (not 'awaiting_user').
+    member _.AddBatchItem(batchId: int64, photoFileId: string, photoMessageId: int64) : Task<AddBatchItemResult> =
         task {
             use! conn = openConn()
             use tx = conn.BeginTransaction(IsolationLevel.ReadCommitted)
 
             //language=postgresql
+            let dupSql = "SELECT id FROM pending_add_batch_item WHERE batch_id = @batch_id AND photo_file_id = @photo_file_id;"
+            let! existingId =
+                conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
+                    dupSql,
+                    {| batch_id = batchId; photo_file_id = photoFileId |},
+                    tx)
+            if existingId.HasValue then
+                do! tx.CommitAsync()
+                return AddBatchItemResult.DuplicatePhoto
+            else
+
+            //language=postgresql
             let lockSql =
                 """
 SELECT id FROM pending_add_batch
-WHERE id = @id AND status IN ('open', 'awaiting_user')
+WHERE id = @id AND status = 'open'
 FOR UPDATE;
 """
             let! lockedId =
                 conn.QuerySingleOrDefaultAsync<Nullable<int64>>(lockSql, {| id = batchId |}, tx)
             if not lockedId.HasValue then
                 do! tx.RollbackAsync()
-                return None
+                return AddBatchItemResult.BatchNotOpen
             else
                 //language=postgresql
                 let insertSql =
@@ -1701,10 +1721,12 @@ RETURNING id;
                     let touchSql = "UPDATE pending_add_batch SET updated_at = @now_utc WHERE id = @id;"
                     let! _ = conn.ExecuteAsync(touchSql, {| id = batchId; now_utc = utcNow () |}, tx)
                     do! tx.CommitAsync()
-                    return Some newId.Value
+                    return AddBatchItemResult.ItemAdded newId.Value
                 else
+                    // Lost a race against a concurrent insert of the same
+                    // photo_file_id that landed between our dup-check and here.
                     do! tx.RollbackAsync()
-                    return None
+                    return AddBatchItemResult.DuplicatePhoto
         }
 
     /// Conditional OCR-success write: only updates if the row is still 'pending'.

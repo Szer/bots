@@ -643,10 +643,27 @@ type CouponFlowHandler(
     /// user via SendFinalizeFallback — a single bug or upstream outage must
     /// never leave the user stuck on the "обрабатываю купоны…" placeholder.
     /// Safe to call concurrently — TryFlipBatchToAwaiting enforces single-winner.
+    /// DB-authoritative: the local timer only TRIGGERS a check; re-reading `updated_at` catches
+    /// activity from a DIFFERENT pod after this pod's timer armed, closing the premature-finalize race.
     member this.FinalizeBatch (batchId: int64) : Task =
         task {
             use a = botActivity.StartActivity("finalizeBatch")
             if not (isNull a) then %a.SetTag("batchId", batchId)
+
+            let! preCheck = db.GetBatchById batchId
+            let deferForMs =
+                match preCheck with
+                | Some batch when batch.status = "open" ->
+                    let debounceMs = botOptions.Value.BatchDebounceMs
+                    let elapsedMs = int (time.GetUtcNow().UtcDateTime - batch.updated_at).TotalMilliseconds
+                    // elapsedMs < 0 (updated_at ahead of our clock, e.g. touched via Postgres
+                    // NOW() directly) is treated as not fresh rather than deferring forever.
+                    if elapsedMs >= 0 && elapsedMs < debounceMs then Some(max 1 (debounceMs - elapsedMs)) else None
+                | _ -> None
+
+            if deferForMs.IsSome then
+                batchDebounce.Schedule(batchId, deferForMs.Value, Func<Task>(fun () -> this.FinalizeBatch batchId))
+            else
 
             let! won = db.TryFlipBatchToAwaiting batchId
             if not won then () else
@@ -750,13 +767,17 @@ type CouponFlowHandler(
                     with ex ->
                         logger.LogWarning(ex, "Failed to send album placeholder for batch {BatchId}", batchId)
 
-                let! itemIdOpt = db.AddBatchItem(batchId, photoFileId, msg.MessageId)
-                match itemIdOpt with
-                | None ->
-                    // Either a Telegram redelivery (same photo_file_id) or the batch
-                    // was concurrently abandoned. Either way, nothing more to do.
+                let! addResult = db.AddBatchItem(batchId, photoFileId, msg.MessageId)
+                match addResult with
+                | AddBatchItemResult.DuplicatePhoto ->
+                    // Telegram redelivery of the same photo_file_id — nothing more to do.
                     return true
-                | Some itemId ->
+                | AddBatchItemResult.BatchNotOpen ->
+                    // Straggler after this batch already flipped/closed (cross-pod race, or the
+                    // user kept sending) — tell the user instead of silently orphaning it.
+                    do! sendText chatId "Этот купон не попал в текущий пакет — альбом уже обрабатывается. Пришли фото отдельным сообщением после подтверждения текущего пакета."
+                    return true
+                | AddBatchItemResult.ItemAdded itemId ->
                     // Fire-and-forget OCR. DB is the channel back to FinalizeBatch.
                     // Capture the current activity context BEFORE Task.Run so the
                     // batchOcrItem span links to handleAlbumPhoto in OTEL traces —

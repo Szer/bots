@@ -1,5 +1,7 @@
 namespace CouponHubBot.Tests
 
+open System
+open System.Diagnostics
 open System.Threading.Tasks
 open System.Text
 open System.Net.Http
@@ -9,7 +11,44 @@ open Npgsql
 open Xunit
 open FakeCallHelpers
 
+/// `/test/run-reminder` is fire-and-forget, so the HTTP response returns before the job's DB
+/// writes land. Every test below polls `last_completed_at` instead of trusting the POST timing.
 type ReminderTests(fixture: DefaultCouponHubTestContainers) =
+
+    let lastCompletedAt () =
+        fixture.QuerySingleOrDefault<Nullable<DateTime>>(
+            "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'", null)
+
+    /// Polls for a value CHANGE, not "greater than a host-side timestamp" -- the poller runs on
+    /// the test host while the write happens in the bot container; cross-clock compares bit BatchDebounce before.
+    let waitForReminderCompletion (before: Nullable<DateTime>) (timeoutMs: int) =
+        task {
+            let sw = Stopwatch.StartNew()
+            let mutable completed = false
+            while not completed && sw.ElapsedMilliseconds < int64 timeoutMs do
+                let! completedAt = lastCompletedAt ()
+                completed <- completedAt.HasValue && completedAt <> before
+                if not completed then do! Task.Delay 25
+            if not completed then
+                failwith $"Timeout: reminder_daily did not complete after {timeoutMs}ms"
+        }
+
+    /// Triggers the reminder job and waits for it to finish. `nowUtc`, if given, moves the shared
+    /// FakeTimeProvider's reported "now" only -- outstanding timers are left alone.
+    let runReminder (nowUtc: string option) =
+        task {
+            let! before = lastCompletedAt ()
+            let path =
+                match nowUtc with
+                | Some raw -> $"/test/run-reminder?nowUtc={raw}"
+                | None -> "/test/run-reminder"
+            use body = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = fixture.Bot.PostAsync(path, body)
+            if not resp.IsSuccessStatusCode then
+                let! text = resp.Content.ReadAsStringAsync()
+                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! waitForReminderCompletion before 5000
+        }
 
     [<Theory>]
     [<InlineData(1, "Сегодня истекает 1 купон на сумму")>]
@@ -29,8 +68,7 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
                     "INSERT INTO coupon(owner_id, photo_file_id, value, min_check, expires_at, status) VALUES (500,@photoId,10.00,50.00,@today::date,'available');",
                     {| photoId = $"seed-photo-plural-{couponCount}-{i}"; today = todayIso |}) :> Task
 
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! _ = fixture.Bot.PostAsync("/test/run-reminder", body)
+            do! runReminder None
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls -42L expectedText,
@@ -70,11 +108,7 @@ VALUES
                 :> Task
 
             // 2026-02-02 is the first Monday of February 2026; 10:00 UTC = 10:00 Dublin (winter/GMT).
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-02-02T10:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-02-02T10:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -101,11 +135,7 @@ VALUES
             do! fixture.ClearFakeCalls()
 
             // 2026-01-12 is the second Monday of January 2026 (day 12 > 7).
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-12T10:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-12T10:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -131,11 +161,7 @@ VALUES
             do! fixture.ClearFakeCalls()
 
             // 2026-01-07 is a Wednesday (day = 7, first week, but not Monday).
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-07T10:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-07T10:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -179,11 +205,7 @@ ON CONFLICT (id) DO NOTHING;
                 )
                 :> Task
 
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-19T08:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-19T08:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let dmCallsToUser =
@@ -227,11 +249,7 @@ ON CONFLICT (id) DO NOTHING;
                 )
                 :> Task
 
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-07-24T09:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-07-24T09:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let dmCallsToUser =
@@ -268,11 +286,7 @@ ON CONFLICT (id) DO NOTHING;
                 )
                 :> Task
 
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-07-24T09:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-07-24T09:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let dmCallsToUser =
@@ -312,11 +326,7 @@ VALUES (9101,701,'used','2026-01-18T10:00:00Z');
                 :> Task
 
             // Run reminder for 2026-01-19 (yesterday = 2026-01-18)
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-19T08:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-19T08:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls 701L "Не забудь добавить купоны в бота",
@@ -353,14 +363,10 @@ VALUES
                 :> Task
 
             // Run reminder for 2026-01-19 (yesterday = 2026-01-18)
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-19T08:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-19T08:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            
+
             // User 702 should NOT receive the add-coupon reminder
             let dmCallsToUser702 =
                 calls
@@ -402,14 +408,10 @@ VALUES
                 :> Task
 
             // Run reminder for 2026-01-19 at 08:00 (yesterday = 2026-01-18)
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-19T08:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-19T08:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            
+
             // User 703 should NOT receive the add-coupon reminder because they added after using
             let dmCallsToUser703 =
                 calls
@@ -443,11 +445,7 @@ VALUES
                    ON CONFLICT (chat_id, message_id) DO NOTHING;""") :> Task
 
             // Run reminder (which triggers retention cleanup)
-            use body = new StringContent("", Encoding.UTF8, "application/json")
-            let! resp = fixture.Bot.PostAsync("/test/run-reminder?nowUtc=2026-01-01T10:00:00Z", body)
-            if not resp.IsSuccessStatusCode then
-                let! text = resp.Content.ReadAsStringAsync()
-                failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
+            do! runReminder (Some "2026-01-01T10:00:00Z")
 
             // Old message should be deleted
             let! oldCount = conn.QuerySingleAsync<int>(
@@ -459,6 +457,3 @@ VALUES
                 "SELECT COUNT(*)::int FROM chat_message WHERE message_id = 50002 AND chat_id = -42", null)
             Assert.Equal(1, recentCount)
         }
-
-
-

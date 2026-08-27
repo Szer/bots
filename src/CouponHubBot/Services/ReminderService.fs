@@ -1,14 +1,14 @@
 namespace CouponHubBot.Services
 
 open System
-open System.Threading
 open System.Threading.Tasks
-open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open BotInfra
 open CouponHubBot
 
+/// Daily reminder run: expiring-coupons post, leaderboard, overdue DMs, retention cleanup.
+/// Scheduling/exactly-once-per-pod is owned by `CouponScheduledJobs` — this type is just the work.
 type ReminderService(
     tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
@@ -16,8 +16,6 @@ type ReminderService(
     logger: ILogger<ReminderService>,
     time: TimeProvider
 ) =
-    inherit BackgroundService()
-
     let formatUser (userId: int64) (username: string) (firstName: string) =
         if not (String.IsNullOrWhiteSpace username) then
             "@" + username
@@ -145,42 +143,8 @@ type ReminderService(
             return anySent
         }
 
-    let nextRunUtc (hourDublin: int) =
-        let now = time.GetUtcNow().UtcDateTime
-        let dublinTz = Utils.TimeZones.getDublinTimeZone()
-        let nowDublin = TimeZoneInfo.ConvertTimeFromUtc(now, dublinTz)
-        let todayAtHourDublin = DateTime(nowDublin.Year, nowDublin.Month, nowDublin.Day, hourDublin, 0, 0)
-        let targetDublin =
-            if nowDublin <= todayAtHourDublin then todayAtHourDublin
-            else todayAtHourDublin.AddDays(1.0)
-        TimeZoneInfo.ConvertTimeToUtc(targetDublin, dublinTz)
-
-    override _.ExecuteAsync(stoppingToken: CancellationToken) =
-        task {
-            if options.Value.ReminderRunOnStart then
-                try
-                    let! _ = runOnce (time.GetUtcNow().UtcDateTime)
-                    ()
-                with ex ->
-                    logger.LogError(ex, "Failed to run reminder on startup")
-
-            while not stoppingToken.IsCancellationRequested do
-                let next = nextRunUtc options.Value.ReminderHourDublin
-                let delay = next - time.GetUtcNow().UtcDateTime
-                if delay > TimeSpan.Zero then
-                    logger.LogInformation("Next reminder run at {NextRunUtc}", next)
-                    do! Task.Delay(delay, stoppingToken)
-
-                if stoppingToken.IsCancellationRequested then
-                    ()
-                else
-                    try
-                        let! _ = runOnce(time.GetUtcNow().UtcDateTime)
-                        ()
-                    with ex ->
-                        logger.LogError(ex, "Failed to send reminder")
-        }
-
+    /// Runs the reminder work once. Called by the lease-gated job definition in production,
+    /// and by TEST_MODE `/test/run-reminder` (bypasses the lease via RunJobNow).
     member _.RunOnce(?nowUtc: DateTime) =
         let now = defaultArg nowUtc (time.GetUtcNow().UtcDateTime)
         runOnce now

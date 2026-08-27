@@ -11,11 +11,14 @@
         <Compile Include="FakeCallHelpers.fs" />
         <Compile Include="SmokeHelpers.fs" />
         <Compile Include="SettingsPollHelpers.fs" />
+        <Compile Include="ClockAdvanceHelpers.fs" />
         <Compile Include="VahterMultiPodContainers.fs" />
         <Compile Include="CouponMultiPodContainers.fs" />
         <Compile Include="VahterMultiPodSmokeTests.fs" />
         <Compile Include="VahterMultiPodFeatureTests.fs" />
         <Compile Include="CouponMultiPodSmokeTests.fs" />
+        <Compile Include="CouponMultiPodReminderLeaseTests.fs" />
+        <Compile Include="CouponMultiPodDebounceTests.fs" />
         <Compile Include="VahterSettingsPropagationTests.fs" />
         <Compile Include="CouponSettingsPropagationTests.fs" />
         <Compile Include="CouponSettingsReconnectTests.fs" />

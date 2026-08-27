@@ -10,6 +10,7 @@
     <Compile Include="Services/CouponOcrEngine.fs" />
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />
+    <Compile Include="Services/CouponScheduledJobs.fs" />
     <Compile Include="Services/BotHelpers.fs" />
     <Compile Include="Services/BatchDebounce.fs" />
     <Compile Include="Services/CouponFlowHandler.fs" />
