@@ -49,26 +49,28 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = NULL, locked_until = NULL, locked_by = NULL WHERE job_name = 'reminder_daily'")
 
-        // Push BOTH instances' clocks past CouponScheduledJobs' 5-minute tick
-        // interval (Program.fs's SchedulerHostedService registration) so both
-        // SchedulerHostedServices actually tick and both attempt tryAcquire against
-        // the same row — this is the natural production race, not a bypass.
-        do! fixture.AdvanceAllClocks(6 * 60 * 1000)
-
-        // Bounds very generous (150s / 60s), not tight: this fixture's containers share the CI
-        // runner with VahterBanBot's much heavier multi-pod fixture (ML cold-start) — observed
-        // container-startup delay alone has reached ~2m39s under contention on this same runner,
-        // so the real wall-clock delay between the fake-clock tick firing and the DB/Telegram
-        // round trips actually completing needs comparable margin. The PeriodicTimer/
-        // FakeTimeProvider tick itself fires immediately once due (verified in isolation); this
-        // bound is purely absorbing CI scheduling/contention latency, not lease logic.
+        // Advance BOTH instances' clocks past CouponScheduledJobs' 5-minute tick interval
+        // (Program.fs's SchedulerHostedService registration) in small steps rather than one big
+        // jump — a single upfront advance races SchedulerHostedService's own PeriodicTimer
+        // construction during host startup (see ClockAdvanceHelpers), so both
+        // SchedulerHostedServices need repeated nudges to guarantee they actually tick and both
+        // attempt tryAcquire against the same row — this is the natural production race, not a
+        // bypass. Bound (150s) is generous: this fixture's containers share the CI runner with
+        // VahterBanBot's much heavier multi-pod fixture (ML cold-start), and observed
+        // container-startup delay alone has reached ~2m39s under contention on this same runner.
         let expectedText = "Сегодня истекает 1 купон на сумму"
-        let sw = Stopwatch.StartNew()
         let mutable matchCount = 0
-        while matchCount = 0 && sw.ElapsedMilliseconds < 150000L do
-            let! calls = fixture.GetFakeCalls("sendMessage")
-            matchCount <- countCallsWithText calls fixture.CommunityChatId expectedText
-            if matchCount = 0 then do! Task.Delay 200
+        let! _ =
+            ClockAdvanceHelpers.advanceUntil
+                fixture.AdvanceAllClocks
+                (fun () -> task {
+                    let! calls = fixture.GetFakeCalls("sendMessage")
+                    matchCount <- countCallsWithText calls fixture.CommunityChatId expectedText
+                    return matchCount > 0
+                })
+                (90 * 1000)
+                300
+                150000
         Assert.True(matchCount > 0, $"Timeout: no reminder post matching '{expectedText}' after 150000ms")
 
         // Dedupe by content: if BOTH pods had won the lease, this would be 2.

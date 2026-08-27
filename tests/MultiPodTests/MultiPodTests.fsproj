@@ -11,6 +11,7 @@
         <Compile Include="FakeCallHelpers.fs" />
         <Compile Include="SmokeHelpers.fs" />
         <Compile Include="SettingsPollHelpers.fs" />
+        <Compile Include="ClockAdvanceHelpers.fs" />
         <Compile Include="VahterMultiPodContainers.fs" />
         <Compile Include="CouponMultiPodContainers.fs" />
         <Compile Include="VahterMultiPodSmokeTests.fs" />
