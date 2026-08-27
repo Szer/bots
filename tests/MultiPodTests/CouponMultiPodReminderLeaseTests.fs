@@ -64,10 +64,13 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         let sw0 = Stopwatch.StartNew()
         let mutable everTouched = false
         while not everTouched && sw0.ElapsedMilliseconds < 30000L do
-            let! row =
-                conn.QuerySingleAsync<{| locked_by: string | null; last_completed_at: Nullable<DateTime> |}>(
-                    "SELECT locked_by, last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
-            everTouched <- not (isNull (box row.locked_by)) || row.last_completed_at.HasValue
+            let! lockedBy =
+                conn.QuerySingleOrDefaultAsync<string | null>(
+                    "SELECT locked_by FROM scheduled_job WHERE job_name = 'reminder_daily'")
+            let! lastCompleted =
+                conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(
+                    "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
+            everTouched <- not (isNull (box lockedBy)) || lastCompleted.HasValue
             if not everTouched then do! Task.Delay 200
         Assert.True(
             everTouched,
