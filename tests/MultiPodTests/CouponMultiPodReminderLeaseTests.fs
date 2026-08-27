@@ -55,14 +55,19 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         // the same row — this is the natural production race, not a bypass.
         do! fixture.AdvanceAllClocks(6 * 60 * 1000)
 
+        // Bounds generous (60s / 30s), not tight: this fixture's containers share the CI
+        // runner with VahterBanBot's much heavier multi-pod fixture (ML cold-start), so the
+        // real wall-clock delay between the fake-clock tick firing and the DB/Telegram
+        // round trips actually completing varies a lot under contention — the PeriodicTimer/
+        // FakeTimeProvider tick itself fires immediately once due, that part isn't in doubt.
         let expectedText = "Сегодня истекает 1 купон на сумму"
         let sw = Stopwatch.StartNew()
         let mutable matchCount = 0
-        while matchCount = 0 && sw.ElapsedMilliseconds < 15000L do
+        while matchCount = 0 && sw.ElapsedMilliseconds < 60000L do
             let! calls = fixture.GetFakeCalls("sendMessage")
             matchCount <- countCallsWithText calls fixture.CommunityChatId expectedText
             if matchCount = 0 then do! Task.Delay 200
-        Assert.True(matchCount > 0, $"Timeout: no reminder post matching '{expectedText}' after 15000ms")
+        Assert.True(matchCount > 0, $"Timeout: no reminder post matching '{expectedText}' after 60000ms")
 
         // Dedupe by content: if BOTH pods had won the lease, this would be 2.
         Assert.Equal(1, matchCount)
@@ -73,7 +78,7 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         // match — poll here too rather than reading once.
         let sw2 = Stopwatch.StartNew()
         let mutable completedAt = Nullable<DateTime>()
-        while not completedAt.HasValue && sw2.ElapsedMilliseconds < 5000L do
+        while not completedAt.HasValue && sw2.ElapsedMilliseconds < 30000L do
             let! v =
                 conn.QuerySingleOrDefaultAsync<Nullable<DateTime>>(
                     "SELECT last_completed_at FROM scheduled_job WHERE job_name = 'reminder_daily'")
