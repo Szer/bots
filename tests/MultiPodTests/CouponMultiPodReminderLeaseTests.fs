@@ -56,7 +56,7 @@ type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
         // lease-race assertions below. Removed once the root cause is found.
         use sanityBody = new StringContent("", Text.Encoding.UTF8, "application/json")
         let! sanityResp = fixture.BotHttpAt(0).PostAsync($"/test/run-reminder?nowUtc={todayIso}T12:06:00Z", sanityBody)
-        Assert.Equal(Net.HttpStatusCode.OK, sanityResp.StatusCode)
+        Assert.Equal(Net.HttpStatusCode.Accepted, sanityResp.StatusCode)
         let sanitySw = Stopwatch.StartNew()
         let mutable sanityMatch = 0
         while sanityMatch = 0 && sanitySw.ElapsedMilliseconds < 15000L do
