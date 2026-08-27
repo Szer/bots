@@ -660,10 +660,8 @@ type CouponFlowHandler(
                 | Some batch when batch.status = "open" ->
                     let debounceMs = botOptions.Value.BatchDebounceMs
                     let elapsedMs = int (time.GetUtcNow().UtcDateTime - batch.updated_at).TotalMilliseconds
-                    // elapsedMs < 0 means updated_at is ahead of our own clock (e.g. a
-                    // row touched via Postgres NOW() directly instead of the app's
-                    // TimeProvider, as recovery-test fixtures do) — treat that as
-                    // "not fresh" rather than deferring forever.
+                    // elapsedMs < 0 (updated_at ahead of our clock, e.g. touched via Postgres
+                    // NOW() directly) is treated as not fresh rather than deferring forever.
                     if elapsedMs >= 0 && elapsedMs < debounceMs then Some(max 1 (debounceMs - elapsedMs)) else None
                 | _ -> None
 
@@ -779,10 +777,8 @@ type CouponFlowHandler(
                     // Telegram redelivery of the same photo_file_id — nothing more to do.
                     return true
                 | AddBatchItemResult.BatchNotOpen ->
-                    // A straggler landed after this batch already flipped/closed
-                    // (cross-pod race, or the user kept sending after confirming).
-                    // Accepting it here would silently orphan it past the already-
-                    // rendered bulk-confirm UI — tell the user instead of losing it.
+                    // Straggler after this batch already flipped/closed (cross-pod race, or the
+                    // user kept sending) — tell the user instead of silently orphaning it.
                     do! sendText chatId "Этот купон не попал в текущий пакет — альбом уже обрабатывается. Пришли фото отдельным сообщением после подтверждения текущего пакета."
                     return true
                 | AddBatchItemResult.ItemAdded itemId ->

@@ -286,10 +286,8 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
             do! waitForBulkConfirmCall fixture user.Id 5000
 
-            // Send another photo with the SAME media_group_id while batch is in
-            // awaiting_user. AddBatchItem now locks FOR UPDATE on status='open'
-            // only, so this straggler is rejected (BatchNotOpen) instead of
-            // silently orphaning past the already-rendered bulk-confirm UI.
+            // Same media_group_id while batch is awaiting_user — AddBatchItem locks FOR UPDATE
+            // on status='open' only, so this straggler is rejected (BatchNotOpen).
             do! fixture.SetTelegramFile("late-2", readImageBytes goodFile)
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = "late-2", messageId = 9951))
 
@@ -322,15 +320,12 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
             do! fixture.SetChatMemberStatus(user.Id, "member")
             let mgid = $"mg-xpod-{DateTime.UtcNow.Ticks}"
 
-            // Photo 1 arrives — arms this pod's debounce timer for BATCH_DEBOUNCE_MS.
             do! sendOnePhotoAlbum user mgid "xpod-1" 9960
             let! batchId = waitForBatchByUser fixture user.Id 5000
             do! waitForAllItemsTerminal fixture batchId 10000
 
-            // Timestamp relative to the app's own (fake) clock, as recorded by
-            // AddBatchItem's touchSql for photo 1 — NOT Postgres NOW(), which
-            // runs on the real wall clock and would be nowhere near the frozen
-            // FakeTimeProvider used under TEST_MODE.
+            // t0 is the app's fake clock (AddBatchItem's touchSql), not Postgres NOW() —
+            // the latter runs on the real wall clock, nowhere near the frozen TEST_MODE time.
             let! t0 = fixture.QuerySingle<DateTime>("SELECT updated_at FROM pending_add_batch WHERE id=@b", {| b = batchId |})
             let t1 = t0.AddSeconds(5.0)
             let! _ =
@@ -342,7 +337,6 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
                     "UPDATE pending_add_batch SET updated_at = @t WHERE id = @b;",
                     {| b = batchId; t = t1 |})
 
-            // Fire this pod's already-armed (unaware-of-item-2) timer.
             do! advancePastDebounce fixture
             do! Task.Delay 500
 
@@ -352,7 +346,6 @@ type BatchStateMachineTests(fixture: OcrCouponHubTestContainers) =
                 fixture.QuerySingle<string>("SELECT status FROM pending_add_batch WHERE id=@b", {| b = batchId |})
             Assert.Equal("open", statusAfterFirstFire)
 
-            // Clear the deferred remainder (~4s) — finalizes for real this time.
             do! fixture.AdvanceBotClock(6_000)
             do! waitForBatchStatus fixture batchId "awaiting_user" 5000
 

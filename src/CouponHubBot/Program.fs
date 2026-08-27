@@ -156,11 +156,8 @@ if botConfOptions.Value.TestMode then
     .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
-    // The reminder's daily run is gated by BotInfra's scheduled_job lease (see
-    // coupon-hub-bot/migrations) so exactly one pod sends it, not one per pod.
-    // SchedulerHostedService needs `connString` directly (ScheduledJobs' lease functions are
-    // plain functions over a connection string, like DbService itself), so it's built via a
-    // factory closure rather than constructor-parameter DI.
+    // Lease-gated (scheduled_job) so exactly one pod sends the reminder. SchedulerHostedService
+    // needs `connString` directly (like DbService), so it's built via factory closure, not ctor DI.
     .AddSingleton<SchedulerHostedService>(fun sp ->
         new SchedulerHostedService(
             connString,
@@ -217,15 +214,9 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
                 return Results.Json({| ok = true; advancedMs = ms |})
     }))
 
-// Test-only hook to trigger the reminder job immediately, bypassing the lease
-// (SchedulerHostedService.RunJobNow — same bypass AlitaBot's /test/run-job
-// uses). Fire-and-forget on the bot side: this returns as soon as the job is
-// kicked off, not once it's finished — callers poll for the job's effects
-// (GetFakeCalls / scheduled_job.last_completed_at), same as AlitaBot's tests.
-// An optional ?nowUtc= sets CouponScheduledJobs' one-shot test override
-// (consumed by the very next run) rather than moving the shared
-// FakeTimeProvider — moving the shared clock would persist across every LATER
-// test sharing this fixture, silently breaking their "today" assumptions.
+// Test-only: bypasses the lease via RunJobNow, fire-and-forget — callers poll for effects
+// (GetFakeCalls / last_completed_at). ?nowUtc= sets a one-shot override instead of moving the
+// shared FakeTimeProvider, which would leak into every later test sharing this fixture.
 %app.MapPost("/test/run-reminder", Func<HttpContext, Task<IResult>>(fun ctx ->
     task {
         let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
