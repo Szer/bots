@@ -15,11 +15,10 @@ open Xunit
 /// not `/test/run-reminder`'s RunJobNow, which bypasses the lease entirely and
 /// would prove nothing about it.
 ///
-/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin); determinism instead
-/// comes from CouponMultiPodContainers pinning BOT_FIXED_UTC_NOW to noon UTC on
-/// today's real date — safely past the scheduled UTC slot (09:00 summer / 10:00
-/// winter) regardless of what hour CI actually runs at, so this no longer depends
-/// on an early-UTC-morning window.
+/// REMINDER_HOUR_DUBLIN is left at its default (10, Dublin); determinism comes from
+/// CouponMultiPodContainers pinning BOT_FIXED_UTC_NOW to noon UTC on today's real
+/// date instead — safely past the scheduled UTC slot (09:00 summer / 10:00 winter)
+/// regardless of what hour CI actually runs at.
 type CouponMultiPodReminderLeaseTests(fixture: CouponMultiPodContainers) =
 
     [<Fact>]

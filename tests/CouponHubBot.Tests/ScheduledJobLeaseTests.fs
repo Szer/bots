@@ -5,13 +5,9 @@ open System.Threading.Tasks
 open BotInfra
 open Xunit
 
-/// Multi-pod safety: `BotInfra.ScheduledJobs.tryAcquire`'s already-completed-today
-/// no-op. The exactly-one-winner guarantee this file used to also cover is now
-/// proven at API level by MultiPodTests' CouponMultiPodReminderLeaseTests (a real
-/// two-pod race). This one case stays here because it isn't a race at all — a
-/// single pod re-ticking a job already marked done today — so there's no
-/// multi-pod API scenario that exercises it; it's only reachable directly
-/// against `tryAcquire`.
+/// `BotInfra.ScheduledJobs.tryAcquire`'s already-completed-today no-op: a single pod
+/// re-ticking a job already marked done today, not a race — no multi-pod API scenario
+/// exercises it, so it's only reachable by calling `tryAcquire` directly.
 type ScheduledJobLeaseTests(fixture: DefaultCouponHubTestContainers) =
 
     [<Fact>]

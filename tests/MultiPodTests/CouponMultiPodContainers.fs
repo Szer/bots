@@ -12,7 +12,7 @@ module private CouponMultiPodTimeConfig =
     /// tryAcquire lease against Postgres's own (unfaked) CURRENT_DATE, so the pinned
     /// instant must track today's actual date. Noon UTC is safely past
     /// REMINDER_HOUR_DUBLIN's UTC-converted slot (09:00 summer / 10:00 winter) no
-    /// matter what hour CI happens to run at — closes the pre-~09:00-UTC flake.
+    /// matter what hour CI happens to run at.
     let fixedUtcNow = DateTimeOffset(DateTime.UtcNow.Date.AddHours 12.0, TimeSpan.Zero)
 
 /// 2-instance CouponHubBot fixture. TEST_MODE gives EACH instance its own FakeTimeProvider
