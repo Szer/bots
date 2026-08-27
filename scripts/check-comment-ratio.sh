@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
-# Gate: net new comment lines per language must stay a minority of net new lines.
-# --cached (pre-commit, staged diff) or --range A...B (CI, commit range).
-# Engine: tokei whole-file BEFORE/AFTER delta, per language (full-parse context
-# both sides, immune to fragment misparse of strings/block comments — diff-only
-# semantics come from before/after snapshots, not from diffing tokei's output).
-# Portable: no repo-specific language/threshold logic lives here — it's all in
-# .comment-ratio.conf at the repo root, so this script works dropped into any repo.
+
+# Ratio + comment-block-length gate. --cached (pre-commit) or --range A...B (CI).
+# tokei before/after delta per language; thresholds in .comment-ratio.conf.
 set -euo pipefail
 
 TOKEI_VERSION="v12.1.2"
@@ -16,6 +12,7 @@ TOKEI_CACHE_DIR="${HOME}/.cache/comment-gate/tokei-${TOKEI_VERSION}"
 
 DEFAULT_RATIO=0.15
 DEFAULT_FLOOR=5
+MAX_COMMENT_BLOCK=2
 IGNORE_LANGUAGES=""
 
 repo_root=$(git rev-parse --show-toplevel)
@@ -59,9 +56,8 @@ esac
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
 
-# -z (NUL-delimited) output must stay in a file, never a $(...) variable —
-# bash strings cannot hold embedded NUL bytes; capturing would silently
-# truncate at the first record.
+# -z output must stay in a file, not a $(...) var — bash strings can't hold
+# embedded NULs, capture would silently truncate at the first record.
 name_status_file="$work_dir/name-status"
 git diff --no-ext-diff --no-color "${name_status_args[@]}" > "$name_status_file"
 
@@ -146,9 +142,17 @@ while IFS= read -r -d '' status; do
   offend_files+=("$new_path")
 done < "$name_status_file"
 
-# Doc-comment exemption: strip whole lines matching the extension's doc-marker
-# from both trees before tokei sees them (same filter both sides). Block-style
-# KDoc/JavaDoc doc comments slip through — accepted v1 limitation.
+diff_args=()
+if [ "$mode" = "--cached" ]; then
+  diff_args=(--cached "$before_ref")
+else
+  diff_args=("$before_ref" "$after_ref")
+fi
+raw_diff_file="$work_dir/raw-diff"
+git diff --no-ext-diff --no-color -U0 --diff-filter=ACMR "${diff_args[@]}" -- "${offend_files[@]}" > "$raw_diff_file" 2>/dev/null || true
+
+# Doc-comment exemption: strip /// lines from both trees before tokei runs.
+# Block-style KDoc/JavaDoc doc comments slip through — accepted v1 limitation.
 strip_doc_comments() {
   local dir="$1"
   while IFS= read -r -d '' f; do
@@ -219,10 +223,9 @@ for norm in "${!langs[@]}"; do
 
   verdict=$(awk -v dcom="$dcom" -v dcode="$dcode" -v floor="$floor" -v thr="$ratio_threshold" '
     BEGIN {
-      if (dcom < floor) { printf "PASS\t0.0000"; exit }
       denom = dcom + ((dcode > 0) ? dcode : 0)
       ratio = (denom > 0) ? dcom / denom : 0
-      if (ratio > thr) { printf "FAIL\t%.4f", ratio } else { printf "PASS\t%.4f", ratio }
+      if (dcom >= floor && ratio > thr) { printf "FAIL\t%.4f", ratio } else { printf "PASS\t%.4f", ratio }
     }')
   verdict_word="${verdict%%$'\t'*}"
   ratio_val="${verdict#*$'\t'}"
@@ -233,14 +236,91 @@ for norm in "${!langs[@]}"; do
   fi
 done
 
-if [ -z "$fail_langs" ]; then
-  echo "comment-ratio: OK (per-language net-new comment ratios within threshold)"
+# Comment-block length cap: independent of the ratio rule, scanned off the raw
+# diff — consecutive marker-matching added lines (incl. blank "//", "///") form a block.
+block_scan_file="$work_dir/block-scan"
+awk '
+  function flush() {
+    if (block_len > 0 && cur_key != "") printf "%s\t%s\t%d\t%s\n", cur_key, cur_file, block_len, block_first
+    block_len = 0; block_first = ""
+  }
+  function set_file(f,    base, ext) {
+    flush()
+    cur_file = f
+    base = f; sub(/^.*\//, "", base)
+    ext = ""
+    if (base ~ /\./) { ext = base; sub(/^.*\./, "", ext); ext = tolower(ext) }
+    if (ext=="fs"||ext=="fsx") { cur_key="FSHARP"; cur_pat="SLASH" }
+    else if (ext=="cs") { cur_key="CSHARP"; cur_pat="SLASH" }
+    else if (ext=="kt"||ext=="kts") { cur_key="KOTLIN"; cur_pat="SLASH" }
+    else if (ext=="tf") { cur_key="HCL"; cur_pat="SLASH" }
+    else if (ext=="alloy") { cur_key="ALLOY"; cur_pat="SLASH" }
+    else if (ext=="river") { cur_key="RIVER"; cur_pat="SLASH" }
+    else if (ext=="go") { cur_key="GO"; cur_pat="SLASH" }
+    else if (ext=="rs") { cur_key="RUST"; cur_pat="SLASH" }
+    else if (ext=="js") { cur_key="JS"; cur_pat="SLASH" }
+    else if (ext=="ts") { cur_key="TS"; cur_pat="SLASH" }
+    else if (ext=="yml"||ext=="yaml") { cur_key="YAML"; cur_pat="HASH" }
+    else if (ext=="sh"||ext=="bash") { cur_key="SHELL"; cur_pat="HASH" }
+    else if (ext=="toml") { cur_key="TOML"; cur_pat="HASH" }
+    else if (ext=="py") { cur_key="PYTHON"; cur_pat="HASH" }
+    else if (ext=="conf") { cur_key="CONF"; cur_pat="HASH" }
+    else if (ext=="sql") { cur_key="SQL"; cur_pat="DASH" }
+    else { cur_key=""; cur_pat="" }
+  }
+  /^\+\+\+ b\// { set_file(substr($0, 7)); next }
+  /^@@/ { flush(); next }
+  /^-/ { next }
+  /^\+/ {
+    if (cur_pat == "") next
+    t = substr($0, 2)
+    sub(/^[ \t]+/, "", t)
+    matched = 0
+    if (cur_pat == "SLASH" && t ~ /^(\/\/|\(\*)/) matched = 1
+    else if (cur_pat == "HASH" && t ~ /^#/) matched = 1
+    else if (cur_pat == "DASH" && t ~ /^--/) matched = 1
+    if (matched) {
+      if (block_len == 0) block_first = t
+      block_len++
+    } else {
+      flush()
+    }
+    next
+  }
+  END { flush() }
+' "$raw_diff_file" > "$block_scan_file"
+
+block_table=""
+block_count=0
+while IFS=$'\t' read -r key file len first; do
+  if [ -z "$key" ]; then
+    continue
+  fi
+  block_var="BLOCK_${key}"
+  block_limit="${!block_var:-$MAX_COMMENT_BLOCK}"
+  if [ "$block_limit" -eq 0 ]; then
+    continue
+  fi
+  if [ "$len" -gt "$block_limit" ]; then
+    preview="$first"
+    if [ "${#preview}" -gt 70 ]; then
+      preview="${preview:0:70}..."
+    fi
+    block_table="${block_table}${file}\t${len}\t${block_limit}\t${preview}\n"
+    block_count=$((block_count + 1))
+  fi
+done < "$block_scan_file"
+
+if [ -z "$fail_langs" ] && [ "$block_count" -eq 0 ]; then
+  echo "comment-ratio: OK"
+  echo "Per-language net-new comment ratios:"
+  printf '%b' "$table" | awk -F'\t' '{printf "  %s:  %+d comment lines vs %+d code lines \xe2\x86\x92 ratio %.2f (limit %.2f, floor %d)\n", $1,$7,$6,$8,$9,$10}'
+  echo "Comment blocks: OK (no added block exceeds its line cap)"
   exit 0
 fi
 
-# This report is read by the offending agent as much as by a human — say what
-# happened, why, and exactly how to fix it. Identical wording from hook and CI
-# (same script); only the commit-vs-PR phrasing below adapts to $mode.
+# Identical wording from hook and CI (same script); only commit-vs-PR
+# phrasing below adapts to $mode.
 if [ "$mode" = "--cached" ]; then
   scope_noun="this commit"; retry_hint="Delete the offending comments, re-stage, and commit again; this check re-runs automatically."
 else
@@ -250,44 +330,53 @@ fi
 echo "✖ COMMENT-RATIO GATE FAILED"
 echo
 echo "This repo blocks commits whose NET NEW comment lines are too high relative to"
-echo "net new code. Measured on this diff only (whole-file counts before vs after;"
-echo "existing comments in touched files are NOT counted against you)."
+echo "net new code, AND any single added comment block longer than its line cap"
+echo "(default ${MAX_COMMENT_BLOCK} lines), regardless of ratio. Measured on this diff only."
 echo
-echo "Per-language result (only failing languages shown):"
-printf '%b' "$table" | awk -F'\t' '$11=="FAIL"{printf "  %s:  %+d comment lines vs %+d code lines \xe2\x86\x92 ratio %.2f (limit %.2f, min %d comment lines)\n", $1,$7,$6,$8,$9,$10}'
 
-echo
-echo "Offending added comment lines (delete or condense these):"
-diff_args=()
-if [ "$mode" = "--cached" ]; then
-  diff_args=(--cached "$before_ref")
-else
-  diff_args=("$before_ref" "$after_ref")
+if [ -n "$fail_langs" ]; then
+  echo "Per-language result (only failing languages shown):"
+  printf '%b' "$table" | awk -F'\t' '$11=="FAIL"{printf "  %s:  %+d comment lines vs %+d code lines \xe2\x86\x92 ratio %.2f (limit %.2f, floor %d)\n", $1,$7,$6,$8,$9,$10}'
+
+  echo
+  echo "Offending added comment lines (delete or condense these):"
+  offend_lines_file="$work_dir/offend-lines"
+  awk '
+    /^\+\+\+ b\// { file = substr($0, 7); next }
+    /^\+/ {
+      t = substr($0, 2)
+      sub(/^[ \t]+/, "", t)
+      if (t == "") next
+      if (t ~ /^\/\/\//) next
+      if (t ~ /^(\/\/|#|\(\*|\/\*)/) printf "%s: %s\n", file, t
+    }
+  ' "$raw_diff_file" > "$offend_lines_file"
+  offend_total=$(wc -l < "$offend_lines_file")
+  head -n 30 "$offend_lines_file" | sed 's/^/  /'
+  if [ "$offend_total" -gt 30 ]; then
+    echo "  ... and $((offend_total - 30)) more"
+  fi
 fi
-offend_lines_file="$work_dir/offend-lines"
-git diff --no-ext-diff --no-color -U0 --diff-filter=ACMR "${diff_args[@]}" -- "${offend_files[@]}" 2>/dev/null | awk '
-  /^\+\+\+ b\// { file = substr($0, 7); next }
-  /^\+/ {
-    t = substr($0, 2)
-    sub(/^[ \t]+/, "", t)
-    if (t == "") next
-    if (t ~ /^\/\/\//) next
-    if (t ~ /^(\/\/|#|\(\*|\/\*)/) printf "%s: %s\n", file, t
-  }
-' > "$offend_lines_file"
-offend_total=$(wc -l < "$offend_lines_file")
-head -n 30 "$offend_lines_file" | sed 's/^/  /'
-if [ "$offend_total" -gt 30 ]; then
-  echo "  ... and $((offend_total - 30)) more"
+
+if [ "$block_count" -gt 0 ]; then
+  echo
+  echo "Comment blocks longer than ${MAX_COMMENT_BLOCK} lines (split, condense, or delete):"
+  printf '%b' "$block_table" | head -n 30 | awk -F'\t' '{printf "  %s: %s-line block (limit %s) starting: %s\n", $1,$2,$3,$4}'
+  if [ "$block_count" -gt 30 ]; then
+    echo "  ... and $((block_count - 30)) more"
+  fi
 fi
 
 echo
 echo "How to fix:"
 echo "  1. Delete narrative/process comments — code should explain itself."
 echo "     Keep ONLY comments stating a non-obvious constraint (1-2 lines max)."
-echo "  2. \`///\` doc comments on public APIs are exempt and not counted — writing"
-echo "     docs is fine; running commentary is not."
-echo "  3. $retry_hint"
+echo "  2. \`///\` doc comments are exempt from the ratio rule above, but NOT from"
+echo "     the block-length cap below — writing docs is fine, running commentary isn't."
+echo "  3. A comment block may be at most ${MAX_COMMENT_BLOCK} lines. If you cannot fit the"
+echo "     thought in ${MAX_COMMENT_BLOCK} lines, the code needs restructuring — or it belongs"
+echo "     in a design doc, not a comment."
+echo "  4. $retry_hint"
 echo
 echo "Do NOT bypass with --no-verify (it is blocked for agents and CI re-checks the"
 echo "full PR anyway). If you believe $scope_noun legitimately needs these comments,"
