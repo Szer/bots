@@ -25,8 +25,6 @@ type UpdateChatAdminsTests(fixture: MlEnabledVahterTestContainers, _unused: MlAw
         Assert.Contains(userX, idsFirst)
         Assert.Contains(userY, idsFirst)
 
-        // A later fetch (simulating the next lease window, possibly won by a different pod) fully
-        // replaces the table -- a stale admin must disappear, not just accumulate.
         do! db.SaveChatAdmins([| chatA, userX |])
         let! idsSecond = db.GetChatAdminIds()
         Assert.Contains(userX, idsSecond)
@@ -55,8 +53,7 @@ type UpdateChatAdminsTests(fixture: MlEnabledVahterTestContainers, _unused: MlAw
         let! podBRightAfterComplete = db.TryAcquireIntervalJob(jobName, minInterval, "pod-b")
         Assert.False(podBRightAfterComplete, "Within minInterval of completion, no pod should re-acquire")
 
-        // Backdate completion past minInterval (same time-travel convention as
-        // LlmVerdictCacheGlobalFlagTests's AgeLlmVerdictCache) instead of sleeping for real.
+        // Backdate completion past minInterval instead of sleeping for real.
         let! _ =
             conn.ExecuteAsync(
                 "UPDATE scheduled_job SET last_completed_at = last_completed_at - make_interval(mins => 61) WHERE job_name = @jobName",

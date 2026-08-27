@@ -71,12 +71,9 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
         let! banResp = fixture.SendUpdateTo(0, banReply)
         Assert.Equal(System.Net.HttpStatusCode.OK, banResp.StatusCode)
 
-        // Sanity: the /ban actually landed (same UserBanned shape VahterBanBot.Tests asserts).
         let! banned = VahterEventAssertions.userBanned fixture.DbConnectionString originalMsg.Message.Value.From.Value.Id
         Assert.True(banned, "Sanity: manual /ban via instance 0 should ban the spammer")
 
-        // A DIFFERENT user repeats the EXACT SAME text as a fresh message, delivered to
-        // instance 1 -- the pod that never processed the /ban.
         let repeatUser = Tg.user()
         let repeatMsg = Tg.quickMsg(text = spamText, chat = fixture.ChatsToMonitor, from = repeatUser)
         let! repeatResp = fixture.SendUpdateTo(1, repeatMsg)
@@ -85,8 +82,7 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
         let repeatChatId = repeatMsg.Message.Value.Chat.Id
         let repeatMessageId = repeatMsg.Message.Value.MessageId
 
-        // Small bounded retry as network-hop insurance (container-to-container HTTP, unlike the
-        // in-process single-pod suite) -- the webhook handler itself awaits the full pipeline.
+        // Bounded retry: container-to-container HTTP hop, unlike the in-process single-pod suite.
         let mutable deleted = false
         let mutable attempts = 0
         while not deleted && attempts < 10 do
@@ -97,8 +93,7 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
                 do! Task.Delay 300
         Assert.True(deleted, "Instance 1 should auto-delete the exact repeat of a message banned via instance 0")
 
-        // Attribution: no MlScoredMessage event for the repeat -- the spam-text cache
-        // short-circuited before ML ever ran on instance 1.
+        // Attribution: no MlScoredMessage event means the cache short-circuited before ML ran.
         let! mlScore = VahterEventAssertions.getMlScore fixture.DbConnectionString repeatChatId repeatMessageId
         Assert.True(mlScore.IsNone, "Cache hit should short-circuit before ML scoring on instance 1")
     }
@@ -109,8 +104,6 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
     let ``Cross-pod chat-admin snapshot: both instances converge to the fetched admin set`` () = task {
         let admin = Tg.user(id = 42L, username = "just_admin")
 
-        // Baseline: confirms the ML deletion pipeline works, so a later "not deleted" for id 42
-        // is attributable to admin immunity, not a broken pipeline.
         let nonAdminMsg = Tg.quickMsg(text = "2222222", chat = fixture.ChatsToMonitor)
         let! _ = fixture.SendUpdateTo(0, nonAdminMsg)
         let! nonAdminDeleted =
