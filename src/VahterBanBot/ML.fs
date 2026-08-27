@@ -178,9 +178,8 @@ type MachineLearning(
             mlContext.Model.Save(trainedModel, dataView.Schema, ms)
             logger.LogInformation("Serialized model ({Size} bytes)", ms.Length)
             ms.Position <- 0L
-            // Guarded write (DB.fs's SaveTrainedModel WHERE clause): if another pod already saved a
-            // newer model while we trained, our write is skipped and we reload theirs instead of
-            // clobbering it — closes the fallback-retrain-vs-real-winner race in ML.fs's StartAsync.
+            // Guarded write: if another pod already saved a newer model, ours is skipped and we
+            // reload theirs — closes the fallback-retrain-vs-real-winner race.
             let! saved = db.SaveTrainedModel(ms)
             if saved then
                 modelCreatedAt <- Some(timeProvider.GetUtcNow().UtcDateTime)
@@ -289,8 +288,7 @@ type MachineLearning(
                             loaded <- result
                             attempts <- attempts + 1
                         if not loaded then
-                            // Timeout or other pod crashed. Re-check once more before training —
-                            // the winner may have finished in the gap since the last poll.
+                            // Timeout or crash: re-check once more (winner may have finished in the gap);
                             // SaveTrainedModel's WHERE guard is the backstop if this is still lost.
                             let! recheckedLoaded = loadModelFromDb()
                             if not recheckedLoaded then

@@ -8,15 +8,12 @@ open Npgsql
 open Dapper
 open Xunit
 
-/// Postgres-backed chat_admin table (V46) + interval lease (UpdateChatAdmins.fs, DB.fs's
-/// TryAcquireIntervalJob) multi-pod integration tests. Uses `DbService` directly against the
-/// shared container's Postgres (same construction pattern as MessageTests/SnapshotTests) rather
-/// than the app HTTP surface -- there is no HTTP endpoint for this internal refresh mechanism.
+/// Postgres-backed chat_admin table (V46) + interval lease integration tests. Uses `DbService`
+/// directly, not the app HTTP surface -- there is no HTTP endpoint for this internal mechanism.
 type UpdateChatAdminsTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture) =
 
-    /// "One pod fetches, all pods read" -- SaveChatAdmins fully replaces the table contents
-    /// (delete-then-insert), and GetChatAdminIds (the reader snapshot every pod's local timer
-    /// reloads from) reflects it, including removal of a stale admin, not just accumulation.
+    /// "One pod fetches, all pods read" -- SaveChatAdmins fully replaces the table (delete-then-
+    /// insert); GetChatAdminIds reflects it, including removal of a stale admin, not just accumulation.
     [<Fact>]
     let ``SaveChatAdmins replaces table contents; GetChatAdminIds reflects it (shared across pods)`` () = task {
         let db = DbService(fixture.DbConnectionString, TimeProvider.System)

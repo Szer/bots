@@ -5,11 +5,8 @@
 /// A text cache catches 44 of those 89; retraining every 2 hours instead of nightly catches
 /// only 2 — a lookup needs one example, a model needs enough to move a decision boundary.
 ///
-/// Storage is the `spam_text_seed` table (V45 migration), not a process-local dictionary — a
-/// single-pod ConcurrentDictionary can't see a /ban handled by a different pod, which halves the
-/// exact-repeat catch rate above with 2+ replicas. Message volume is low enough that a per-message
-/// indexed DB lookup is acceptable (every read is an indexed point lookup by primary key).
-/// Old rows are swept by the existing daily cleanup job (Cleanup.fs), not a new schedule.
+/// Storage is the `spam_text_seed` table (V45), not a process-local dict — a single-pod
+/// ConcurrentDictionary can't see cross-pod bans. Swept by the existing daily cleanup job.
 ///
 /// Normalization is DELIBERATELY conservative: NFKC, invariant-lowercase, trim, collapse
 /// internal whitespace runs to one space. That is ALL — URLs and digits are NOT stripped or
@@ -53,9 +50,8 @@ type private SpamTextSeedRow =
 [<AllowNullLiteral>]
 type ISpamTextCache =
     /// Seeds the cache from a manually-banned message's text. `bannedAt` is the ban's own
-    /// timestamp, not necessarily "now". Returns false (and does not store anything) when the
-    /// normalized text is shorter than `minLength`. Idempotent: an INSERT ... ON CONFLICT upsert,
-    /// so re-seeding the same normalized text just refreshes its expiry.
+    /// timestamp, not necessarily "now". Returns false when normalized text is shorter than
+    /// `minLength`; idempotent upsert, so re-seeding just refreshes the expiry.
     abstract member Seed: text: string * minLength: int * ttl: TimeSpan * chatId: int64 * messageId: int64 * bannedAt: DateTime -> Task<bool>
     /// Looks up a normalized-text match that has not expired as of `now`.
     abstract member TryGet: text: string * now: DateTime -> Task<SpamCacheHit option>

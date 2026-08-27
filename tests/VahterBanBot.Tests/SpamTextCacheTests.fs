@@ -8,12 +8,8 @@ open Xunit
 
 /// Ban-seeded spam-text cache (SPAM_TEXT_CACHE_MODE) integration tests.
 ///
-/// Isolation: the cache is Postgres-backed (spam_text_seed table) but keyed purely on normalized
-/// text, with no per-test Clear() call (ISpamTextCache.Clear exists for callers that need it, but
-/// every text used below embeds a fresh GUID — collision with any other test, in this file or any
-/// other sharing these containers, is not possible). This mirrors ReactionSpamTests.fs's
-/// `svetla_{guid}` convention rather than the truncate-a-table approach
-/// LlmVerdictCacheGlobalFlagTests/OcrCacheTests use.
+/// Isolation: Postgres-backed but keyed on normalized text; no per-test Clear() since every text
+/// below embeds a fresh GUID (ReactionSpamTests.fs's convention, not a truncate-a-table approach).
 let private longSpamText () =
     $"click this link right now to claim your huge prize before it expires forever {Guid.NewGuid()}"
 
@@ -199,9 +195,8 @@ type SpamTextCacheEnforceTests(fixture: SpamTextCacheEnforceTestContainers, _unu
         Assert.False(wasDeleted, "A vahter's own message must never be actioned, cache hit or not")
     }
 
-    /// Two independent `SpamTextCache` instances (own connections, same Postgres) simulate two
-    /// pods: a seed written by one must be visible to a lookup on the other. This is the property
-    /// the Postgres-backed cache exists to fix — a ConcurrentDictionary could never do this.
+    /// Two independent `SpamTextCache` instances simulate two pods: a seed written by one must
+    /// be visible to a lookup on the other -- the property a ConcurrentDictionary could never fix.
     [<Fact>]
     let ``Cross-pod visibility: a seed written via one SpamTextCache instance is read via a second`` () = task {
         let text = $"win a free prize right now claim it before it expires forever {Guid.NewGuid()}"
@@ -218,9 +213,8 @@ type SpamTextCacheEnforceTests(fixture: SpamTextCacheEnforceTestContainers, _unu
         Assert.Equal(1L, hit.Value.SeedMessageId)
     }
 
-    /// Same two-instance setup as above, but proves TTL expiry is enforced by the read (not by
-    /// eviction on the writer's side) -- a second pod that never wrote the seed still sees it
-    /// expire at the correct wall-clock instant.
+    /// Same two-instance setup, but proves TTL expiry is enforced by the read, not writer-side
+    /// eviction -- a pod that never wrote the seed still sees it expire correctly.
     [<Fact>]
     let ``Cross-pod TTL: expiry is enforced on read by a different instance than the one that seeded`` () = task {
         let text = $"limited time offer act now before this deal disappears forever {Guid.NewGuid()}"

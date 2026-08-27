@@ -67,9 +67,8 @@ type VahterMultiPodContainers() =
                   // Wall-clock daily retrain could otherwise rebuild the pinned model mid-suite —
                   // same rationale as VahterBanBot.Tests/ContainerTestBase.fs's mlSettings.
                   "ML_RETRAIN_SCHEDULED_ENABLED", "false", "FEATURE_FLAG", "ML"
-                  // Needed for VahterMultiPodFeatureTests: ML_SPAM_DELETION_ENABLED makes a spam
-                  // verdict (ML or spam-text-cache Enforce) actually DeleteSpam instead of just
-                  // reporting, and SPAM_TEXT_CACHE_MODE=enforce activates the cross-pod cache path.
+                  // ML_SPAM_DELETION_ENABLED makes a spam verdict actually DeleteSpam (not just
+                  // report); SPAM_TEXT_CACHE_MODE=enforce activates the cross-pod cache path.
                   "ML_SPAM_DELETION_ENABLED", "true", "FEATURE_FLAG", "ML_SPAM_DELETION"
                   "SPAM_TEXT_CACHE_MODE", "enforce", "FREE_FORM", "SPAM_TEXT_CACHE"
                   // Short interval so the chat-admin convergence test doesn't wait on the

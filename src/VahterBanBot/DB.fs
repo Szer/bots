@@ -1142,9 +1142,8 @@ ORDER BY MAX(m.created_at), MIN(m.stream_id);
             return Array.ofSeq data
         }
 
-    /// Saves a trained ML model to the database (singleton row, upsert). WHERE guards against a
-    /// losing pod's fallback retrain (ML.fs StartAsync timeout branch) clobbering a model another
-    /// pod already saved more recently. Returns false when the write was skipped for that reason.
+    /// Saves a trained ML model (singleton row, upsert). WHERE guards a losing pod's fallback
+    /// retrain from clobbering a newer model; returns false when the write was skipped for that.
     member _.SaveTrainedModel(modelStream: Stream) : Task<bool> =
         task {
             use conn = new NpgsqlConnection(connString)
@@ -1247,10 +1246,8 @@ WHERE job_name = @jobName;
             return ()
         }
 
-    /// Interval-based counterpart to TryAcquireScheduledJob: acquires the lease when the job has
-    /// never completed or completed more than `minInterval` ago, instead of gating on a fixed
-    /// time-of-day. Used by jobs that refresh every N minutes/hours (UpdateChatAdmins.fs) rather
-    /// than once per day. Shares the same `scheduled_job` table/lease shape and CompleteScheduledJob.
+    /// Interval counterpart to TryAcquireScheduledJob: acquires when the job hasn't completed within
+    /// `minInterval`, instead of gating on time-of-day. Same `scheduled_job` lease/CompleteScheduledJob.
     member _.TryAcquireIntervalJob(jobName: string, minInterval: TimeSpan, podId: string) : Task<bool> =
         task {
             use conn = new NpgsqlConnection(connString)
@@ -1290,13 +1287,10 @@ RETURNING job_name;
                 return false
         }
 
-    // -----------------------------------------------------------------------
     // Public members — chat_admin (shared UpdateChatAdmins snapshot)
-    // -----------------------------------------------------------------------
 
-    /// Replaces the whole chat_admin table with a freshly-fetched admin set (delete-then-insert in
-    /// one transaction, so readers never see a partial/empty table mid-refresh). Called by the pod
-    /// that holds the 'chat_admins_refresh' lease (UpdateChatAdmins.fs).
+    /// Replaces the whole chat_admin table (delete-then-insert in one transaction, so readers
+    /// never see a partial/empty table mid-refresh). Called by the 'chat_admins_refresh' lease holder.
     member _.SaveChatAdmins(admins: (int64 * int64) array) : Task =
         task {
             use conn = new NpgsqlConnection(connString)
@@ -1323,12 +1317,10 @@ RETURNING job_name;
             return Array.ofSeq rows
         }
 
-    // -----------------------------------------------------------------------
     // Public members — spam_text_seed cleanup
-    // -----------------------------------------------------------------------
 
-    /// Sweeps expired spam-text cache seeds. Piggybacks on the existing daily cleanup job
-    /// (Cleanup.fs) instead of adding pg_cron or a dedicated schedule.
+    /// Sweeps expired spam-text cache seeds; piggybacks on the existing daily cleanup job
+    /// instead of a dedicated schedule.
     member _.DeleteExpiredSpamTextSeeds() : Task<int> =
         task {
             use conn = new NpgsqlConnection(connString)

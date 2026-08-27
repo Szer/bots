@@ -8,9 +8,7 @@ open Dapper
 open Xunit
 
 /// Minimal direct-SQL assertions against the `event` table -- same queries
-/// VahterBanBot.Tests/ContainerTestBase.fs uses (MessageIsAutoDeleted/UserBanned/GetMlScore),
-/// not shared via a project reference (see FakeCallHelpers.fs's note: a test project referencing
-/// another test project is unusual here).
+/// VahterBanBot.Tests/ContainerTestBase.fs uses, not shared via a project reference.
 module private VahterEventAssertions =
     let messageIsAutoDeleted (connString: string) (chatId: int64) (messageId: int64) = task {
         use conn = new NpgsqlConnection(connString)
@@ -56,18 +54,12 @@ WHERE stream_id  = 'user:' || @userId
         return count > 0
     }
 
-/// Feature-specific multi-pod behavior stacking on VahterMultiPodSmokeTests.fs's proof that the
-/// harness itself works -- covers two DB-shared-state fixes: the spam-text cache (spam_text_seed)
-/// and the chat-admin snapshot (chat_admin). The ML fallback guard (SaveTrainedModel WHERE clause)
-/// is covered at DB-integration level in VahterBanBot.Tests/MLFallbackGuardTests.fs -- a real
-/// two-pod cold-start race is impractical here too (SDCA training takes minutes).
+/// Feature-specific multi-pod behavior stacking on VahterMultiPodSmokeTests.fs -- covers two
+/// DB-shared-state fixes: the spam-text cache (spam_text_seed) and chat-admin snapshot (chat_admin).
 type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
 
-    /// A manual /ban delivered to instance 0 seeds spam_text_seed (V45); the
-    /// exact same normalized text arriving as a FRESH message on instance 1 -- which never saw
-    /// the /ban -- is still auto-deleted, because the cache is Postgres-backed, not a per-pod
-    /// ConcurrentDictionary. Requires SPAM_TEXT_CACHE_MODE=enforce + ML_SPAM_DELETION_ENABLED=true
-    /// (seeded in VahterMultiPodContainers.SeedDatabase).
+    /// A manual /ban on instance 0 seeds spam_text_seed (V45); the exact same text arriving fresh
+    /// on instance 1 (which never saw the /ban) is still auto-deleted -- Postgres-backed, not per-pod.
     [<Fact>]
     let ``Cross-pod spam-text cache: a ban seeded via instance 0 is enforced by instance 1`` () = task {
         let spamText = $"click this link right now to claim your huge prize before it expires forever {Guid.NewGuid()}"
@@ -111,22 +103,14 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
         Assert.True(mlScore.IsNone, "Cache hit should short-circuit before ML scoring on instance 1")
     }
 
-    /// Chat-admin snapshot convergence: the lease-gated Telegram fetch (FakeTgApi always answers
-    /// getChatAdministrators with a fixed admin, id 42) runs on a short interval here (see
-    /// VahterMultiPodContainers.SeedDatabase's UPDATE_CHAT_ADMINS_INTERVAL_SEC=3, vs. production's
-    /// 5-minute default) so convergence is a bounded few-second poll, not a multi-minute wait --
-    /// no SQL-seed shortcut needed. Proof is behavioral (same admin-immunity mechanism Bot.fs uses,
-    /// `AllowedUsers` OR `UpdateChatAdmins.Admins`, which single-pod MLBanTests.fs exercises too):
-    /// id 42's spam-scoring message stops being ML-scored/auto-deleted on EACH instance once its
-    /// local snapshot reloads chat_admin, including instance 1, which never itself won the fetch
-    /// lease.
+    /// Chat-admin snapshot convergence: id 42 (FakeTgApi's fixed admin) stops being auto-deleted on
+    /// EACH instance once its local snapshot reloads chat_admin -- including instance 1, which never won the fetch lease.
     [<Fact>]
     let ``Cross-pod chat-admin snapshot: both instances converge to the fetched admin set`` () = task {
         let admin = Tg.user(id = 42L, username = "just_admin")
 
-        // Baseline: a fresh non-admin's spam message is deleted on instance 0 -- confirms the ML
-        // deletion pipeline itself works, so a later "not deleted" result for id 42 is
-        // attributable to admin immunity, not a broken pipeline.
+        // Baseline: confirms the ML deletion pipeline works, so a later "not deleted" for id 42
+        // is attributable to admin immunity, not a broken pipeline.
         let nonAdminMsg = Tg.quickMsg(text = "2222222", chat = fixture.ChatsToMonitor)
         let! _ = fixture.SendUpdateTo(0, nonAdminMsg)
         let! nonAdminDeleted =

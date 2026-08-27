@@ -8,16 +8,8 @@ open Npgsql
 open Dapper
 open Xunit
 
-/// DB-integration-level coverage of DB.fs's SaveTrainedModel WHERE guard (ML.fs's loser-timeout
-/// fallback race). A full two-pod StartAsync race is impractical to test directly
-/// (SDCA training takes minutes; timing two real HostedServices against the 5-minute poll window
-/// would be slow and flaky) -- this exercises the exact SQL guard against a real Postgres instead,
-/// which is what actually prevents the clobber.
-///
-/// Uses the ML-DISABLED container deliberately: ml_trained_model is untouched by app logic there
-/// (MlEnabled=false short-circuits both StartAsync's load and CleanupService's TryReloadIfNewer),
-/// so writing directly to the singleton row here can't corrupt the ML-enabled container's shared,
-/// pinned model that other tests assert deterministic scores against.
+/// DB-integration coverage of SaveTrainedModel's WHERE guard (a real two-pod race is impractical:
+/// SDCA training takes minutes). ML-DISABLED container so this can't corrupt the shared pinned model.
 type MLFallbackGuardTests(fixture: MlDisabledVahterTestContainers) =
 
     [<Fact>]

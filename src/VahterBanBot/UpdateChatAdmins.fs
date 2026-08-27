@@ -24,10 +24,8 @@ type UpdateChatAdmins(
     let podId = getEnvOr "POD_NAME" Environment.MachineName
     static let mutable localAdmins: ISet<int64> = HashSet<int64>()
 
-    /// Every tick, on every pod: reload the local snapshot from `chat_admin` (cheap SELECT), and
-    /// attempt the Telegram fetch under the 'chat_admins_refresh' lease so only one pod calls
-    /// GetChatAdministrators per refresh window. One-shot mode (UpdateChatAdminsInterval = None)
-    /// uses a decade-long minInterval, so the lease grants the fetch effectively once, ever.
+    /// Every tick, every pod reloads the local snapshot and attempts the Telegram fetch under the
+    /// 'chat_admins_refresh' lease, so only one pod calls GetChatAdministrators per window.
     let refreshChatAdmins _ = task {
         try
             let minInterval = botConf.Value.UpdateChatAdminsInterval |> Option.defaultValue (TimeSpan.FromDays 3650.0)
