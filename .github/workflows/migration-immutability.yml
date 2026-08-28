@@ -1,0 +1,26 @@
+name: "Lint: Migration immutability"
+
+on:
+  pull_request:
+    paths:
+      - 'src/vahter-bot/migrations/**'
+      - 'src/coupon-hub-bot/migrations/**'
+      - 'src/alita-bot/migrations/**'
+
+permissions:
+  contents: read
+
+jobs:
+  migration-immutability:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Fetch base ref
+      run: git fetch origin "${{ github.base_ref }}"
+
+    - name: Check migration immutability
+      run: scripts/check-migration-immutability.sh --range "origin/${{ github.base_ref }}...HEAD"
