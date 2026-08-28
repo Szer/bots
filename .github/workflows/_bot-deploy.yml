@@ -60,7 +60,7 @@ on:
         description: "For the SRE agent (_sre-agent.yml), invoked on deploy/verify failure"
 
 env:
-  DOCKER_IMAGE: flyway/flyway
+  DOCKER_IMAGE: flyway/flyway:13.4.0
   SCHEMAS: public
 
 jobs:
@@ -182,6 +182,20 @@ jobs:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         SPLIT_TUNNEL: "false"
 
+    # Unconditional: no-op if the last run's migrate succeeded (checksum-safe),
+    # required to clear a failed CIC migration's success=false history row.
+    - name: Repair production DB migration history
+      run: >-
+        docker run --rm
+        --network host
+        --volume ${{ github.workspace }}/${{ inputs.migrations-path }}:/flyway/sql:ro
+        --volume ${{ github.workspace }}/reports:/flyway/reports
+        "${{ env.DOCKER_IMAGE }}"
+        -url="jdbc:postgresql://${{ secrets.DB_PROD_HOST }}/${{ inputs.db-name }}"
+        -user="${{ secrets.DB_PROD_USERNAME }}"
+        -password="${{ secrets.DB_PROD_PASSWORD }}"
+        repair -schemas="${{ env.SCHEMAS }}"
+
     - name: Apply migrations to production DB
       run: >-
         docker run --rm
@@ -192,6 +206,7 @@ jobs:
         -url="jdbc:postgresql://${{ secrets.DB_PROD_HOST }}/${{ inputs.db-name }}"
         -user="${{ secrets.DB_PROD_USERNAME }}"
         -password="${{ secrets.DB_PROD_PASSWORD }}"
+        -postgresql.transactional.lock=false
         migrate -schemas="${{ env.SCHEMAS }}"
 
     - name: Disconnect VPN

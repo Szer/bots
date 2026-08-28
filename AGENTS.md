@@ -93,6 +93,14 @@ These tests are for **deliberate feature work and manual dev-iteration only** (`
 - CouponHubBot DB: `coupon_hub_bot`, role: `coupon_hub_bot_service`
 - AlitaBot DB: `alita_bot`, role: `alita_bot_service` (pgvector-backed — `message_embedding`/`interaction_memory` use the `vector` extension, `pgvector/pgvector:pg17` everywhere AlitaBot provisions its own Postgres)
 
+### `CREATE INDEX CONCURRENTLY` migrations
+
+Deploy (`flyway/flyway:13.4.0`) runs `migrate` with `-postgresql.transactional.lock=false` (session-level advisory lock, not Flyway's default transactional one since 9.1.2) so a CIC migration doesn't deadlock against Flyway's own coordination lock. `repair` runs unconditionally before every `migrate`.
+
+- Author CIC migrations like any other, in the normal versioned migrations dir — no `.sql.conf`, Flyway auto-detects them non-transactional. Make them idempotent: `DROP INDEX CONCURRENTLY IF EXISTS <name>; CREATE [UNIQUE] INDEX CONCURRENTLY <name> ON ...;`.
+- **If a CIC migration `Vn` fails on a data problem**, the data-fix migration's version must sit strictly between the last successfully-applied version and `Vn` (e.g. `V(n-1).1`) — never above `Vn`. Pending migrations run in ascending version order, so a higher-numbered fix never runs before `Vn`'s retry, and `Vn` fails identically on every deploy forever.
+- Unconditional `repair` means editing an already-applied migration's file gets its checksum silently realigned instead of failing validation — don't edit applied migrations.
+
 ## Settings configuration
 
 - All **non-secret** bot configuration lives in the `bot_setting` table. Env vars are only for secrets (`BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`, `AZURE_OCR_KEY`, `GITHUB_TOKEN`, `DATABASE_URL`, etc.).
