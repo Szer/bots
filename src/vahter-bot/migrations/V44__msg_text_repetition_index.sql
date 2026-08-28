@@ -5,3 +5,4 @@
 CREATE INDEX IF NOT EXISTS idx_event_msg_text_md5_created_at
     ON event (msg_text_md5, created_at)
     WHERE event_type = 'MessageReceived' AND msg_text_md5 IS NOT NULL;
+-- CI test: this line proves migration-immutability detects an edit --
