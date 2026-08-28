@@ -28,7 +28,7 @@ services:
       retries: 5
 
   flyway:
-    image: flyway/flyway
+    image: flyway/flyway:13.4.0
     container_name: alita-bot-flyway-dev
     depends_on:
       postgres:
@@ -39,7 +39,7 @@ services:
       FLYWAY_URL: jdbc:postgresql://postgres:5432/alita_bot
       FLYWAY_USER: admin
       FLYWAY_PASSWORD: admin
-    command: migrate -schemas=public
+    command: -postgresql.transactional.lock=false migrate -schemas=public
     restart: "no"
 
   seed-bot-settings:

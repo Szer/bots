@@ -248,9 +248,10 @@ jobs:
       run: >-
         docker run --rm --network host
         --volume ${{ github.workspace }}/src/coupon-hub-bot/migrations:/flyway/sql:ro
-        flyway/flyway
+        flyway/flyway:13.4.0
         -url="jdbc:postgresql://127.0.0.1:15434/coupon_hub_bot"
         -user=admin -password=admin
+        -postgresql.transactional.lock=false
         migrate -schemas=public
 
     - name: Seed bot_setting
