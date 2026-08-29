@@ -482,7 +482,8 @@ GROUP BY event_type;
     /// zero for that coupon (ReturnToAvailable writes 'returned' with user_id = the
     /// returner, same as 'taken', so no join to a separate take event is needed). Nets
     /// "<type>_reverted" the same way GetUserStats does, including 'returned_reverted'
-    /// (an admin /undo of a return restores the take).
+    /// (an admin /undo of a return restores the take). 'reported' nets the take to zero
+    /// the same way 'returned' does — TryReportCoupon relinquishes the take, no credit.
     member _.GetUserContributionStats(userId: int64) =
         task {
             use! conn = openConn()
@@ -497,15 +498,19 @@ SELECT
     (COUNT(*) FILTER (WHERE e.event_type = 'taken')
      - COUNT(*) FILTER (WHERE e.event_type = 'taken_reverted')
      - COUNT(*) FILTER (WHERE e.event_type = 'returned')
-     + COUNT(*) FILTER (WHERE e.event_type = 'returned_reverted'))::bigint AS taken_count,
+     + COUNT(*) FILTER (WHERE e.event_type = 'returned_reverted')
+     - COUNT(*) FILTER (WHERE e.event_type = 'reported')
+     + COUNT(*) FILTER (WHERE e.event_type = 'reported_reverted'))::bigint AS taken_count,
     COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken'), 0)
      - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken_reverted'), 0)
      - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned'), 0)
-     + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned_reverted'), 0) AS taken_value
+     + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned_reverted'), 0)
+     - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'reported'), 0)
+     + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'reported_reverted'), 0) AS taken_value
 FROM coupon_event e
 JOIN coupon c ON c.id = e.coupon_id
 WHERE e.user_id = @user_id
-  AND e.event_type IN ('added', 'added_reverted', 'taken', 'taken_reverted', 'returned', 'returned_reverted');
+  AND e.event_type IN ('added', 'added_reverted', 'taken', 'taken_reverted', 'returned', 'returned_reverted', 'reported', 'reported_reverted');
 """
             return! conn.QuerySingleAsync<UserContributionStats>(sql, {| user_id = userId |})
         }
@@ -542,7 +547,7 @@ LIMIT @limit;
         }
 
     /// One /balances page: all-user added/taken aggregates (netting "<type>_reverted" like
-    /// GetUserContributionStats, "taken" also net of "returned"/"returned_reverted" — see
+    /// GetUserContributionStats, "taken" also net of "returned"/"reported" — see
     /// GetUserContributionStats' doc comment), plus two owner-attributed informational counts
     /// (voided/reported coupons this user ADDED). 'voided' events already carry the owner's
     /// user_id (VoidCoupon writes original.owner_id, not the acting admin), while 'reported'
@@ -576,14 +581,18 @@ WITH added AS (
            (COUNT(*) FILTER (WHERE e.event_type = 'taken')
             - COUNT(*) FILTER (WHERE e.event_type = 'taken_reverted')
             - COUNT(*) FILTER (WHERE e.event_type = 'returned')
-            + COUNT(*) FILTER (WHERE e.event_type = 'returned_reverted'))::bigint AS cnt,
+            + COUNT(*) FILTER (WHERE e.event_type = 'returned_reverted')
+            - COUNT(*) FILTER (WHERE e.event_type = 'reported')
+            + COUNT(*) FILTER (WHERE e.event_type = 'reported_reverted'))::bigint AS cnt,
            COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken'), 0)
             - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'taken_reverted'), 0)
             - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned'), 0)
-            + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned_reverted'), 0) AS val
+            + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'returned_reverted'), 0)
+            - COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'reported'), 0)
+            + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'reported_reverted'), 0) AS val
     FROM coupon_event e
     JOIN coupon c ON c.id = e.coupon_id
-    WHERE e.event_type IN ('taken', 'taken_reverted', 'returned', 'returned_reverted')
+    WHERE e.event_type IN ('taken', 'taken_reverted', 'returned', 'returned_reverted', 'reported', 'reported_reverted')
     GROUP BY e.user_id
 ), owner_flags AS (
     SELECT c.owner_id AS user_id,
