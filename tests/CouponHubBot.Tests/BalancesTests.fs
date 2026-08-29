@@ -384,6 +384,49 @@ ON CONFLICT (id) DO NOTHING;
         }
 
     [<Fact>]
+    let ``Take-then-report nets the REPORTER's own taken bucket to zero in /balances and /whois`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(username = "bal_report_owner", firstName = "ReportOwner")
+            let reporter = Tg.user(username = "bal_report_taker", firstName = "ReportTaker")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(reporter.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", reporter))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/report {couponId}", reporter))
+
+            let! rowOpt = findRowAcrossPages admin "balance" reporter.Id
+            match rowOpt with
+            | Some cells ->
+                Assert.Equal("0", cells[4]) // в# — take relinquished by report, nets to 0
+                Assert.Equal("0", cells[5]) // в€
+                Assert.Equal("0", cells[6]) // б# — reporter never added anything either
+                Assert.Equal("0", cells[7]) // б€
+            | None -> Assert.True(false, "reporter row not found across any /balances page")
+
+            do! fixture.ClearFakeCalls()
+            let! whoisResp = fixture.SendUpdate(Tg.dmMessage($"/whois {reporter.Id}", admin))
+            Assert.Equal(HttpStatusCode.OK, whoisResp.StatusCode)
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let whoisText =
+                calls
+                |> Array.tryPick (fun c ->
+                    match parseCallBody c.Body with
+                    | Some parsed when parsed.ChatId = Some adminId && parsed.Text.IsSome && parsed.Text.Value.Contains("<pre>") -> parsed.Text
+                    | _ -> None)
+            Assert.True(whoisText.IsSome, "Admin should get a /whois reply for the reporter")
+            Assert.Contains("Взято: 0 · 0€", whoisText.Value)
+            Assert.Contains("Баланс: 0 · 0€", whoisText.Value)
+        }
+
+    [<Fact>]
     let ``Voided/reported coupons count against the OWNER, not the voiding admin or the reporter`` () =
         task {
             do! fixture.ClearFakeCalls()
