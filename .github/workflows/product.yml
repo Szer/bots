@@ -299,7 +299,7 @@ jobs:
         sandbox: workspace-write
         safety-strategy: drop-sudo
         effort: medium
-        codex-args: '--config sandbox_workspace_write.network_access=true'
+        codex-home: ${{ github.workspace }}/.github/codex
         prompt: |
           <instructions>
           ${{ env.AGENT_PROMPT }}

@@ -1,0 +1,4 @@
+# Trusted by codex-action@v1 (not sanitized by its codex-args validation).
+# Enables network inside the workspace-write sandbox for the agent workflows.
+[sandbox_workspace_write]
+network_access = true
