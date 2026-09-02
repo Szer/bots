@@ -1,0 +1,248 @@
+name: Workflow Canary
+
+# Canary: watches scheduled workflows and pages PagerDuty on failed/stalled.
+# Dedup key per workflow; resolve on recovery (PD auto_resolve_timeout is null).
+
+on:
+  schedule:
+    - cron: '50 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+        description: Print events instead of sending to PagerDuty
+      test_event:
+        type: choice
+        default: none
+        options:
+          - none
+          - warning-roundtrip
+        description: Send one warning trigger+resolve on bots/canary-selftest
+
+permissions:
+  actions: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PD_URL: https://events.eu.pagerduty.com/v2/enqueue
+      PD_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+      DRY_RUN: ${{ inputs.dry_run == 'true' }}
+
+    steps:
+    - name: Resolve canary self-report
+      run: |
+        set -euo pipefail
+        if [ -z "$PD_KEY" ]; then
+          echo "PAGERDUTY_ROUTING_KEY not set, skipping"
+          exit 0
+        fi
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "[dry-run] would resolve bots/workflow-canary"
+          exit 0
+        fi
+        PAYLOAD=$(jq -cn --arg key "$PD_KEY" '{routing_key:$key,event_action:"resolve",dedup_key:"bots/workflow-canary"}')
+        CODE=$(curl -sS -o "$RUNNER_TEMP/pd-resolve.json" -w '%{http_code}' -X POST "$PD_URL" -H 'Content-Type: application/json' -d "$PAYLOAD")
+        if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+          echo "PagerDuty returned HTTP $CODE:"
+          cat "$RUNNER_TEMP/pd-resolve.json"
+          exit 1
+        fi
+        echo "resolved bots/workflow-canary (HTTP $CODE)"
+
+    - name: Classify watched workflows
+      id: classify
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        NOW=$(date -u +%s)
+        DECISIONS="$RUNNER_TEMP/decisions.tsv"
+        : > "$DECISIONS"
+        declare -a ROWS=()
+        AGENT_BAD=0
+        echo "=== workflow canary classification $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+        printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %s\n' \
+          'workflow' 'display' 'state' 'run_id' 'conclusion' 'created_at' 'threshold'
+        while IFS='|' read -r file display thr_sec thr_human; do
+          RUNS=$(gh run list --workflow "$file" --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json databaseId,event,status,conclusion,createdAt,url)
+          LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.status == "completed" and .conclusion != "cancelled")][0] // empty')
+          SCHED_LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.event == "schedule" and .conclusion != "cancelled")][0] // empty')
+          FAILED="false"
+          if [ -n "$LATEST" ]; then
+            case "$(echo "$LATEST" | jq -r '.conclusion')" in
+              failure|timed_out|startup_failure) FAILED="true" ;;
+            esac
+          fi
+          STALLED="false"
+          if [ -n "$SCHED_LATEST" ]; then
+            STARTED=$(echo "$SCHED_LATEST" | jq -r '.createdAt')
+            AGE=$(( NOW - $(date -u -d "$STARTED" +%s) ))
+            if [ "$AGE" -gt "$thr_sec" ]; then
+              STALLED="true"
+            fi
+          else
+            STALLED="true"
+          fi
+          if [ "$FAILED" = "true" ]; then
+            STATE="failed"
+          elif [ "$STALLED" = "true" ]; then
+            STATE="stalled"
+          else
+            STATE="healthy"
+          fi
+          RUN_ID=$(echo "$LATEST" | jq -r '.databaseId // empty' 2>/dev/null || true)
+          CONCLUSION=$(echo "$LATEST" | jq -r '.conclusion // empty' 2>/dev/null || true)
+          CREATED_AT=$(echo "$LATEST" | jq -r '.createdAt // empty' 2>/dev/null || true)
+          URL=$(echo "$LATEST" | jq -r '.url // empty' 2>/dev/null || true)
+          SCHED_CREATED=$(echo "$SCHED_LATEST" | jq -r '.createdAt // empty' 2>/dev/null || true)
+          if [ "$STATE" = "failed" ]; then
+            SUMMARY="${display}: failed — ${URL}"
+          elif [ "$STATE" = "stalled" ]; then
+            if [ -n "$SCHED_CREATED" ]; then
+              SUMMARY="${display}: stalled — no run in ${thr_human} (last ${SCHED_CREATED})"
+            else
+              SUMMARY="${display}: stalled — no run in ${thr_human}"
+            fi
+          else
+            SUMMARY="${display}: healthy"
+          fi
+          if [ "$STATE" = "failed" ] || [ "$STATE" = "stalled" ]; then
+            case "$file" in
+              monitor.yml|project.yml|product.yml) AGENT_BAD=$((AGENT_BAD + 1)) ;;
+            esac
+          fi
+          ROWS+=("$file|$display|$STATE|$RUN_ID|$CONCLUSION|$CREATED_AT|$URL|$SCHED_CREATED|$thr_human|$SUMMARY")
+          printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %s\n' \
+            "$file" "$display" "$STATE" "$RUN_ID" "$CONCLUSION" "$CREATED_AT" "$thr_human"
+        done <<'EOF'
+        monitor.yml|Monitor|19800|5h30m
+        project.yml|Daily Project Assessment|93600|26h
+        product.yml|Product Analysis|352800|98h
+        vahter-mirror-reconcile.yml|Vahter: Mirror Reconcile|93600|26h
+        EOF
+        # Severity: critical only when >=2 of monitor/project/product are bad.
+        if [ "$AGENT_BAD" -ge 2 ]; then
+          CRITICAL="true"
+        else
+          CRITICAL="false"
+        fi
+        echo "agent_bad=${AGENT_BAD} critical=${CRITICAL}"
+        : > "$DECISIONS"
+        for row in "${ROWS[@]}"; do
+          IFS='|' read -ra F <<< "$row"
+          file=${F[0]}; display=${F[1]}; STATE=${F[2]}; RUN_ID=${F[3]}; CONCLUSION=${F[4]}
+          CREATED_AT=${F[5]}; URL=${F[6]}; SCHED_CREATED=${F[7]}; thr_human=${F[8]}; SUMMARY=${F[9]}
+          if [ "$STATE" = "healthy" ]; then
+            ACTION="resolve"
+            SEVERITY=""
+          else
+            ACTION="trigger"
+            SEVERITY="warning"
+            if [ "$CRITICAL" = "true" ]; then
+              case "$file" in
+                monitor.yml|project.yml|product.yml) SEVERITY="critical" ;;
+              esac
+            fi
+          fi
+          echo "$file|$display|$STATE|$ACTION|$SEVERITY|$RUN_ID|$CONCLUSION|$CREATED_AT|$URL|$thr_human|$SUMMARY" >> "$DECISIONS"
+        done
+
+    - name: PagerDuty warning roundtrip
+      if: inputs.test_event == 'warning-roundtrip'
+      run: |
+        set -euo pipefail
+        if [ -z "$PD_KEY" ]; then
+          echo "PAGERDUTY_ROUTING_KEY not set, skipping"
+          exit 0
+        fi
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "[dry-run] would trigger bots/canary-selftest severity=warning"
+          echo "[dry-run] would resolve bots/canary-selftest"
+          exit 0
+        fi
+        TRIGGER=$(jq -cn --arg key "$PD_KEY" '{routing_key:$key,event_action:"trigger",dedup_key:"bots/canary-selftest",payload:{summary:"Workflow Canary self-test",source:"Szer/bots/workflow-canary.yml",severity:"warning",component:"workflow-canary.yml",group:"github-actions"}}')
+        RESOLVE=$(jq -cn --arg key "$PD_KEY" '{routing_key:$key,event_action:"resolve",dedup_key:"bots/canary-selftest"}')
+        CODE1=$(curl -sS -o "$RUNNER_TEMP/pd-selftest-trigger.json" -w '%{http_code}' -X POST "$PD_URL" -H 'Content-Type: application/json' -d "$TRIGGER")
+        CODE2=$(curl -sS -o "$RUNNER_TEMP/pd-selftest-resolve.json" -w '%{http_code}' -X POST "$PD_URL" -H 'Content-Type: application/json' -d "$RESOLVE")
+        if [ "$CODE1" -lt 200 ] || [ "$CODE1" -ge 300 ] || [ "$CODE2" -lt 200 ] || [ "$CODE2" -ge 300 ]; then
+          echo "selftest failed — trigger HTTP $CODE1, resolve HTTP $CODE2"
+          cat "$RUNNER_TEMP/pd-selftest-trigger.json"
+          cat "$RUNNER_TEMP/pd-selftest-resolve.json"
+          exit 1
+        fi
+        echo "selftest roundtrip OK — trigger HTTP $CODE1, resolve HTTP $CODE2"
+
+    - name: Send PagerDuty events
+      run: |
+        set -euo pipefail
+        DECISIONS="$RUNNER_TEMP/decisions.tsv"
+        if [ ! -s "$DECISIONS" ]; then
+          echo "no decisions to send"
+          exit 0
+        fi
+        if [ -z "$PD_KEY" ]; then
+          echo "PAGERDUTY_ROUTING_KEY not set, skipping"
+          exit 0
+        fi
+        while IFS='|' read -r -a F; do
+          file=${F[0]}; display=${F[1]}; action=${F[3]}; severity=${F[4]}
+          run_id=${F[5]}; conclusion=${F[6]}; created_at=${F[7]}; thr_human=${F[9]}; summary=${F[10]}
+          DEDUP="bots/${file}"
+          if [ "$action" = "resolve" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would resolve ${DEDUP} (${display})"
+              continue
+            fi
+            PAYLOAD=$(jq -cn --arg key "$PD_KEY" --arg dedup "$DEDUP" '{routing_key:$key,event_action:"resolve",dedup_key:$dedup}')
+          else
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "[dry-run] would trigger ${DEDUP} severity=${severity} summary=${summary}"
+              continue
+            fi
+            PAYLOAD=$(jq -cn \
+              --arg key "$PD_KEY" \
+              --arg dedup "$DEDUP" \
+              --arg source "Szer/bots/${file}" \
+              --arg summary "$summary" \
+              --arg component "$file" \
+              --arg severity "$severity" \
+              --arg run_id "$run_id" \
+              --arg conclusion "$conclusion" \
+              --arg created_at "$created_at" \
+              --arg threshold "$thr_human" \
+              '{routing_key:$key,event_action:"trigger",dedup_key:$dedup,payload:{summary:$summary,source:$source,severity:$severity,component:$component,group:"github-actions",custom_details:{run_id:$run_id,conclusion:$conclusion,created_at:$created_at,threshold:$threshold}}}')
+          fi
+          CODE=$(curl -sS -o "$RUNNER_TEMP/pd-send.json" -w '%{http_code}' -X POST "$PD_URL" -H 'Content-Type: application/json' -d "$PAYLOAD")
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+            echo "PagerDuty returned HTTP $CODE for ${DEDUP}:"
+            cat "$RUNNER_TEMP/pd-send.json"
+            exit 1
+          fi
+          echo "${action} ${DEDUP} severity=${severity:-n/a} (HTTP $CODE)"
+        done < "$DECISIONS"
+
+    - name: Report canary failure
+      if: failure()
+      run: |
+        set -euo pipefail
+        if [ -z "$PD_KEY" ]; then
+          echo "PAGERDUTY_ROUTING_KEY not set, skipping"
+          exit 0
+        fi
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "[dry-run] would trigger bots/workflow-canary severity=warning"
+          exit 0
+        fi
+        PAYLOAD=$(jq -cn --arg key "$PD_KEY" --arg rid "$GITHUB_RUN_ID" '{routing_key:$key,event_action:"trigger",dedup_key:"bots/workflow-canary",payload:{summary:"Workflow Canary run $rid failed",source:"Szer/bots/workflow-canary.yml",severity:"warning",component:"workflow-canary.yml",group:"github-actions",custom_details:{run_id:$rid}}}')
+        CODE=$(curl -sS -o "$RUNNER_TEMP/pd-canary-fail.json" -w '%{http_code}' -X POST "$PD_URL" -H 'Content-Type: application/json' -d "$PAYLOAD")
+        if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+          echo "PagerDuty returned HTTP $CODE:"
+          cat "$RUNNER_TEMP/pd-canary-fail.json"
+          exit 1
+        fi
+        echo "canary self-report trigger HTTP $CODE"
