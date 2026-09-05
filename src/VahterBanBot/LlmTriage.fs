@@ -539,7 +539,7 @@ Message:
                     // defensive only) stays sender-scoped, never shared.
                     let key = match verdictStr with "SPAM" | "SKIP" -> globalKey | _ -> senderKey
                     do! cache.Save(key, verdictStr, reason, Some modelName)
-                return LlmVerdict.FromString(verdictStr, reason)
+                return LlmVerdict.FromString(verdictStr, reason, None)
             | None ->
                 return LlmVerdict.Error
         with
@@ -599,7 +599,7 @@ Message:
         logger.LogInformation(
             "LLM triage cache hit: verdict={Verdict} reason={Reason} cacheScope={CacheScope} cachedAt={CachedAt} chatId={ChatId} userId={UserId}",
             cv.Verdict, cv.Reason, scope, cv.CreatedAt, msg.ChatId, msg.SenderId)
-        return LlmVerdict.FromString(cv.Verdict, cv.Reason)
+        return LlmVerdict.FromString(cv.Verdict, cv.Reason, Some scope)
     }
 
     interface ILlmTriage with
@@ -607,7 +607,7 @@ Message:
         member _.PromptHash = promptHash
 
         member _.Classify(msg: TgMessage, userMsgCount: int64, ct: CancellationToken) = task {
-            if not botConf.Value.LlmTriageEnabled then return LlmVerdict.Skip None
+            if not botConf.Value.LlmTriageEnabled then return LlmVerdict.Skip (None, None)
             else
 
             // Photo-only / empty-text messages have no stable text key → classify directly, no cache.

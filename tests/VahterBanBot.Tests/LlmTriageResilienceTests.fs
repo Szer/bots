@@ -108,6 +108,10 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
 
         let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
         Assert.Equal(Some ("SPAM", Some "keyword match: kill", "global"), cacheHit)
+
+        let! sends = fixture.GetFakeCalls "sendMessage"
+        let toDetected = sends |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{fixture.DetectedSpamChannel.Id}")
+        Assert.True(toDetected |> Array.exists (fun c -> c.Body.Contains "cached/global"), "cache-served kill must be marked in the channel text")
     }
 
     [<Fact>]
@@ -132,6 +136,12 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
 
         let! calls = fixture.GetAzureLlmCalls()
         Assert.Equal(1, calls.Length)
+
+        // NOT_SPAM (the other same-sender cache case) posts no channel message to check, so this
+        // SKIP case is the stand-in coverage for a cache-served report's channel-text annotation.
+        let! sends = fixture.GetFakeCalls "sendMessage"
+        let toPotential = sends |> Array.filter (fun c -> c.Body.Contains $"\"chat_id\":{fixture.PotentialSpamChannel.Id}")
+        Assert.True(toPotential |> Array.exists (fun c -> c.Body.Contains "cached/global"), "cache-served SKIP report must be marked in the channel text")
     }
 
     [<Fact>]

@@ -53,9 +53,11 @@ type BannedBy =
 
 [<RequireQualifiedAccess>]
 type LlmVerdict =
-    | Kill of reason: string option
-    | NotSpam of reason: string option
-    | Skip of reason: string option    // LLM "SPAM" verdict — message goes to human triage
+    /// `cacheScope` is None for a fresh Azure call, Some "global"|"sender" when served from the
+    /// verdict cache (D4) — carried through so Bot.fs can mark cached verdicts in channel text.
+    | Kill of reason: string option * cacheScope: string option
+    | NotSpam of reason: string option * cacheScope: string option
+    | Skip of reason: string option * cacheScope: string option    // LLM "SPAM" verdict — message goes to human triage
     | Error   // HTTP failure or parse error — falls back to human triage
     /// Azure OpenAI rejected the triage request itself with HTTP 400 `content_filter` — its RAI
     /// policy judged the (already ML-flagged) prompt severely harmful, e.g. incident
@@ -69,11 +71,11 @@ type LlmVerdict =
     /// when LLM_CONTENT_FILTER_IS_SPAM is true (default); false reverts to the same Uncertain
     /// fallback as Error.
     | ContentFiltered of triggers: string
-    static member FromString(verdictStr: string, reason: string option) =
+    static member FromString(verdictStr: string, reason: string option, cacheScope: string option) =
         match verdictStr with
-        | "SPAM"     -> LlmVerdict.Kill reason
-        | "NOT_SPAM" -> LlmVerdict.NotSpam reason
-        | "SKIP"     -> LlmVerdict.Skip reason
+        | "SPAM"     -> LlmVerdict.Kill (reason, cacheScope)
+        | "NOT_SPAM" -> LlmVerdict.NotSpam (reason, cacheScope)
+        | "SKIP"     -> LlmVerdict.Skip (reason, cacheScope)
         | _          -> LlmVerdict.Error
 
 /// Verdict for the reaction-spam triage pipeline (separate from LlmVerdict because the
@@ -251,8 +253,9 @@ type AutoDeleteReason =
     /// (@AvaloniaRU msg 217142): an innocent caption-less sticker was auto-deleted with
     /// `reason = MlSpam` even though the LLM, not the ML threshold, made the kill call.
     /// `score` is still the ML score that triggered LLM escalation (for the same human-facing
-    /// "score: x" rendering as MlSpam); `modelName` names which deployment decided.
-    | LlmSpam of {| score: float; modelName: string; reason: string option |}
+    /// "score: x" rendering as MlSpam); `modelName` names which deployment decided. `cacheScope`
+    /// (D4) is None for a fresh call, Some "global"|"sender" when the verdict was cache-served.
+    | LlmSpam of {| score: float; modelName: string; reason: string option; cacheScope: string option |}
     | ReactionSpam of {| reactionCount: int |}
     | InvisibleMention
     /// Deterministic attachment-extension delete (SUSPICIOUS_ATTACHMENT_EXTENSIONS). Delete only, no ban.
@@ -292,7 +295,8 @@ type SpamTextCacheMode =
 type AutoVerdict =
     /// Spam detected — delete message, reduce karma, check autoban. `reason` is the LLM's
     /// short verdict phrase when `actor` is `Actor.LLM` (None for a plain ML-threshold kill).
-    | Spam of score: float * actor: Actor * reason: string option
+    /// `cacheScope` (D4) is Some "global"|"sender" when the verdict was cache-served.
+    | Spam of score: float * actor: Actor * reason: string option * cacheScope: string option
     /// Azure OpenAI's content_filter rejected the triage prompt as severely harmful (see
     /// LlmVerdict.ContentFiltered / LLM_CONTENT_FILTER_IS_SPAM). Takes the EXACT SAME
     /// delete/report/karma/autoban enforcement action as Spam (same score+actor shape, so
@@ -303,8 +307,9 @@ type AutoVerdict =
     | ContentFilterSpam of score: float * actor: Actor * triggers: string
     /// Not spam — no action
     | NotSpam of score: float * actor: Actor
-    /// Uncertain — route to human triage channel. `reason` is the LLM's SKIP phrase, when any.
-    | Uncertain of score: float * reason: string option
+    /// Uncertain — route to human triage channel. `reason` is the LLM's SKIP phrase, when any;
+    /// `cacheScope` (D4) is Some "global"|"sender" when the verdict was cache-served.
+    | Uncertain of score: float * reason: string option * cacheScope: string option
 
 type ModerationEvent =
     | VahterActed      of {| vahterId: int64; actionType: VahterAction; targetUserId: int64; chatId: int64; messageId: int64 |}
