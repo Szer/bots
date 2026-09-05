@@ -1517,7 +1517,6 @@ type BotService(
                         | Some (AutoVerdict.Uncertain (score, reason)) ->
                             %mlActivity.SetTag("spamScoreMl", score)
                             %mlActivity.SetTag("autoVerdict", "uncertain")
-                            // Uncertain always went through the LLM — surface its reason as LlmSpam too.
                             let uncertainReason =
                                 match reason with
                                 | Some r -> LlmSpam {| score = score; modelName = llmTriage.ModelName; reason = Some r |}

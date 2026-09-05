@@ -251,7 +251,6 @@ let ``New BotAutoDeleted with LlmSpam reason round-trips with score, modelName a
 
 [<Fact>]
 let ``Old BotAutoDeleted with LlmSpam (pre-D3, no reason) deserializes reason as None`` () =
-    // Simulates an event stored before AutoDeleteReason.LlmSpam carried `reason`.
     let json =
         """{"Case":"BotAutoDeleted","chatId":-666,"messageId":217142,"userId":8931498652,"reason":{"Case":"LlmSpam","score":0.31478,"modelName":"gpt-4o-mini"}}"""
     let event = JsonSerializer.Deserialize<ModerationEvent>(json, eventJsonOpts)

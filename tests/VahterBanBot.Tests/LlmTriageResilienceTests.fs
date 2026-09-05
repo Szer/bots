@@ -77,7 +77,6 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
         let! calls = fixture.GetAzureLlmCalls()
         Assert.Equal(1, calls.Length)
 
-        // D4: SPAM only ever writes the GLOBAL key, so even this same-sender repeat hits it.
         let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
         Assert.Equal(Some ("SPAM", Some "keyword match: kill", "global"), cacheHit)
     }
@@ -107,7 +106,6 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
         let! calls = fixture.GetAzureLlmCalls()
         Assert.Equal(1, calls.Length)
 
-        // D4: sender B's own key misses; the fall-through to the global tier is the hit.
         let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
         Assert.Equal(Some ("SPAM", Some "keyword match: kill", "global"), cacheHit)
     }
@@ -163,7 +161,6 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
 
     [<Fact>]
     let ``LLM triage caches NOT_SPAM per-sender even with the global flag ON: the same sender's repeat is Tier-1 sender-first`` () = task {
-        // Global flag ON: NOT_SPAM never touches the global key, so this repeat hits Tier 1 (sender).
         do! resetFakes ()
         let a = Tg.user()
 

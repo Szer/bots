@@ -427,7 +427,6 @@ Respond with exactly: {"verdict":"SPAM","reason":"..."} or {"verdict":"SKIP","re
     // is retried next time rather than pinned.
     let classifyUncached (msg: TgMessage) (userMsgCount: int64) (cacheRouting: CacheRouting) (ct: CancellationToken) = task {
         use activity = botActivity.StartActivity("llmTriage")
-        // Miss scope = the tier actually checked: NoCache=none, SingleKey=sender, SplitByVerdict=global.
         let missScope =
             match cacheRouting with
             | NoCache -> "none"
@@ -580,7 +579,6 @@ Message:
             return LlmVerdict.Error
     }
 
-    // D4: makes a cache hit observable — span/counter/event/log, same as a real classification.
     let recordCacheHit (msg: TgMessage) (scope: string) (cv: CachedVerdict) = task {
         use activity = botActivity.StartActivity("llmTriage")
         if not (isNull activity) then
