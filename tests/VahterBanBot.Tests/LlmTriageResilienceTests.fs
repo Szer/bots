@@ -162,6 +162,27 @@ type LlmTriageResilienceTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwa
     }
 
     [<Fact>]
+    let ``LLM triage caches NOT_SPAM per-sender even with the global flag ON: the same sender's repeat is Tier-1 sender-first`` () = task {
+        // Global flag ON: NOT_SPAM never touches the global key, so this repeat hits Tier 1 (sender).
+        do! resetFakes ()
+        let a = Tg.user()
+
+        let m1 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77", from = a)
+        let! _ = fixture.SendMessage m1
+        let! v1 = fixture.TryGetLlmTriageVerdict m1.Message.Value
+        Assert.Equal(Some "NOT_SPAM", v1)
+
+        let m2 = Tg.quickMsg(chat = fixture.ChatsToMonitor[1], text = "77", from = a)
+        let! _ = fixture.SendMessage m2
+
+        let! calls = fixture.GetAzureLlmCalls()
+        Assert.Equal(1, calls.Length)
+
+        let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
+        Assert.Equal(Some ("NOT_SPAM", Some "keyword match: none", "sender"), cacheHit)
+    }
+
+    [<Fact>]
     let ``LLM triage global cache respects TTL: an aged-out SPAM entry is re-classified`` () = task {
         do! resetFakes ()
         let a = Tg.user(firstName = "kill ttl-a")

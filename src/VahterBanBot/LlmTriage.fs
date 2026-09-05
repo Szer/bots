@@ -412,7 +412,7 @@ Classify the message as exactly one of:
 
 In case of doubt, select SKIP.
 
-Also give a `reason`: one short English phrase, max ~12 words, no personal data.
+Also give a `reason`: one short English phrase, max ~12 words, no PII.
 
 Respond with exactly: {"verdict":"SPAM","reason":"..."} or {"verdict":"SKIP","reason":"..."} or {"verdict":"NOT_SPAM","reason":"..."}"""
 
@@ -427,8 +427,13 @@ Respond with exactly: {"verdict":"SPAM","reason":"..."} or {"verdict":"SKIP","re
     // is retried next time rather than pinned.
     let classifyUncached (msg: TgMessage) (userMsgCount: int64) (cacheRouting: CacheRouting) (ct: CancellationToken) = task {
         use activity = botActivity.StartActivity("llmTriage")
-        // Every call here bypassed (or found no) cached verdict — a "miss" regardless of outcome.
-        llmVerdictCacheTotalCounter.Add(1L, tagsForLlmVerdictCache "miss" "none")
+        // Miss scope = the tier actually checked: NoCache=none, SingleKey=sender, SplitByVerdict=global.
+        let missScope =
+            match cacheRouting with
+            | NoCache -> "none"
+            | SingleKey _ -> "sender"
+            | SplitByVerdict _ -> "global"
+        llmVerdictCacheTotalCounter.Add(1L, tagsForLlmVerdictCache "miss" missScope)
 
         // endpoint/key/deployment are hot-reloadable — read live for this call.
         let modelName = botConf.Value.AzureOpenAiDeployment
@@ -520,8 +525,8 @@ Message:
                         .SetTag("llm.cache",    "miss")
                         .SetTag("llm.reason",   Option.toObj reason)
                 logger.LogInformation(
-                    "LLM triage classified: verdict={Verdict} reason={Reason} latencyMs={LatencyMs} cacheScope={CacheScope}",
-                    verdictStr, reason, sw.ElapsedMilliseconds, "miss")
+                    "LLM triage classified: verdict={Verdict} reason={Reason} latencyMs={LatencyMs} cacheResult={CacheResult} cacheScope={CacheScope}",
+                    verdictStr, reason, sw.ElapsedMilliseconds, "miss", missScope)
                 do! db.RecordLlmClassified(
                         msg.ChatId, msg.MessageId, verdictStr, reason,
                         promptTokens, completionTokens, int sw.ElapsedMilliseconds,
@@ -588,7 +593,11 @@ Message:
                 .SetTag("chat_id",         msg.ChatId)
                 .SetTag("user_id",         msg.SenderId)
         llmVerdictCacheTotalCounter.Add(1L, tagsForLlmVerdictCache "hit" scope)
-        do! db.RecordLlmVerdictCacheHit(msg.ChatId, msg.MessageId, cv.Verdict, cv.Reason, scope, cv.CreatedAt, cv.ModelName)
+        // Never let a DB error on this write block returning the already-known verdict.
+        try
+            do! db.RecordLlmVerdictCacheHit(msg.ChatId, msg.MessageId, cv.Verdict, cv.Reason, scope, cv.CreatedAt, cv.ModelName)
+        with ex ->
+            logger.LogWarning(ex, "Failed to record LlmVerdictCacheHit event (cacheScope={CacheScope})", scope)
         logger.LogInformation(
             "LLM triage cache hit: verdict={Verdict} reason={Reason} cacheScope={CacheScope} cachedAt={CachedAt} chatId={ChatId} userId={UserId}",
             cv.Verdict, cv.Reason, scope, cv.CreatedAt, msg.ChatId, msg.SenderId)

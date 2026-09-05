@@ -259,10 +259,8 @@ module private BotHelpers =
         // Same "score: x" shape as MlSpam — the actor prefix (already "LLM/{modelName}, " via
         // Actor.LLM.DisplayName) is what tells a human this was the LLM's own kill call, not a
         // plain ML-threshold verdict; formatReasonStr keeps that wording stable on purpose.
-        | AutoDeleteReason.LlmSpam r ->
-            match r.reason with
-            | Some llmReason -> $"{prefix}score: {r.score}, LLM: {llmReason}"
-            | None           -> $"{prefix}score: {r.score}"
+        | AutoDeleteReason.LlmSpam r when r.reason.IsSome -> $"{prefix}score: {r.score}, LLM: {r.reason.Value}"
+        | AutoDeleteReason.LlmSpam r -> $"{prefix}score: {r.score}"
         | AutoDeleteReason.ReactionSpam r     -> $"{prefix}reactions: {r.reactionCount}"
         | AutoDeleteReason.InvisibleMention   -> $"{prefix}invisible mention"
         | AutoDeleteReason.SuspiciousAttachment -> $"{prefix}suspicious attachment"
