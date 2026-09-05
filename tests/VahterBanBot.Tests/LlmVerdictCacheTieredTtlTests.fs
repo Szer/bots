@@ -1,6 +1,7 @@
 module VahterBanBot.Tests.LlmVerdictCacheTieredTtlTests
 
 open System
+open System.Net
 open VahterBanBot.Tests.ContainerTestBase
 open BotTestInfra
 open Xunit
@@ -153,6 +154,74 @@ type LlmVerdictCacheTieredTtlTests(fixture: MlEnabledVahterTestContainers, _ml: 
         Assert.Equal(2, calls2.Length)
 
         let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
+        Assert.Equal(None, cacheHit)
+    }
+
+    [<Fact>]
+    let ``LLM verdict cache: /ban invalidates both the per-sender NOT_SPAM row and the global SKIP row`` () = task {
+        do! resetFakes ()
+        let x = Tg.user()
+        let y = Tg.user(firstName = "spam ban-inval-y")
+        let text = longSpamText
+
+        let m1 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = x)
+        let! _ = fixture.SendMessage m1
+        let! v1 = fixture.TryGetLlmTriageVerdict m1.Message.Value
+        Assert.Equal(Some "NOT_SPAM", v1)
+
+        let m2 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = y)
+        let! _ = fixture.SendMessage m2
+        let! v2 = fixture.TryGetLlmTriageVerdict m2.Message.Value
+        Assert.Equal(Some "SKIP", v2)
+        let! calls2 = fixture.GetAzureLlmCalls()
+        Assert.Equal(2, calls2.Length)
+
+        let! banResp = Tg.replyMsg(m1.Message.Value, "/ban", fixture.Vahters[0]) |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, banResp.StatusCode)
+
+        // harness only — a banned sender never reaches LLM triage, /unban itself touches nothing
+        let! _ = Tg.quickMsg(text = $"/unban {x.Id}", chat = fixture.ChatsToMonitor[0], from = fixture.Vahters[0]) |> fixture.SendMessage
+
+        let m3 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = x)
+        let! _ = fixture.SendMessage m3
+
+        let! calls3 = fixture.GetAzureLlmCalls()
+        Assert.Equal(3, calls3.Length)
+        let! cacheHit = fixture.TryGetLlmVerdictCacheHit m3.Message.Value
+        Assert.Equal(None, cacheHit)
+    }
+
+    [<Fact>]
+    let ``LLM verdict cache: /vahter markspam invalidates both the per-sender NOT_SPAM row and the global SKIP row`` () = task {
+        do! resetFakes ()
+        let x = Tg.user()
+        let y = Tg.user(firstName = "spam markspam-inval-y")
+        let text = longSpamText
+
+        let m1 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = x)
+        let! _ = fixture.SendMessage m1
+        let! v1 = fixture.TryGetLlmTriageVerdict m1.Message.Value
+        Assert.Equal(Some "NOT_SPAM", v1)
+
+        let m2 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = y)
+        let! _ = fixture.SendMessage m2
+        let! v2 = fixture.TryGetLlmTriageVerdict m2.Message.Value
+        Assert.Equal(Some "SKIP", v2)
+        let! calls2 = fixture.GetAzureLlmCalls()
+        Assert.Equal(2, calls2.Length)
+
+        // ref token must point at the REAL m1 — TryGetMessageTextAndSender reads snapshot_message
+        let logText = $"Deleted spam (ml) in @pro.hell from @bad with text:\n{text}\n#ref:{m1.Message.Value.Chat.Id}:{m1.Message.Value.MessageId}"
+        let logMsg = Tg.quickMsg(text = logText, chat = fixture.AdminChannel, from = fixture.Vahters[0])
+        let! resp = Tg.replyMsg(logMsg.Message.Value, "/vahter markspam", fixture.Vahters[0]) |> fixture.SendMessage
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+        let m3 = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = text, from = x)
+        let! _ = fixture.SendMessage m3
+
+        let! calls3 = fixture.GetAzureLlmCalls()
+        Assert.Equal(3, calls3.Length)
+        let! cacheHit = fixture.TryGetLlmVerdictCacheHit m3.Message.Value
         Assert.Equal(None, cacheHit)
     }
 

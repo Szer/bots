@@ -1838,12 +1838,11 @@ type BotService(
             | Some(chatId, messageId) ->
                 do! db.RecordMessageMarkedHam(chatId, messageId, "", Some vahter.Id)
 
-                let! textAndSender = db.TryGetMessageTextAndSender(chatId, messageId)
-                match textAndSender with
-                | Some(text, _senderId) ->
-                    let unmarkGlobalKey = LlmVerdictCache.globalKey text
-                    do! invalidateVerdictCache "hamMark-global-admin" (fun () -> verdictCache.Invalidate(unmarkGlobalKey, None))
-                | None -> ()
+                do! invalidateVerdictCache $"hamMark-global-admin (chat={chatId}, msg={messageId})" (fun () -> task {
+                    match! db.TryGetMessageTextAndSender(chatId, messageId) with
+                    | Some(text, _senderId) -> do! verdictCache.Invalidate(LlmVerdictCache.globalKey text, None)
+                    | None -> ()
+                })
 
                 do! this.MaybeGrantSpamProtection(chatId, null, messageId, vahter.Id)
                 do! this.ReplyAdmin(msg, $"✅ Reversed: message {messageId} in chat {chatId} marked as NOT spam (ham).")
@@ -1874,15 +1873,14 @@ type BotService(
                     if revoked then recordSpamProtectionRevoked chatId null "markspam"
                 | None -> ()
 
-                // D2: mark-spam invalidation; text/sender recovered from snapshot (no TgMessage here).
-                let! textAndSender = db.TryGetMessageTextAndSender(chatId, messageId)
-                match textAndSender with
-                | Some(text, senderId) ->
-                    let markSpamSenderKey = LlmVerdictCache.senderKey senderId text
-                    let markSpamGlobalKey = LlmVerdictCache.globalKey text
-                    do! invalidateVerdictCache "markSpam-sender-admin" (fun () -> verdictCache.Invalidate(markSpamSenderKey, Some "NOT_SPAM"))
-                    do! invalidateVerdictCache "markSpam-global-admin" (fun () -> verdictCache.Invalidate(markSpamGlobalKey, Some "SKIP"))
-                | None -> ()
+                // D2: text/sender recovered from snapshot (no TgMessage here).
+                do! invalidateVerdictCache $"markSpam-admin (chat={chatId}, msg={messageId})" (fun () -> task {
+                    match! db.TryGetMessageTextAndSender(chatId, messageId) with
+                    | Some(text, senderId) ->
+                        do! verdictCache.Invalidate(LlmVerdictCache.senderKey senderId text, Some "NOT_SPAM")
+                        do! verdictCache.Invalidate(LlmVerdictCache.globalKey text, Some "SKIP")
+                    | None -> ()
+                })
 
                 do! this.ReplyAdmin(msg, $"✅ Message {messageId} in chat {chatId} marked as spam.")
                 logger.LogInformation($"Vahter {vahter.Id} marked {chatId}:{messageId} as spam")

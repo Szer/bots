@@ -44,10 +44,8 @@ open BotInfra
 // exoneration and always wins — even if a DIFFERENT sender has since made the same text SPAM/SKIP
 // globally. Only when the per-sender key misses do we fall through to the global key. This favors
 // "don't re-punish a user we already cleared" over "a newer global verdict might supersede an older
-// personal one" — a stale personal NOT_SPAM naturally falls out of consideration once its own TTL
-// expires, same as any other cache entry, so the exposure window is bounded by
-// LLM_VERDICT_CACHE_TTL_MINUTES either way. With the flag OFF, only the per-sender key exists for
-// any verdict (the pre-PR behavior).
+// personal one" — a stale personal NOT_SPAM naturally falls out once its own (length-tiered, D1)
+// TTL expires. With the flag OFF, only the per-sender key exists for any verdict (the pre-PR behavior).
 
 /// D1: TTL (minutes) that applies to a cached row, given its verdict and normalized text length.
 /// SKIP always keeps the short TTL; SPAM/NOT_SPAM get the long TTL once text is long enough.
@@ -366,7 +364,9 @@ type ILlmTriage =
     abstract member PromptHash: string
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmVerdict>
 
-type AzureLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService, cache: ILlmVerdictCache, profileFetcher: IUserProfileFetcher) =
+type AzureLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<AzureLlmTriage>, db: DbService, cache: ILlmVerdictCache, profileFetcher: IUserProfileFetcher, timeProvider: TimeProvider) =
+
+    let utcNow () = timeProvider.GetUtcNow().UtcDateTime
 
     // Coalesces concurrent identical-text classifications (same spam across channels at once).
     let inflight = ConcurrentDictionary<string, Lazy<Task<LlmVerdict>>>()
@@ -619,11 +619,9 @@ Message:
             // Photo-only / empty-text messages have no stable text key → classify directly, no cache.
             // (Unchanged by the media-placeholder prompt rendering above — hasStableTextCacheKey
             // reads msg.Text, never the placeholder; see that function's doc comment.)
-            if not (hasStableTextCacheKey msg) then
-                return! classifyUncached msg userMsgCount NoCache ct
-            else
-
-                let senderKey = LlmVerdictCache.senderKey msg.SenderId msg.Text
+            match (if hasStableTextCacheKey msg then Some (LlmVerdictCache.senderKey msg.SenderId msg.Text) else None) with
+            | None -> return! classifyUncached msg userMsgCount NoCache ct
+            | Some senderKey ->
 
                 // In-process single-flight coalescing stays scoped to (sender, text) — NOT widened to
                 // the global text-only key — even though the persisted cache below now has a global
@@ -654,7 +652,7 @@ Message:
                                     botConf.Value.LlmVerdictCacheLongTextTtlMinutes
                                     cv.Verdict
                                     normalizedTextLength
-                            if cv.CreatedAt > DateTime.UtcNow - TimeSpan.FromMinutes(float ttlMinutes)
+                            if cv.CreatedAt > utcNow() - TimeSpan.FromMinutes(float ttlMinutes)
                             then return Some cv
                             else return None
                     }
