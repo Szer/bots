@@ -62,6 +62,10 @@ type LlmVerdictCacheGlobalFlagTests(fixture: LlmVerdictCacheGlobalDisabledTestCo
 
         let! calls = fixture.GetAzureLlmCalls()
         Assert.Equal(1, calls.Length)
+
+        // D4: flag off ⇒ SingleKey routing ⇒ the only key is the sender key.
+        let! cacheHit = fixture.TryGetLlmVerdictCacheHit m2.Message.Value
+        Assert.Equal(Some ("SPAM", Some "keyword match: kill", "sender"), cacheHit)
     }
 
     interface IClassFixture<MlAwaitFixture>
