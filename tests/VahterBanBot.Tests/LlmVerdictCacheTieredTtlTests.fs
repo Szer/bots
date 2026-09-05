@@ -106,8 +106,7 @@ type LlmVerdictCacheTieredTtlTests(fixture: MlEnabledVahterTestContainers, _ml: 
         let a = Tg.user(firstName = "kill norm-variant-a")
         let b = Tg.user(firstName = "kill norm-variant-b")
 
-        // Confirmed empirically to score identically under the pinned test ML model — only
-        // internal whitespace differs, so both normalize to the same cache key (D5).
+        // internal whitespace differs only — normalizes to the same cache key (D5)
         let baseText    = longSpamText
         let variantText = "77  77 77 77 77 77 77 77 77 77 77 77 77 77"
 
