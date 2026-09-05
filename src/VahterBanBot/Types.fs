@@ -293,9 +293,8 @@ type SpamTextCacheMode =
 /// Result of automated spam triage (ML + optional LLM).
 [<RequireQualifiedAccess>]
 type AutoVerdict =
-    /// Spam detected — delete message, reduce karma, check autoban. `reason` is the LLM's
-    /// short verdict phrase when `actor` is `Actor.LLM` (None for a plain ML-threshold kill).
-    /// `cacheScope` (D4) is Some "global"|"sender" when the verdict was cache-served.
+    /// Spam detected — delete message, reduce karma, check autoban. `reason`/`cacheScope` are the
+    /// LLM's verdict phrase / cache tier when `actor` is `Actor.LLM` (both None otherwise).
     | Spam of score: float * actor: Actor * reason: string option * cacheScope: string option
     /// Azure OpenAI's content_filter rejected the triage prompt as severely harmful (see
     /// LlmVerdict.ContentFiltered / LLM_CONTENT_FILTER_IS_SPAM). Takes the EXACT SAME
