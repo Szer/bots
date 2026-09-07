@@ -24,5 +24,6 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('OCR_MAX_FILE_SIZE_BYTES','20971520',                                             'FREE_FORM',    'ocr',         'Maximum photo size in bytes that will be sent to Azure OCR'),
     ('REMINDER_HOUR_DUBLIN',   '10',                                                   'FREE_FORM',    'reminders',   'Hour of day (Europe/Dublin) to send daily reminders'),
     ('REMINDER_RUN_ON_START',  'false',                                                'FEATURE_FLAG', 'reminders',   'Run the reminder job immediately on startup (debug only)'),
+    ('ADD_COUPON_REMINDER_LOOKBACK_DAYS','2',                                            'FREE_FORM',    'reminders',   'Days in a row the "add coupons" DM repeats after a used coupon; 0 or less disables it'),
     ('COMMUNITY_CHAT_ID',      '-5252116059',                                          'FREE_FORM',    'telegram',    'Telegram group chat id the bot serves')
 ON CONFLICT (key) DO NOTHING;

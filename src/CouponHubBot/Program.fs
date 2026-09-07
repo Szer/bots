@@ -59,6 +59,7 @@ let buildBotConf () =
         | v -> v
       ReminderHourDublin = getSettingOr "REMINDER_HOUR_DUBLIN" "10" |> int
       ReminderRunOnStart = getSettingOr "REMINDER_RUN_ON_START" "false" |> bool.Parse
+      AddCouponReminderLookbackDays = getSettingOr "ADD_COUPON_REMINDER_LOOKBACK_DAYS" "2" |> int
       OcrEnabled = getSettingOr "OCR_ENABLED" "false" |> bool.Parse
       OcrMaxFileSizeBytes = getSettingOr "OCR_MAX_FILE_SIZE_BYTES" (string (20L * 1024L * 1024L)) |> int64
       AzureOcrEndpoint = getSettingOr "AZURE_OCR_ENDPOINT" (getEnvOr "AZURE_OCR_ENDPOINT" "")

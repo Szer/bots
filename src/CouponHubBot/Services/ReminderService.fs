@@ -120,16 +120,18 @@ type ReminderService(
                 with ex ->
                     logger.LogWarning(ex, "Failed to send overdue-taken reminder to {UserId}", userId)
 
-            // DM reminder: user used coupon yesterday but did not add any coupon on the same day.
-            // One message per user.
-            let! usersWhoUsedButDidNotAdd = db.GetUsersWhoUsedButDidNotAddYesterday(nowUtc)
-            for userId in usersWhoUsedButDidNotAdd do
-                try
-                    let text = "Не забудь добавить купоны в бота"
-                    do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(userId, text)) |> taskIgnore
-                    anySent <- true
-                with ex ->
-                    logger.LogWarning(ex, "Failed to send add-coupon reminder to {UserId}", userId)
+            // DM reminder: used a coupon within the lookback window and added nothing since. One
+            // message per user, repeated daily while that holds; a lookback of 0 turns it off.
+            let lookbackDays = options.Value.AddCouponReminderLookbackDays
+            if lookbackDays > 0 then
+                let! usersWhoUsedButDidNotAdd = db.GetUsersWhoUsedButDidNotAdd(nowUtc, lookbackDays)
+                for userId in usersWhoUsedButDidNotAdd do
+                    try
+                        let text = "Не забудь добавить купоны в бота"
+                        do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(userId, text)) |> taskIgnore
+                        anySent <- true
+                    with ex ->
+                        logger.LogWarning(ex, "Failed to send add-coupon reminder to {UserId}", userId)
 
             // Retention cleanup: delete community chat messages older than 1 year.
             try

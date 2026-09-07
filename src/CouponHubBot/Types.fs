@@ -12,6 +12,9 @@ type BotConfiguration =
       TelegramApiBaseUrl: string | null
       ReminderHourDublin: int
       ReminderRunOnStart: bool
+      /// bot_setting `ADD_COUPON_REMINDER_LOOKBACK_DAYS` — how many days in a row the
+      /// "add coupons" nag repeats after a `used`. 0 or less turns the nag off entirely.
+      AddCouponReminderLookbackDays: int
       OcrEnabled: bool
       OcrMaxFileSizeBytes: int64
       AzureOcrEndpoint: string

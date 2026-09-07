@@ -2,6 +2,7 @@ namespace CouponHubBot.Tests
 
 open System
 open System.Diagnostics
+open System.Globalization
 open System.Threading.Tasks
 open System.Text
 open System.Net.Http
@@ -9,6 +10,8 @@ open System.Text.Json
 open Dapper
 open Npgsql
 open Xunit
+open BotTestInfra
+open Funogram.Telegram.Types
 open FakeCallHelpers
 
 /// `/test/run-reminder` is fire-and-forget, so the HTTP response returns before the job's DB
@@ -48,6 +51,84 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
                 let! text = resp.Content.ReadAsStringAsync()
                 failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
             do! waitForReminderCompletion before 5000
+        }
+
+    let addReminderText = "Не забудь добавить купоны в бота"
+
+    let runReminderOn (day: DateOnly) =
+        runReminder (Some(day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + "T08:00:00Z"))
+
+    /// Coupon events land on the DB wall clock, not the bot's frozen one, so the reminder runs
+    /// are dated off the real `used` event instead of `FixedToday`.
+    let lastUsedDay (userId: int64) =
+        task {
+            let! iso =
+                fixture.QuerySingle<string>(
+                    "SELECT to_char(MAX(created_at) AT TIME ZONE 'utc', 'YYYY-MM-DD') FROM coupon_event WHERE user_id = @user_id AND event_type = 'used'",
+                    {| user_id = userId |})
+            return DateOnly.ParseExact(iso, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None)
+        }
+
+    let addCoupon (owner: User) (photoTag: string) =
+        task {
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner, fileId = photoTag))
+            return!
+                fixture.QuerySingle<int>(
+                    "SELECT id FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
+                    {| owner_id = owner.Id |})
+        }
+
+    /// Full Telegram round trip: owner posts a coupon, taker takes it and taps «Использован».
+    let takeAndUse (owner: User) (taker: User) (photoTag: string) =
+        task {
+            let! couponId = addCoupon owner photoTag
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmCallback($"used:{couponId}", taker))
+            return couponId
+        }
+
+    let countAddReminders (userId: int64) =
+        task {
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            return
+                calls
+                |> Array.filter (fun c ->
+                    match parseCallBody c.Body with
+                    | Some p -> p.ChatId = Some userId && p.Text = Some addReminderText
+                    | _ -> false)
+                |> Array.length
+        }
+
+    let countAllAddReminders () =
+        task {
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            return
+                calls
+                |> Array.filter (fun c ->
+                    match parseCallBody c.Body with
+                    | Some p -> p.Text = Some addReminderText
+                    | _ -> false)
+                |> Array.length
+        }
+
+    /// Every test that asserts on the add-coupon nag sets the window it needs up front — the
+    /// setting is fixture-wide, so leaving it to a previous test's value would be order-dependent.
+    let setLookbackDays (days: int) =
+        task {
+            let! _ =
+                fixture.Execute(
+                    """
+INSERT INTO bot_setting(key, value, type, feature_group)
+VALUES ('ADD_COUPON_REMINDER_LOOKBACK_DAYS', @value, 'FREE_FORM', 'REMINDER')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+""",
+                    {| value = string days |})
+            use body = new StringContent("", Encoding.UTF8, "application/json")
+            let! resp = fixture.Bot.PostAsync("/reload-settings", body)
+            if not resp.IsSuccessStatusCode then
+                failwith $"Expected 2xx from /reload-settings, got {resp.StatusCode}"
         }
 
     [<Theory>]
@@ -303,6 +384,7 @@ ON CONFLICT (id) DO NOTHING;
     [<Fact>]
     let ``User who used coupon yesterday but did not add gets reminder`` () =
         task {
+            do! setLookbackDays 2
             do! fixture.ClearFakeCalls()
 
             use conn = new NpgsqlConnection(fixture.DbConnectionString)
@@ -336,6 +418,7 @@ VALUES (9101,701,'used','2026-01-18T10:00:00Z');
     [<Fact>]
     let ``User who used and added yesterday does not get reminder`` () =
         task {
+            do! setLookbackDays 2
             do! fixture.ClearFakeCalls()
 
             use conn = new NpgsqlConnection(fixture.DbConnectionString)
@@ -381,6 +464,7 @@ VALUES
     [<Fact>]
     let ``User who used late at night and added next day does not get reminder`` () =
         task {
+            do! setLookbackDays 2
             do! fixture.ClearFakeCalls()
 
             use conn = new NpgsqlConnection(fixture.DbConnectionString)
@@ -421,6 +505,99 @@ VALUES
                     | _ -> false)
 
             Assert.Equal(0, dmCallsToUser703.Length)
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder repeats on the second day and stops on the third`` () =
+        task {
+            do! setLookbackDays 2
+            let owner = Tg.user(id = 78001L, username = "nag_owner", firstName = "NagO")
+            let taker = Tg.user(id = 78002L, username = "nag_taker", firstName = "NagT")
+
+            let! _ = takeAndUse owner taker "nag-repeat-1"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+            let! firstDay = countAddReminders taker.Id
+            Assert.Equal(1, firstDay)
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 2)
+            let! secondDay = countAddReminders taker.Id
+            Assert.Equal(1, secondDay)
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 3)
+            let! thirdDay = countAddReminders taker.Id
+            Assert.Equal(0, thirdDay)
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder is not repeated once the user adds a coupon`` () =
+        task {
+            do! setLookbackDays 2
+            let owner = Tg.user(id = 78003L, username = "nag_stop_o", firstName = "StopO")
+            let taker = Tg.user(id = 78004L, username = "nag_stop_t", firstName = "StopT")
+
+            let! _ = takeAndUse owner taker "nag-repeat-2"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+            let! firstDay = countAddReminders taker.Id
+            Assert.Equal(1, firstDay)
+
+            let! _ = addCoupon taker "nag-repeat-2-added"
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 2)
+            let! secondDay = countAddReminders taker.Id
+            Assert.Equal(0, secondDay)
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder with a lookback of 1 day nags only once`` () =
+        task {
+            do! setLookbackDays 1
+            let owner = Tg.user(id = 78005L, username = "nag_one_o", firstName = "OneO")
+            let taker = Tg.user(id = 78006L, username = "nag_one_t", firstName = "OneT")
+
+            let! _ = takeAndUse owner taker "nag-lookback-1"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+            let! firstDay = countAddReminders taker.Id
+            Assert.Equal(1, firstDay)
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 2)
+            let! secondDay = countAddReminders taker.Id
+            Assert.Equal(0, secondDay)
+
+            do! setLookbackDays 2
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder is switched off entirely by a lookback of 0`` () =
+        task {
+            do! setLookbackDays 0
+            let owner = Tg.user(id = 78007L, username = "nag_off_o", firstName = "OffO")
+            let taker = Tg.user(id = 78008L, username = "nag_off_t", firstName = "OffT")
+
+            let! _ = takeAndUse owner taker "nag-lookback-0"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+
+            let! toTaker = countAddReminders taker.Id
+            Assert.Equal(0, toTaker)
+            let! toAnyone = countAllAddReminders ()
+            Assert.Equal(0, toAnyone)
+
+            do! setLookbackDays 2
         }
 
     [<Fact>]

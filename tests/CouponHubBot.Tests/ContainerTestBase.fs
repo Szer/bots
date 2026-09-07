@@ -51,6 +51,7 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
                 "COMMUNITY_CHAT_ID",      string CouponTestConfig.communityChatId, "FREE_FORM", "CORE"
                 "REMINDER_HOUR_DUBLIN",    "10",                   "FREE_FORM", "REMINDER"
                 "REMINDER_RUN_ON_START",   "false",                "FEATURE_FLAG", "REMINDER"
+                "ADD_COUPON_REMINDER_LOOKBACK_DAYS", "2",       "FREE_FORM", "REMINDER"
                 "OCR_ENABLED",             (if ocrEnabled then "true" else "false"), "FEATURE_FLAG", "OCR"
                 "OCR_MAX_FILE_SIZE_BYTES", "52428800",             "FREE_FORM", "OCR"
                 "AZURE_OCR_ENDPOINT",      (if ocrEnabled then $"http://{CouponTestConfig.fakeAzureAlias}:8081" else ""), "FREE_FORM", "OCR"
