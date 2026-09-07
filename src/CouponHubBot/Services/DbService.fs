@@ -915,14 +915,15 @@ HAVING (COUNT(*) FILTER (WHERE e.event_type = 'reported')
             return rows |> Seq.toArray
         }
 
-    member _.GetUsersWhoUsedButDidNotAddYesterday(nowUtc: DateTime) =
+    /// Users who used a coupon within the last `lookbackDays` whole UTC days and added nothing
+    /// since — someone who keeps forgetting is reminded on that many days in a row.
+    member _.GetUsersWhoUsedButDidNotAdd(nowUtc: DateTime, lookbackDays: int) =
         task {
             use! conn = openConn()
-            // Calculate yesterday's date range in UTC
             let today = DateTime(nowUtc.Year, nowUtc.Month, nowUtc.Day, 0, 0, 0, DateTimeKind.Utc)
-            let yesterdayStart = today.AddDays(-1.0)
-            let yesterdayEnd = today
-            
+            let windowStart = today.AddDays(-(float lookbackDays))
+            let windowEnd = today
+
             //language=postgresql
             let sql =
                 """
@@ -931,8 +932,8 @@ FROM (
     SELECT user_id, MAX(created_at) AS last_used_at
     FROM coupon_event
     WHERE event_type = 'used'
-      AND created_at >= @yesterday_start
-      AND created_at < @yesterday_end
+      AND created_at >= @window_start
+      AND created_at < @window_end
     GROUP BY user_id
 ) u
 WHERE NOT EXISTS (
@@ -947,8 +948,8 @@ ORDER BY u.user_id;
             let! userIds =
                 conn.QueryAsync<int64>(
                     sql,
-                    {| yesterday_start = yesterdayStart
-                       yesterday_end = yesterdayEnd |}
+                    {| window_start = windowStart
+                       window_end = windowEnd |}
                 )
             return userIds |> Seq.toArray
         }

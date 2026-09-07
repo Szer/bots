@@ -16,6 +16,9 @@ type ReminderService(
     logger: ILogger<ReminderService>,
     time: TimeProvider
 ) =
+    /// Days a "не забудь добавить купоны" nag keeps repeating after the user's last `used`.
+    let addReminderLookbackDays = 2
+
     let formatUser (userId: int64) (username: string) (firstName: string) =
         if not (String.IsNullOrWhiteSpace username) then
             "@" + username
@@ -120,9 +123,9 @@ type ReminderService(
                 with ex ->
                     logger.LogWarning(ex, "Failed to send overdue-taken reminder to {UserId}", userId)
 
-            // DM reminder: user used coupon yesterday but did not add any coupon on the same day.
-            // One message per user.
-            let! usersWhoUsedButDidNotAdd = db.GetUsersWhoUsedButDidNotAddYesterday(nowUtc)
+            // DM reminder: user used a coupon in the last `addReminderLookbackDays` days and has
+            // added nothing since. One message per user, repeated daily while that stays true.
+            let! usersWhoUsedButDidNotAdd = db.GetUsersWhoUsedButDidNotAdd(nowUtc, addReminderLookbackDays)
             for userId in usersWhoUsedButDidNotAdd do
                 try
                     let text = "Не забудь добавить купоны в бота"

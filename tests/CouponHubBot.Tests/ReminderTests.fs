@@ -2,6 +2,7 @@ namespace CouponHubBot.Tests
 
 open System
 open System.Diagnostics
+open System.Globalization
 open System.Threading.Tasks
 open System.Text
 open System.Net.Http
@@ -9,6 +10,8 @@ open System.Text.Json
 open Dapper
 open Npgsql
 open Xunit
+open BotTestInfra
+open Funogram.Telegram.Types
 open FakeCallHelpers
 
 /// `/test/run-reminder` is fire-and-forget, so the HTTP response returns before the job's DB
@@ -48,6 +51,54 @@ type ReminderTests(fixture: DefaultCouponHubTestContainers) =
                 let! text = resp.Content.ReadAsStringAsync()
                 failwith $"Expected 2xx from /test/run-reminder, got {resp.StatusCode}. Body: {text}"
             do! waitForReminderCompletion before 5000
+        }
+
+    let addReminderText = "Не забудь добавить купоны в бота"
+
+    let runReminderOn (day: DateOnly) =
+        runReminder (Some(day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + "T08:00:00Z"))
+
+    /// Coupon events land on the DB wall clock, not the bot's frozen one, so the reminder runs
+    /// are dated off the real `used` event instead of `FixedToday`.
+    let lastUsedDay (userId: int64) =
+        task {
+            let! iso =
+                fixture.QuerySingle<string>(
+                    "SELECT to_char(MAX(created_at) AT TIME ZONE 'utc', 'YYYY-MM-DD') FROM coupon_event WHERE user_id = @user_id AND event_type = 'used'",
+                    {| user_id = userId |})
+            return DateOnly.ParseExact(iso, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None)
+        }
+
+    let addCoupon (owner: User) (photoTag: string) =
+        task {
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner, fileId = photoTag))
+            return!
+                fixture.QuerySingle<int>(
+                    "SELECT id FROM coupon WHERE owner_id = @owner_id ORDER BY id DESC LIMIT 1",
+                    {| owner_id = owner.Id |})
+        }
+
+    /// Full Telegram round trip: owner posts a coupon, taker takes it and taps «Использован».
+    let takeAndUse (owner: User) (taker: User) (photoTag: string) =
+        task {
+            let! couponId = addCoupon owner photoTag
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmCallback($"used:{couponId}", taker))
+            return couponId
+        }
+
+    let countAddReminders (userId: int64) =
+        task {
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            return
+                calls
+                |> Array.filter (fun c ->
+                    match parseCallBody c.Body with
+                    | Some p -> p.ChatId = Some userId && p.Text = Some addReminderText
+                    | _ -> false)
+                |> Array.length
         }
 
     [<Theory>]
@@ -421,6 +472,53 @@ VALUES
                     | _ -> false)
 
             Assert.Equal(0, dmCallsToUser703.Length)
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder repeats on the second day and stops on the third`` () =
+        task {
+            let owner = Tg.user(id = 78001L, username = "nag_owner", firstName = "NagO")
+            let taker = Tg.user(id = 78002L, username = "nag_taker", firstName = "NagT")
+
+            let! _ = takeAndUse owner taker "nag-repeat-1"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+            let! firstDay = countAddReminders taker.Id
+            Assert.Equal(1, firstDay)
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 2)
+            let! secondDay = countAddReminders taker.Id
+            Assert.Equal(1, secondDay)
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 3)
+            let! thirdDay = countAddReminders taker.Id
+            Assert.Equal(0, thirdDay)
+        }
+
+    [<Fact>]
+    let ``Add-coupon reminder is not repeated once the user adds a coupon`` () =
+        task {
+            let owner = Tg.user(id = 78003L, username = "nag_stop_o", firstName = "StopO")
+            let taker = Tg.user(id = 78004L, username = "nag_stop_t", firstName = "StopT")
+
+            let! _ = takeAndUse owner taker "nag-repeat-2"
+            let! usedDay = lastUsedDay taker.Id
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 1)
+            let! firstDay = countAddReminders taker.Id
+            Assert.Equal(1, firstDay)
+
+            let! _ = addCoupon taker "nag-repeat-2-added"
+
+            do! fixture.ClearFakeCalls()
+            do! runReminderOn (usedDay.AddDays 2)
+            let! secondDay = countAddReminders taker.Id
+            Assert.Equal(0, secondDay)
         }
 
     [<Fact>]
