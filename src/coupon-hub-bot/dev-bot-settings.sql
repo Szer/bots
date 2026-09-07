@@ -18,6 +18,7 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('TEST_MODE',              'false',                                                'FEATURE_FLAG', 'diagnostics', 'Enables test-only endpoints (e.g. /test/run-reminder)'),
     ('FEEDBACK_ADMINS',        '432506904;509847134',                                  'FREE_FORM',    'feedback',    'Telegram user ids (; , or space separated) who receive /feedback reports'),
     ('GITHUB_REPO',            'Szer/bots',                                            'FREE_FORM',    'feedback',    'owner/repo used by /feedback to open GitHub issues'),
+    ('FEEDBACK_GITHUB_ISSUES', 'false',                                                'FEATURE_FLAG', 'feedback',    'Open a GitHub issue in GITHUB_REPO for every /feedback (private feedback -> public repo, keep off unless intended)'),
     ('AZURE_OCR_ENDPOINT',     'https://szer-vision-ocr.cognitiveservices.azure.com', 'FREE_FORM',    'ocr',         'Azure Computer Vision resource base URL'),
     ('OCR_ENABLED',            'true',                                                 'FEATURE_FLAG', 'ocr',         'Master toggle for Azure OCR pre-fill of coupon fields'),
     ('OCR_MAX_FILE_SIZE_BYTES','20971520',                                             'FREE_FORM',    'ocr',         'Maximum photo size in bytes that will be sent to Azure OCR'),

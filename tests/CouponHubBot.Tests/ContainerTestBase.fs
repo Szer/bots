@@ -56,6 +56,7 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
                 "AZURE_OCR_ENDPOINT",      (if ocrEnabled then $"http://{CouponTestConfig.fakeAzureAlias}:8081" else ""), "FREE_FORM", "OCR"
                 "FEEDBACK_ADMINS",         "900,901",              "FREE_FORM", "CORE"
                 "GITHUB_REPO",             "",                     "FREE_FORM", "CORE"
+                "FEEDBACK_GITHUB_ISSUES",  "false",                "FEATURE_FLAG", "feedback"
                 "TEST_MODE",               "true",                 "FEATURE_FLAG", "CORE"
                 "MAX_TAKEN_COUPONS",       "4",                    "FREE_FORM", "CORE"
                 // With TestMode the bot uses FakeTimeProvider, so this debounce timer
