@@ -18,6 +18,7 @@ type GitHubServiceIsConfiguredTests() =
           TelegramApiBaseUrl = null
           ReminderHourDublin = 10
           ReminderRunOnStart = false
+          AddCouponReminderLookbackDays = 2
           OcrEnabled = false
           OcrMaxFileSizeBytes = 0L
           AzureOcrEndpoint = ""
