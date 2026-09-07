@@ -19,6 +19,9 @@ type BotConfiguration =
       FeedbackAdminIds: int64 array
       GitHubToken: string
       GitHubRepo: string
+      /// Gates GitHub issue creation for /feedback — private feedback landing in the
+      /// public repo must stay opt-in. Off by default (see GitHubService.IsConfigured).
+      FeedbackGitHubIssues: bool
       /// bot_setting key (env fallback WEBHOOK_URL) — full webhook URL to self-register
       /// at startup (WebhookRegistrationService.fs). Empty/absent means "do nothing":
       /// production's webhook is set once, manually (README.dev.md), and must keep

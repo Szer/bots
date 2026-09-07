@@ -173,7 +173,9 @@ The `/feedback` command lets users send feedback to bot authors. The flow is:
    e. User receives confirmation: "Спасибо! Сообщение отправлено авторам."
 3. Any command cancels pending feedback
 
-Steps (c) and (d) are best-effort — if the GitHub API call fails at runtime, feedback is still saved in DB and forwarded to admins. The user experience is unaffected. Note: `GITHUB_TOKEN` is required at startup; the bot will not start without it.
+Steps (c) and (d) only run when the `FEEDBACK_GITHUB_ISSUES` feature flag (`bot_setting`, default `false`) is on — private feedback landing in the public repo must stay opt-in. When off, `GitHubService.IsConfigured` is `false` and feedback is still saved and forwarded, silently skipping GitHub.
+
+When on, steps (c) and (d) are best-effort — if the GitHub API call fails at runtime, feedback is still saved in DB and forwarded to admins. The user experience is unaffected. Note: `GITHUB_TOKEN` is required at startup; the bot will not start without it.
 
 ### GitHub Issue Format
 

@@ -66,6 +66,7 @@ let buildBotConf () =
       FeedbackAdminIds = getSettingOr "FEEDBACK_ADMINS" (getEnvOr "FEEDBACK_ADMINS" "") |> parseAdmins
       GitHubToken = getEnvOr "GITHUB_TOKEN" ""
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/bots")
+      FeedbackGitHubIssues = getSettingOr "FEEDBACK_GITHUB_ISSUES" "false" |> bool.Parse
       WebhookUrl = getSettingOr "WEBHOOK_URL" (getEnvOr "WEBHOOK_URL" "")
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int

@@ -44,7 +44,8 @@ type GitHubService(httpClient: HttpClient, options: IOptions<BotConfiguration>, 
         else text.Replace("@", "@\u200B")
 
     member _.IsConfigured =
-        repoApiUrl().IsSome
+        options.Value.FeedbackGitHubIssues
+        && repoApiUrl().IsSome
         && not (String.IsNullOrWhiteSpace options.Value.GitHubToken)
 
     member _.CreateFeedbackIssue(feedbackText: string | null, hasMedia: bool) =
