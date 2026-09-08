@@ -92,6 +92,41 @@ type WhoisTests(fixture: DefaultCouponHubTestContainers) =
         }
 
     [<Fact>]
+    let ``Admin undo of a take nets out of the taker's whois, and the admin's own whois stays at zero`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(id = 749L, username = "whois_undo_owner", firstName = "Owner")
+            let taker = Tg.user(id = 750L, username = "whois_undo_taker", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin))
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/whois {taker.Id}", admin))
+            let! takerCalls = fixture.GetFakeCalls("sendMessage")
+            let takerWhois = findWhoisReply takerCalls
+            Assert.True(takerWhois.IsSome, "Admin should get a /whois reply for the taker")
+            Assert.Contains("Взято: 0 · 0€", takerWhois.Value)
+            Assert.Contains("Баланс: 0 · 0€", takerWhois.Value)
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/whois {adminId}", admin))
+            let! adminCalls = fixture.GetFakeCalls("sendMessage")
+            let adminWhois = findWhoisReply adminCalls
+            Assert.True(adminWhois.IsSome, "Admin should get a /whois reply for themself")
+            Assert.Contains("Добавлено: 0 · 0€", adminWhois.Value)
+            Assert.Contains("Взято: 0 · 0€", adminWhois.Value)
+        }
+
+    [<Fact>]
     let ``Admin whois by username resolves case-insensitively`` () =
         task {
             do! fixture.ClearFakeCalls()

@@ -332,6 +332,44 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
         }
 
     [<Fact>]
+    let ``Admin voiding another user's taken coupon nets it to the owner's stats, not the admin's`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 715L, username = "void_attr_owner", firstName = "Owner")
+            let taker = Tg.user(id = 716L, username = "void_attr_taker", firstName = "Taker")
+            let admin = Tg.user(id = 900L, username = "admin_void_attr", firstName = "Admin")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage($"/void {couponId}", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! status = getCouponStatus couponId
+            Assert.Equal("voided", status)
+            let! takenBy = fixture.QuerySingle<int64>("SELECT COALESCE(taken_by, 0) FROM coupon WHERE id = @id", {| id = couponId |})
+            Assert.Equal(0L, takenBy)
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", owner))
+            let! ownerCalls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText ownerCalls owner.Id "Аннулировано: 1",
+                "The owner's voided count must carry the mark, not the admin's")
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", admin))
+            let! adminCalls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText adminCalls admin.Id "Аннулировано: 0",
+                "The admin never owned a voided coupon — running /void must not credit the admin")
+        }
+
+    [<Fact>]
     let ``/added shows only non-expired coupons`` () =
         task {
             do! fixture.ClearFakeCalls()

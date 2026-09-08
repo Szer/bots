@@ -453,9 +453,47 @@ ON CONFLICT (id) DO NOTHING;
             let! rowOpt = findRowAcrossPages admin "balance" owner.Id
             match rowOpt with
             | Some cells ->
-                Assert.Equal("1", cells[8]) // ан — 'voided' event carries the owner's user_id already, even though the admin acted
+                Assert.Equal("1", cells[8]) // ан — owner_flags keys on coupon.owner_id, not e.user_id, so the admin acting doesn't move the mark
                 Assert.Equal("1", cells[9]) // рп — 'reported' event carries the taker's user_id; joined via coupon.owner_id to land on the owner
             | None -> Assert.True(false, "owner row not found across any /balances page")
+
+            let! adminRowOpt = findRowAcrossPages admin "balance" adminId
+            match adminRowOpt with
+            | Some cells -> Assert.Equal("0", cells[8]) // ан — the admin voided someone else's coupon; that must not count against the admin
+            | None -> Assert.True(false, "admin row not found across any /balances page")
+        }
+
+    [<Fact>]
+    let ``Undo of a take nets out of the taker's balance without crediting or debiting the admin`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let owner = Tg.user(username = "bal_undo_owner", firstName = "OwnerUndo")
+            let taker = Tg.user(username = "bal_undo_taker", firstName = "TakerUndo")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 40 50 2026-01-25", owner))
+            let! couponId = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin))
+
+            let! takerRowOpt = findRowAcrossPages admin "balance" taker.Id
+            match takerRowOpt with
+            | Some cells ->
+                Assert.Equal("0", cells[4]) // в# — the take was reverted, so it must net to 0
+                Assert.Equal("0", cells[5]) // в€
+            | None -> Assert.True(false, "taker row not found across any /balances page")
+
+            let! adminRowOpt = findRowAcrossPages admin "balance" adminId
+            match adminRowOpt with
+            | Some cells ->
+                Assert.Equal("0", cells[4]) // в# — the admin never took anything; running /undo must not touch it
+                Assert.Equal("0", cells[5]) // в€
+            | None -> Assert.True(false, "admin row not found across any /balances page")
         }
 
     [<Fact>]

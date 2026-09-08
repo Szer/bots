@@ -268,7 +268,8 @@ type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! couponId = getLatestCouponId ()
             let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
             let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId}", taker))
-            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+            let admin = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin))
 
             do! fixture.ClearFakeCalls()
             let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", taker))
@@ -278,6 +279,12 @@ type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
                 "Reverted use should net out of the event stats line")
             Assert.True(findCallWithText calls taker.Id "Взято: 1",
                 "Non-reverted take should remain counted")
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", admin))
+            let! adminCalls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText adminCalls adminId "Взято: 0 · Возвращено: 0 · Использовано: 0",
+                "The admin never took/used anything — performing the undo must not credit the admin")
         }
 
     [<Fact>]
@@ -600,4 +607,49 @@ type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! listCalls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText listCalls other.Id $"ID:{couponId}",
                 "Returned coupon should be offered in /list again")
+        }
+
+    [<Fact>]
+    let ``Chained undo by two different admins still attributes each revert to the original taker`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 767L, username = "undo_chain2_owner", firstName = "Owner")
+            let taker = Tg.user(id = 768L, username = "undo_chain2_taker", firstName = "Taker")
+            let admin1 = Tg.user(id = adminId, username = "admin_chain1", firstName = "Admin1")
+            let admin2Id = 901L
+            let admin2 = Tg.user(id = admin2Id, username = "admin_chain2", firstName = "Admin2")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+            do! fixture.SetChatMemberStatus(admin2Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId}", taker))
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin1))
+            let! s1 = getStatus couponId
+            Assert.Equal("taken", s1)
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin2))
+            let! s2 = getStatus couponId
+            Assert.Equal("available", s2)
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage($"/debug {couponId}", admin2))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let debugText =
+                calls |> Array.tryPick (fun call ->
+                    match parseCallBody call.Body with
+                    | Some parsed when parsed.ChatId = Some admin2Id && parsed.Text.IsSome && parsed.Text.Value.Contains("<pre>") ->
+                        Some parsed.Text.Value
+                    | _ -> None)
+            Assert.True(debugText.IsSome, "Admin2 should get a /debug reply with the coupon's full history")
+            let text = debugText.Value
+
+            Assert.Contains("admin_chain1 → undo_chain2_taker", text)
+            Assert.Contains("admin_chain2 → undo_chain2_taker", text)
         }
