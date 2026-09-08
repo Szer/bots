@@ -12,6 +12,10 @@ If a deploy-failure issue number was provided, that issue is still the incident 
 
 Your deliverables are **issue comments** with structured incident analysis, **rollback actions** when production is down, **one-liner code mitigations** for simple bugs, and **escalation issues** for complex bugs requiring human attention.
 
+## Non-interactive run
+
+This run is unattended CI — nobody is watching to answer a question. Never end your report with a question, an offer, or a menu of follow-up options to choose from. Every recommendation you make must be either executed now (Path A one-liner, Step 6) or filed as an issue for a human (Path B, Step 6) — there is no third "ask and wait" option. Your final message must be the finished incident report itself (the Step 7 template), written so it reads correctly as a standalone artifact with no further input from anyone.
+
 ## Prerequisites
 
 - VPN is pre-established by the workflow (WireGuard to `*.internal` hosts)
@@ -24,7 +28,7 @@ Your deliverables are **issue comments** with structured incident analysis, **ro
 
 You already have the workflow run link and commit SHA from your prompt. Determine severity.
 
-**The central fact for every bot in this fleet: pod health and HTTP status code are not usable "is it broken" signals.** A runtime failure in update handling does not crash the process — `/healthz` keeps returning OK and readiness keeps passing. The `/bot` webhook always returns HTTP 200 to Telegram regardless of internal exceptions (deliberately, to avoid Telegram retry storms), so the 5xx rate (`sum(rate(http_server_request_duration_seconds_count{status_code=~"5.."}))`) is **structurally always zero, for every bot, forever** — it is dead logic, not evidence of anything. A bot can be completely non-functional — throwing on every update, replying to nobody — while ArgoCD reports it `Healthy` and every HTTP response is a 200. **Pod health is therefore a necessary-but-not-sufficient signal, never proof of a working bot.** The real "is it actually broken" signal is Loki `level="Error"` on the update-handling path (`level` is a real indexed Loki label, values `Information`/`Warning`/`Error`), plus each bot's own business metrics (Step 1c).
+**The central fact for every bot in this fleet: pod health and HTTP status code are not usable "is it broken" signals.** A runtime failure in update handling does not crash the process — `/healthz` keeps returning OK and readiness keeps passing. The `/bot` webhook always returns HTTP 200 to Telegram regardless of internal exceptions (deliberately, to avoid Telegram retry storms), so a genuine 5xx from that route never happens — but the aggregate 5xx rate is **not** "structurally always zero": `/ready` (the DB-ping readiness check, `src/BotInfra/Readiness.fs`) returns 503 by design whenever the DB ping fails, and with 2 replicas per bot and no per-pod label on the Prometheus scrape, `rate()`/`increase()` on that job's counters can report a constant phantom non-zero value once the two pods' raw values diverge and alternate in one series (each alternation looks like a counter reset). **2026-09-08 worked example:** the shared Postgres restarted at 23:58:49Z, `/ready` 503'd on both coupon-bot and vahter-bot for ~2 minutes, the raw counters then froze (29 coupon-pod, 30/29 vahter-pods) — yet `rate()` kept reporting a constant 0.5557/s (coupon) and 0.4466/s (vahter) for the next 9 hours, and `verify-deploy.sh` failed a real deploy on `5xx_rate=0.63`. **Diagnostic:** query the raw counter series and `changes(...[5m])`/`resets(...[5m])` over the window — a non-zero rate on a counter whose raw value never moves is this collision artifact, not traffic. `verify-deploy.sh` now excludes `/ready`/`/healthz` from its 5xx gate, but the same phantom-rate mechanism can surface on any other frozen counter on a 2-replica job — never assume 5xx is dead logic. A bot can be completely non-functional — throwing on every update, replying to nobody — while ArgoCD reports it `Healthy` and every HTTP response is a 200. **Pod health is therefore a necessary-but-not-sufficient signal, never proof of a working bot.** The real "is it actually broken" signal is Loki `level="Error"` on the update-handling path (`level` is a real indexed Loki label, values `Information`/`Warning`/`Error`), plus each bot's own business metrics (Step 1c).
 
 | Severity | Criteria | Response |
 |----------|----------|----------|
@@ -190,6 +194,8 @@ curl -s -G http://loki.internal/loki/api/v1/query_range \
 | **Infrastructure** | Database unreachable, GHCR auth failure, Kubernetes node issue, OOMKilled | Document in issue, label as `infra` |
 | **Code bug** | Application crash, unhandled exception, regression from recent commit | Escalate to coding agent (Step 6) |
 | **Configuration** | Missing env var, wrong secret, migration failure | Document in issue, label as `infra` |
+
+**When `verify-deploy.sh` failed on a metric threshold, "transient race" is not an acceptable root cause on its own.** The report must state the metric's actual value, which series/route produced it, and since when — pull the raw series (not just the aggregate) and check whether it's actually moving before naming a cause.
 
 ### Step 5: Rollback (if production is impacted)
 

@@ -352,9 +352,10 @@ RESTARTS=$(curl -sf -G "${PROMETHEUS_URL}/api/v1/query" \
     2>/dev/null || echo '{"data":{"result":[]}}')
 RESTART_COUNT=$(echo "$RESTARTS" | jq -r '[.data.result[].value[1] | tonumber] | add // 0')
 
-# Check 5xx rate
+# Check 5xx rate. Readiness (/ready, /healthz) 503s are excluded: those
+# counters are expected to be non-zero after any DB blip; Phase 2 covers readiness.
 ERRORS_5XX=$(curl -sf -G "${PROMETHEUS_URL}/api/v1/query" \
-    --data-urlencode "query=sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~\"5..\",job=\"${CONTAINER}\"}[5m]))" \
+    --data-urlencode "query=sum(rate(http_server_request_duration_seconds_count{http_response_status_code=~\"5..\",http_route!~\"/ready|/healthz\",job=\"${CONTAINER}\"}[5m]))" \
     2>/dev/null || echo '{"data":{"result":[]}}')
 ERROR_5XX_RATE=$(echo "$ERRORS_5XX" | jq -r '[.data.result[].value[1] | tonumber] | add // 0')
 
@@ -363,9 +364,9 @@ log "  Prometheus: restarts=${RESTART_COUNT}, 5xx_rate=${ERROR_5XX_RATE}"
 # Note: restart count is cumulative, so we only fail if it's unexpectedly high.
 # For a fresh deployment, a single restart might be acceptable.
 if [ "$(echo "$ERROR_5XX_RATE > 0" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
-    log "FAILED: 5xx error rate is non-zero: ${ERROR_5XX_RATE}"
+    log "FAILED: 5xx error rate is non-zero: ${ERROR_5XX_RATE} (probe routes excluded)"
     summary "### ❌ Phase 3: Log & Metrics Check FAILED"
-    summary "- **5xx Error Rate:** ${ERROR_5XX_RATE} (expected: 0)"
+    summary "- **5xx Error Rate:** ${ERROR_5XX_RATE} (expected: 0, probe routes excluded)"
     summary "- **Container Restarts:** ${RESTART_COUNT}"
     emit_failure_class "app"
     exit 1
