@@ -8,10 +8,6 @@ open Npgsql
 open Xunit
 open FakeCallHelpers
 
-/// user_id/subject_user_id of a single "voided" row, for asserting actor vs. owner attribution.
-[<CLIMutable>]
-type private VoidAttributionRow = { user_id: int64; subject_user_id: int64 }
-
 type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
 
     let getLatestCouponId () =
@@ -336,7 +332,7 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
         }
 
     [<Fact>]
-    let ``Admin voiding another user's taken coupon attributes it to the owner, not the admin`` () =
+    let ``Admin voiding another user's taken coupon nets it to the owner's stats, not the admin's`` () =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
@@ -355,13 +351,8 @@ type VoidFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! resp = fixture.SendUpdate(Tg.dmMessage($"/void {couponId}", admin))
             Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
 
-            let! row =
-                fixture.QuerySingle<VoidAttributionRow>(
-                    "SELECT user_id, subject_user_id FROM coupon_event WHERE coupon_id = @id AND event_type = 'voided'",
-                    {| id = couponId |})
-            Assert.Equal(admin.Id, row.user_id)
-            Assert.Equal(owner.Id, row.subject_user_id)
-
+            let! status = getCouponStatus couponId
+            Assert.Equal("voided", status)
             let! takenBy = fixture.QuerySingle<int64>("SELECT COALESCE(taken_by, 0) FROM coupon WHERE id = @id", {| id = couponId |})
             Assert.Equal(0L, takenBy)
 

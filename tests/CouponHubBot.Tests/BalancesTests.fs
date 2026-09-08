@@ -453,9 +453,14 @@ ON CONFLICT (id) DO NOTHING;
             let! rowOpt = findRowAcrossPages admin "balance" owner.Id
             match rowOpt with
             | Some cells ->
-                Assert.Equal("1", cells[8]) // ан — 'voided' event carries the owner's user_id already, even though the admin acted
+                Assert.Equal("1", cells[8]) // ан — owner_flags keys on coupon.owner_id, not e.user_id, so the admin acting doesn't move the mark
                 Assert.Equal("1", cells[9]) // рп — 'reported' event carries the taker's user_id; joined via coupon.owner_id to land on the owner
             | None -> Assert.True(false, "owner row not found across any /balances page")
+
+            let! adminRowOpt = findRowAcrossPages admin "balance" adminId
+            match adminRowOpt with
+            | Some cells -> Assert.Equal("0", cells[8]) // ан — the admin voided someone else's coupon; that must not count against the admin
+            | None -> Assert.True(false, "admin row not found across any /balances page")
         }
 
     [<Fact>]

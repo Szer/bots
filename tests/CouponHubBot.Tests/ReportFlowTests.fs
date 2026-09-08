@@ -604,3 +604,44 @@ VALUES
             | Some line -> Assert.DoesNotContain("⚠️", line)
             | None -> ()
         }
+
+    // ── 15. Admin-undone use still nets correctly in the monthly leaderboard, admin excluded ──
+
+    [<Fact>]
+    let ``Admin-undone use nets to the taker's real count in the monthly leaderboard, not the admin's`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            let owner = Tg.user(id = 9737L, username = "report_lb_owner", firstName = "Owner")
+            let taker = Tg.user(id = 9738L, username = "report_lb_taker", firstName = "Taker")
+            let admin = Tg.user(id = 901L, username = "report_lb_admin", firstName = "AdminLb")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-02-01", owner))
+            let! couponId1 = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 20 50 2026-02-01", owner))
+            let! couponId2 = fixture.QuerySingle<int>("SELECT id FROM coupon WHERE owner_id = @o ORDER BY id DESC LIMIT 1", {| o = owner.Id |})
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId1}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId1}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId2}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId2}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId1}", admin))
+
+            // Backdate into the reminder's query window — the live bot stamps real wall-clock time.
+            let! _ =
+                fixture.Execute(
+                    "UPDATE coupon_event SET created_at = '2026-01-18T10:00:00Z'::timestamptz WHERE coupon_id IN (@id1, @id2)",
+                    {| id1 = couponId1; id2 = couponId2 |})
+
+            do! runReminderAt "2026-02-02T10:00:00Z"
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let takerLine = findLeaderboardLine calls "@report_lb_taker"
+            Assert.True(takerLine.IsSome, "Taker should have a leaderboard line")
+            Assert.Contains("— 1/0", takerLine.Value)
+
+            let adminLine = findLeaderboardLine calls "@report_lb_admin"
+            Assert.True(adminLine.IsNone, "Admin performing the undo must not get a leaderboard line")
+        }
