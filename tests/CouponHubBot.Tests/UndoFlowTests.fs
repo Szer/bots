@@ -7,6 +7,11 @@ open Npgsql
 open Xunit
 open FakeCallHelpers
 
+/// user_id/subject_user_id of a single "<type>_reverted" row, for asserting admin-actor
+/// vs. original-subject attribution.
+[<CLIMutable>]
+type private RevertAttributionRow = { user_id: int64; subject_user_id: int64 }
+
 type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
 
     // Admin user ID 900 is configured in FEEDBACK_ADMINS for the test container.
@@ -600,4 +605,102 @@ type UndoFlowTests(fixture: DefaultCouponHubTestContainers) =
             let! listCalls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText listCalls other.Id $"ID:{couponId}",
                 "Returned coupon should be offered in /list again")
+        }
+
+    [<Fact>]
+    let ``Undo stamps the reverted event with the admin as actor and the original user as subject`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 763L, username = "undo_attr_owner", firstName = "Owner")
+            let taker = Tg.user(id = 764L, username = "undo_attr_taker", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId}", taker))
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+
+            let! row =
+                fixture.QuerySingle<RevertAttributionRow>(
+                    "SELECT user_id, subject_user_id FROM coupon_event WHERE coupon_id = @id AND event_type = 'used_reverted'",
+                    {| id = couponId |})
+            Assert.Equal(adminId, row.user_id)
+            Assert.Equal(taker.Id, row.subject_user_id)
+        }
+
+    [<Fact>]
+    let ``Undo does not change the admin's own event counts, only the original actor's`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 765L, username = "undo_attr2_owner", firstName = "Owner")
+            let taker = Tg.user(id = 766L, username = "undo_attr2_taker", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", taker))
+            let! takerCalls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText takerCalls taker.Id "Взято: 0",
+                "Taker's own take was reverted, so it must net to 0 for the taker")
+
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage("/stats", Tg.user(id = adminId, username = "admin", firstName = "Admin")))
+            let! adminCalls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText adminCalls adminId "Взято: 0",
+                "Admin never took anything — performing the undo must not credit/debit the admin")
+        }
+
+    [<Fact>]
+    let ``Chained undo by two different admins still attributes each revert to the original taker`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 767L, username = "undo_chain2_owner", firstName = "Owner")
+            let taker = Tg.user(id = 768L, username = "undo_chain2_taker", firstName = "Taker")
+            let admin1 = Tg.user(id = adminId, username = "admin", firstName = "Admin")
+            let admin2Id = 901L
+            let admin2 = Tg.user(id = admin2Id, username = "admin2", firstName = "AdminTwo")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+            do! fixture.SetChatMemberStatus(adminId, "member")
+            do! fixture.SetChatMemberStatus(admin2Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/used {couponId}", taker))
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin1))
+            let! s1 = getStatus couponId
+            Assert.Equal("taken", s1)
+
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin2))
+            let! s2 = getStatus couponId
+            Assert.Equal("available", s2)
+
+            let! usedRevertRow =
+                fixture.QuerySingle<RevertAttributionRow>(
+                    "SELECT user_id, subject_user_id FROM coupon_event WHERE coupon_id = @id AND event_type = 'used_reverted'",
+                    {| id = couponId |})
+            Assert.Equal(adminId, usedRevertRow.user_id)
+            Assert.Equal(taker.Id, usedRevertRow.subject_user_id)
+
+            let! takenRevertRow =
+                fixture.QuerySingle<RevertAttributionRow>(
+                    "SELECT user_id, subject_user_id FROM coupon_event WHERE coupon_id = @id AND event_type = 'taken_reverted'",
+                    {| id = couponId |})
+            Assert.Equal(admin2Id, takenRevertRow.user_id)
+            Assert.Equal(taker.Id, takenRevertRow.subject_user_id)
         }

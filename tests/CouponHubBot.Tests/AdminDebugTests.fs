@@ -178,3 +178,33 @@ type AdminDebugTests(fixture: DefaultCouponHubTestContainers) =
                         "Admin should be told the coupon does not exist")
             Assert.True((findDebugReply calls).IsNone, "No history block for a coupon that does not exist")
         }
+
+    [<Fact>]
+    let ``Debug renders a reverted row as admin arrow victim, not the victim undoing herself`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin_debug", firstName = "Admin")
+            let taker = Tg.user(id = 813L, username = "debug_victim", firstName = "Victim")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", admin))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/undo {couponId}", admin))
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage($"/debug {couponId}", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let debugResponse = findDebugReply calls
+            Assert.True(debugResponse.IsSome, "Admin should receive debug output with <pre> block")
+            let text = debugResponse.Value
+
+            Assert.Contains("taken_reverted", text)
+            Assert.Contains("admin_debug → debug_victim", text)
+            Assert.DoesNotContain("debug_victim → admin_debug", text)
+        }

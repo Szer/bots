@@ -184,14 +184,16 @@ type DbService(connString: string, timeProvider: TimeProvider, maxTakenCoupons: 
         return conn
     }
 
-    let insertEvent (conn: NpgsqlConnection) (tx: IDbTransaction) (couponId: int) (userId: int64) (eventType: string) =
+    /// subjectUserId is set only for "<type>_reverted" rows: userId is the admin who undid the
+    /// action, subjectUserId is the user whose action was reverted. None for every other event.
+    let insertEvent (conn: NpgsqlConnection) (tx: IDbTransaction) (couponId: int) (userId: int64) (eventType: string) (subjectUserId: int64 option) =
         //language=postgresql
         let sql =
             """
-INSERT INTO coupon_event (coupon_id, user_id, event_type)
-VALUES (@coupon_id, @user_id, @event_type);
+INSERT INTO coupon_event (coupon_id, user_id, event_type, subject_user_id)
+VALUES (@coupon_id, @user_id, @event_type, @subject_user_id);
 """
-        conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId; event_type = eventType |}, tx) |> taskIgnore
+        conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId; event_type = eventType; subject_user_id = Option.toNullable subjectUserId |}, tx) |> taskIgnore
 
     member _.UpsertUser(user: DbUser) =
         task {
@@ -305,7 +307,7 @@ RETURNING *;
                                        valid_from = validFromValue |},
                                     tx
                                 )
-                            do! insertEvent conn tx coupon.id ownerId "added"
+                            do! insertEvent conn tx coupon.id ownerId "added" None
                             do! tx.CommitAsync()
                             return AddCouponResult.Added coupon
                         with
@@ -458,7 +460,7 @@ ORDER BY c.taken_at DESC NULLS LAST, c.id DESC;
                 """
 SELECT event_type, COUNT(*)::bigint AS count
 FROM coupon_event
-WHERE user_id = @user_id
+WHERE COALESCE(subject_user_id, user_id) = @user_id
 GROUP BY event_type;
 """
             let! rows = conn.QueryAsync<EventTypeCountRow>(sql, {| user_id = userId |})
@@ -509,7 +511,7 @@ SELECT
      + COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'reported_reverted'), 0) AS taken_value
 FROM coupon_event e
 JOIN coupon c ON c.id = e.coupon_id
-WHERE e.user_id = @user_id
+WHERE COALESCE(e.subject_user_id, e.user_id) = @user_id
   AND e.event_type IN ('added', 'added_reverted', 'taken', 'taken_reverted', 'returned', 'returned_reverted', 'reported', 'reported_reverted');
 """
             return! conn.QuerySingleAsync<UserContributionStats>(sql, {| user_id = userId |})
@@ -567,7 +569,7 @@ LIMIT @limit;
             let sql =
                 $"""
 WITH added AS (
-    SELECT e.user_id,
+    SELECT COALESCE(e.subject_user_id, e.user_id) AS user_id,
            (COUNT(*) FILTER (WHERE e.event_type = 'added')
             - COUNT(*) FILTER (WHERE e.event_type = 'added_reverted'))::bigint AS cnt,
            COALESCE(SUM(c.value) FILTER (WHERE e.event_type = 'added'), 0)
@@ -575,9 +577,9 @@ WITH added AS (
     FROM coupon_event e
     JOIN coupon c ON c.id = e.coupon_id
     WHERE e.event_type IN ('added', 'added_reverted')
-    GROUP BY e.user_id
+    GROUP BY COALESCE(e.subject_user_id, e.user_id)
 ), taken AS (
-    SELECT e.user_id,
+    SELECT COALESCE(e.subject_user_id, e.user_id) AS user_id,
            (COUNT(*) FILTER (WHERE e.event_type = 'taken')
             - COUNT(*) FILTER (WHERE e.event_type = 'taken_reverted')
             - COUNT(*) FILTER (WHERE e.event_type = 'returned')
@@ -593,7 +595,7 @@ WITH added AS (
     FROM coupon_event e
     JOIN coupon c ON c.id = e.coupon_id
     WHERE e.event_type IN ('taken', 'taken_reverted', 'returned', 'returned_reverted', 'reported', 'reported_reverted')
-    GROUP BY e.user_id
+    GROUP BY COALESCE(e.subject_user_id, e.user_id)
 ), owner_flags AS (
     SELECT c.owner_id AS user_id,
            (COUNT(*) FILTER (WHERE e.event_type = 'voided')
@@ -740,7 +742,7 @@ RETURNING *;
                 do! tx.RollbackAsync()
                 return NotFoundOrNotAvailable
             | Some coupon ->
-                do! insertEvent conn tx coupon.id takerId "taken"
+                do! insertEvent conn tx coupon.id takerId "taken" None
                 do! tx.CommitAsync()
                 return Taken coupon
         }
@@ -761,7 +763,7 @@ AND taken_by = @user_id;
 """
             let! rows = conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId |}, tx)
             if rows = 1 then
-                do! insertEvent conn tx couponId userId "used"
+                do! insertEvent conn tx couponId userId "used" None
                 do! tx.CommitAsync()
                 return true
             else
@@ -787,7 +789,7 @@ WHERE id = @coupon_id
 """
             let! rows = conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId |}, tx)
             if rows = 1 then
-                do! insertEvent conn tx couponId userId "returned"
+                do! insertEvent conn tx couponId userId "returned" None
                 do! tx.CommitAsync()
                 return true
             else
@@ -850,20 +852,20 @@ ORDER BY taken_by, id;
             //language=postgresql
             let sql =
                 """
-SELECT e.user_id,
+SELECT COALESCE(e.subject_user_id, e.user_id) AS user_id,
        u.username,
        u.first_name,
        (COUNT(*) FILTER (WHERE e.event_type = @event_type)
         - COUNT(*) FILTER (WHERE e.event_type = @reverted_type))::bigint AS count
 FROM coupon_event e
-JOIN "user" u ON u.id = e.user_id
+JOIN "user" u ON u.id = COALESCE(e.subject_user_id, e.user_id)
 WHERE e.event_type IN (@event_type, @reverted_type)
   AND (NOT @has_since OR e.created_at >= @since_utc)
   AND e.created_at < @until_utc
-GROUP BY e.user_id, u.username, u.first_name
+GROUP BY COALESCE(e.subject_user_id, e.user_id), u.username, u.first_name
 HAVING (COUNT(*) FILTER (WHERE e.event_type = @event_type)
         - COUNT(*) FILTER (WHERE e.event_type = @reverted_type)) > 0
-ORDER BY count DESC, e.user_id;
+ORDER BY count DESC, COALESCE(e.subject_user_id, e.user_id);
 """
             // @has_since gates the lower bound so the SQL text stays constant (preparable, and
             // Rider can still validate it). @since_utc is always a real timestamptz value — never
@@ -1113,7 +1115,7 @@ WHERE id = @coupon_id;
 """
                 let! _ = conn.ExecuteAsync(updateSql, {| coupon_id = couponId |}, tx)
 
-                do! insertEvent conn tx couponId original.owner_id "voided"
+                do! insertEvent conn tx couponId original.owner_id "voided" None
                 do! tx.CommitAsync()
                 return VoidCouponResult.Voided ({ original with status = "voided"; taken_by = Nullable(); taken_at = Nullable() }, takenBy)
         }
@@ -1152,7 +1154,7 @@ SET status = 'reported',
 WHERE id = @coupon_id;
 """
                 let! _ = conn.ExecuteAsync(updateSql, {| coupon_id = couponId |}, tx)
-                do! insertEvent conn tx couponId reporterId "reported"
+                do! insertEvent conn tx couponId reporterId "reported" None
                 let! updated = conn.QueryAsync<Coupon>("SELECT * FROM coupon WHERE id = @coupon_id;", {| coupon_id = couponId |}, tx)
                 do! tx.CommitAsync()
                 return ReportCouponResult.Reported (updated |> Seq.head)
@@ -1196,7 +1198,7 @@ WHERE id = @coupon_id
 """
             let! rows = conn.ExecuteAsync(sql, {| coupon_id = couponId; owner_id = ownerId |}, tx)
             if rows = 1 then
-                do! insertEvent conn tx couponId ownerId "used"
+                do! insertEvent conn tx couponId ownerId "used" None
                 do! tx.CommitAsync()
                 return true
             else
@@ -1262,7 +1264,7 @@ ORDER BY created_at DESC, id DESC;
                                 do! tx.RollbackAsync()
                                 return UndoResult.StateChanged
                             else
-                                do! insertEvent conn tx couponId ev.user_id (ev.event_type + "_reverted")
+                                do! insertEvent conn tx couponId adminId (ev.event_type + "_reverted") (Some ev.user_id)
                                 let! updated = conn.QueryAsync<Coupon>("SELECT * FROM coupon WHERE id = @coupon_id;", {| coupon_id = couponId |}, tx)
                                 do! tx.CommitAsync()
                                 return UndoResult.Undone(updated |> Seq.head, ev.event_type, pocketChange)
@@ -1336,13 +1338,22 @@ ORDER BY expires_at, id;
     member _.GetCouponEventHistory(couponId: int) =
         task {
             use! conn = openConn()
+            // For "<type>_reverted" rows ce.user_id is the admin and ce.subject_user_id is
+            // the user whose action was undone; render "Admin → Victim" for those rows only.
             //language=postgresql
             let sql = """
 SELECT TO_CHAR(ce.created_at, 'YYYY-MM-DD HH24:MI:SS') AS date,
-       COALESCE(u.username, COALESCE(u.first_name, '') || COALESCE(u.last_name, '')) AS "user",
+       CASE
+           WHEN ce.subject_user_id IS NOT NULL THEN
+               COALESCE(actor.username, COALESCE(actor.first_name, '') || COALESCE(actor.last_name, '')) || ' → ' ||
+               COALESCE(subject.username, COALESCE(subject.first_name, '') || COALESCE(subject.last_name, ''))
+           ELSE
+               COALESCE(actor.username, COALESCE(actor.first_name, '') || COALESCE(actor.last_name, ''))
+       END AS "user",
        ce.event_type
 FROM coupon_event ce
-         JOIN public."user" u ON u.id = ce.user_id
+         JOIN public."user" actor ON actor.id = ce.user_id
+         LEFT JOIN public."user" subject ON subject.id = ce.subject_user_id
 WHERE ce.coupon_id = @couponId
 ORDER BY ce.created_at;
 """
