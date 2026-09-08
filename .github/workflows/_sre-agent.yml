@@ -87,6 +87,7 @@ jobs:
         } >> "$GITHUB_ENV"
 
     - name: Run SRE agent
+      id: run-agent
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -96,6 +97,7 @@ jobs:
         safety-strategy: drop-sudo
         effort: high
         codex-home: ${{ github.workspace }}/.github/codex
+        output-file: /tmp/codex-output/sre-report.md
         prompt: |
           <instructions>
           ${{ env.AGENT_PROMPT }}
@@ -119,6 +121,27 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+    - name: Upload SRE agent report
+      # codex-action's output-file is the only transcript it exposes.
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: sre-report-${{ inputs.bot }}
+        path: /tmp/codex-output/
+        if-no-files-found: ignore
+        retention-days: 14
+
+    - name: Post SRE agent report to job summary
+      # Makes the report visible on the run's Summary page without opening logs.
+      if: always()
+      run: |
+        echo "## SRE agent report — ${{ inputs.bot }}" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f /tmp/codex-output/sre-report.md ]; then
+          cat /tmp/codex-output/sre-report.md >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "no report file produced (agent step failed or was cancelled)" >> "$GITHUB_STEP_SUMMARY"
+        fi
 
     - name: Re-enable ArgoCD auto-sync (safety net — a killed run must not leave it off)
       # Idempotent: a no-op if the agent never touched auto-sync. Runs even if
