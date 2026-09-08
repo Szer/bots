@@ -208,3 +208,31 @@ type AdminDebugTests(fixture: DefaultCouponHubTestContainers) =
             Assert.Contains("admin_debug → debug_victim", text)
             Assert.DoesNotContain("debug_victim → admin_debug", text)
         }
+
+    [<Fact>]
+    let ``Debug renders an admin void of someone else's coupon as admin arrow owner`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+
+            let admin = Tg.user(id = adminId, username = "admin_debug", firstName = "Admin")
+            let owner = Tg.user(id = 814L, username = "debug_void_owner", firstName = "Owner")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/void {couponId}", admin))
+
+            do! fixture.ClearFakeCalls()
+            let! resp = fixture.SendUpdate(Tg.dmMessage($"/debug {couponId}", admin))
+            Assert.Equal(HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            let debugResponse = findDebugReply calls
+            Assert.True(debugResponse.IsSome, "Admin should receive debug output with <pre> block")
+            let text = debugResponse.Value
+
+            Assert.Contains("voided", text)
+            Assert.Contains("admin_debug → debug_void_owner", text)
+        }

@@ -551,8 +551,8 @@ LIMIT @limit;
     /// One /balances page: all-user added/taken aggregates (netting "<type>_reverted" like
     /// GetUserContributionStats, "taken" also net of "returned"/"reported" — see
     /// GetUserContributionStats' doc comment), plus two owner-attributed informational counts
-    /// (voided/reported coupons this user ADDED). 'voided' events already carry the owner's
-    /// user_id (VoidCoupon writes original.owner_id, not the acting admin), while 'reported'
+    /// (voided/reported coupons this user ADDED). 'voided' events carry the ACTOR's user_id
+    /// (owner or admin) with subject_user_id = owner_id only when an admin voided it, while 'reported'
     /// events carry the REPORTER's user_id (TryReportCoupon) — both are joined through
     /// coupon.owner_id here so the attribution is correct and symmetric regardless of which
     /// event type happens to already agree with it. sortMode is a DU matched to one of three
@@ -1115,7 +1115,10 @@ WHERE id = @coupon_id;
 """
                 let! _ = conn.ExecuteAsync(updateSql, {| coupon_id = couponId |}, tx)
 
-                do! insertEvent conn tx couponId original.owner_id "voided" None
+                // userId is the actor (owner self-voiding, or an admin); subject is only set
+                // when an admin voids someone else's coupon, so the OWNER keeps the mark.
+                let subjectUserId = if userId = original.owner_id then None else Some original.owner_id
+                do! insertEvent conn tx couponId userId "voided" subjectUserId
                 do! tx.CommitAsync()
                 return VoidCouponResult.Voided ({ original with status = "voided"; taken_by = Nullable(); taken_at = Nullable() }, takenBy)
         }
