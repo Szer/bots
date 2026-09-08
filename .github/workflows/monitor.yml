@@ -29,7 +29,8 @@ name: Monitor
 #              15 — before this split, only the first bot in the old single
 #              job ever got analysed). Skipped entirely (guarded by `if:`)
 #              when `clean_bots` is `[]`, since GitHub errors on an empty
-#              matrix.
+#              matrix. `timeout-minutes: 20` bounds a wedged runner (dies
+#              silently, no logs); codex's `output-file` is uploaded as an artifact.
 #   finalize — `if: always()`; fails the run if the gather job reports any
 #              skipped bot OR if any `agent` matrix leg failed, but not
 #              merely because `agent` itself was skipped (empty matrix).
@@ -489,6 +490,8 @@ jobs:
     # other two also degraded).
     if: needs.gather.outputs.clean_bots != '[]' && needs.gather.outputs.clean_bots != ''
     runs-on: ubuntu-latest
+    # Healthy legs finish in 1-3 min; unbounded, a wedged runner burns 6h with no logs.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -508,6 +511,7 @@ jobs:
       run: |
         set -euo pipefail
         source scripts/gather/lib.sh
+        mkdir -p /tmp/codex-output
         BOT="${{ matrix.bot }}"
         DISPLAY_NAME="$(bot_field "$BOT" '.display_name')"
         TRAFFIC_CLASS="$(bot_field "$BOT" '.traffic_class')"
@@ -562,6 +566,7 @@ jobs:
         } >> "$GITHUB_ENV"
 
     - name: "Run monitor agent"
+      id: run-agent
       uses: openai/codex-action@v1
       with:
         openai-api-key: ${{ secrets.AZURE_OPENAI_API_KEY }}
@@ -571,6 +576,7 @@ jobs:
         safety-strategy: drop-sudo
         effort: high
         codex-home: ${{ github.workspace }}/.github/codex
+        output-file: /tmp/codex-output/${{ matrix.bot }}.md
         prompt: |
           <instructions>
           ${{ env.AGENT_PROMPT }}
@@ -586,6 +592,16 @@ jobs:
           Every issue you create or comment on must carry the label `bot:${{ matrix.bot }}` in addition to `monitor`, `anomaly`, and a priority label.
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload codex transcript
+      # codex-action's output-file is the only transcript it exposes.
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-transcript-${{ matrix.bot }}
+        path: /tmp/codex-output/
+        if-no-files-found: ignore
+        retention-days: 14
 
   # ─── finalize — surfaces both failure modes (degraded evidence pipeline,
   # and any bot's agent invocation failing) without depending on `agent`
