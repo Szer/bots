@@ -10,6 +10,11 @@ open System.Text
 open Funogram.Telegram.Types
 open BotInfra
 
+/// An unmodeled block/rich-text type (e.g. "buttons") falls back to the
+/// nearest-shape DU case with unset fields — null, not None. Treat null as absent.
+let private isNullValue (x: 'a) : bool = isNull (box x)
+let private orEmpty (arr: 'a[]) : 'a[] = if isNull arr then [||] else arr
+
 /// Breaks the line unless the buffer is empty or already ends with one —
 /// keeps the output newline-separated without stacking blank lines.
 let private appendLineBreak (sb: StringBuilder) =
@@ -29,6 +34,7 @@ let private appendPayload (sb: StringBuilder) (payload: string) =
 // custom_emoji_count feature does not see them; their AlternativeText below
 // partially compensates via the text featurizer.
 let rec private appendRichText (sb: StringBuilder) (richText: RichText) =
+    if isNullValue richText then () else
     match richText with
     | RichText.Plain text -> %sb.Append text
     | RichText.ArrayOf items -> for item in items do appendRichText sb item
@@ -97,6 +103,7 @@ let private appendCaption (sb: StringBuilder) (caption: RichBlockCaption option)
     | None -> ()
 
 let rec private appendBlock (sb: StringBuilder) (block: RichBlock) =
+    if isNullValue block then () else
     match block with
     | RichBlock.Paragraph p -> appendRichTextLine sb p.Text
     | RichBlock.SectionHeading h -> appendRichTextLine sb h.Text
@@ -110,27 +117,27 @@ let rec private appendBlock (sb: StringBuilder) (block: RichBlock) =
     | RichBlock.Divider _ -> ()
     | RichBlock.Anchor a -> appendPayload sb a.Name
     | RichBlock.List l ->
-        for item in l.Items do
+        for item in l.Items |> orEmpty do
             if not (String.IsNullOrWhiteSpace item.Label) then
                 %sb.Append item.Label
                 appendLineBreak sb
-            for nested in item.Blocks do
+            for nested in item.Blocks |> orEmpty do
                 appendBlock sb nested
     | RichBlock.BlockQuotation q ->
-        for nested in q.Blocks do
+        for nested in q.Blocks |> orEmpty do
             appendBlock sb nested
         appendOptionalCredit sb q.Credit
     | RichBlock.Collage c ->
-        for nested in c.Blocks do
+        for nested in c.Blocks |> orEmpty do
             appendBlock sb nested
         appendCaption sb c.Caption
     | RichBlock.Slideshow s ->
-        for nested in s.Blocks do
+        for nested in s.Blocks |> orEmpty do
             appendBlock sb nested
         appendCaption sb s.Caption
     | RichBlock.Table t ->
-        for row in t.Cells do
-            for cell in row do
+        for row in t.Cells |> orEmpty do
+            for cell in row |> orEmpty do
                 match cell.Text with
                 | Some text -> appendRichTextLine sb text
                 | None -> ()
@@ -141,7 +148,7 @@ let rec private appendBlock (sb: StringBuilder) (block: RichBlock) =
     // (IsOpen absent) — that is exactly where spam would hide.
     | RichBlock.Details d ->
         appendRichTextLine sb d.Summary
-        for nested in d.Blocks do
+        for nested in d.Blocks |> orEmpty do
             appendBlock sb nested
     | RichBlock.Map m -> appendCaption sb m.Caption
     | RichBlock.Animation a -> appendCaption sb a.Caption
@@ -155,6 +162,6 @@ let rec private appendBlock (sb: StringBuilder) (block: RichBlock) =
 /// an empty string for content-free messages (caller checks).
 let flatten (richMessage: RichMessage) : string =
     let sb = StringBuilder()
-    for block in richMessage.Blocks do
+    for block in richMessage.Blocks |> orEmpty do
         appendBlock sb block
     sb.ToString().Trim('\r', '\n')

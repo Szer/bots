@@ -36,6 +36,21 @@ let ``table spam: custom emoji alternative text is extracted`` () =
     Assert.Contains("😊", flattened)
 
 [<Fact>]
+let ``heading+buttons spam: unmodeled block types don't stop extraction of the rest`` () =
+    // "buttons" isn't a modeled RichBlock case; Funogram falls back to Paragraph
+    // with a null Text, which must not abort flattening of the other blocks.
+    let flattened = fixtureUpdate "heading-buttons-spam-update.json" |> richMessageOf |> RichMessageText.flatten
+    Assert.Contains("Last 10 invites left 💦", flattened)
+    Assert.Contains("TEEN 🌸", flattened)
+    Assert.Contains("LATIN 🍑", flattened)
+    Assert.Contains("KOREAN 🌸", flattened)
+    Assert.Contains("PRIVATE 📂", flattened)
+    // "heading" resolves exactly to SectionHeading (its own Always-tagged shape),
+    // so heading text survives even though "buttons" does not.
+    Assert.Contains("WILD SNAP DROP", flattened)
+    Assert.Contains("BARELY LEGAL AMATEUR", flattened)
+
+[<Fact>]
 let ``latex: block expression is extracted`` () =
     let flattened = fixtureUpdate "latex-update.json" |> richMessageOf |> RichMessageText.flatten
     Assert.Contains(@"\int_{a}^{b} x^2", flattened)
