@@ -31,7 +31,8 @@ jobs:
     env:
       PD_URL: https://events.eu.pagerduty.com/v2/enqueue
       PD_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
-      DRY_RUN: ${{ inputs.dry_run == 'true' }}
+      # boolean input vs string 'true' never matched (coerced to 1 vs NaN) — every "dry run" was live
+      DRY_RUN: ${{ inputs.dry_run == true }}
 
     steps:
     - name: Resolve canary self-report
