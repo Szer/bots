@@ -9,6 +9,7 @@ on:
       - Monitor
       - Daily Project Assessment
       - Product Analysis
+      - Retry Probe (temporary)   # TEMPORARY, removed with _retry-probe.yml
     types: [completed]
 
 permissions:
