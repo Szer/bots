@@ -22,6 +22,7 @@ on:
 
 permissions:
   actions: read
+  checks: read   # job annotations, to tell a `timeout-minutes` kill from a plain cancel
 
 jobs:
   canary:
@@ -65,15 +66,35 @@ jobs:
         declare -a ROWS=()
         AGENT_BAD=0
         echo "=== workflow canary classification $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
-        printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %s\n' \
-          'workflow' 'display' 'state' 'run_id' 'conclusion' 'created_at' 'threshold'
+        printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %-7s | %s\n' \
+          'workflow' 'display' 'state' 'run_id' 'conclusion' 'created_at' 'attempt' 'threshold'
         while IFS='|' read -r file display thr_sec thr_human; do
           RUNS=$(gh run list --workflow "$file" --repo "$GITHUB_REPOSITORY" --limit 100 \
-            --json databaseId,event,status,conclusion,createdAt,url)
-          LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.status == "completed" and .conclusion != "cancelled")][0] // empty')
-          SCHED_LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.event == "schedule" and .conclusion != "cancelled")][0] // empty')
+            --json databaseId,event,status,conclusion,createdAt,url,attempt)
+          # A run "cancelled" by a timeout-minutes kill counts as failed (see #489);
+          # any other cancelled run is skipped for the newest non-cancelled one.
+          LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.status == "completed")][0] // empty')
+          TIMED_OUT="false"
+          if [ "$(echo "$LATEST" | jq -r '.conclusion // empty')" = "cancelled" ]; then
+            CANCELLED_ID=$(echo "$LATEST" | jq -r '.databaseId')
+            for job_id in $(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CANCELLED_ID}/jobs" \
+                              --jq '.jobs[] | select(.conclusion == "cancelled") | .id'); do
+              if gh api "repos/${GITHUB_REPOSITORY}/check-runs/${job_id}/annotations" \
+                   --jq '.[].message' | grep -q 'exceeded the maximum execution time'; then
+                TIMED_OUT="true"
+                break
+              fi
+            done
+            if [ "$TIMED_OUT" = "false" ]; then
+              LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.status == "completed" and .conclusion != "cancelled")][0] // empty')
+            fi
+          fi
+          # Any scheduled run, whatever its conclusion, proves the cron fired.
+          SCHED_LATEST=$(echo "$RUNS" | jq -c '[.[] | select(.event == "schedule")][0] // empty')
           FAILED="false"
-          if [ -n "$LATEST" ]; then
+          if [ "$TIMED_OUT" = "true" ]; then
+            FAILED="true"
+          elif [ -n "$LATEST" ]; then
             case "$(echo "$LATEST" | jq -r '.conclusion')" in
               failure|timed_out|startup_failure) FAILED="true" ;;
             esac
@@ -97,6 +118,13 @@ jobs:
           fi
           RUN_ID=$(echo "$LATEST" | jq -r '.databaseId // empty' 2>/dev/null || true)
           CONCLUSION=$(echo "$LATEST" | jq -r '.conclusion // empty' 2>/dev/null || true)
+          if [ "$TIMED_OUT" = "true" ]; then
+            CONCLUSION="timed_out"
+          fi
+          ATTEMPT=$(echo "$LATEST" | jq -r '.attempt // empty' 2>/dev/null || true)
+          if [ "${ATTEMPT:-1}" -gt 1 ]; then
+            echo "::notice::${display}: latest run ${RUN_ID} needed attempt ${ATTEMPT} (agent-retry.yml) — a wedge happened, retry masked it"
+          fi
           CREATED_AT=$(echo "$LATEST" | jq -r '.createdAt // empty' 2>/dev/null || true)
           URL=$(echo "$LATEST" | jq -r '.url // empty' 2>/dev/null || true)
           SCHED_CREATED=$(echo "$SCHED_LATEST" | jq -r '.createdAt // empty' 2>/dev/null || true)
@@ -117,8 +145,8 @@ jobs:
             esac
           fi
           ROWS+=("$file|$display|$STATE|$RUN_ID|$CONCLUSION|$CREATED_AT|$URL|$SCHED_CREATED|$thr_human|$SUMMARY")
-          printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %s\n' \
-            "$file" "$display" "$STATE" "$RUN_ID" "$CONCLUSION" "$CREATED_AT" "$thr_human"
+          printf '%-28s | %-24s | %-8s | %-11s | %-14s | %-20s | %-7s | %s\n' \
+            "$file" "$display" "$STATE" "$RUN_ID" "$CONCLUSION" "$CREATED_AT" "${ATTEMPT:-}" "$thr_human"
         done <<'EOF'
         monitor.yml|Monitor|19800|5h30m
         project.yml|Daily Project Assessment|93600|26h

@@ -1,0 +1,58 @@
+name: Agent Retry
+
+# One automatic re-run of a codex-agent run whose leg was killed by timeout-minutes
+# or a dead runner. Rationale, probe results and guard rails: PR body of #489.
+
+on:
+  workflow_run:
+    workflows:
+      - Monitor
+      - Daily Project Assessment
+      - Product Analysis
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read   # job annotations, to tell a `timeout-minutes` kill from a deliberate cancel
+
+jobs:
+  retry:
+    if: >-
+      github.event.workflow_run.run_attempt == 1 &&
+      (github.event.workflow_run.conclusion == 'failure' ||
+       github.event.workflow_run.conclusion == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      RUN_NAME: ${{ github.event.workflow_run.name }}
+      RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+    - name: Re-run failed and cancelled jobs once
+      run: |
+        set -euo pipefail
+        echo "${RUN_NAME} run ${RUN_ID} ended ${RUN_CONCLUSION} on attempt 1 — ${RUN_URL}"
+        JOBS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs")
+        echo "jobs that did not succeed:"
+        echo "$JOBS" | jq -r '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "  \(.name): \(.conclusion)"'
+        # Only a timeout-minutes kill is retried; a manual or concurrency-queue
+        # cancel stays cancelled (re-running would fight the person/queue).
+        for job_id in $(echo "$JOBS" | jq -r '.jobs[] | select(.conclusion == "cancelled") | .id'); do
+          if ! gh api "repos/${GITHUB_REPOSITORY}/check-runs/${job_id}/annotations" \
+                 --jq '.[].message' | grep -q 'exceeded the maximum execution time'; then
+            echo "job ${job_id} was cancelled but not by timeout — deliberate cancel, not retrying"
+            exit 0
+          fi
+        done
+        if gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun-failed-jobs" \
+             > "$RUNNER_TEMP/rerun.json" 2>&1; then
+          echo "re-run of failed jobs requested for ${RUN_ID} (attempt 2)"
+          exit 0
+        fi
+        echo "rerun-failed-jobs was refused:"
+        cat "$RUNNER_TEMP/rerun.json"
+        echo "falling back to a full re-run of ${RUN_ID}"
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/rerun"
+        echo "full re-run requested for ${RUN_ID} (attempt 2)"

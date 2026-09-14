@@ -624,10 +624,10 @@ jobs:
           echo "::error::Evidence pipeline degraded for: ${SKIPPED_BOTS} — see the evidence-pipeline-degraded issue. Any other bot's agent still ran normally."
           FAILED="true"
         fi
-        # AGENT_RESULT is "skipped" (not "failure") when clean_bots was `[]` —
-        # that must NOT fail this job, only an actual matrix-leg failure should.
-        if [ "$AGENT_RESULT" = "failure" ]; then
-          echo "::error::One or more bot agent invocations failed this run (see the 'agent' job's matrix legs)."
+        # "skipped" (clean_bots was `[]`) must NOT fail this job. "cancelled" is
+        # what a leg killed by timeout-minutes reports: bot never analysed → fail.
+        if [ "$AGENT_RESULT" = "failure" ] || [ "$AGENT_RESULT" = "cancelled" ]; then
+          echo "::error::One or more bot agent invocations failed or timed out this run (agent result: ${AGENT_RESULT} — see the 'agent' job's matrix legs)."
           FAILED="true"
         fi
         if [ "$FAILED" = "true" ]; then
