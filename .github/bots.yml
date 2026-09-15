@@ -38,9 +38,8 @@ bots:
     query_set: vahter # -> scripts/queries/vahter/*.sql
     community_hashes: []
     notes: |
-      Legacy tables (message, user, banned, banned_by_bot, callback, vahter_actions,
-      llm_triage) FROZEN at 2026-04-02 (event-sourcing cutover, Flyway V23).
-      Query `event` / `snapshot_message` / `snapshot_user` only.
+      Legacy tables renamed to deprecated_* by V41 (2026-08-12, #362); dropped by
+      V50 (#494). Query `event` / `snapshot_message` / `snapshot_user` only.
 
   coupon:
     display_name: CouponHubBot

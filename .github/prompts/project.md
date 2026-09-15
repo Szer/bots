@@ -108,9 +108,8 @@ perform these checks and say in your summary which you ran and what you saw:
    bot lists that omit a bot in `.github/bots.yml`.
 3. Config drift: `bot_setting` keys referenced in code but absent from docs, or documented but
    unreferenced; workflow inputs/secrets declared but never consumed.
-4. Dead code: functions or files with no remaining callers (a recent event-sourcing cutover in
-   VahterBanBot left known examples — `DB.fs:866 GetVahterStats` is dead; the live path is
-   `GetVahterActionStats`).
+4. Dead code: functions or files with no remaining callers — confirm with a repo-wide grep for
+   callers before filing; a symbol that only appears in its own definition is dead.
 
 "I found nothing" without naming what you looked at is not a clean day — it is an unverified
 claim, and it is exactly how this role silently became a no-op before.
