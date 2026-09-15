@@ -121,9 +121,9 @@ agent — which, per §1.1, does not exist.
   (group by `SourceContext` + message prefix).
 - Vahter's legacy tables (`message`, `user`, `banned`, `banned_by_bot`, `callback`,
   `vahter_actions`, `llm_triage`) froze at **2026-04-02** during the event-sourcing cutover
-  (Flyway V23). Any agent querying them gets four-month-stale data that looks live.
-  `DB.fs:866 GetVahterStats` is dead code; `DB.fs:896 GetVahterActionStats` reading `event`
-  is the live path.
+  (Flyway V23), were renamed to `deprecated_*` by V41 (2026-08-12, #362), and are being
+  dropped by V50 (#494). Query `event` / `snapshot_message` / `snapshot_user` only —
+  `GetVahterActionStats` reading `event` is the live path.
 - Nothing said in the vahters' private moderator channel (`ADMIN_CHANNEL_ID
   = -1001170325774`) is persisted. `Bot.fs:1533-1550` — recognized `/vahter` commands are
   dispatched without `InsertMessage`; free-form discussion falls through the
@@ -202,9 +202,8 @@ bots:
     traffic_class: high                   # drives baseline windows + alert sensitivity
     query_set: vahter                     # -> scripts/queries/vahter/*.sql
     notes: |
-      Legacy tables (message, user, banned, banned_by_bot, callback, vahter_actions,
-      llm_triage) FROZEN at 2026-04-02 (event-sourcing cutover, Flyway V23).
-      Query `event` / `snapshot_message` / `snapshot_user` only.
+      Legacy tables renamed to deprecated_* by V41 (2026-08-12, #362); dropped by
+      V50 (#494). Query `event` / `snapshot_message` / `snapshot_user` only.
   coupon:
     display_name: CouponHubBot
     argocd_app: coupon-bot
