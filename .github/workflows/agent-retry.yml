@@ -7,7 +7,7 @@ on:
   workflow_run:
     workflows:
       - Monitor
-      - Daily Project Assessment
+      - Weekly Project Assessment
       - Product Analysis
     types: [completed]
 
