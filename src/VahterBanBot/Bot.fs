@@ -1266,7 +1266,7 @@ type BotService(
                     let actor = Actor.LLM {| modelName = llmTriage.ModelName; promptHash = llmTriage.PromptHash |}
                     return Some (AutoVerdict.Spam (float prediction.Score, actor, reason, cacheScope))
                 | LlmVerdict.NotSpam (reason, _) ->
-                    // Previously-silent warning-band pass-through — now logged for the injection threat model.
+                    // A warning-band NOT_SPAM overrides the ML warning (the injection payoff path) — must stay visible in logs.
                     let msgLength = if isNull msg.Text then 0 else msg.Text.Length
                     logger.LogInformation(
                         "LLM triage NOT_SPAM in ML warning band — message passes (chat {ChatId}, user {UserId}, ML score {MlScore}, msg length {MsgLength}, reason {Reason})",
