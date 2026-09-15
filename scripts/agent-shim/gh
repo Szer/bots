@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Mechanical enforcement for the project agent's `gh` calls (silence-by-default
+# comment rules) — see .github/prompts/project.md rule 3.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_real_gh() {
+  local candidate
+  while IFS= read -r candidate; do
+    if [ "$(cd "$(dirname "$candidate")" && pwd)" != "$SCRIPT_DIR" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(type -aP gh 2>/dev/null || true)
+  return 1
+}
+
+REAL_GH="$(resolve_real_gh)" || { echo "gh shim: no real gh found on PATH besides itself" >&2; exit 127; }
+
+log_action() {
+  if [ -z "${AGENT_ACTIONS_LOG:-}" ]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$AGENT_ACTIONS_LOG")"
+  printf '%s\n' "$1" >> "$AGENT_ACTIONS_LOG"
+}
+
+if [ -z "${AGENT_ACTIONS_LOG:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; then
+  echo "gh shim: AGENT_ACTIONS_LOG or GITHUB_REPOSITORY unset, passing through unenforced" >&2
+  exec "$REAL_GH" "$@"
+fi
+
+refuse() {
+  local log_line="$1" reason="$2"
+  echo "REFUSED by project-agent gh shim: ${reason} (do not retry; note it in your summary)" >&2
+  log_action "REFUSED ${log_line}: ${reason}"
+  exit 1
+}
+
+handle_comment() {
+  local n="${3:-}"
+  if [ -z "$n" ]; then
+    log_action "PASSTHROUGH issue comment"
+    exec "$REAL_GH" "$@"
+  fi
+  if [ -n "${AGENT_LOG_ISSUE:-}" ] && [ "$n" = "$AGENT_LOG_ISSUE" ]; then
+    refuse "issue comment ${n}" "issue ${n} is \$AGENT_LOG_ISSUE; the workflow posts there, not the agent"
+  fi
+  local comments_json
+  comments_json=$("$REAL_GH" api "repos/${GITHUB_REPOSITORY}/issues/${n}/comments" --paginate)
+  local human_count
+  human_count=$(echo "$comments_json" | jq '[.[] | select(.user.login != "github-actions[bot]" and .user.login != "github-actions")] | length')
+  if [ "$human_count" -gt 0 ]; then
+    refuse "issue comment ${n}" "issue ${n} has a comment from a human (non github-actions) author"
+  fi
+  local timeline_json
+  timeline_json=$("$REAL_GH" api "repos/${GITHUB_REPOSITORY}/issues/${n}/timeline" --paginate)
+  local pr_ref_count
+  pr_ref_count=$(echo "$timeline_json" | jq '[.[] | select((.event == "cross-referenced" or .event == "connected") and (.source.issue.pull_request != null))] | length')
+  if [ "$pr_ref_count" -gt 0 ]; then
+    refuse "issue comment ${n}" "issue ${n} is referenced by a pull request"
+  fi
+  local newest_bot_ts
+  newest_bot_ts=$(echo "$comments_json" | jq -r '[.[] | select(.user.login == "github-actions[bot]" or .user.login == "github-actions")] | sort_by(.created_at) | last | .created_at // empty')
+  if [ -n "$newest_bot_ts" ]; then
+    local throttle_days now_epoch comment_epoch age_days
+    throttle_days="${AGENT_COMMENT_THROTTLE_DAYS:-14}"
+    now_epoch=$(date -u +%s)
+    comment_epoch=$(date -u -d "$newest_bot_ts" +%s)
+    age_days=$(( (now_epoch - comment_epoch) / 86400 ))
+    if [ "$age_days" -lt "$throttle_days" ]; then
+      refuse "issue comment ${n}" "newest agent comment on issue ${n} is ${age_days}d old, throttle is ${throttle_days}d"
+    fi
+  fi
+  log_action "ALLOWED issue comment ${n}"
+  exec "$REAL_GH" "$@"
+}
+
+handle_close() {
+  local n="${3:-}"
+  if [ -n "${AGENT_LOG_ISSUE:-}" ] && [ -n "$n" ] && [ "$n" = "$AGENT_LOG_ISSUE" ]; then
+    refuse "issue close ${n}" "issue ${n} is \$AGENT_LOG_ISSUE; it must never be closed by the agent"
+  fi
+  log_action "ALLOWED issue close ${n}"
+  exec "$REAL_GH" "$@"
+}
+
+if [ "${1:-}" = "issue" ] && [ "${2:-}" = "comment" ]; then
+  handle_comment "$@"
+elif [ "${1:-}" = "issue" ] && [ "${2:-}" = "close" ]; then
+  handle_close "$@"
+elif [ "${1:-}" = "issue" ] && [ "${2:-}" = "create" ]; then
+  log_action "ALLOWED issue create"
+  exec "$REAL_GH" "$@"
+else
+  first="${1:-}"; second="${2:-}"
+  if [ -n "$second" ]; then
+    log_action "PASSTHROUGH ${first} ${second}"
+  else
+    log_action "PASSTHROUGH ${first}"
+  fi
+  exec "$REAL_GH" "$@"
+fi

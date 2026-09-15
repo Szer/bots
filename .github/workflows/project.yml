@@ -1,16 +1,11 @@
-name: Daily Project Assessment
+name: Weekly Project Assessment
 
-# Repo-wide, ONE invocation per run (not looped per bot — see
-# AGENT-FLOWS-REDESIGN.md §3/§6.3). No VPN/live-metrics gather anymore:
-# project.md dropped all runtime signals (memory thresholds, log-volume
-# threshold, 5xx, Loki queries, pod-health summary) per §6.3/§9 — that
-# responsibility moves to the future `monitor` role (Phase 2), which is the
-# one that will still need the aks-vpn concurrency group. The project agent
-# now works purely from the repo checkout + the GitHub issues API.
+# Repo-wide, weekly sweep of the repo checkout + GitHub issues API (see
+# AGENT-FLOWS-REDESIGN.md §3/§6.3). Posts to the log issue only when it acted.
 
 on:
   schedule:
-    - cron: '37 4 * * *'
+    - cron: '37 4 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -18,25 +13,7 @@ permissions:
   issues: write
 
 jobs:
-  cleanup:
-    runs-on: ubuntu-latest
-    steps:
-    - name: Close stale orchestration issues
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        gh issue list --repo "${{ github.repository }}" --label "project" --state open \
-          --json number,title \
-          --jq '.[] | select(.title | test("project assessment \\d{4}-\\d{2}-\\d{2}"; "i")) | .number' \
-        | while read -r NUM; do
-          echo "Closing stale orchestration issue #${NUM}"
-          gh issue close "$NUM" --repo "${{ github.repository }}" \
-            --comment "**Auto-closed by cleanup.** Agent did not close this issue in time." \
-            || echo "WARNING: Failed to close orchestration issue #${NUM}, continuing"
-        done
-
   project:
-    needs: cleanup
     runs-on: ubuntu-latest
 
     steps:
@@ -53,33 +30,46 @@ jobs:
             --description "Findings for the ${bot} bot" --force
         done
 
-    - name: Create orchestration issue
-      id: create-issue
+    - name: Ensure project agent log issue
+      id: log-issue
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-        DATE=$(date -u +%Y-%m-%d)
+        EXISTING=$(gh issue list --repo "${{ github.repository }}" --label "project" --state open \
+          --json number,title --jq '.[] | select(.title == "Project agent log") | .number' | head -n1)
+        if [ -n "$EXISTING" ]; then
+          echo "Reusing existing log issue #${EXISTING}"
+          echo "issue_number=${EXISTING}" >> "$GITHUB_OUTPUT"
+        else
+          {
+            echo "The project agent posts a run summary here only on runs where it created,"
+            echo "updated, or closed a finding. Clean runs are visible only in that run's"
+            echo "GitHub Actions step summary. Workflow: \`.github/workflows/project.yml\`."
+          } > /tmp/log-issue-body.md
+          ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
+            --title "Project agent log" --label "project" --body-file /tmp/log-issue-body.md)
+          NEW=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
+          echo "Created log issue #${NEW}"
+          echo "issue_number=${NEW}" >> "$GITHUB_OUTPUT"
+          gh issue pin "$NEW" --repo "${{ github.repository }}" || true
+        fi
 
-        ISSUE_URL=$(gh issue create --repo "${{ github.repository }}" \
-          --title "Daily project assessment ${DATE}" \
-          --label "project" \
-          --body "## Daily Project Assessment — ${DATE}
+    - name: Prepare agent output dir and PATH
+      run: |
+        set -euo pipefail
+        mkdir -p "$GITHUB_WORKSPACE/.agent-out"
+        echo "$GITHUB_WORKSPACE/scripts/agent-shim" >> "$GITHUB_PATH"
 
-        **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-        Repo-wide tech-debt / stale-doc / config-drift sweep. No runtime
-        metrics snapshot in this role anymore — see
-        \`.github/AGENT-FLOWS-REDESIGN.md\` §6.3; runtime anomaly detection
-        is the future \`monitor\` role's job (Phase 2, not yet built).")
-
-        ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -Eo '[0-9]+$')
-        if [ -z "$ISSUE_NUMBER" ]; then
-          echo "ERROR: Failed to parse issue number from: $ISSUE_URL"
+    - name: Self-test — gh resolves to the shim
+      run: |
+        set -euo pipefail
+        RESOLVED=$(command -v gh)
+        if [ "$RESOLVED" != "$GITHUB_WORKSPACE/scripts/agent-shim/gh" ]; then
+          echo "::error::gh resolved to ${RESOLVED}, not the project-agent shim — refusing to run the agent unenforced."
           exit 1
         fi
-        echo "Created issue #${ISSUE_NUMBER}"
-        echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+        echo "gh resolves to the shim: ${RESOLVED}"
 
     - name: Load agent prompt
       run: |
@@ -105,74 +95,95 @@ jobs:
           ${{ env.AGENT_PROMPT }}
           </instructions>
 
-          You have been triggered for the daily project assessment — repo-wide, covering every bot in `.github/bots.yml` (VahterBanBot, CouponHubBot, AlitaBot).
+          You have been triggered for the weekly project assessment — repo-wide, covering every bot in `.github/bots.yml` (VahterBanBot, CouponHubBot, AlitaBot).
           When a finding is specific to one bot's source directory, add its `bot:<name>` label (e.g. `bot:vahter`) in addition to `project`. Shared-infra findings (BotInfra, tests, CI) need no bot label.
-          The orchestration issue is #${{ steps.create-issue.outputs.issue_number }}.
+          The long-lived log issue is #${{ steps.log-issue.outputs.issue_number }} ($AGENT_LOG_ISSUE) — never comment on or close it, the workflow posts there. Write your summary to $AGENT_SUMMARY_FILE as your final action. A `gh` command refused by the shim must not be retried — note it in the summary and move on.
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        AGENT_SUMMARY_FILE: ${{ github.workspace }}/.agent-out/summary.md
+        AGENT_ACTIONS_LOG: ${{ github.workspace }}/.agent-out/actions.log
+        AGENT_LOG_ISSUE: ${{ steps.log-issue.outputs.issue_number }}
+        AGENT_COMMENT_THROTTLE_DAYS: 14
 
-    # Guards against run 30241204433 (2026-07-27): every step exited 0, the
-    # orchestration issue was created and auto-closed, but the agent never
-    # made its required `gh issue comment` summary call — a silent no-op
-    # that is indistinguishable from a genuine clean day. See
-    # .github/AGENT-FLOWS-REDESIGN.md §1. This step only asserts PRESENCE of
-    # an agent-authored comment, never its content — a legitimate clean-day
-    # summary must still pass.
-    - name: Assert agent posted a summary
+    - name: Assert agent wrote summary
       id: assert-agent-output
-      if: always() && steps.create-issue.outputs.issue_number
+      if: always()
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        ISSUE_NUMBER: ${{ steps.create-issue.outputs.issue_number }}
-        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        SUMMARY_FILE: ${{ github.workspace }}/.agent-out/summary.md
+        ACTIONS_LOG: ${{ github.workspace }}/.agent-out/actions.log
       run: |
         set -euo pipefail
-        COMMENTS_JSON=$(gh issue view "$ISSUE_NUMBER" --repo "${{ github.repository }}" --json comments)
-        # The agent posts its summary through the same GH_TOKEN identity as
-        # this workflow's own automated comments (cleanup's stale-issue
-        # auto-close, the "Close orchestration issue" step below, and this
-        # step's own recorded-silence comment), so comment author cannot
-        # distinguish "agent" from "workflow" here -- only the fixed
-        # boilerplate text of the workflow's own comments can. Anything that
-        # does not match one of those known prefixes must have come from
-        # the agent.
-        AGENT_COMMENTS=$(echo "$COMMENTS_JSON" | jq '[.comments[] | select(
-          ((.body | startswith("Orchestration issue auto-closed")) or
-           (.body | startswith("**Auto-closed by cleanup.**")) or
-           (.body | startswith("**Agent produced no summary.**"))) | not
-        )]')
-        COUNT=$(echo "$AGENT_COMMENTS" | jq 'length')
-        if [ "$COUNT" -gt 0 ]; then
-          echo "PASS: agent posted $COUNT non-workflow comment(s) on orchestration issue #$ISSUE_NUMBER."
+        if [ -s "$SUMMARY_FILE" ]; then
           echo "agent_posted=true" >> "$GITHUB_OUTPUT"
         else
-          echo "FAIL: agent produced no summary comment on orchestration issue #$ISSUE_NUMBER."
-          gh issue comment "$ISSUE_NUMBER" --repo "${{ github.repository }}" \
-            --body "**Agent produced no summary.** The project agent's run finished without posting the required summary comment (see \`.github/prompts/project.md\`: \"Your final tool call should always be the \`gh issue comment\` that posts the summary\"). Recording this run as a failure, not a clean day. Workflow run: ${RUN_URL}"
           echo "agent_posted=false" >> "$GITHUB_OUTPUT"
         fi
+        if [ -s "$ACTIONS_LOG" ]; then
+          echo "shim_reached=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "shim_reached=false" >> "$GITHUB_OUTPUT"
+          echo "::error::actions log is empty — the gh shim was never invoked inside the sandbox this run; treat as a failure, never as a clean day."
+        fi
 
-    - name: Close orchestration issue
-      if: always() && steps.create-issue.outputs.issue_number
+    - name: Publish step summary
+      if: always()
+      env:
+        SUMMARY_FILE: ${{ github.workspace }}/.agent-out/summary.md
+        ACTIONS_LOG: ${{ github.workspace }}/.agent-out/actions.log
+      run: |
+        {
+          echo "## Project agent summary"
+          if [ -s "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE"
+          else
+            echo "Agent produced no summary."
+          fi
+          echo
+          echo "## gh shim actions log"
+          echo '```'
+          if [ -s "$ACTIONS_LOG" ]; then
+            cat "$ACTIONS_LOG"
+          else
+            echo "(empty — shim was never invoked)"
+          fi
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Post to log issue when actions were taken
+      if: always() && steps.assert-agent-output.outputs.agent_posted == 'true'
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        ACTIONS_LOG: ${{ github.workspace }}/.agent-out/actions.log
+        SUMMARY_FILE: ${{ github.workspace }}/.agent-out/summary.md
+        LOG_ISSUE: ${{ steps.log-issue.outputs.issue_number }}
       run: |
-        gh issue close "${{ steps.create-issue.outputs.issue_number }}" --repo "${{ github.repository }}" \
-          --comment "Orchestration issue auto-closed after agent run. See workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        set -euo pipefail
+        if ! grep -q '^ALLOWED ' "$ACTIONS_LOG" 2>/dev/null; then
+          echo "No ALLOWED actions this run — nothing to post."
+          exit 0
+        fi
+        {
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo
+          cat "$SUMMARY_FILE"
+        } > /tmp/log-comment.md
+        gh issue comment "$LOG_ISSUE" --repo "${{ github.repository }}" --body-file /tmp/log-comment.md
 
-    # Placed AFTER the close step (rather than exiting 1 directly in the
-    # assert step above) so the orchestration issue is always closed
-    # regardless of outcome -- a failed run must not leave the issue open
-    # for the next cleanup job to also complain about. `if: always()` makes
-    # this run even if an earlier step in the job failed outright.
-    - name: Fail run if agent produced no summary
-      if: always() && steps.create-issue.outputs.issue_number
+    # Guards run 30241204433 (2026-07-27): a step exiting 0 with no summary
+    # is a silent no-op, not a clean day — must fail, not look green.
+    - name: Fail run if agent produced no summary or shim not reached
+      if: always()
       env:
         AGENT_POSTED: ${{ steps.assert-agent-output.outputs.agent_posted }}
+        SHIM_REACHED: ${{ steps.assert-agent-output.outputs.shim_reached }}
       run: |
         set -euo pipefail
         if [ "$AGENT_POSTED" != "true" ]; then
-          echo "::error::Project agent produced no summary comment this run -- see the recorded-silence comment on the orchestration issue. Failing the run so a silent no-op is never indistinguishable from a green clean-day run."
+          echo "::error::Project agent produced no summary file this run."
           exit 1
         fi
-        echo "Agent posted a summary comment -- run considered successful."
+        if [ "$SHIM_REACHED" != "true" ]; then
+          echo "::error::gh shim actions log is empty -- shim never invoked inside the sandbox."
+          exit 1
+        fi
+        echo "Agent posted a summary and the shim was reached -- run considered successful."

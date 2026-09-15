@@ -150,7 +150,7 @@ jobs:
             "$file" "$display" "$STATE" "$RUN_ID" "$CONCLUSION" "$CREATED_AT" "${ATTEMPT:-}" "$thr_human"
         done <<'EOF'
         monitor.yml|Monitor|19800|5h30m
-        project.yml|Daily Project Assessment|93600|26h
+        project.yml|Weekly Project Assessment|612000|7d2h
         product.yml|Product Analysis|352800|98h
         vahter-mirror-reconcile.yml|Vahter: Mirror Reconcile|93600|26h
         EOF

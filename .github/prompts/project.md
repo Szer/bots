@@ -57,17 +57,20 @@ signal from an existing SRE/monitor finding.
 ## Non-Interactive Flow — read this first
 
 You are running inside a scheduled GitHub Actions workflow. **There is no human listening**: any
-question you ask will be ignored and the workflow will close the orchestration issue automatically
-when you exit.
+question you ask will be ignored, and nothing you write outside `$AGENT_SUMMARY_FILE` is read by
+anyone.
 
 - **Take action directly.** Run `gh issue create`, `gh issue comment`, `gh issue close` yourself —
   don't list commands and ask the user to run them.
 - **Never end your run with a question** ("Would you like…?", "Should I…?"). Do the work or skip
-  it, then post the summary comment and exit.
-- **If a tool fails for real** (network down, `gh` unreachable, permission denied), state that in
-  the orchestration issue summary comment and exit — don't ask for permission to retry.
-- Your final tool call should always be the `gh issue comment` that posts the summary to the
-  orchestration issue.
+  it, then write the summary file and exit.
+- **If a tool fails for real** (network down, `gh` unreachable, permission denied) — or a `gh`
+  command is refused by the shim (see rule 3 below) — write that into the summary file and exit;
+  don't retry, work around it, or ask for permission.
+- Your final action should always be writing your summary markdown to `$AGENT_SUMMARY_FILE`
+  (an absolute path in the workspace) — see "Summary" below.
+- The long-lived log issue number is in `$AGENT_LOG_ISSUE`. Never comment on it or close it —
+  the workflow (not you) posts your summary there, and only on runs where you acted.
 
 ## Bots in this repo
 
@@ -84,14 +87,14 @@ Shared infrastructure: `src/BotInfra/`, `tests/BotTestInfra/`, `tests/FakeTgApi/
 
 ## Network Errors
 
-If `gh` CLI commands fail with network errors, immediately post a comment on the orchestration
-issue and stop:
+If `gh` CLI commands fail with network errors, write the failure into `$AGENT_SUMMARY_FILE` and
+exit. Do not retry or diagnose:
 
 ```bash
-gh issue comment ISSUE_NUMBER --body "Network error: cannot reach GitHub API. Check VPN/firewall config."
+cat >> "$AGENT_SUMMARY_FILE" << 'BODY'
+Network error: cannot reach GitHub API. Check VPN/firewall config.
+BODY
 ```
-
-Do not retry or diagnose — the workflow will close the issue.
 
 A clean day — nothing demonstrable found — is a valid, common outcome. If no demonstrable tech
 debt surfaced, **create nothing** — say so in the summary and exit. An empty backlog day is a
@@ -157,7 +160,7 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
 1. **One issue per root cause — stable titles, never dated.** A finding's title must describe the
    underlying problem and stay **identical** across runs so the same problem maps to the same
    issue. **Never put a date, "scan YYYY-MM-DD", or run id in a finding's title** — that is the
-   #1 cause of duplicates. (Dates belong only on the orchestration issue, not on findings.)
+   #1 cause of duplicates. (A date belongs only in a summary or comment, never in a title.)
 2. **Search before creating — by root cause, not wording.** List open **and recently-closed**
    `project` issues and match on the underlying problem, not the title text. Differently-worded
    issues about the same root cause are duplicates — never re-file them.
@@ -166,10 +169,21 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
      --jq '.[] | "\(.number) [\(.state)]: \(.title)"'
    ```
    If a finding was **closed as invalid / won't-fix / by-design**, it is settled — do not reopen
-   or re-file it. **Default to bumping an existing issue; creating a new one is the exception.**
-3. **Bump if exists** — if a similar issue is open, add a comment:
-   `**Project assessment bump (YYYY-MM-DD)** Still relevant. [updated context]`. Add the `project`
-   label if missing. Do **not** open a second issue for it.
+   or re-file it. **If a matching issue is already open, the default action is to do NOTHING** —
+   it being open already means "still relevant"; move on to the next finding. Only touch it per
+   rule 3 (evidence changed) or rule 7 (resolved).
+3. **Comment on an existing finding only when something changed.** Allowed only to (a) close it
+   as resolved (rule 7 — verified fix in `main`), or (b) add evidence that has actually **changed**
+   since the issue body / last comment — a moved `file:line`, a new reference, a new SRE/monitor
+   issue citing it. Never comment to restate evidence that's already there.
+
+   **Hard exclusions — never comment if:** a human (any author other than `github-actions` /
+   `github-actions[bot]`) has commented on the issue; a pull request references it; or the last
+   agent comment on it is less than 14 days old.
+
+   **These rules are enforced mechanically** by a wrapper around `gh` on `PATH`. A refused
+   `gh issue comment` prints `REFUSED by project-agent gh shim: ...` and exits non-zero — do not
+   retry or work around it, just note the refusal (issue number + reason) in your summary.
 4. **Always use `--label "project"`** when creating issues. **When a finding is specific to one
    bot's source directory**, also add that bot's `bot:<name>` label (e.g. `bot:vahter`,
    `bot:coupon`, `bot:alita` — the label already exists, created by the workflow). Shared-infra
@@ -208,25 +222,22 @@ gh issue list --state open --label project --json number,title --jq '.[] | "\(.n
 
 ## Summary
 
-Post a summary comment on the orchestration issue. The workflow closes it automatically.
-
-Use a heredoc with `--body-file`, **not** `--body "..."` — your summary contains inline backticks
-(file paths, label names, code refs) and bash command-substitutes backticks inside double quotes,
-mangling the comment and failing with "Permission denied" / "command not found":
+Your **final action** must be writing your summary markdown to `$AGENT_SUMMARY_FILE` — this is a
+plain file write, not a `gh` call, and nothing in this workflow posts it anywhere except the
+"Post to log issue when actions were taken" step, and only when you actually took an action:
 
 ```bash
-cat > /tmp/summary.md << 'BODY'
+cat > "$AGENT_SUMMARY_FILE" << 'BODY'
 ## Project Assessment Summary (YYYY-MM-DD)
 
 ### Actions Taken
 - New issues created: N (#X, #Y) — for each, one line on why it is NOT a duplicate of any
   open/closed project issue, and its `bot:<name>` label if bot-specific
-- Existing issues bumped: N (#X)
+- Existing issues updated (changed evidence): N (#X)
 - Issues closed as resolved: N (#X)
 
 ### Key Observations
-- [Notable findings, even if no issue was created — including "clean day, nothing filed"]
+- [Notable findings, even if no issue was created — including "clean day, nothing filed"; note
+  any `gh` command the shim refused and why]
 BODY
-
-gh issue comment ISSUE_NUMBER --body-file /tmp/summary.md
 ```
