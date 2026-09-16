@@ -83,8 +83,7 @@ type BotService(
                     |> db.UpsertUser
 
                 // Pending /feedback: next non-command message is forwarded to admins.
-                let isCommand =
-                    msg.Text |> Option.exists (fun t -> t.StartsWith("/"))
+                let isCommand = TelegramMessage.isCommand msg
 
                 if isCommand then
                     // Any command cancels pending feedback (if present)

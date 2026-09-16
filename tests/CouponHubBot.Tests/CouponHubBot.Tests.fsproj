@@ -38,6 +38,7 @@
     <Compile Include="GitHubServiceIsConfiguredTests.fs" />
     <Compile Include="WhoisTests.fs" />
     <Compile Include="BalancesTests.fs" />
+    <Compile Include="ForwardedCommandTests.fs" />
     <Compile Include="HealthCheckTests.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

@@ -496,6 +496,14 @@ type CommandHandler(
             let recordCommand cmd =
                 Metrics.commandTotal.Add(1L, KeyValuePair("command", box cmd))
 
+            // A forwarded command must never execute; non-command forwarded text is unaffected.
+            // Photo captions (the /add path below) are untouched — forwarding a photo is legitimate.
+            if msg.ForwardOrigin.IsSome && TelegramMessage.isCommand msg then
+                logger.LogInformation("Ignoring forwarded command from user {UserId}", user.id)
+                if msg.Chat.Type = ChatType.Private then
+                    do! sendText msg.Chat.Id "Пересланные сообщения не выполняются как команды."
+            else
+
             // user.id always equals msg.From.Id here: BotService only dispatches private
             // messages whose From is present, and `user` is upserted from that From.
             match msg.Text with

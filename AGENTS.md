@@ -54,7 +54,7 @@ scripts/
 
 ## Comment-Ratio Gate
 
-Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comment-ratio.conf`: (1) net new `//` comment lines per language (tokei-based before/after delta) fail at ≥5 lines AND >5% of net new non-blank lines — `///` doc comments are exempt here; (2) any single added comment block (incl. `///`) longer than 2 lines fails outright, regardless of ratio. Enforced by `.githooks/pre-commit` and CI (`comment-lint.yml`); run `make install-hooks` once per clone to arm it locally.
+Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comment-ratio.conf`: (1) net new `//` comment lines per language (tokei-based before/after delta) fail at ≥5 lines AND >5% of net new non-blank lines — `///` doc comments are exempt here; (2) any single added comment block (incl. `///`) longer than 2 lines fails outright, regardless of ratio. Enforced by `.githooks/pre-commit` and CI (`comment-lint.yml`); run `make install-hooks` once per clone to arm it locally. Comments state constraints and invariants only — never transient facts such as incident names, dates, or PR/issue numbers; those belong in commit messages and PR descriptions.
 
 ## Development Environment
 
