@@ -55,6 +55,12 @@ type CouponFlowHandler(
     let albumNudgeLine =
         "\n\n_(подсказка: можно выделить несколько фото сразу и отправить альбомом)_"
 
+    /// Buckets a flow's recognised-field count into full/partial/none for ocr_read_total.
+    let ocrReadOutcome (recognizedCount: int) (neededCount: int) : string =
+        if recognizedCount = neededCount then "full"
+        elif recognizedCount = 0 then "none"
+        else "partial"
+
     let buildConfirmTextAndKeyboard (value: decimal) (minCheck: decimal) (expiresAt: DateOnly) (barcodeText: string | null) (validFrom: DateOnly option) =
         let v = value.ToString("0.##")
         let mc = minCheck.ToString("0.##")
@@ -72,6 +78,7 @@ type CouponFlowHandler(
 
     member _.HandleAddWizardStart (user: DbUser) (chatId: int64) =
         task {
+            Metrics.addStartedTotal.Add(1L, KeyValuePair("source", box "command"))
             do! db.UpsertPendingAddFlow(
                     { user_id = user.id
                       stage = "awaiting_photo"
@@ -126,9 +133,14 @@ type CouponFlowHandler(
                             logger.LogInformation(
                                 "Manual-add OCR result for user {UserId}: hasBarcode={HasBarcode}",
                                 userId, not (isNull barcodeText))
+                            Metrics.ocrReadTotal.Add(
+                                1L,
+                                KeyValuePair("flow", box "caption"),
+                                KeyValuePair("outcome", box (ocrReadOutcome (if isNull barcodeText then 0 else 1) 1)))
                             return barcodeText
                 with ex ->
                     logger.LogWarning(ex, "Manual-add OCR failed for user {UserId}; adding coupon without barcode", userId)
+                    Metrics.ocrReadTotal.Add(1L, KeyValuePair("flow", box "caption"), KeyValuePair("outcome", box "failed"))
                     return null
         }
 
@@ -270,6 +282,14 @@ type CouponFlowHandler(
                             "Single-photo OCR result for user {UserId}: hasBarcode={HasBarcode} hasValue={HasValue} hasMinCheck={HasMinCheck} hasValidTo={HasValidTo}",
                             user.id, not (isNull barcodeText), valueOpt.IsSome, minCheckOpt.IsSome, validToOpt.IsSome)
 
+                        let recognizedCount =
+                            [ not (isNull barcodeText); valueOpt.IsSome; minCheckOpt.IsSome; validToOpt.IsSome ]
+                            |> List.filter id |> List.length
+                        Metrics.ocrReadTotal.Add(
+                            1L,
+                            KeyValuePair("flow", box "single"),
+                            KeyValuePair("outcome", box (ocrReadOutcome recognizedCount 4)))
+
                         if isNull barcodeText then
                             // Barcode not recognized — photo quality is insufficient.
                             do! db.UpsertPendingAddFlow(
@@ -378,6 +398,7 @@ type CouponFlowHandler(
                 // Do NOT override explicit /add manual flow via caption.
                 match BotHelpers.getLargestPhotoFileId msg with
                 | Some photoFileId when msg.Caption |> Option.forall (fun c -> not (c.StartsWith("/add")) && not (c.StartsWith("/a"))) ->
+                    Metrics.addStartedTotal.Add(1L, KeyValuePair("source", box "photo"))
                     do! this.HandleAddWizardPhoto user msg.Chat.Id photoFileId
                     return true
                 | _ -> return false
@@ -488,10 +509,13 @@ type CouponFlowHandler(
             let recordOk () =
                 if not (isNull a) then %a.SetTag("outcome", "ok")
                 Metrics.batchItemOutcomeTotal.Add(1L, KeyValuePair("outcome", box "ok"))
+                Metrics.ocrReadTotal.Add(1L, KeyValuePair("flow", box "album"), KeyValuePair("outcome", box "full"))
                 logger.LogInformation(
                     "Batch {BatchId} item {ItemId}: outcome=ok",
                     batchId, itemId)
-            let writeNeedsInput note =
+            // `readOutcome` is couponhubbot_ocr_read_total's outcome (full/partial/none/failed),
+            // a finer-grained view than `note`/batchItemOutcomeTotal's failure_note.
+            let writeNeedsInput note readOutcome =
                 task {
                     do! db.UpdateBatchItemNeedsInput(itemId, note)
                     if not (isNull a) then
@@ -501,6 +525,10 @@ type CouponFlowHandler(
                         1L,
                         KeyValuePair("outcome", box "needs_input"),
                         KeyValuePair("failure_note", box note))
+                    Metrics.ocrReadTotal.Add(
+                        1L,
+                        KeyValuePair("flow", box "album"),
+                        KeyValuePair("outcome", box readOutcome))
                     logger.LogInformation(
                         "Batch {BatchId} item {ItemId}: outcome=needs_input note={FailureNote}",
                         batchId, itemId, note)
@@ -510,16 +538,16 @@ type CouponFlowHandler(
                 let ocrConfig = ocrOptions.Value
 
                 if not ocrConfig.OcrEnabled then
-                    do! writeNeedsInput "OCR disabled"
+                    do! writeNeedsInput "OCR disabled" "failed"
                 else
                     let! file = tg.CallExn(Funogram.Telegram.Req.GetFile.Make(photoFileId))
                     let filePath = file.FilePath |> Option.defaultValue ""
                     if String.IsNullOrWhiteSpace filePath then
-                        do! writeNeedsInput "OCR failed"
+                        do! writeNeedsInput "OCR failed" "failed"
                     else
                         let! bytes = tg.DownloadFile filePath
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
-                            do! writeNeedsInput "OCR failed"
+                            do! writeNeedsInput "OCR failed" "failed"
                         else
                             // Transient/timeout failures are retried by the OCR HTTP
                             // resilience pipeline; Recognize then degrades to a null-field
@@ -543,7 +571,17 @@ type CouponFlowHandler(
                                     if ocr.backendFailed then "OCR failed"
                                     elif String.IsNullOrWhiteSpace ocr.barcode then "no barcode"
                                     else "partial"
-                                do! writeNeedsInput note
+                                let readOutcome =
+                                    if ocr.backendFailed then "failed"
+                                    else
+                                        let recognizedCount =
+                                            [ not (String.IsNullOrWhiteSpace ocr.barcode)
+                                              ocr.couponValue.HasValue
+                                              ocr.minCheck.HasValue
+                                              ocr.validTo.HasValue ]
+                                            |> List.filter id |> List.length
+                                        ocrReadOutcome recognizedCount 4
+                                do! writeNeedsInput note readOutcome
                             else
                                 let validFromNullable =
                                     if ocr.validFrom.HasValue then
@@ -561,7 +599,7 @@ type CouponFlowHandler(
                                 recordOk ()
             with ex ->
                 logger.LogWarning(ex, "OCR failed for batch {BatchId} item {ItemId}", batchId, itemId)
-                try do! writeNeedsInput "OCR failed"
+                try do! writeNeedsInput "OCR failed" "failed"
                 with ex2 ->
                     logger.LogError(ex2, "Also failed to write OCR-failed status for item {ItemId}", itemId)
         } :> Task
@@ -778,6 +816,7 @@ type CouponFlowHandler(
                     do! sendText chatId "Этот купон не попал в текущий пакет — альбом уже обрабатывается. Пришли фото отдельным сообщением после подтверждения текущего пакета."
                     return true
                 | AddBatchItemResult.ItemAdded itemId ->
+                    Metrics.addStartedTotal.Add(1L, KeyValuePair("source", box "album"))
                     // Fire-and-forget OCR. DB is the channel back to FinalizeBatch.
                     // Capture the current activity context BEFORE Task.Run so the
                     // batchOcrItem span links to handleAlbumPhoto in OTEL traces —

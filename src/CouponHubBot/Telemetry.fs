@@ -63,3 +63,13 @@ module Metrics =
     /// 1 per active batch that was abandoned without the user clicking confirm/cancel.
     /// Tag: reason ∈ {supersede_album, command, ttl}.
     let batchAbandonedTotal = meter.CreateCounter<int64>("couponhubbot_batch_abandoned_total")
+
+    // ── Add-flow source + OCR accuracy ────────────────────────────────
+
+    /// 1 per photo/attempt entering an add flow (not per retry).
+    /// Tag: source ∈ {command, photo, album, caption}.
+    let addStartedTotal = meter.CreateCounter<int64>("couponhubbot_add_started_total")
+
+    /// 1 per OCR attempt. Tags: flow ∈ {single, caption, album}, outcome ∈
+    /// {full, partial, none, failed} (all/some/none of the needed fields recognised, or the call failed/was disabled).
+    let ocrReadTotal = meter.CreateCounter<int64>("couponhubbot_ocr_read_total")

@@ -576,6 +576,7 @@ type CommandHandler(
                 | None -> do! sendText msg.Chat.Id "Формат: /return <id>"
             | Some t when t.StartsWith("/add ") || t.StartsWith("/a ") ->
                 recordCommand "add_manual"
+                Metrics.addStartedTotal.Add(1L, KeyValuePair("source", box "caption"))
                 do! sendText msg.Chat.Id "Для ручного добавления пришли фото с подписью: /add <discount> <min_check> <date>"
             | Some t when t.StartsWith("/void ") ->
                 recordCommand "void"
@@ -613,6 +614,7 @@ type CommandHandler(
                     msg.Caption |> Option.exists (fun c -> c.StartsWith("/add") || c.StartsWith("/a"))
                 if hasPhoto && captionIsAdd then
                     recordCommand "add_photo"
+                    Metrics.addStartedTotal.Add(1L, KeyValuePair("source", box "caption"))
                     do! couponFlow.HandleAddManual user msg
                 else
                     logger.LogInformation("Ignoring private message")
