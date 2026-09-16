@@ -293,7 +293,7 @@ type Tg() =
                 (date |> Option.defaultValue DateTime.UtcNow),
                 (originalSender |> Option.defaultWith (fun () -> Tg.user()))))
 
-    static member dmPhotoWithCaption(caption: string, fromUser: User, ?fileId: string) =
+    static member dmPhotoWithCaption(caption: string, fromUser: User, ?fileId: string, ?forwardOrigin: MessageOrigin) =
         let chat = Tg.privateChat(id = fromUser.Id)
         let fid = defaultArg fileId ($"photo-{next ()}")
         Update.Create(
@@ -305,7 +305,8 @@ type Tg() =
                     chat = chat,
                     from = fromUser,
                     caption = caption,
-                    photo = [| PhotoSize.Create(fid, fid + "-uid", 10L, 10L, fileSize = 1024L) |]
+                    photo = [| PhotoSize.Create(fid, fid + "-uid", 10L, 10L, fileSize = 1024L) |],
+                    ?forwardOrigin = forwardOrigin
                 )
         )
 
@@ -313,7 +314,7 @@ type Tg() =
     /// of a real Telegram album shares the same media_group_id but has a distinct
     /// message_id and file_id. Tests pass an explicit messageId to assert
     /// reply_parameters.message_id matches in per-failed-photo replies.
-    static member dmAlbumPhoto(fromUser: User, mediaGroupId: string, ?fileId: string, ?messageId: int64, ?caption: string) =
+    static member dmAlbumPhoto(fromUser: User, mediaGroupId: string, ?fileId: string, ?messageId: int64, ?caption: string, ?forwardOrigin: MessageOrigin) =
         let chat = Tg.privateChat(id = fromUser.Id)
         let fid = defaultArg fileId ($"album-photo-{next ()}")
         let mid = defaultArg messageId (next())
@@ -327,7 +328,8 @@ type Tg() =
                     from = fromUser,
                     ?caption = caption,
                     mediaGroupId = mediaGroupId,
-                    photo = [| PhotoSize.Create(fid, fid + "-uid", 10L, 10L, fileSize = 1024L) |]
+                    photo = [| PhotoSize.Create(fid, fid + "-uid", 10L, 10L, fileSize = 1024L) |],
+                    ?forwardOrigin = forwardOrigin
                 )
         )
 
