@@ -269,7 +269,7 @@ type Tg() =
 
     // ── Message factories (CouponHubBot-style) ──────────────────────────────
 
-    static member dmMessage(text: string, fromUser: User) =
+    static member dmMessage(text: string, fromUser: User, ?forwardOrigin: MessageOrigin) =
         let chat = Tg.privateChat(id = fromUser.Id)
         Update.Create(
             updateId = next(),
@@ -279,9 +279,19 @@ type Tg() =
                     date = DateTime.UtcNow,
                     chat = chat,
                     from = fromUser,
-                    text = text
+                    text = text,
+                    ?forwardOrigin = forwardOrigin
                 )
         )
+
+    /// A forward_origin as Telegram sends it for a message forwarded from a known user —
+    /// the shape exercised by the forwarded-command guard.
+    static member forwardedFromUser(?originalSender: User, ?date: DateTime) =
+        MessageOrigin.User(
+            MessageOriginUser.Create(
+                "user",
+                (date |> Option.defaultValue DateTime.UtcNow),
+                (originalSender |> Option.defaultWith (fun () -> Tg.user()))))
 
     static member dmPhotoWithCaption(caption: string, fromUser: User, ?fileId: string) =
         let chat = Tg.privateChat(id = fromUser.Id)

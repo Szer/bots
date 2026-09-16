@@ -496,6 +496,14 @@ type CommandHandler(
             let recordCommand cmd =
                 Metrics.commandTotal.Add(1L, KeyValuePair("command", box cmd))
 
+            // Forwarded text never executes as a command (coupon 1534 replay incident).
+            // Photo captions (the /add path below) are untouched — forwarding is legitimate there.
+            if msg.Text.IsSome && msg.ForwardOrigin.IsSome then
+                logger.LogInformation("Ignoring forwarded text command from user {UserId}", user.id)
+                if msg.Chat.Type = ChatType.Private then
+                    do! sendText msg.Chat.Id "Пересланные сообщения не выполняются как команды."
+            else
+
             // user.id always equals msg.From.Id here: BotService only dispatches private
             // messages whose From is present, and `user` is upserted from that From.
             match msg.Text with
