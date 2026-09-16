@@ -228,7 +228,7 @@ type CommandHandler(
         task {
             let! updated = db.MarkUsed(couponId, user.id)
             if updated then
-                do! sendText chatId $"Купон ID:{couponId} отмечен как использованный."
+                do! sendText chatId $"Купон ID:{couponId} отмечен как использованный. Если это ошибка — напиши администратору, действие можно откатить."
             else
                 do! sendText chatId $"Не получилось отметить купон ID:{couponId}. Убедись что он взят тобой."
             return updated

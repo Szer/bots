@@ -657,6 +657,8 @@ VALUES (99901, 'constraint-test-photo-2', 10, 50, '2026-06-01', 'BARCODE-CONSTRA
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls 221L "отмечен",
                 $"Expected DM with 'отмечен'. Got %d{calls.Length} calls")
+            Assert.True(findCallWithText calls 221L "напиши администратору",
+                "Success message should point non-admins at an admin for recovery")
         }
 
     [<Fact>]
