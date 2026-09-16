@@ -8,8 +8,8 @@ open FakeCallHelpers
 open BatchTestHelpers
 open Funogram.Telegram.Types
 
-/// #498: a forwarded old /undo group message replayed into the bot DM reverted someone
-/// else's legitimate action (coupon 1534). Forwarded text must never execute as a command.
+/// A forwarded command must never execute, regardless of admin status or command kind;
+/// forwarded non-command text and forwarded photos (coupon adds) are unaffected.
 type ForwardedCommandTests(fixture: DefaultCouponHubTestContainers) =
 
     let adminId = 900L
@@ -97,6 +97,24 @@ type ForwardedCommandTests(fixture: DefaultCouponHubTestContainers) =
             let! calls = fixture.GetFakeCalls("sendMessage")
             Assert.True(findCallWithText calls taker.Id "Пересланные сообщения не выполняются как команды",
                 "Forwarded command in a private chat should get the one-line rejection")
+        }
+
+    [<Fact>]
+    let ``Forwarded non-command text in a private chat is silently ignored, same as a plain one`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let taker = Tg.user(id = 9807L, username = "fwd_plain_text", firstName = "Taker")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let forwarded = Tg.dmMessage("just forwarding this note, not a command", taker, forwardOrigin = Tg.forwardedFromUser())
+            let! resp = fixture.SendUpdate(forwarded)
+            Assert.Equal(System.Net.HttpStatusCode.OK, resp.StatusCode)
+
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.Empty(calls)
+            let! count = getCouponCount ()
+            Assert.Equal(0L, count)
         }
 
     // ── Forwarded photos must keep working — spouses forward each other coupon photos ──
