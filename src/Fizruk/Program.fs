@@ -38,9 +38,14 @@ WebhookHost.configureSharedServices webhookCfg builder
 
 %builder.Services.AddSingleton<FizrukConfig>(config)
 
+// FIZRUK_FAKE_K8S selects an in-memory gateway with no cluster dependency —
+// used by the container smoke tests, never set in production.
 %builder.Services.AddSingleton<IK8sGateway>(fun _ ->
-    let k8sConfig = k8s.KubernetesClientConfiguration.InClusterConfig()
-    KubernetesGateway(new k8s.Kubernetes(k8sConfig)) :> IK8sGateway)
+    if getEnvOrBool "FIZRUK_FAKE_K8S" false then
+        InMemoryK8sGateway() :> IK8sGateway
+    else
+        let k8sConfig = k8s.KubernetesClientConfiguration.InClusterConfig()
+        KubernetesGateway(new k8s.Kubernetes(k8sConfig)) :> IK8sGateway)
 
 %builder.Services.AddSingleton<INotifier>(fun sp ->
     TelegramNotifier(sp.GetRequiredService<ITelegramApi>(), sp.GetRequiredService<ILogger<TelegramNotifier>>())

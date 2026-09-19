@@ -5,6 +5,7 @@
     <Compile Include="Config.fs" />
     <Compile Include="Domain.fs" />
     <Compile Include="K8sGateway.fs" />
+    <Compile Include="InMemoryK8sGateway.fs" />
     <Compile Include="Rcon.fs" />
     <Compile Include="RakNet.fs" />
     <Compile Include="PlayerProbe.fs" />
