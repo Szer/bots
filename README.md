@@ -64,14 +64,42 @@ and in a mounted config file.
   `@botname` suffix, case-insensitive). If a chat controls exactly one game the name
   can be omitted; a chat controlling several games must name one for `/start`/`/stop`,
   while a nameless `/status` reports on all of them.
-- **Config** (`FIZRUK_CONFIG_PATH`, a mounted ConfigMap): a `games` map (per game:
-  `displayName`, `namespace`, `deployment`, `podSelector`, `container`,
+- **Config** (`FIZRUK_CONFIG_PATH`, a mounted ConfigMap): a top-level optional
+  `gateway` (`name`, `namespace` — the shared Envoy Gateway), a `games` map (per
+  game: `displayName`, `namespace`, `deployment`, `podSelector`, `container`,
   `nodeLabelSelector`, `address`, an optional `players` probe — `rcon` or `raknet` —,
-  `activityRegex`, `idleGraceMinutes`, `idleWindowMinutes`, `startTimeoutMinutes`) and
-  a `chats` map from Telegram chat id to the list of games that chat may control.
+  an optional `listener` (`port`, `protocol` — `UDP` or `TCP`; requires the
+  top-level `gateway` to be set), `activityRegex`, `idleGraceMinutes`,
+  `idleWindowMinutes`, `startTimeoutMinutes`) and a `chats` map from Telegram chat
+  id to the list of games that chat may control.
 - **Idle shutdown**: every 10 minutes, a game running past its `idleGraceMinutes`
   with nobody online (player probe) and no matching activity in its recent pod logs
   is scaled back to 0, with every controlling chat notified.
+- **On-demand public port**: a game's UDP/TCP port on the shared load balancer is a
+  billed-hourly rule, and only five are free, so Fizruk opens it only while the game
+  is running instead of listening on it permanently. A game with `listener`
+  configured gets a Gateway API `ListenerSet` (`gateway.networking.k8s.io/v1`,
+  parented to the top-level `gateway`) created before it's scaled up and deleted
+  after it's scaled down:
+  - `/start` creates the `ListenerSet` before scaling to 1 — the LB rule
+    provisions while the node boots. If creation fails, Fizruk doesn't scale and
+    replies "Could not open the public port: ...".
+  - The start watcher waits for the pod to be Ready **and** the `ListenerSet`'s
+    `Programmed` condition True before posting "ready"; a timeout names whichever
+    is still missing ("pod not ready" or "public port `<port>` not programmed").
+  - `/stop` and an idle stop scale to 0 first, then delete the `ListenerSet`; a
+    deletion failure is logged and appended to the reply/notification as
+    "(public port cleanup failed: ...)" — the stop itself is still reported.
+  - A reconcile pass runs on startup and at the start of every idle tick: for
+    every game with a `listener`, it ensures the `ListenerSet` exists when desired
+    replicas are non-zero and deletes it otherwise. Idempotent and cheap — this is
+    what recovers a `ListenerSet` left out of sync by a Fizruk restart or crash
+    mid-command.
+  - `/status` adds a `Public port <port>/<protocol>: open / opening / closed` line
+    for any game with a `listener` (`open` = Programmed, `opening` = created but not
+    yet Programmed, `closed` = no `ListenerSet`).
+  - **RBAC**: the bot's service account needs `get`, `list`, `create`, `delete` on
+    `listenersets.gateway.networking.k8s.io` in each game's namespace.
 - **Env vars**: `FIZRUK_CONFIG_PATH`, `BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`,
   `BOT_USERNAME` (optional, for the `@botname` suffix), `TELEGRAM_API_URL`
   (optional test override), `BOT_WEBHOOK_URL` (optional; when set, Fizruk

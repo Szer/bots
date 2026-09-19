@@ -31,19 +31,32 @@ module private StatusText =
         | PlayersProbeResult.Error msg -> $"Players: unknown ({msg})."
         | PlayersProbeResult.NotConfigured -> "Players: unknown."
 
-    let formatStatus (game: GameConfig) (desired: int) (pod: PodInfo option) (node: NodeInfo option) (players: PlayersProbeResult) (now: DateTimeOffset) : string =
+    let formatStatus
+        (game: GameConfig)
+        (desired: int)
+        (pod: PodInfo option)
+        (node: NodeInfo option)
+        (players: PlayersProbeResult)
+        (listenerLine: string option)
+        (now: DateTimeOffset)
+        : string =
         let prefix = game.DisplayName
+        let withListener (lines: string list) =
+            match listenerLine with
+            | Some line -> lines @ [ line ]
+            | None -> lines
         if desired = 0 then
-            $"{prefix}: stopped."
+            withListener [ $"{prefix}: stopped." ] |> String.concat "\n"
         else
             match pod with
-            | None -> $"{prefix}: starting (pod pending)."
-            | Some p when not p.Ready -> $"{prefix}: starting (pod {p.Phase})."
+            | None -> withListener [ $"{prefix}: starting (pod pending)." ] |> String.concat "\n"
+            | Some p when not p.Ready -> withListener [ $"{prefix}: starting (pod {p.Phase})." ] |> String.concat "\n"
             | Some _ ->
-                [ $"{prefix}: running."
-                  formatNodeLine node now
-                  formatPlayersLine players
-                  $"Address: {game.Address}" ]
+                withListener
+                    [ $"{prefix}: running."
+                      formatNodeLine node now
+                      formatPlayersLine players
+                      $"Address: {game.Address}" ]
                 |> String.concat "\n"
 
     /// "who was online at shutdown" summary for the /stop reply.
@@ -60,6 +73,21 @@ module private StatusText =
         match ageMinutes with
         | Some m -> $"{m / 60}h {m % 60}m"
         | None -> "unknown"
+
+    let formatListenerLine (listener: ListenerConfig) (status: ListenerSetStatus) : string =
+        let state =
+            match status with
+            | ListenerSetStatus.Absent -> "closed"
+            | ListenerSetStatus.Present(_, true) -> "open"
+            | ListenerSetStatus.Present(_, false) -> "opening"
+        $"Public port {listener.Port}/{Config.protocolText listener.Protocol}: {state}"
+
+    /// Appends the "(public port cleanup failed: ...)" suffix Stop/idle-stop add to
+    /// their reply/notification when DeleteListenerSet fails.
+    let formatCleanupSuffix (error: string option) : string =
+        match error with
+        | Some msg -> $" (public port cleanup failed: {msg})"
+        | None -> ""
 
 /// One game's runtime behaviour: state reads, start/stop, the start watcher, and the
 /// idle check, serialised per game so a double /start or /stop is a safe no-op.
@@ -115,12 +143,38 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
             return desired, pod, node, players
         }
 
+    /// `None` for a game with no listener; otherwise the current /status line text.
+    member _.GetListenerLine(game: GameConfig) : Task<string option> =
+        match game.Listener with
+        | None -> Task.FromResult None
+        | Some listener ->
+            task {
+                let! status = k8s.GetListenerSetStatus game
+                return Some(StatusText.formatListenerLine listener status)
+            }
+
     member this.Status(gameId: string) : Task<string> =
         task {
             let game = gameConfig gameId
             let! desired, pod, node, players = this.GetState gameId
-            return StatusText.formatStatus game desired pod node players (time.GetUtcNow())
+            let! listenerLine = this.GetListenerLine game
+            return StatusText.formatStatus game desired pod node players listenerLine (time.GetUtcNow())
         }
+
+    /// Deletes a game's ListenerSet, if it has one, swallowing (and logging) any
+    /// error — the caller still reports the stop, with an appended cleanup-failed note.
+    member _.CleanUpListenerSet(gameId: string, game: GameConfig) : Task<string option> =
+        match game.Listener with
+        | None -> Task.FromResult None
+        | Some _ ->
+            task {
+                try
+                    do! k8s.DeleteListenerSet game
+                    return None
+                with ex ->
+                    logger.LogError(ex, "Fizruk: failed to clean up public port for {Game}", gameId)
+                    return Some ex.Message
+            }
 
     member this.Start(gameId: string) : Task<string> =
         task {
@@ -140,14 +194,31 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                         this.EnsureWatcher gameId
                         return "Already starting."
                 else
-                    do! k8s.ScaleDeployment(game.Namespace, game.Deployment, 1)
-                    this.EnsureWatcher gameId
-                    return $"Starting {game.DisplayName}, the node takes a few minutes. I'll post here once it's ready."
+                    // The LB rule provisions while the node boots, so open the public
+                    // port before scaling up — never scale if that fails.
+                    let! opened =
+                        match game.Listener with
+                        | None -> Task.FromResult(Ok())
+                        | Some _ ->
+                            task {
+                                try
+                                    do! k8s.EnsureListenerSet game
+                                    return Ok()
+                                with ex ->
+                                    logger.LogError(ex, "Fizruk: failed to open public port for {Game}", gameId)
+                                    return Error ex.Message
+                            }
+                    match opened with
+                    | Error msg -> return $"Could not open the public port: {msg}"
+                    | Ok() ->
+                        do! k8s.ScaleDeployment(game.Namespace, game.Deployment, 1)
+                        this.EnsureWatcher gameId
+                        return $"Starting {game.DisplayName}, the node takes a few minutes. I'll post here once it's ready."
             finally
                 %sem.Release()
         }
 
-    member _.Stop(gameId: string) : Task<string> =
+    member this.Stop(gameId: string) : Task<string> =
         task {
             let sem = lockFor gameId
             do! sem.WaitAsync()
@@ -163,7 +234,10 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                             with ex -> return PlayersProbeResult.Error ex.Message
                         }
                     do! k8s.ScaleDeployment(game.Namespace, game.Deployment, 0)
-                    return $"Stopping {game.DisplayName}. Players online at shutdown: {StatusText.formatPlayersAtShutdown players}."
+                    let! cleanupError = this.CleanUpListenerSet(gameId, game)
+                    return
+                        $"Stopping {game.DisplayName}. Players online at shutdown: {StatusText.formatPlayersAtShutdown players}."
+                        + StatusText.formatCleanupSuffix cleanupError
             finally
                 %sem.Release()
         }
@@ -178,16 +252,52 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                     finally watching.TryRemove(gameId) |> ignore
                 } :> Task)
 
-    /// Re-arms a start watcher for every game already scaled up but not yet Ready —
-    /// call once at startup so a mid-start pod restart still gets its notification.
+    /// Re-arms a start watcher for every game already scaled up but not yet Ready, and
+    /// reconciles every ListenerSet — call once at startup.
     member this.ArmPendingWatchers() : Task<unit> =
         task {
+            do! this.ReconcileListenerSets()
             for gameId in config.Games.Keys do
                 let! desired, pod, _node, _players = this.GetState gameId
                 let podReady = pod |> Option.map (fun p -> p.Ready) |> Option.defaultValue false
                 if desired > 0 && not podReady then
                     this.EnsureWatcher gameId
         }
+
+    /// Idempotent pass over every game with a listener: EnsureListenerSet when
+    /// scaled up, DeleteListenerSet when scaled down — recovers from a restart/crash.
+    member _.ReconcileListenerSets() : Task<unit> =
+        task {
+            for gameId in config.Games.Keys do
+                let game = gameConfig gameId
+                match game.Listener with
+                | None -> ()
+                | Some _ ->
+                    try
+                        let! desired = k8s.GetDesiredReplicas(game.Namespace, game.Deployment)
+                        if desired > 0 then do! k8s.EnsureListenerSet game
+                        else do! k8s.DeleteListenerSet game
+                    with ex ->
+                        logger.LogError(ex, "Fizruk: listener-set reconcile failed for {Game}", gameId)
+        }
+
+    /// Pod Ready AND (no listener OR its ListenerSet Programmed). The second element
+    /// is the timeout wording for whichever of the two isn't ready yet.
+    member private _.CheckReady(game: GameConfig, pod: PodInfo option) : Task<bool * string> =
+        match pod with
+        | Some p when p.Ready ->
+            match game.Listener with
+            | None -> Task.FromResult(true, "")
+            | Some listener ->
+                task {
+                    let! status = k8s.GetListenerSetStatus game
+                    let programmed =
+                        match status with
+                        | ListenerSetStatus.Present(_, prog) -> prog
+                        | ListenerSetStatus.Absent -> false
+                    return programmed, $"public port {listener.Port} not programmed"
+                }
+        | _ -> Task.FromResult(false, "pod not ready")
 
     member private this.RunWatcher(gameId: string) : Task =
         task {
@@ -196,6 +306,7 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
             let intervalSeconds = max 1 (int pollInterval.TotalSeconds)
             let maxIterations = (totalSeconds + intervalSeconds - 1) / intervalSeconds
             let mutable finished = false
+            let mutable lastMissing = "pod not ready"
             let mutable i = 0
             while not finished && i < maxIterations do
                 do! Task.Delay pollInterval
@@ -207,18 +318,19 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                     do! notify gameId $"Start cancelled, {game.DisplayName} stopped"
                     finished <- true
                 else
-                    match pod with
-                    | Some p when p.Ready ->
+                    let! ready, missing = this.CheckReady(game, pod)
+                    if ready then
                         do! notify gameId $"{game.DisplayName} ready at {game.Address}"
                         finished <- true
-                    | _ -> ()
+                    else
+                        lastMissing <- missing
             if not finished then
-                do! notify gameId $"{game.DisplayName} did not become ready within {game.StartTimeoutMinutes} minutes, check /status."
+                do! notify gameId $"{game.DisplayName} did not become ready within {game.StartTimeoutMinutes} minutes ({lastMissing}), check /status."
         } :> Task
 
     /// One idle-check pass for a single game: pure IdleDecision.decide fed with a
     /// fresh player probe and a window of recent activity-log lines.
-    member _.CheckIdle(gameId: string) : Task<unit> =
+    member this.CheckIdle(gameId: string) : Task<unit> =
         task {
             let sem = lockFor gameId
             do! sem.WaitAsync()
@@ -263,13 +375,20 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                 | IdleDecision.Stop ->
                     do! k8s.ScaleDeployment(game.Namespace, game.Deployment, 0)
                     Metrics.idleStopTotal.Add(1L, Collections.Generic.KeyValuePair("game", box gameId))
-                    do! notify gameId $"Stopped {game.DisplayName}: nobody online for the last {game.IdleWindowMinutes} min (was up {StatusText.formatUpFor ageMinutes})."
+                    let! cleanupError = this.CleanUpListenerSet(gameId, game)
+                    do!
+                        notify gameId (
+                            $"Stopped {game.DisplayName}: nobody online for the last {game.IdleWindowMinutes} min (was up {StatusText.formatUpFor ageMinutes})."
+                            + StatusText.formatCleanupSuffix cleanupError)
             finally
                 %sem.Release()
         }
 
+    /// Reconciles every listener, then idle-checks every game in turn — called every
+    /// 10 minutes by IdleCheckHostedService.
     member this.CheckAllIdle() : Task<unit> =
         task {
+            do! this.ReconcileListenerSets()
             for gameId in config.Games.Keys do
                 try do! this.CheckIdle gameId
                 with ex -> logger.LogError(ex, "Fizruk idle-check failed for {Game}", gameId)
