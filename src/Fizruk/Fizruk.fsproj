@@ -14,6 +14,7 @@
     <Compile Include="Core.fs" />
     <Compile Include="Commands.fs" />
     <Compile Include="IdleCheckHostedService.fs" />
+    <Compile Include="WebhookRegistrationHostedService.fs" />
     <Compile Include="BotFrontend.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

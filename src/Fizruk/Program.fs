@@ -3,6 +3,7 @@
 open System
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.DependencyInjection
+open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Fizruk
 open BotInfra
@@ -19,6 +20,8 @@ let botUsername =
     match getEnvOr "BOT_USERNAME" "" with
     | "" -> None
     | u -> Some u
+
+let webhookUrl = getEnvOr "BOT_WEBHOOK_URL" ""
 
 let webhookCfg: WebhookConfig =
     { BotToken = getEnv "BOT_TELEGRAM_TOKEN"
@@ -69,6 +72,14 @@ WebhookHost.configureSharedServices webhookCfg builder
         sp.GetRequiredService<ILogger<FizrukBotService>>()))
 
 %builder.Services.AddHostedService<IdleCheckHostedService>()
+
+%builder.Services.AddSingleton<IHostedService>(fun sp ->
+    WebhookRegistrationHostedService(
+        sp.GetRequiredService<ITelegramApi>(),
+        webhookUrl,
+        webhookCfg.SecretToken,
+        sp.GetRequiredService<ILogger<WebhookRegistrationHostedService>>())
+    :> IHostedService)
 
 let app = builder.Build()
 

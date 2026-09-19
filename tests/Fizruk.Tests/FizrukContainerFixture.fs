@@ -43,6 +43,10 @@ let UnknownChatId = 999L
 
 let SecretToken = "fizruk-test-secret"
 
+/// Sentinel BOT_WEBHOOK_URL for the second (webhook-registration-enabled) bot
+/// container — never dialed, FakeTgApi only records the setWebhook call it causes.
+let WebhookUrl = "http://fizruk.invalid/bot"
+
 /// Runs the real Fizruk image (src/Dockerfile.bot, BOT_PROJECT=Fizruk) against a
 /// FakeTgApi container standing in for api.telegram.org, with FIZRUK_FAKE_K8S=true.
 type FizrukContainerFixture() =
@@ -84,9 +88,29 @@ type FizrukContainerFixture() =
             .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(80))
             .Build()
 
+    /// Same image/config, BOT_WEBHOOK_URL set — exercises webhook self-registration
+    /// without a second image build (Testcontainers caches botImage by name).
+    let webhookBotContainer =
+        ContainerBuilder(botImage)
+            .WithNetwork(network)
+            .WithPortBinding(80, true)
+            .WithBindMount(configFilePath, "/config/fizruk.json", AccessMode.ReadOnly)
+            .WithCreateParameterModifier(fun p -> p.HostConfig.SecurityOpt <- ResizeArray [ "label=disable" ])
+            .WithEnvironment("ASPNETCORE_HTTP_PORTS", "80")
+            .WithEnvironment("FIZRUK_CONFIG_PATH", "/config/fizruk.json")
+            .WithEnvironment("BOT_TELEGRAM_TOKEN", "test-token")
+            .WithEnvironment("BOT_AUTH_TOKEN", SecretToken)
+            .WithEnvironment("TELEGRAM_API_URL", $"http://{fakeAlias}:8080")
+            .WithEnvironment("FIZRUK_FAKE_K8S", "true")
+            .WithEnvironment("BOT_WEBHOOK_URL", WebhookUrl)
+            .DependsOn(fakeTgContainer)
+            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(80))
+            .Build()
+
     let mutable botHttp: HttpClient = null
     let mutable fakeTgHttp: HttpClient = null
     let mutable testArtifactsDir: string = null
+    let mutable webhookRegistrationCalls: FakeCall array = [||]
 
     interface IAsyncLifetime with
         member _.InitializeAsync() =
@@ -99,7 +123,7 @@ type FizrukContainerFixture() =
                 do! Task.WhenAll(botBuildTask, fakeTgBuildTask)
 
                 do! fakeTgContainer.StartAsync()
-                do! botContainer.StartAsync()
+                do! Task.WhenAll(botContainer.StartAsync(), webhookBotContainer.StartAsync())
 
                 botHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{botContainer.GetMappedPublicPort(80)}"))
                 botHttp.Timeout <- TimeSpan.FromSeconds 15.0
@@ -107,20 +131,36 @@ type FizrukContainerFixture() =
 
                 fakeTgHttp <- new HttpClient(BaseAddress = Uri($"http://127.0.0.1:{fakeTgContainer.GetMappedPublicPort(8080)}"))
                 fakeTgHttp.Timeout <- TimeSpan.FromSeconds 5.0
+
+                // Snapshot the (fire-and-forget, so not necessarily instant) setWebhook
+                // call now, before any test's ClearFakeCalls() can wipe the evidence.
+                let sw = Diagnostics.Stopwatch.StartNew()
+                let mutable snapshot: FakeCall array = [||]
+                while snapshot.Length = 0 && sw.ElapsedMilliseconds < 10_000L do
+                    let! calls = fakeTgHttp.GetFromJsonAsync<FakeCall array>("/test/calls?method=setWebhook")
+                    snapshot <- calls
+                    if snapshot.Length = 0 then do! Task.Delay 100
+                webhookRegistrationCalls <- snapshot
             } :> Task)
 
         member _.DisposeAsync() =
             ValueTask(task {
                 let! _ = dumpContainerLogs testArtifactsDir "bot" botContainer
+                let! _ = dumpContainerLogs testArtifactsDir "webhook-bot" webhookBotContainer
                 let! _ = dumpContainerLogs testArtifactsDir "fake-tg-api" fakeTgContainer
                 if not (isNull botHttp) then botHttp.Dispose()
                 if not (isNull fakeTgHttp) then fakeTgHttp.Dispose()
                 do! botContainer.DisposeAsync()
+                do! webhookBotContainer.DisposeAsync()
                 do! fakeTgContainer.DisposeAsync()
                 File.Delete configFilePath
             } :> Task)
 
     member _.BotHttp = botHttp
+
+    /// setWebhook calls snapshotted once at startup, independent of any test's
+    /// ClearFakeCalls() — expected to be exactly one, from webhookBotContainer.
+    member _.WebhookRegistrationCalls = webhookRegistrationCalls
 
     member _.SendUpdate(update: Funogram.Telegram.Types.Update) =
         task {

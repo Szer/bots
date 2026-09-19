@@ -74,8 +74,15 @@ and in a mounted config file.
   is scaled back to 0, with every controlling chat notified.
 - **Env vars**: `FIZRUK_CONFIG_PATH`, `BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`,
   `BOT_USERNAME` (optional, for the `@botname` suffix), `TELEGRAM_API_URL`
-  (optional test override), and each RCON-probed game's `passwordEnv` variable
-  (e.g. `FACTORIO_RCON_PASSWORD`).
+  (optional test override), `BOT_WEBHOOK_URL` (optional; when set, Fizruk
+  self-registers its webhook at startup via `BotInfra.WebhookRegistration` —
+  see below), and each RCON-probed game's `passwordEnv` variable (e.g.
+  `FACTORIO_RCON_PASSWORD`).
+- **Webhook self-registration**: opt-in, via `BotInfra.WebhookRegistration`
+  (any bot can adopt it). Unset/empty `BOT_WEBHOOK_URL` is a no-op. When set,
+  Fizruk calls Telegram's `setWebhook` at startup (fire-and-forget, retried a
+  few times with backoff, never crashes the pod) with that URL,
+  `secret_token=BOT_AUTH_TOKEN`, and `allowed_updates=["message"]`.
 - **GHCR image**: `ghcr.io/szer/fizruk`.
 
 ## License

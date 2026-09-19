@@ -2,10 +2,26 @@ module Fizruk.Tests.ContainerTests
 
 open System.Net
 open System.Net.Http
+open System.Text.Json
 open BotTestInfra
 open Fizruk.Tests.ContainerFixture
 open Fizruk.Tests.FakeCallHelpers
 open Xunit
+
+/// Pulls url/secret_token/allowed_updates out of a recorded setWebhook call body.
+let private parseSetWebhookBody (body: string) =
+    use doc = JsonDocument.Parse body
+    let root = doc.RootElement
+    let url = root.GetProperty("url").GetString()
+    let secretToken =
+        match root.TryGetProperty "secret_token" with
+        | true, v -> Some(v.GetString())
+        | false, _ -> None
+    let allowedUpdates =
+        match root.TryGetProperty "allowed_updates" with
+        | true, v -> v.EnumerateArray() |> Seq.map (fun e -> e.GetString()) |> Array.ofSeq
+        | false, _ -> [||]
+    url, secretToken, allowedUpdates
 
 /// Polls fakeTg's recorded calls for up to `timeoutMs` real milliseconds — the
 /// webhook response returns before the bot's outbound sendMessage necessarily lands.
@@ -65,3 +81,18 @@ type ContainerTests(fixture: FizrukContainerFixture) =
             let! calls = fixture.GetFakeCalls "sendMessage"
             Assert.Empty(calls |> Array.filter (fun c -> (parseCallBody c.Body |> Option.bind (fun p -> p.ChatId)) = Some UnknownChatId))
         }
+
+    [<Fact>]
+    let ``webhook self-registration calls setWebhook with the expected url, secret token, and allowed_updates`` () =
+        let calls = fixture.WebhookRegistrationCalls
+        Assert.Single(calls) |> ignore
+        let url, secretToken, allowedUpdates = parseSetWebhookBody calls.[0].Body
+        Assert.Equal(WebhookUrl, url)
+        Assert.Equal(Some SecretToken, secretToken)
+        Assert.Equal<string[]>([| "message" |], allowedUpdates)
+
+    [<Fact>]
+    let ``no setWebhook call is made by the container with BOT_WEBHOOK_URL unset`` () =
+        // The one captured call (asserted above) belongs to webhookBotContainer —
+        // botContainer never sets BOT_WEBHOOK_URL, so it contributes none.
+        Assert.Single(fixture.WebhookRegistrationCalls) |> ignore
