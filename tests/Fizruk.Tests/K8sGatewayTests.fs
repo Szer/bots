@@ -25,7 +25,9 @@ let private parseStatus (json: string) =
 
 [<Fact>]
 let ``parseListenerSetStatus reads a fresh object with no status yet as not accepted, not programmed`` () =
-    Assert.Equal(ListenerSetStatus.Present(accepted = false, programmed = false), parseStatus """{ "metadata": {} }""")
+    Assert.Equal(
+        ListenerSetStatus.Present(accepted = false, programmed = false, listeners = Map.empty),
+        parseStatus """{ "metadata": {} }""")
 
 [<Fact>]
 let ``parseListenerSetStatus reads Accepted and Programmed True conditions`` () =
@@ -35,7 +37,7 @@ let ``parseListenerSetStatus reads Accepted and Programmed True conditions`` () 
             { "type": "Accepted", "status": "True" },
             { "type": "Programmed", "status": "True" } ] } }
         """
-    Assert.Equal(ListenerSetStatus.Present(accepted = true, programmed = true), parseStatus json)
+    Assert.Equal(ListenerSetStatus.Present(accepted = true, programmed = true, listeners = Map.empty), parseStatus json)
 
 [<Fact>]
 let ``parseListenerSetStatus treats a False Programmed condition as not programmed`` () =
@@ -45,7 +47,7 @@ let ``parseListenerSetStatus treats a False Programmed condition as not programm
             { "type": "Accepted", "status": "True" },
             { "type": "Programmed", "status": "False" } ] } }
         """
-    Assert.Equal(ListenerSetStatus.Present(accepted = true, programmed = false), parseStatus json)
+    Assert.Equal(ListenerSetStatus.Present(accepted = true, programmed = false, listeners = Map.empty), parseStatus json)
 
 [<Fact>]
 let ``parseListenerSetStatus requires every per-listener Programmed condition when the listeners array is present`` () =
@@ -57,4 +59,17 @@ let ``parseListenerSetStatus requires every per-listener Programmed condition wh
               { "conditions": [ { "type": "Programmed", "status": "True" } ] },
               { "conditions": [ { "type": "Programmed", "status": "False" } ] } ] } }
         """
-    Assert.Equal(ListenerSetStatus.Present(accepted = false, programmed = false), parseStatus json)
+    Assert.Equal(ListenerSetStatus.Present(accepted = false, programmed = false, listeners = Map.empty), parseStatus json)
+
+[<Fact>]
+let ``parseListenerSetStatus captures each named listener's own Programmed condition`` () =
+    let json =
+        """
+        { "status": {
+            "conditions": [ { "type": "Programmed", "status": "True" } ],
+            "listeners": [
+              { "name": "bedrock-tcp", "conditions": [ { "type": "Programmed", "status": "True" } ] },
+              { "name": "bedrock-udp", "conditions": [ { "type": "Programmed", "status": "False" } ] } ] } }
+        """
+    let expected = Map.ofList [ "bedrock-tcp", true; "bedrock-udp", false ]
+    Assert.Equal(ListenerSetStatus.Present(accepted = false, programmed = false, listeners = expected), parseStatus json)

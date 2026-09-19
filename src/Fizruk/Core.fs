@@ -37,14 +37,11 @@ module private StatusText =
         (pod: PodInfo option)
         (node: NodeInfo option)
         (players: PlayersProbeResult)
-        (listenerLine: string option)
+        (listenerLines: string list)
         (now: DateTimeOffset)
         : string =
         let prefix = game.DisplayName
-        let withListener (lines: string list) =
-            match listenerLine with
-            | Some line -> lines @ [ line ]
-            | None -> lines
+        let withListener (lines: string list) = lines @ listenerLines
         if desired = 0 then
             withListener [ $"{prefix}: stopped." ] |> String.concat "\n"
         else
@@ -74,13 +71,24 @@ module private StatusText =
         | Some m -> $"{m / 60}h {m % 60}m"
         | None -> "unknown"
 
-    let formatListenerLine (listener: ListenerConfig) (status: ListenerSetStatus) : string =
-        let state =
-            match status with
-            | ListenerSetStatus.Absent -> "closed"
-            | ListenerSetStatus.Present(_, true) -> "open"
-            | ListenerSetStatus.Present(_, false) -> "opening"
-        $"Public port {listener.Port}/{Config.protocolText listener.Protocol}: {state}"
+    /// A single listener's own Programmed state: its named entry in `status.listeners[]`
+    /// when the cluster has reported one, otherwise the ListenerSet's top-level state.
+    let isListenerProgrammed (status: ListenerSetStatus) (listener: ListenerConfig) : bool =
+        match status with
+        | ListenerSetStatus.Absent -> false
+        | ListenerSetStatus.Present(_, topProgrammed, perListener) ->
+            match Map.tryFind listener.Name perListener with
+            | Some p -> p
+            | None -> topProgrammed
+
+    let formatListenerLines (listeners: ListenerConfig list) (status: ListenerSetStatus) : string list =
+        listeners
+        |> List.map (fun l ->
+            let state =
+                match status with
+                | ListenerSetStatus.Absent -> "closed"
+                | ListenerSetStatus.Present _ -> if isListenerProgrammed status l then "open" else "opening"
+            $"Public port {l.Port}/{Config.protocolText l.Protocol}: {state}")
 
     /// Appends the "(public port cleanup failed: ...)" suffix Stop/idle-stop add to
     /// their reply/notification when DeleteListenerSet fails.
@@ -143,30 +151,30 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
             return desired, pod, node, players
         }
 
-    /// `None` for a game with no listener; otherwise the current /status line text.
-    member _.GetListenerLine(game: GameConfig) : Task<string option> =
-        match game.Listener with
-        | None -> Task.FromResult None
-        | Some listener ->
+    /// Empty for a game with no listeners; otherwise one /status line per listener.
+    member _.GetListenerLines(game: GameConfig) : Task<string list> =
+        match game.Listeners with
+        | [] -> Task.FromResult []
+        | listeners ->
             task {
                 let! status = k8s.GetListenerSetStatus game
-                return Some(StatusText.formatListenerLine listener status)
+                return StatusText.formatListenerLines listeners status
             }
 
     member this.Status(gameId: string) : Task<string> =
         task {
             let game = gameConfig gameId
             let! desired, pod, node, players = this.GetState gameId
-            let! listenerLine = this.GetListenerLine game
-            return StatusText.formatStatus game desired pod node players listenerLine (time.GetUtcNow())
+            let! listenerLines = this.GetListenerLines game
+            return StatusText.formatStatus game desired pod node players listenerLines (time.GetUtcNow())
         }
 
     /// Deletes a game's ListenerSet, if it has one, swallowing (and logging) any
     /// error — the caller still reports the stop, with an appended cleanup-failed note.
     member _.CleanUpListenerSet(gameId: string, game: GameConfig) : Task<string option> =
-        match game.Listener with
-        | None -> Task.FromResult None
-        | Some _ ->
+        match game.Listeners with
+        | [] -> Task.FromResult None
+        | _ ->
             task {
                 try
                     do! k8s.DeleteListenerSet game
@@ -197,9 +205,9 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                     // The LB rule provisions while the node boots, so open the public
                     // port before scaling up — never scale if that fails.
                     let! opened =
-                        match game.Listener with
-                        | None -> Task.FromResult(Ok())
-                        | Some _ ->
+                        match game.Listeners with
+                        | [] -> Task.FromResult(Ok())
+                        | _ ->
                             task {
                                 try
                                     do! k8s.EnsureListenerSet game
@@ -270,9 +278,9 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
         task {
             for gameId in config.Games.Keys do
                 let game = gameConfig gameId
-                match game.Listener with
-                | None -> ()
-                | Some _ ->
+                match game.Listeners with
+                | [] -> ()
+                | _ ->
                     try
                         let! desired = k8s.GetDesiredReplicas(game.Namespace, game.Deployment)
                         if desired > 0 then do! k8s.EnsureListenerSet game
@@ -281,21 +289,22 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                         logger.LogError(ex, "Fizruk: listener-set reconcile failed for {Game}", gameId)
         }
 
-    /// Pod Ready AND (no listener OR its ListenerSet Programmed). The second element
-    /// is the timeout wording for whichever of the two isn't ready yet.
+    /// Pod Ready AND every listener's ListenerSet entry Programmed. The second
+    /// element names whichever of pod/listeners isn't ready yet, for the timeout.
     member private _.CheckReady(game: GameConfig, pod: PodInfo option) : Task<bool * string> =
         match pod with
         | Some p when p.Ready ->
-            match game.Listener with
-            | None -> Task.FromResult(true, "")
-            | Some listener ->
+            match game.Listeners with
+            | [] -> Task.FromResult(true, "")
+            | listeners ->
                 task {
                     let! status = k8s.GetListenerSetStatus game
-                    let programmed =
-                        match status with
-                        | ListenerSetStatus.Present(_, prog) -> prog
-                        | ListenerSetStatus.Absent -> false
-                    return programmed, $"public port {listener.Port} not programmed"
+                    let notProgrammed = listeners |> List.filter (fun l -> not (StatusText.isListenerProgrammed status l))
+                    match notProgrammed with
+                    | [] -> return true, ""
+                    | _ ->
+                        let names = notProgrammed |> List.map (fun l -> l.Name) |> String.concat ", "
+                        return false, $"public ports not programmed: {names}"
                 }
         | _ -> Task.FromResult(false, "pod not ready")
 

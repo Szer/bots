@@ -51,20 +51,31 @@ module K8sGateway =
 
     /// Reads Accepted/Programmed off a ListenerSet's `status`; when `status.listeners`
     /// is present, overall Programmed also requires every listener's own to be True.
+    /// Named entries are additionally captured in the returned per-listener map.
     let parseListenerSetStatus (el: JsonElement) : ListenerSetStatus =
         match tryProp el "status" with
-        | None -> ListenerSetStatus.Present(accepted = false, programmed = false)
+        | None -> ListenerSetStatus.Present(accepted = false, programmed = false, listeners = Map.empty)
         | Some status ->
             let conditions = tryProp status "conditions"
             let accepted = hasTrueCondition conditions "Accepted"
             let topProgrammed = hasTrueCondition conditions "Programmed"
+            let listenersEl = tryProp status "listeners"
             let listenersProgrammed =
-                match tryProp status "listeners" with
+                match listenersEl with
                 | None -> true
                 | Some listeners ->
                     listeners.EnumerateArray()
                     |> Seq.forall (fun l -> hasTrueCondition (tryProp l "conditions") "Programmed")
-            ListenerSetStatus.Present(accepted, topProgrammed && listenersProgrammed)
+            let perListener =
+                match listenersEl with
+                | None -> Map.empty
+                | Some listeners ->
+                    listeners.EnumerateArray()
+                    |> Seq.choose (fun l ->
+                        tryProp l "name"
+                        |> Option.map (fun n -> n.GetString(), hasTrueCondition (tryProp l "conditions") "Programmed"))
+                    |> Map.ofSeq
+            ListenerSetStatus.Present(accepted, topProgrammed && listenersProgrammed, perListener)
 
 /// Real implementation backed by the official KubernetesClient, using in-cluster config.
 type KubernetesGateway(client: Kubernetes) =
@@ -125,9 +136,9 @@ type KubernetesGateway(client: Kubernetes) =
 
         member _.EnsureListenerSet(game) =
             task {
-                match game.Listener with
-                | None -> ()
-                | Some _ ->
+                match game.Listeners with
+                | [] -> ()
+                | _ ->
                     let body = ListenerSet.build game
                     try
                         let! _ =
@@ -139,9 +150,9 @@ type KubernetesGateway(client: Kubernetes) =
 
         member _.DeleteListenerSet(game) =
             task {
-                match game.Listener with
-                | None -> ()
-                | Some _ ->
+                match game.Listeners with
+                | [] -> ()
+                | _ ->
                     try
                         let! _ =
                             client.CustomObjects.DeleteNamespacedCustomObjectAsync<JsonElement>(
@@ -152,9 +163,9 @@ type KubernetesGateway(client: Kubernetes) =
 
         member _.GetListenerSetStatus(game) =
             task {
-                match game.Listener with
-                | None -> return ListenerSetStatus.Absent
-                | Some _ ->
+                match game.Listeners with
+                | [] -> return ListenerSetStatus.Absent
+                | _ ->
                     try
                         let! el =
                             client.CustomObjects.GetNamespacedCustomObjectAsync<JsonElement>(

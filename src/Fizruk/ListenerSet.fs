@@ -17,20 +17,15 @@ module ListenerSet =
     type Metadata = { name: string; ``namespace``: string; labels: Map<string, string> }
     type Body = { apiVersion: string; kind: string; metadata: Metadata; spec: Spec }
 
-    let private routeSuffix (protocol: ListenerProtocol) =
-        match protocol with
-        | ListenerProtocol.UDP -> "udp"
-        | ListenerProtocol.TCP -> "tcp"
-
     let private routeKind (protocol: ListenerProtocol) =
         match protocol with
         | ListenerProtocol.UDP -> "UDPRoute"
         | ListenerProtocol.TCP -> "TCPRoute"
 
-    /// Builds the manifest for `game`. `game.Listener` must be `Some` — callers
-    /// (GameCore, IK8sGateway) only invoke this after checking that.
+    /// `game.Listeners` must be non-empty and `game.Gateway` `Some` — callers only
+    /// invoke this after checking that.
     let build (game: GameConfig) : Body =
-        let listener = game.Listener.Value
+        let gateway = game.Gateway.Value
         { apiVersion = $"{group}/{version}"
           kind = "ListenerSet"
           metadata =
@@ -44,12 +39,14 @@ module ListenerSet =
             { parentRef =
                 { group = group
                   kind = "Gateway"
-                  ``namespace`` = listener.Gateway.Namespace
-                  name = listener.Gateway.Name }
+                  ``namespace`` = gateway.Namespace
+                  name = gateway.Name }
               listeners =
-                [ { name = $"{game.Id}-{routeSuffix listener.Protocol}"
-                    port = listener.Port
-                    protocol = Config.protocolText listener.Protocol
-                    allowedRoutes =
-                      { namespaces = { from = "Same" }
-                        kinds = [ { group = group; kind = routeKind listener.Protocol } ] } } ] } }
+                game.Listeners
+                |> List.map (fun l ->
+                    { name = l.Name
+                      port = l.Port
+                      protocol = Config.protocolText l.Protocol
+                      allowedRoutes =
+                        { namespaces = { from = "Same" }
+                          kinds = [ { group = group; kind = routeKind l.Protocol } ] } }) } }

@@ -66,13 +66,31 @@ let sampleConfigJson =
           "idleGraceMinutes": 45,
           "idleWindowMinutes": 60,
           "startTimeoutMinutes": 1
+        },
+        "bedrock-game": {
+          "displayName": "Bedrock Game",
+          "namespace": "games",
+          "deployment": "bedrock-game",
+          "podSelector": "app=bedrock-game",
+          "container": "server",
+          "nodeLabelSelector": "workload=game",
+          "address": "bedrock.szer.dev:19132",
+          "listeners": [
+            { "name": "bedrock-tcp", "port": 19132, "protocol": "TCP" },
+            { "name": "bedrock-udp", "port": 19133, "protocol": "UDP" }
+          ],
+          "activityRegex": "\\[(JOIN|LEAVE)\\]",
+          "idleGraceMinutes": 45,
+          "idleWindowMinutes": 60,
+          "startTimeoutMinutes": 1
         }
       },
       "chats": {
         "-100": ["factorio"],
         "-200": ["factorio", "minecraft-creative"],
         "-300": ["no-probe-game"],
-        "-400": ["listener-game"]
+        "-400": ["listener-game"],
+        "-500": ["bedrock-game"]
       }
     }
     """
@@ -86,7 +104,8 @@ type FakeK8sGateway() =
     let pods = ConcurrentDictionary<string * string, PodInfo list>()
     let nodes = ConcurrentDictionary<string, NodeInfo list>()
     let logs = ConcurrentDictionary<string * string, string>()
-    let listenerSets = ConcurrentDictionary<string * string, bool * bool>() // (accepted, programmed)
+    // (accepted, topProgrammed, perListenerProgrammed by name)
+    let listenerSets = ConcurrentDictionary<string * string, bool * bool * Map<string, bool>>()
     let ensureListenerCalls = ConcurrentQueue<string>()
     let deleteListenerCalls = ConcurrentQueue<string>()
     let mutable ensureListenerError: string option = None
@@ -103,7 +122,12 @@ type FakeK8sGateway() =
     /// Sets a game's ListenerSet Accepted/Programmed, creating it if absent —
     /// simulates the gateway controller reconciling it.
     member _.SetListenerSetStatus(ns, gameId, accepted, programmed) =
-        listenerSets.[(ns, gameId)] <- (accepted, programmed)
+        listenerSets.[(ns, gameId)] <- (accepted, programmed, Map.empty)
+
+    /// Sets each named listener's own Programmed condition, simulating a
+    /// ListenerSet where the controller has only reconciled some of them.
+    member _.SetListenerSetListeners(ns, gameId, accepted, topProgrammed, listeners: (string * bool) list) =
+        listenerSets.[(ns, gameId)] <- (accepted, topProgrammed, Map.ofList listeners)
 
     member _.EnsureListenerSetCalls = ensureListenerCalls |> List.ofSeq
     member _.DeleteListenerSetCalls = deleteListenerCalls |> List.ofSeq
@@ -148,7 +172,7 @@ type FakeK8sGateway() =
                 callLog.Enqueue $"ensure:{game.Id}"
                 match ensureListenerError with
                 | Some msg -> failwith msg
-                | None -> listenerSets.TryAdd((game.Namespace, game.Id), (false, false)) |> ignore
+                | None -> listenerSets.TryAdd((game.Namespace, game.Id), (false, false, Map.empty)) |> ignore
             }
 
         member _.DeleteListenerSet(game) =
@@ -162,7 +186,9 @@ type FakeK8sGateway() =
             task {
                 match listenerSets.TryGetValue((game.Namespace, game.Id)) with
                 | false, _ -> return ListenerSetStatus.Absent
-                | true, (accepted, programmed) -> return ListenerSetStatus.Present(accepted, programmed)
+                | true, (accepted, topProgrammed, perListener) ->
+                    let overall = topProgrammed && (perListener |> Map.forall (fun _ v -> v))
+                    return ListenerSetStatus.Present(accepted, overall, perListener)
             }
 
 /// Records every notification instead of calling Telegram.
