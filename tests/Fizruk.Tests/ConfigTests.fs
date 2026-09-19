@@ -30,9 +30,17 @@ let private minimalGame (activityRegex: string) (playersJson: string) =
 [<Fact>]
 let ``valid config parses every game and chat`` () =
     let config = sampleConfig ()
-    Assert.Equal(3, config.Games.Count)
+    Assert.Equal(4, config.Games.Count)
     Assert.Equal<string list>([ "factorio" ], config.Chats.[-100L])
     Assert.Equal<string list>([ "factorio"; "minecraft-creative" ], config.Chats.[-200L])
+
+[<Fact>]
+let ``a game's listener carries its port, protocol, and the top-level gateway`` () =
+    let config = sampleConfig ()
+    let listener = config.Games.["factorio"].Listener.Value
+    Assert.Equal(34197, listener.Port)
+    Assert.Equal(ListenerProtocol.UDP, listener.Protocol)
+    Assert.Equal({ Name = "main-gateway"; Namespace = "gateway-system" }, listener.Gateway)
 
 [<Fact>]
 let ``rcon game requires host, port, and passwordEnv`` () =
@@ -74,3 +82,38 @@ let ``rcon players block with passwordEnv parses`` () =
     let json = minimalGame "JOIN" players
     let config = Config.parse json
     Assert.Equal(Some "PW", config.Games.["g"].Players.PasswordEnv)
+
+[<Fact>]
+let ``a game's listener requires a top-level gateway`` () =
+    let json = minimalGame "JOIN" """"listener": { "port": 1234, "protocol": "UDP" },"""
+    Assert.Throws<ConfigError>(fun () -> Config.parse json |> ignore) |> ignore
+
+[<Fact>]
+let ``listener with an unknown protocol raises ConfigError`` () =
+    let json =
+        (minimalGame "JOIN" """"listener": { "port": 1234, "protocol": "carrier-pigeon" },""")
+            .Replace("\"games\":", """"gateway": { "name": "gw", "namespace": "gw-ns" }, "games":""")
+    Assert.Throws<ConfigError>(fun () -> Config.parse json |> ignore) |> ignore
+
+[<Fact>]
+let ``listener with an out-of-range port raises ConfigError`` () =
+    let json =
+        (minimalGame "JOIN" """"listener": { "port": 70000, "protocol": "UDP" },""")
+            .Replace("\"games\":", """"gateway": { "name": "gw", "namespace": "gw-ns" }, "games":""")
+    Assert.Throws<ConfigError>(fun () -> Config.parse json |> ignore) |> ignore
+
+[<Fact>]
+let ``listener with a configured gateway parses`` () =
+    let json =
+        (minimalGame "JOIN" """"listener": { "port": 34197, "protocol": "udp" },""")
+            .Replace("\"games\":", """"gateway": { "name": "gw", "namespace": "gw-ns" }, "games":""")
+    let config = Config.parse json
+    let listener = config.Games.["g"].Listener.Value
+    Assert.Equal(34197, listener.Port)
+    Assert.Equal(ListenerProtocol.UDP, listener.Protocol)
+    Assert.Equal({ Name = "gw"; Namespace = "gw-ns" }, listener.Gateway)
+
+[<Fact>]
+let ``a game without a listener block has none configured`` () =
+    let config = sampleConfig ()
+    Assert.True(config.Games.["no-probe-game"].Listener.IsNone)

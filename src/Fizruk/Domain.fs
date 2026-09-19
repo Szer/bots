@@ -35,3 +35,10 @@ type PlayersProbeResult =
     | Ok of PlayersInfo
     | Error of string
     | NotConfigured
+
+/// A game's ListenerSet as read from the cluster. Absent means the object doesn't
+/// exist (404) — a fresh object with no status yet is `Present(false, false)`.
+[<RequireQualifiedAccess>]
+type ListenerSetStatus =
+    | Absent
+    | Present of accepted: bool * programmed: bool

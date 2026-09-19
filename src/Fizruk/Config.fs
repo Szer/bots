@@ -18,6 +18,21 @@ type PlayersConfig =
       /// Env var holding the RCON password. Set only when Type = Rcon.
       PasswordEnv: string option }
 
+/// The shared Envoy Gateway a game's ListenerSet attaches to.
+type GatewayConfig = { Name: string; Namespace: string }
+
+[<RequireQualifiedAccess>]
+type ListenerProtocol =
+    | UDP
+    | TCP
+
+/// A game's on-demand public port: the ListenerSet Fizruk creates on start and
+/// deletes on stop carries this port/protocol, parented to `Gateway`.
+type ListenerConfig =
+    { Port: int
+      Protocol: ListenerProtocol
+      Gateway: GatewayConfig }
+
 type GameConfig =
     { Id: string
       DisplayName: string
@@ -28,6 +43,7 @@ type GameConfig =
       NodeLabelSelector: string
       Address: string
       Players: PlayersConfig
+      Listener: ListenerConfig option
       ActivityRegex: Regex
       IdleGraceMinutes: int
       IdleWindowMinutes: int
@@ -35,7 +51,8 @@ type GameConfig =
 
 type FizrukConfig =
     { Games: Map<string, GameConfig>
-      Chats: Map<int64, string list> }
+      Chats: Map<int64, string list>
+      Gateway: GatewayConfig option }
 
 /// Raised for any config file/schema problem. Program.fs lets this crash startup.
 exception ConfigError of string
@@ -44,6 +61,12 @@ module Config =
 
     let noProbe =
         { Type = ProbeType.None; Host = ""; Port = 0; PasswordEnv = None }
+
+    /// "UDP"/"TCP" — the ListenerSet manifest's `protocol` value and the /status text.
+    let protocolText (protocol: ListenerProtocol) : string =
+        match protocol with
+        | ListenerProtocol.UDP -> "UDP"
+        | ListenerProtocol.TCP -> "TCP"
 
     let private prop (el: JsonElement) (name: string) : JsonElement option =
         match el.TryGetProperty name with
@@ -83,7 +106,31 @@ module Config =
                   PasswordEnv = None }
             | other -> raise (ConfigError $"{ctx}: unknown players.type '{other}'")
 
-    let private parseGame (id: string) (el: JsonElement) : GameConfig =
+    let private parseGateway (el: JsonElement) : GatewayConfig =
+        { Name = requireString el "gateway" "name"
+          Namespace = requireString el "gateway" "namespace" }
+
+    /// A game's `listener` block requires the top-level `gateway` to be configured —
+    /// the ListenerSet's parentRef has nowhere to point otherwise.
+    let private parseListener (ctx: string) (gateway: GatewayConfig option) (el: JsonElement option) : ListenerConfig option =
+        match el with
+        | None -> None
+        | Some el ->
+            let gateway =
+                match gateway with
+                | Some g -> g
+                | None -> raise (ConfigError $"{ctx}: listener requires a top-level 'gateway' to be configured")
+            let port = requireInt el ctx "port"
+            if port < 1 || port > 65535 then
+                raise (ConfigError $"{ctx}: listener.port must be between 1 and 65535, got {port}")
+            let protocol =
+                match (requireString el ctx "protocol").ToUpperInvariant() with
+                | "UDP" -> ListenerProtocol.UDP
+                | "TCP" -> ListenerProtocol.TCP
+                | other -> raise (ConfigError $"{ctx}: unknown listener.protocol '{other}'")
+            Some { Port = port; Protocol = protocol; Gateway = gateway }
+
+    let private parseGame (gateway: GatewayConfig option) (id: string) (el: JsonElement) : GameConfig =
         let ctx = $"games.{id}"
         let regexStr = requireString el ctx "activityRegex"
         let regex =
@@ -99,6 +146,7 @@ module Config =
           NodeLabelSelector = requireString el ctx "nodeLabelSelector"
           Address = requireString el ctx "address"
           Players = parsePlayers ctx (prop el "players")
+          Listener = parseListener ctx gateway (prop el "listener")
           ActivityRegex = regex
           IdleGraceMinutes = requireInt el ctx "idleGraceMinutes"
           IdleWindowMinutes = requireInt el ctx "idleWindowMinutes"
@@ -125,12 +173,13 @@ module Config =
         try
             use doc = JsonDocument.Parse json
             let root = doc.RootElement
+            let gateway = prop root "gateway" |> Option.map parseGateway
             let games =
                 (requireProp root "$" "games").EnumerateObject()
-                |> Seq.map (fun p -> p.Name, parseGame p.Name p.Value)
+                |> Seq.map (fun p -> p.Name, parseGame gateway p.Name p.Value)
                 |> Map.ofSeq
             let chats = parseChats games (requireProp root "$" "chats")
-            { Games = games; Chats = chats }
+            { Games = games; Chats = chats; Gateway = gateway }
         with
         | ConfigError _ as ex -> raise ex
         | ex -> raise (ConfigError $"failed to parse config: {ex.Message}")

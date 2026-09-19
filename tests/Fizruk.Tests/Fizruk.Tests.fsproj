@@ -15,7 +15,9 @@
     <Compile Include="RconTests.fs" />
     <Compile Include="RakNetTests.fs" />
     <Compile Include="K8sGatewayTests.fs" />
+    <Compile Include="ListenerSetTests.fs" />
     <Compile Include="CoreFlowTests.fs" />
+    <Compile Include="ListenerSetFlowTests.fs" />
     <Compile Include="FakeCallHelpers.fs" />
     <Compile Include="FizrukContainerFixture.fs" />
     <Compile Include="ContainerTests.fs" />
