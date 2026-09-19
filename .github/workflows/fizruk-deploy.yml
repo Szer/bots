@@ -1,0 +1,48 @@
+name: "Fizruk: Deploy"
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'src/BotInfra/**'
+      - '!src/BotInfra/**/*.md'
+      - 'src/Fizruk/**'
+      - '!src/Fizruk/**/*.md'
+      - 'src/Dockerfile.bot'
+      - 'tests/Fizruk.Tests/**'
+      - 'Directory.Build.props'
+      - 'Directory.Packages.props'
+      - 'global.json'
+  workflow_dispatch:
+
+permissions:
+  # contents: write (not read) because this workflow calls _bot-deploy.yml,
+  # which calls _sre-agent.yml on failure — see coupon-deploy.yml for why.
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/_bot-deploy.yml
+    with:
+      has-database: false
+      test-command: |
+        dotnet test tests/Fizruk.Tests/Fizruk.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
+      docker-image: ghcr.io/szer/fizruk
+      bot-project: Fizruk
+      argocd-app-name: fizruk
+      container-name: fizruk
+      # Off until the ArgoCD app exists in my-infra and has had a chance to settle —
+      # see other bots' alita-deploy.yml for the same new-bot convention.
+      sre-enabled: false
+    secrets:
+      # Dedicated single-occupancy peer (Szer/my-infra#111), not the shared
+      # WIREGUARD_CONFIG secret — must exist in my-infra before verify-deploy can pass.
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG_FIZRUK }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}

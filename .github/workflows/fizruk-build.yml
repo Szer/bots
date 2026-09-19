@@ -1,0 +1,14 @@
+name: "Fizruk: Build"
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/_bot-build.yml
+    with:
+      test-command: |
+        dotnet test tests/Fizruk.Tests/Fizruk.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
+      bot-paths-regex: '^(src/(BotInfra|Fizruk)/|src/Dockerfile\.bot$|tests/Fizruk\.Tests/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'
