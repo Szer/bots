@@ -1,5 +1,3 @@
--- Message ids are BIGINT throughout (see V17): admin_message_id must match, not the
--- documented-elsewhere INT, to hold real Telegram message ids without truncation.
 CREATE TABLE feedback_delivery (
     feedback_id       BIGINT      NOT NULL REFERENCES user_feedback(id),
     admin_chat_id     BIGINT      NOT NULL,
