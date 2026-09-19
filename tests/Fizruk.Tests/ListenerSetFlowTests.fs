@@ -14,6 +14,9 @@ let private listenerPodSelector = "app=listener-game"
 let private noProbeGameId = "no-probe-game"
 let private noProbeDeployment = "no-probe-game"
 let private noProbePodSelector = "app=no-probe-game"
+let private bedrockGameId = "bedrock-game"
+let private bedrockDeployment = "bedrock-game"
+let private bedrockPodSelector = "app=bedrock-game"
 
 let private readyPod (name: string) (startedMinutesAgo: int) =
     { Name = name
@@ -122,16 +125,17 @@ let ``idle check stops an idle game with a listener and deletes its ListenerSet`
     }
 
 [<Fact>]
-let ``ReconcileListenerSets ensures a scaled-up game and deletes a scaled-down one`` () =
+let ``ReconcileListenerSets ensures a scaled-up game and deletes every scaled-down one`` () =
     task {
         let k8s = FakeK8sGateway()
-        // "factorio" is scaled up, "listener-game" is scaled down — one game each way.
+        // "factorio" is scaled up; "listener-game" and "bedrock-game" default to
+        // scaled down — every game with a listener is covered, one way or the other.
         k8s.SetReplicas(ns, "factorio", 1)
         k8s.SetReplicas(ns, listenerDeployment, 0)
         let core = newCore k8s (FakeNotifier()) (TimeSpan.FromSeconds 30.0)
         do! core.ReconcileListenerSets()
         Assert.Equal<string list>([ "factorio" ], k8s.EnsureListenerSetCalls)
-        Assert.Equal<string list>([ listenerGameId ], k8s.DeleteListenerSetCalls)
+        Assert.Equal<string list>([ "bedrock-game"; listenerGameId ], k8s.DeleteListenerSetCalls)
     }
 
 [<Fact>]
@@ -150,4 +154,33 @@ let ``status reports the public port state for a game with a listener`` () =
         k8s.SetListenerSetStatus(ns, listenerGameId, true, true)
         let! openText = core.Status listenerGameId
         Assert.Contains("Public port 5000/UDP: open", openText)
+    }
+
+[<Fact>]
+let ``status reports each listener's own state independently, one open one still opening`` () =
+    task {
+        let k8s = FakeK8sGateway()
+        k8s.SetReplicas(ns, bedrockDeployment, 1)
+        k8s.SetListenerSetListeners(ns, bedrockGameId, true, true, [ "bedrock-tcp", true; "bedrock-udp", false ])
+        let core = newCore k8s (FakeNotifier()) (TimeSpan.FromSeconds 30.0)
+        let! text = core.Status bedrockGameId
+        Assert.Contains("Public port 19132/TCP: open", text)
+        Assert.Contains("Public port 19133/UDP: opening", text)
+    }
+
+[<Fact>]
+let ``the start watcher's timeout message names only the listener that isn't programmed yet`` () =
+    task {
+        let k8s = FakeK8sGateway()
+        let notifier = FakeNotifier()
+        let core = newCore k8s notifier (TimeSpan.FromMilliseconds 20.0)
+        let! _ = core.Start bedrockGameId
+        k8s.SetPods(ns, bedrockPodSelector, [ readyPod "bedrock-game-1" 0 ])
+        k8s.SetListenerSetListeners(ns, bedrockGameId, true, true, [ "bedrock-tcp", true; "bedrock-udp", false ])
+        let! found =
+            waitUntil 5000 (fun () -> notifier.Sent |> List.exists (fun (_, text) -> text.Contains "did not become ready"))
+        Assert.True(found, "expected a start-timeout notification")
+        let _, text = notifier.Sent |> List.find (fun (_, text) -> text.Contains "did not become ready")
+        Assert.Contains("bedrock-udp", text)
+        Assert.DoesNotContain("bedrock-tcp", text)
     }

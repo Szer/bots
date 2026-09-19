@@ -18,9 +18,9 @@ type InMemoryK8sGateway() =
 
         member _.EnsureListenerSet(game) =
             task {
-                match game.Listener with
-                | None -> ()
-                | Some _ -> listenerSets.TryAdd((game.Namespace, game.Id), false) |> ignore
+                match game.Listeners with
+                | [] -> ()
+                | _ -> listenerSets.TryAdd((game.Namespace, game.Id), false) |> ignore
             }
 
         member _.DeleteListenerSet(game) =
@@ -28,12 +28,13 @@ type InMemoryK8sGateway() =
 
         member _.GetListenerSetStatus(game) =
             task {
-                match game.Listener with
-                | None -> return ListenerSetStatus.Absent
-                | Some _ ->
+                match game.Listeners with
+                | [] -> return ListenerSetStatus.Absent
+                | _ ->
                     match listenerSets.TryGetValue((game.Namespace, game.Id)) with
                     | false, _ -> return ListenerSetStatus.Absent
-                    | true, programmed -> return ListenerSetStatus.Present(accepted = true, programmed = programmed)
+                    | true, programmed ->
+                        return ListenerSetStatus.Present(accepted = true, programmed = programmed, listeners = Map.empty)
             }
 
     /// Test hook: flips a previously-created ListenerSet's Programmed condition, as

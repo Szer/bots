@@ -26,12 +26,12 @@ type ListenerProtocol =
     | UDP
     | TCP
 
-/// A game's on-demand public port: the ListenerSet Fizruk creates on start and
-/// deletes on stop carries this port/protocol, parented to `Gateway`.
+/// One of a game's on-demand public ports; `Name` is stable and referenced by
+/// UDPRoute/TCPRoute manifests, so it must survive config reordering.
 type ListenerConfig =
-    { Port: int
-      Protocol: ListenerProtocol
-      Gateway: GatewayConfig }
+    { Name: string
+      Port: int
+      Protocol: ListenerProtocol }
 
 type GameConfig =
     { Id: string
@@ -43,7 +43,9 @@ type GameConfig =
       NodeLabelSelector: string
       Address: string
       Players: PlayersConfig
-      Listener: ListenerConfig option
+      /// Empty when the game has no public port. `Gateway` is `Some` iff non-empty.
+      Listeners: ListenerConfig list
+      Gateway: GatewayConfig option
       ActivityRegex: Regex
       IdleGraceMinutes: int
       IdleWindowMinutes: int
@@ -110,25 +112,69 @@ module Config =
         { Name = requireString el "gateway" "name"
           Namespace = requireString el "gateway" "namespace" }
 
-    /// A game's `listener` block requires the top-level `gateway` to be configured —
-    /// the ListenerSet's parentRef has nowhere to point otherwise.
-    let private parseListener (ctx: string) (gateway: GatewayConfig option) (el: JsonElement option) : ListenerConfig option =
-        match el with
-        | None -> None
-        | Some el ->
-            let gateway =
-                match gateway with
-                | Some g -> g
-                | None -> raise (ConfigError $"{ctx}: listener requires a top-level 'gateway' to be configured")
-            let port = requireInt el ctx "port"
-            if port < 1 || port > 65535 then
-                raise (ConfigError $"{ctx}: listener.port must be between 1 and 65535, got {port}")
-            let protocol =
-                match (requireString el ctx "protocol").ToUpperInvariant() with
-                | "UDP" -> ListenerProtocol.UDP
-                | "TCP" -> ListenerProtocol.TCP
-                | other -> raise (ConfigError $"{ctx}: unknown listener.protocol '{other}'")
-            Some { Port = port; Protocol = protocol; Gateway = gateway }
+    let private dns1123LabelRegex = Regex(@"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", RegexOptions.Compiled)
+
+    let private parsePort (el: JsonElement) (ctx: string) (label: string) : int =
+        let port = requireInt el ctx "port"
+        if port < 1 || port > 65535 then
+            raise (ConfigError $"{ctx}: {label}.port must be between 1 and 65535, got {port}")
+        port
+
+    let private parseProtocol (el: JsonElement) (ctx: string) (label: string) : ListenerProtocol =
+        match (requireString el ctx "protocol").ToUpperInvariant() with
+        | "UDP" -> ListenerProtocol.UDP
+        | "TCP" -> ListenerProtocol.TCP
+        | other -> raise (ConfigError $"{ctx}: unknown {label}.protocol '{other}'")
+
+    /// One entry of the canonical `listeners` array — `name` is required and must be
+    /// a valid DNS-1123 label, since it's what UDPRoute/TCPRoute manifests reference.
+    let private parseListenerEntry (ctx: string) (el: JsonElement) : ListenerConfig =
+        let name = requireString el ctx "name"
+        if name.Length > 63 || not (dns1123LabelRegex.IsMatch name) then
+            raise (ConfigError $"{ctx}: listener name '{name}' must be a valid DNS-1123 label")
+        { Name = name; Port = parsePort el ctx "listeners[]"; Protocol = parseProtocol el ctx "listeners[]" }
+
+    /// The deprecated singular `listener` object, reproducing the name it used to
+    /// bake into the ListenerSet: `<game>-udp`/`<game>-tcp`.
+    let private parseLegacyListener (ctx: string) (gameId: string) (el: JsonElement) : ListenerConfig =
+        let protocol = parseProtocol el ctx "listener"
+        let suffix = match protocol with ListenerProtocol.UDP -> "udp" | ListenerProtocol.TCP -> "tcp"
+        { Name = $"{gameId}-{suffix}"; Port = parsePort el ctx "listener"; Protocol = protocol }
+
+    let private validateListeners (ctx: string) (listeners: ListenerConfig list) : unit =
+        listeners
+        |> List.map (fun l -> l.Name)
+        |> List.countBy id
+        |> List.tryFind (fun (_, c) -> c > 1)
+        |> Option.iter (fun (n, _) -> raise (ConfigError $"{ctx}: duplicate listener name '{n}'"))
+        listeners
+        |> List.map (fun l -> l.Port)
+        |> List.countBy id
+        |> List.tryFind (fun (_, c) -> c > 1)
+        |> Option.iter (fun (p, _) -> raise (ConfigError $"{ctx}: duplicate listener port {p}"))
+
+    /// `listener`/`listeners` are mutually exclusive; any non-empty result requires
+    /// the top-level `gateway`, the ListenerSet's parentRef target.
+    let private parseListeners
+        (ctx: string)
+        (gameId: string)
+        (gateway: GatewayConfig option)
+        (legacyEl: JsonElement option)
+        (listEl: JsonElement option)
+        : ListenerConfig list * GatewayConfig option =
+        let listeners =
+            match legacyEl, listEl with
+            | Some _, Some _ -> raise (ConfigError $"{ctx}: specify either 'listener' or 'listeners', not both")
+            | None, None -> []
+            | Some el, None -> [ parseLegacyListener ctx gameId el ]
+            | None, Some el -> el.EnumerateArray() |> Seq.map (parseListenerEntry ctx) |> List.ofSeq
+        if listeners.IsEmpty then
+            [], None
+        else
+            validateListeners ctx listeners
+            match gateway with
+            | Some g -> listeners, Some g
+            | None -> raise (ConfigError $"{ctx}: listeners require a top-level 'gateway' to be configured")
 
     let private parseGame (gateway: GatewayConfig option) (id: string) (el: JsonElement) : GameConfig =
         let ctx = $"games.{id}"
@@ -137,6 +183,7 @@ module Config =
             try Regex(regexStr, RegexOptions.Compiled)
             with :? ArgumentException as ex ->
                 raise (ConfigError $"{ctx}: invalid activityRegex '{regexStr}': {ex.Message}")
+        let listeners, gameGateway = parseListeners ctx id gateway (prop el "listener") (prop el "listeners")
         { Id = id
           DisplayName = requireString el ctx "displayName"
           Namespace = requireString el ctx "namespace"
@@ -146,7 +193,8 @@ module Config =
           NodeLabelSelector = requireString el ctx "nodeLabelSelector"
           Address = requireString el ctx "address"
           Players = parsePlayers ctx (prop el "players")
-          Listener = parseListener ctx gateway (prop el "listener")
+          Listeners = listeners
+          Gateway = gameGateway
           ActivityRegex = regex
           IdleGraceMinutes = requireInt el ctx "idleGraceMinutes"
           IdleWindowMinutes = requireInt el ctx "idleWindowMinutes"

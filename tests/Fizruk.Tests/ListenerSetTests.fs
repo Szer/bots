@@ -5,15 +5,15 @@ open Fizruk
 open Fizruk.Tests.Fakes
 open Xunit
 
-let private gateway: GatewayConfig = { Name = "main-gateway"; Namespace = "gateway-system" }
-
 let private udpGame = (sampleConfig ()).Games.["factorio"]
 
 let private tcpGame =
     { udpGame with
         Id = "tcp-game"
         Namespace = "other-ns"
-        Listener = Some { Port = 25565; Protocol = ListenerProtocol.TCP; Gateway = gateway } }
+        Listeners = [ { Name = "tcp-game-tcp"; Port = 25565; Protocol = ListenerProtocol.TCP } ] }
+
+let private twoListenerGame = (sampleConfig ()).Games.["bedrock-game"]
 
 [<Fact>]
 let ``build produces the exact UDP ListenerSet manifest`` () =
@@ -61,3 +61,27 @@ let ``build produces the exact TCP ListenerSet manifest`` () =
     Assert.Equal(
         "TCPRoute",
         listener.GetProperty("allowedRoutes").GetProperty("kinds").[0].GetProperty("kind").GetString())
+
+[<Fact>]
+let ``build produces one ordered spec.listeners entry per configured listener, TCP then UDP`` () =
+    let json = JsonSerializer.Serialize(ListenerSet.build twoListenerGame)
+    use doc = JsonDocument.Parse json
+    let listeners = doc.RootElement.GetProperty("spec").GetProperty("listeners")
+    Assert.Equal(2, listeners.GetArrayLength())
+
+    let tcp = listeners.[0]
+    Assert.Equal("bedrock-tcp", tcp.GetProperty("name").GetString())
+    Assert.Equal(19132, tcp.GetProperty("port").GetInt32())
+    Assert.Equal("TCP", tcp.GetProperty("protocol").GetString())
+    Assert.Equal("Same", tcp.GetProperty("allowedRoutes").GetProperty("namespaces").GetProperty("from").GetString())
+    Assert.Equal(
+        "TCPRoute",
+        tcp.GetProperty("allowedRoutes").GetProperty("kinds").[0].GetProperty("kind").GetString())
+
+    let udp = listeners.[1]
+    Assert.Equal("bedrock-udp", udp.GetProperty("name").GetString())
+    Assert.Equal(19133, udp.GetProperty("port").GetInt32())
+    Assert.Equal("UDP", udp.GetProperty("protocol").GetString())
+    Assert.Equal(
+        "UDPRoute",
+        udp.GetProperty("allowedRoutes").GetProperty("kinds").[0].GetProperty("kind").GetString())

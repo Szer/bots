@@ -36,9 +36,9 @@ type PlayersProbeResult =
     | Error of string
     | NotConfigured
 
-/// A game's ListenerSet as read from the cluster. Absent means the object doesn't
-/// exist (404) — a fresh object with no status yet is `Present(false, false)`.
+/// A game's ListenerSet as read from the cluster (Absent = 404). `listeners` maps
+/// each named `status.listeners[]` entry to its own Programmed condition.
 [<RequireQualifiedAccess>]
 type ListenerSetStatus =
     | Absent
-    | Present of accepted: bool * programmed: bool
+    | Present of accepted: bool * programmed: bool * listeners: Map<string, bool>
