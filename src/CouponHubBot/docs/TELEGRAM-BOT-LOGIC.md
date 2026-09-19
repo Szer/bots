@@ -184,3 +184,16 @@ When on, steps (c) and (d) are best-effort — if the GitHub API call fails at r
 - **Labels:** `user-feedback` (quarantines from coding agent — only Product agent triages)
 - **Assignment:** `copilot-swe-agent[bot]` with `custom_agent: product`
 - User content has `@` mentions neutralized to prevent unwanted GitHub notifications
+
+### Admin reply (/reply, /r)
+
+Each forwarded copy in step 2b is recorded in `feedback_delivery` (feedback_id, admin_chat_id,
+admin_message_id) once the forward's returned message id is known. An admin replies to their
+forwarded copy with `/reply <text>` (or `/r <text>`) in the DM; the command resolves the
+Telegram reply target through `feedback_delivery` → `user_feedback` to find the original
+author and their message id, then DMs the author via `sendTextReply` with "Ответ авторов на
+твой фидбэк:\n\n<text>". Every attempt is recorded in `feedback_reply` (feedback_id, admin_id,
+reply_text, delivered) — `delivered=false` on send failure (e.g. user blocked the bot), still
+telling the admin. On success, every other configured admin gets a best-effort notification
+replying to their own forwarded copy. No reply target, an unrecognized target, or empty text
+all get the same short hint back to the admin; non-admins get silence.
