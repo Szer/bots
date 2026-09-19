@@ -1,7 +1,5 @@
 name: "Fizruk: Deploy"
 
-# Fizruk has no database, so unlike the other bots it skips _bot-deploy.yml
-# (Flyway, WireGuard, Loki/Prometheus verification) and just tests + pushes.
 on:
   push:
     branches: [ "main" ]
@@ -18,46 +16,33 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # contents: write (not read) because this workflow calls _bot-deploy.yml,
+  # which calls _sre-agent.yml on failure — see coupon-deploy.yml for why.
+  contents: write
   packages: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-22.04-arm
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - uses: actions/setup-dotnet@v4
-      with:
-        global-json-file: global.json
-
-    - name: Tests
-      run: dotnet test tests/Fizruk.Tests/Fizruk.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
-
-    - name: Upload dotnet test results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: test-results
-        path: "**/*.trx"
-
-    - name: Login to GHCR
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Build and push to GHCR
-      uses: docker/build-push-action@v5
-      with:
-        push: true
-        tags: ghcr.io/szer/fizruk:${{ github.sha }}, ghcr.io/szer/fizruk:latest
-        file: ./src/Dockerfile.bot
-        build-args: BOT_PROJECT=Fizruk
-        platforms: linux/arm64
+  deploy:
+    uses: ./.github/workflows/_bot-deploy.yml
+    with:
+      has-database: false
+      test-command: |
+        dotnet test tests/Fizruk.Tests/Fizruk.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
+      docker-image: ghcr.io/szer/fizruk
+      bot-project: Fizruk
+      argocd-app-name: fizruk
+      container-name: fizruk
+      # Off until the ArgoCD app exists in my-infra and has had a chance to settle —
+      # see other bots' alita-deploy.yml for the same new-bot convention.
+      sre-enabled: false
+    secrets:
+      # Dedicated single-occupancy peer (Szer/my-infra#111), not the shared
+      # WIREGUARD_CONFIG secret — must exist in my-infra before verify-deploy can pass.
+      WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG_FIZRUK }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+      AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}

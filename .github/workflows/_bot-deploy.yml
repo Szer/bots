@@ -6,14 +6,20 @@ on:
       test-command:
         required: true
         type: string
+      has-database:
+        type: boolean
+        default: true
+        description: "False skips every Flyway/migration and DB-connectivity step (e.g. Fizruk, which has no database)"
       migrations-path:
-        required: true
+        required: false
         type: string
-        description: "Path to migrations dir relative to repo root"
+        default: ""
+        description: "Path to migrations dir relative to repo root (required when has-database is true)"
       db-name:
-        required: true
+        required: false
         type: string
-        description: "Database name for Flyway migrations (e.g. vahter_db)"
+        default: ""
+        description: "Database name for Flyway migrations, e.g. vahter_db (required when has-database is true)"
       docker-image:
         required: true
         type: string
@@ -45,11 +51,12 @@ on:
           single-occupancy; sharing it across bots flaps the WG endpoint
           for concurrent deploys (issue #368).
       DB_PROD_HOST:
-        required: true
+        required: false
+        description: "Required when has-database is true — workflow_call can't make secrets conditional, so the migration steps are the only consumers"
       DB_PROD_USERNAME:
-        required: true
+        required: false
       DB_PROD_PASSWORD:
-        required: true
+        required: false
       ARGOCD_AUTH_TOKEN:
         required: true
       AZURE_OPENAI_API_KEY:
@@ -182,9 +189,10 @@ jobs:
         WIREGUARD_CONFIG: ${{ secrets.WIREGUARD_CONFIG }}
         SPLIT_TUNNEL: "false"
 
-    # Unconditional: no-op if the last run's migrate succeeded (checksum-safe),
-    # required to clear a failed CIC migration's success=false history row.
+    # No-op if the last migrate succeeded; clears a failed CIC migration's
+    # success=false row. Skipped entirely when has-database is false.
     - name: Repair production DB migration history
+      if: inputs.has-database
       run: >-
         docker run --rm
         --network host
@@ -197,6 +205,7 @@ jobs:
         repair -schemas="${{ env.SCHEMAS }}"
 
     - name: Apply migrations to production DB
+      if: inputs.has-database
       run: >-
         docker run --rm
         --network host
@@ -213,6 +222,7 @@ jobs:
       run: sudo wg-quick down wg0 || true
 
     - name: Upload Flyway report
+      if: inputs.has-database
       uses: actions/upload-artifact@v4
       with:
         name: Database Report
