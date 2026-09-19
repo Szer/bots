@@ -132,7 +132,13 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                 if desired > 0 then
                     let! pods = k8s.ListPods(game.Namespace, game.PodSelector)
                     let ready = pods |> List.exists (fun p -> not p.Terminating && p.Ready)
-                    return if ready then "Already running." else "Already starting."
+                    if ready then
+                        return "Already running."
+                    else
+                        // Already scaled up from an earlier /start (or a pod restart
+                        // wiped the in-memory watcher) — make sure one is still running.
+                        this.EnsureWatcher gameId
+                        return "Already starting."
                 else
                     do! k8s.ScaleDeployment(game.Namespace, game.Deployment, 1)
                     this.EnsureWatcher gameId
@@ -171,6 +177,17 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
                     try do! this.RunWatcher gameId
                     finally watching.TryRemove(gameId) |> ignore
                 } :> Task)
+
+    /// Re-arms a start watcher for every game already scaled up but not yet Ready —
+    /// call once at startup so a mid-start pod restart still gets its notification.
+    member this.ArmPendingWatchers() : Task<unit> =
+        task {
+            for gameId in config.Games.Keys do
+                let! desired, pod, _node, _players = this.GetState gameId
+                let podReady = pod |> Option.map (fun p -> p.Ready) |> Option.defaultValue false
+                if desired > 0 && not podReady then
+                    this.EnsureWatcher gameId
+        }
 
     member private this.RunWatcher(gameId: string) : Task =
         task {

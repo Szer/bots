@@ -72,7 +72,10 @@ module Commands =
         | Some allowed ->
             match gameArg with
             | Some name ->
-                if List.contains name allowed then Resolution.Resolved name else Resolution.Unknown allowed
+                // Case-insensitive match; the reply uses the configured spelling, not the user's.
+                match allowed |> List.tryFind (fun g -> String.Equals(g, name, StringComparison.OrdinalIgnoreCase)) with
+                | Some configuredName -> Resolution.Resolved configuredName
+                | None -> Resolution.Unknown allowed
             | None ->
                 match allowed with
                 | [ only ] -> Resolution.Resolved only

@@ -13,6 +13,11 @@ type IdleCheckHostedService(core: GameCore, time: TimeProvider, logger: ILogger<
 
     override _.ExecuteAsync(ct: CancellationToken) =
         task {
+            // A pod restart mid-start must still produce the "ready"/timeout
+            // notification, so re-arm watchers for every game left starting.
+            try do! core.ArmPendingWatchers()
+            with ex -> logger.LogError(ex, "Fizruk: failed to arm pending start watchers at startup")
+
             use timer = new PeriodicTimer(TimeSpan.FromMinutes 10.0, time)
             while! timer.WaitForNextTickAsync ct do
                 if not ct.IsCancellationRequested then

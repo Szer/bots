@@ -76,3 +76,13 @@ let ``multi-game chat with no name reports every game for status`` () =
     Assert.Equal(
         Commands.Resolution.AllGames [ "factorio"; "minecraft-creative" ],
         Commands.resolveGame config.Chats BotAction.Status -200L None)
+
+[<Fact>]
+let ``explicit game name resolves case-insensitively to the configured spelling`` () =
+    let config = sampleConfig ()
+    Assert.Equal(
+        Commands.Resolution.Resolved "minecraft-creative",
+        Commands.resolveGame config.Chats BotAction.Start -200L (Some "Minecraft-Creative"))
+    Assert.Equal(
+        Commands.Resolution.Resolved "minecraft-creative",
+        Commands.resolveGame config.Chats BotAction.Start -200L (Some "MINECRAFT-CREATIVE"))

@@ -16,6 +16,15 @@ type IK8sGateway =
     abstract GetPodLog: ns: string * podName: string * container: string * sinceSeconds: int -> Task<string>
     abstract ListNodes: labelSelector: string -> Task<NodeInfo list>
 
+/// K8sGateway-internal helpers, exposed for unit testing without a cluster.
+module K8sGateway =
+
+    /// DateTimeOffset from a k8s-deserialized DateTime, treating Unspecified Kind
+    /// as UTC (as k8s API timestamps always are) instead of the local offset.
+    let asUtcOffset (dt: DateTime) : DateTimeOffset =
+        let utc = if dt.Kind = DateTimeKind.Unspecified then DateTime.SpecifyKind(dt, DateTimeKind.Utc) else dt
+        DateTimeOffset utc
+
 /// Real implementation backed by the official KubernetesClient, using in-cluster config.
 type KubernetesGateway(client: Kubernetes) =
 
@@ -49,7 +58,7 @@ type KubernetesGateway(client: Kubernetes) =
                           Phase = p.Status.Phase
                           Ready = isReady p.Status.Conditions
                           Terminating = p.Metadata.DeletionTimestamp.HasValue
-                          StartTime = p.Status.StartTime |> Option.ofNullable |> Option.map DateTimeOffset
+                          StartTime = p.Status.StartTime |> Option.ofNullable |> Option.map K8sGateway.asUtcOffset
                           NodeName = p.Spec.NodeName |> Option.ofObj })
                     |> List.ofSeq
             }
@@ -69,6 +78,6 @@ type KubernetesGateway(client: Kubernetes) =
                     |> Seq.map (fun n ->
                         { Name = n.Metadata.Name
                           Ready = isNodeReady n.Status.Conditions
-                          CreationTimestamp = n.Metadata.CreationTimestamp |> Option.ofNullable |> Option.map DateTimeOffset })
+                          CreationTimestamp = n.Metadata.CreationTimestamp |> Option.ofNullable |> Option.map K8sGateway.asUtcOffset })
                     |> List.ofSeq
             }

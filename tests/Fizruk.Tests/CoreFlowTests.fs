@@ -118,6 +118,37 @@ let ``watcher posts ready once the pod becomes Ready`` () =
     }
 
 [<Fact>]
+let ``start when already starting re-arms a watcher that still posts ready`` () =
+    task {
+        let k8s = FakeK8sGateway()
+        let notifier = FakeNotifier()
+        k8s.SetReplicas(ns, deployment, 1)
+        k8s.SetPods(ns, podSelector, [ pendingPod ])
+        let core = newCore k8s notifier (TimeSpan.FromMilliseconds 20.0)
+        let! reply = core.Start gameId
+        Assert.Equal("Already starting.", reply)
+
+        k8s.SetPods(ns, podSelector, [ readyPod "no-probe-game-1" 0 ])
+        let! found = waitUntil 5000 (fun () -> notifier.Sent |> List.exists (fun (_, text) -> text.Contains "ready at"))
+        Assert.True(found, "expected a ready notification from the re-armed watcher")
+    }
+
+[<Fact>]
+let ``ArmPendingWatchers re-arms a watcher for a game left starting after a restart`` () =
+    task {
+        let k8s = FakeK8sGateway()
+        let notifier = FakeNotifier()
+        k8s.SetReplicas(ns, deployment, 1)
+        k8s.SetPods(ns, podSelector, [ pendingPod ])
+        let core = newCore k8s notifier (TimeSpan.FromMilliseconds 20.0)
+
+        do! core.ArmPendingWatchers()
+        k8s.SetPods(ns, podSelector, [ readyPod "no-probe-game-1" 0 ])
+        let! found = waitUntil 5000 (fun () -> notifier.Sent |> List.exists (fun (_, text) -> text.Contains "ready at"))
+        Assert.True(found, "expected ArmPendingWatchers to have armed a watcher")
+    }
+
+[<Fact>]
 let ``watcher posts cancelled when replicas drop to zero`` () =
     task {
         let k8s = FakeK8sGateway()

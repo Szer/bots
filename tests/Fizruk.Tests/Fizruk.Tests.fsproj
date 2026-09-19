@@ -14,6 +14,7 @@
     <Compile Include="IdleDecisionTests.fs" />
     <Compile Include="RconTests.fs" />
     <Compile Include="RakNetTests.fs" />
+    <Compile Include="K8sGatewayTests.fs" />
     <Compile Include="CoreFlowTests.fs" />
     <Compile Include="FakeCallHelpers.fs" />
     <Compile Include="FizrukContainerFixture.fs" />
