@@ -146,10 +146,81 @@ the projection callback always reflects the actual append version.
 If the decider returns `[]`, no events are written and the projection is
 not invoked — events and projection cannot drift.
 
+## Snapshots (opt-in)
+
+Without a policy every load folds the entire stream. For long-lived aggregates
+(vahter's `user:*` streams run into thousands of events), pass a snapshot table
+and use the `SnapshotPolicy` overloads: state is loaded as *stored snapshot +
+the events after it*, in one statement.
+
+```sql
+CREATE TABLE event_snapshot (
+    stream_id       TEXT        NOT NULL,
+    state_type      TEXT        NOT NULL,
+    schema_version  INT         NOT NULL,
+    stream_version  INT         NOT NULL,
+    state           JSONB       NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_id, state_type)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON event_snapshot TO <bot_service_role>;
+```
+
+```fsharp
+let store = EventStore(connString, "event", eventJsonOpts, "event_snapshot")
+
+type User =
+    ...
+    static member SnapshotPolicy = { StateType = "User"; SchemaVersion = 1; SnapshotEvery = 20 }
+
+let! (state, version) = EventStore.loadSnapshottedState<UserEvent, User> store User.SnapshotPolicy streamId
+let! (events, state)  = EventStore.appendSnapshottedEventWithProjection store User.SnapshotPolicy streamId decider
+// explicit fold/zero: store.LoadState / store.Transact / store.TransactWithProjection overloads
+```
+
+Rules the implementation guarantees:
+
+- **Snapshots are a cache, never the source of truth.** Truncating the table is
+  always safe; loads replay and re-create rows. A snapshot write failure is
+  recorded (`eventstore_snapshot_ops_total{op="write_failed"}` + span error) and
+  swallowed — it never fails a load, and on the append path it runs *after* the
+  commit so it can never roll back events.
+- **Stale snapshots are detected and discarded.** A row whose `schema_version`
+  differs from the policy is ignored (and overwritten by the next write). A row
+  that is ahead of its log or doesn't deserialize is deleted and the stream is
+  replayed (`op="discarded_ahead" | "discarded_unreadable"`).
+- **Snapshots only move forward** within a schema version (upsert guard), so a
+  slow writer can't regress a newer snapshot. A different schema version (new
+  code or a rollback) always overwrites.
+- **Consistent reads.** Snapshot and tail come from one SQL statement, so a
+  concurrent snapshot rewrite can't make the tail skip events. Optimistic
+  concurrency is unchanged: expected version = snapshot version + tail length.
+- **Write cadence.** A snapshot is written when a load or a committed append
+  leaves at least `SnapshotEvery` events past the stored one — frozen streams
+  get snapshotted lazily on their first slow load, no backfill needed.
+- **Request scope.** `BeginRequestScope` caches snapshot-loaded states next to
+  raw streams; every committed append (through any API) drops both cached views
+  of that stream, then the appending path re-populates its own.
+
+### Versioning — the one thing you must not forget
+
+A snapshot bakes in two things: the state type's *shape* and the *result of
+its fold*. Bump `SchemaVersion` on any change to either — a new field silently
+deserializes to its default, and a fixed fold bug stays baked into old
+snapshots. Enforce it with two pin tests next to the aggregate (see
+`tests/VahterBanBot.Unit.Tests/UserSnapshotTests.fs`):
+
+1. `SnapshotShape.describe typeof<State>` pinned per schema version.
+2. The fold of a canonical event sequence (covering every case) pinned per
+   schema version.
+
+Both assert the *latest* pin's version equals the policy's, so changing the
+type or the fold fails until the version is bumped and a new pin appended.
+Also keep a JSON round-trip test and a "snapshot + tail = full replay at every
+split point" test.
+
 ## What this wrapper does NOT do
 
-- **Snapshots / state caching.** Every read folds the entire stream. If you
-  have very long streams, project to a separate read model.
 - **Cross-stream transactions.** One stream per call. If you need to write
   to two streams atomically, model them as one stream.
 - **Schema migrations** of payload shapes. If you change a DU case, write a

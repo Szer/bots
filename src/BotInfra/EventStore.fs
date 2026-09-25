@@ -26,6 +26,10 @@ module internal EventStoreTelemetry =
         meter.CreateCounter<int64>(
             "eventstore_stream_cache_mutations_total", "mutations",
             "Request-scoped stream-cache mutations, tagged by action (appended|evicted)")
+    let private snapshotOpsCounter =
+        meter.CreateCounter<int64>(
+            "eventstore_snapshot_ops_total", "ops",
+            "Aggregate-snapshot outcomes, tagged by state_type and op (hit|miss|written|discarded_ahead|discarded_unreadable|write_failed)")
 
     /// Records a load and tags the (possibly null) load span with its provenance.
     let recordLoad (activity: Activity) (source: string) (streamId: string) (version: int) (eventCount: int) =
@@ -45,6 +49,12 @@ module internal EventStoreTelemetry =
         | null -> ()
         | a -> a.SetTag("eventstore.cache.action", action) |> ignore
 
+    /// Records a snapshot outcome on a metric and as a tag on the (possibly null) span.
+    let recordSnapshot (activity: Activity) (stateType: string) (op: string) =
+        snapshotOpsCounter.Add(1L, KeyValuePair("state_type", box stateType), KeyValuePair("op", box op))
+        if not (isNull activity) then
+            activity.AddEvent(ActivityEvent($"snapshot.{op}")) |> ignore
+
 /// Raw row materialized from the per-bot event table.
 /// `data` is JSONB read back as TEXT so Dapper can map it as a plain string.
 [<CLIMutable>]
@@ -60,6 +70,28 @@ type RawEvent =
 /// expected version. The caller's job is to re-read state and retry.
 type ConcurrencyConflict = ConcurrencyConflict
 
+/// A snapshot-aware load row: the usable snapshot (if any) first, then the tail events.
+/// `head_version` (snapshot row only) is the log's max version, to detect a snapshot ahead of it.
+[<CLIMutable>]
+type internal SnapshotLoadRow =
+    { is_snapshot:    bool
+      stream_version: int
+      data:           string
+      head_version:   Nullable<int> }
+
+/// Snapshot-loaded aggregate state; `SnapshotVersion` is the version persisted in the snapshot table.
+type internal LoadedState =
+    { StateType:       string
+      State:           obj
+      Version:         int
+      SnapshotVersion: int }
+
+/// Request-scoped identity map: raw event lists and snapshot-loaded states, keyed by stream id.
+[<AllowNullLiteral>]
+type internal RequestCache() =
+    member val Raws = Dictionary<string, RawEvent list * int>()
+    member val States = Dictionary<string, LoadedState>()
+
 /// Append-only event store wrapper. One instance per (connection-string, event-table)
 /// pair. Each bot owns its own event table — this wrapper does not attempt to merge them.
 ///
@@ -73,13 +105,19 @@ type ConcurrencyConflict = ConcurrencyConflict
 /// with `WithUnionInternalTag()` is the canonical pick.
 ///
 /// The event table must follow the schema described in `EVENTSTORE.md`.
-type EventStore(connString: string, tableName: string, jsonOptions: JsonSerializerOptions) =
+/// `snapshotTableName` (optional, same schema doc) enables the `SnapshotPolicy` overloads.
+type EventStore(connString: string, tableName: string, jsonOptions: JsonSerializerOptions, ?snapshotTableName: string) =
+    static let identifierPattern = @"^[a-z_][a-z0-9_]{0,62}$"
     do
         if isNull connString then nullArg (nameof connString)
         if isNull tableName then nullArg (nameof tableName)
         if isNull jsonOptions then nullArg (nameof jsonOptions)
-        if not (Regex.IsMatch(tableName, @"^[a-z_][a-z0-9_]{0,62}$")) then
+        if not (Regex.IsMatch(tableName, identifierPattern)) then
             invalidArg (nameof tableName) $"invalid event table name: %s{tableName}"
+        match snapshotTableName with
+        | Some snap when not (Regex.IsMatch(snap, identifierPattern)) ->
+            invalidArg (nameof snapshotTableName) $"invalid snapshot table name: %s{snap}"
+        | _ -> ()
 
     let selectAllSql =
         $"""
@@ -100,6 +138,58 @@ RETURNING id
     let maxVersionSql =
         $"SELECT MAX(stream_version) FROM {tableName} WHERE stream_id = @streamId"
 
+    let snapshotTable = defaultArg snapshotTableName ""
+
+    let validatePolicy (policy: SnapshotPolicy) =
+        if snapshotTableName.IsNone then
+            invalidOp "SnapshotPolicy requires an EventStore constructed with snapshotTableName"
+        if String.IsNullOrWhiteSpace policy.StateType then
+            invalidArg (nameof policy) "SnapshotPolicy.StateType must be set"
+        if policy.SnapshotEvery < 1 then
+            invalidArg (nameof policy) "SnapshotPolicy.SnapshotEvery must be >= 1"
+
+    // One statement, so the snapshot and the tail boundary come from the same MVCC snapshot —
+    // a concurrent snapshot rewrite can never make the tail skip events.
+    let snapshotLoadSql =
+        $"""
+WITH snap AS (
+    SELECT stream_version, state
+    FROM {snapshotTable}
+    WHERE stream_id = @streamId AND state_type = @stateType AND schema_version = @schemaVersion
+)
+SELECT TRUE AS is_snapshot, s.stream_version, s.state::TEXT AS data,
+       (SELECT MAX(stream_version) FROM {tableName} WHERE stream_id = @streamId) AS head_version
+FROM snap s
+UNION ALL
+SELECT FALSE, e.stream_version, e.data::TEXT, NULL
+FROM {tableName} e
+WHERE e.stream_id = @streamId
+  AND e.stream_version > COALESCE((SELECT stream_version FROM snap), 0)
+ORDER BY is_snapshot DESC, stream_version
+"""
+
+    // Never moves a snapshot backwards within a schema version; a different schema version
+    // (newer code, or a rollback) always overwrites.
+    let snapshotWriteSql =
+        $"""
+INSERT INTO {snapshotTable} (stream_id, state_type, schema_version, stream_version, state)
+VALUES (@streamId, @stateType, @schemaVersion, @streamVersion, @state::JSONB)
+ON CONFLICT (stream_id, state_type) DO UPDATE
+   SET schema_version = EXCLUDED.schema_version,
+       stream_version = EXCLUDED.stream_version,
+       state          = EXCLUDED.state,
+       updated_at     = now()
+ WHERE {snapshotTable}.schema_version <> EXCLUDED.schema_version
+    OR {snapshotTable}.stream_version < EXCLUDED.stream_version
+"""
+
+    let snapshotDeleteSql =
+        $"""
+DELETE FROM {snapshotTable}
+WHERE stream_id = @streamId AND state_type = @stateType
+  AND schema_version = @schemaVersion AND stream_version = @streamVersion
+"""
+
     // Request-scoped identity map (unit of work): while a scope is active, repeated loads of the
     // same stream within one handle are served from memory instead of re-querying Postgres. The
     // AsyncLocal value is null outside a scope (no caching). Only the `readStream` path is cached;
@@ -108,24 +198,50 @@ RETURNING id
     // NOTE: cached raws are only ever folded by `data` + `stream_version` (id/created_at/event_type
     // are never read off the cache — verified for all readStream consumers), so appended events are
     // synthesized in-memory below without a re-read.
-    let scopedCache = AsyncLocal<Dictionary<string, RawEvent list * int>>()
+    let scopedCache = AsyncLocal<RequestCache>()
 
     let cacheTryGet (streamId: string) : (RawEvent list * int) voption =
         let c = scopedCache.Value
         if isNull c then ValueNone
         else
-            match c.TryGetValue streamId with
+            match c.Raws.TryGetValue streamId with
             | true, v -> ValueSome v
             | _ -> ValueNone
 
     let cachePut (streamId: string) (entry: RawEvent list * int) =
         let c = scopedCache.Value
-        if not (isNull c) then c[streamId] <- entry
+        if not (isNull c) then c.Raws[streamId] <- entry
 
     let cacheEvict (streamId: string) =
         let c = scopedCache.Value
         if not (isNull c) then
-            if c.Remove streamId then EventStoreTelemetry.recordMutation "evicted" streamId
+            if c.Raws.Remove streamId then EventStoreTelemetry.recordMutation "evicted" streamId
+
+    // Snapshot-loaded states live in the same scope; every committed append drops both views.
+    let stateCacheTryGet (streamId: string) (stateType: string) : LoadedState option =
+        let c = scopedCache.Value
+        if isNull c then None
+        else
+            match c.States.TryGetValue streamId with
+            | true, e when e.StateType = stateType -> Some e
+            | _ -> None
+
+    let stateCachePut (streamId: string) (entry: LoadedState) =
+        let c = scopedCache.Value
+        if not (isNull c) then c.States[streamId] <- entry
+
+    let stateCacheEvict (streamId: string) =
+        let c = scopedCache.Value
+        if not (isNull c) then
+            if c.States.Remove streamId then EventStoreTelemetry.recordMutation "evicted" streamId
+
+    /// Drops every cached view of a stream after a committed append; the caller re-populates
+    /// whichever view it maintains, so no other view can serve pre-append data.
+    let invalidateStream (streamId: string) =
+        let c = scopedCache.Value
+        if not (isNull c) then
+            %c.Raws.Remove streamId
+            %c.States.Remove streamId
 
     /// Reflects an append into the cache (if a scope is active) by synthesizing the new rows in
     /// memory, so a subsequent load in the same handle is free and reflects our own write.
@@ -143,8 +259,105 @@ RETURNING id
                       data = JsonSerializer.Serialize<'TEvent>(e, jsonOptions)
                       created_at = Unchecked.defaultof<DateTime> })
             let newVersion = baseVersion + List.length newEvents
-            c[streamId] <- (priorRaws @ synthesized, newVersion)
+            c.Raws[streamId] <- (priorRaws @ synthesized, newVersion)
             EventStoreTelemetry.recordMutation "appended" streamId
+
+    /// Upserts a snapshot. A failure is recorded (metric + span error) and swallowed: snapshots
+    /// are a cache, so a failed write must never fail the load or the committed append.
+    let tryWriteSnapshot (conn: NpgsqlConnection) (activity: Activity) (policy: SnapshotPolicy)
+                         (streamId: string) (version: int) (state: 'State) : Task<bool> =
+        task {
+            try
+                let json = JsonSerializer.Serialize<'State>(state, jsonOptions)
+                let! _ =
+                    conn.ExecuteAsync(snapshotWriteSql,
+                        {| streamId = streamId; stateType = policy.StateType; schemaVersion = policy.SchemaVersion
+                           streamVersion = version; state = json |})
+                EventStoreTelemetry.recordSnapshot activity policy.StateType "written"
+                return true
+            with ex ->
+                EventStoreTelemetry.recordSnapshot activity policy.StateType "write_failed"
+                if not (isNull activity) then
+                    %activity.AddException(ex).SetStatus(ActivityStatusCode.Error, "snapshot write failed")
+                return false
+        }
+
+    /// Loads aggregate state as snapshot + tail. A snapshot that is ahead of its log or can't be
+    /// deserialized is deleted and the stream is replayed from scratch.
+    let loadSnapshotted (fold: 'State -> 'TEvent -> 'State) (zero: 'State) (policy: SnapshotPolicy)
+                        (streamId: string) : Task<LoadedState> =
+        task {
+            validatePolicy policy
+            match stateCacheTryGet streamId policy.StateType with
+            | Some entry ->
+                use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.load")
+                EventStoreTelemetry.recordLoad activity "cache" streamId entry.Version 0
+                return entry
+            | None ->
+                use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.load")
+                use conn = new NpgsqlConnection(connString)
+                let keyArgs =
+                    {| streamId = streamId; stateType = policy.StateType; schemaVersion = policy.SchemaVersion |}
+                let! rows = conn.QueryAsync<SnapshotLoadRow>(snapshotLoadSql, keyArgs)
+                let rows = List.ofSeq rows
+                let snapshotRow, tailRows =
+                    match rows with
+                    | r :: rest when r.is_snapshot -> Some r, rest
+                    | _ -> None, rows
+                let tail = tailRows |> List.map (fun r -> r.stream_version, r.data)
+                let fromSnapshot =
+                    match snapshotRow with
+                    | None -> Ok None
+                    | Some r when not r.head_version.HasValue || r.head_version.Value < r.stream_version ->
+                        Error ("discarded_ahead", r.stream_version)
+                    | Some r ->
+                        try
+                            match box (JsonSerializer.Deserialize<'State>(r.data, jsonOptions)) with
+                            | null -> Error ("discarded_unreadable", r.stream_version)
+                            | s -> Ok (Some (unbox<'State> s, r.stream_version))
+                        with ex ->
+                            if not (isNull activity) then %activity.AddException ex
+                            Error ("discarded_unreadable", r.stream_version)
+                let! (baseState, baseVersion, events) =
+                    task {
+                        match fromSnapshot with
+                        | Ok (Some (s, v)) ->
+                            EventStoreTelemetry.recordSnapshot activity policy.StateType "hit"
+                            return s, v, tail
+                        | Ok None ->
+                            EventStoreTelemetry.recordSnapshot activity policy.StateType "miss"
+                            return zero, 0, tail
+                        | Error (op, badVersion) ->
+                            EventStoreTelemetry.recordSnapshot activity policy.StateType op
+                            let! _ =
+                                conn.ExecuteAsync(snapshotDeleteSql,
+                                    {| streamId = streamId; stateType = policy.StateType
+                                       schemaVersion = policy.SchemaVersion; streamVersion = badVersion |})
+                            let! raws = conn.QueryAsync<RawEvent>(selectAllSql, {| streamId = streamId |})
+                            return zero, 0, (raws |> Seq.map (fun r -> r.stream_version, r.data) |> List.ofSeq)
+                    }
+                let state =
+                    events
+                    |> List.fold (fun s (_, data) -> fold s (JsonSerializer.Deserialize<'TEvent>(data, jsonOptions))) baseState
+                let version =
+                    match List.tryLast events with
+                    | Some (v, _) -> v
+                    | None -> baseVersion
+                let! snapshotVersion =
+                    if version - baseVersion >= policy.SnapshotEvery then
+                        task {
+                            let! written = tryWriteSnapshot conn activity policy streamId version state
+                            return if written then version else baseVersion
+                        }
+                    else Task.FromResult baseVersion
+                EventStoreTelemetry.recordLoad activity "db" streamId version (List.length events)
+                if not (isNull activity) then %activity.SetTag("snapshot_version", baseVersion)
+                let entry =
+                    { StateType = policy.StateType; State = box state
+                      Version = version; SnapshotVersion = snapshotVersion }
+                stateCachePut streamId entry
+                return entry
+        }
 
     let readStream (streamId: string) : Task<RawEvent list * int> =
         task {
@@ -189,7 +402,7 @@ RETURNING id
     /// Intended to wrap one update handle — see the webhook entry point.
     member _.BeginRequestScope() : IDisposable =
         let prev = scopedCache.Value
-        scopedCache.Value <- Dictionary<string, RawEvent list * int>()
+        scopedCache.Value <- RequestCache()
         { new IDisposable with member _.Dispose() = scopedCache.Value <- prev }
 
     /// Returns the highest stream_version for the given stream, or 0 if the stream is empty.
@@ -285,6 +498,7 @@ ORDER BY stream_id, stream_version
                 return Error ConcurrencyConflict
             else
                 do! tx.CommitAsync()
+                invalidateStream streamId
                 return Ok ()
         }
 
@@ -310,6 +524,7 @@ ORDER BY stream_id, stream_version
             else
                 do! projection conn tx
                 do! tx.CommitAsync()
+                invalidateStream streamId
                 return Ok ()
         }
 
@@ -384,6 +599,64 @@ ORDER BY stream_id, stream_version
             return result.Value
         }
 
+    /// Loads state as snapshot + tail with the stream version (`0` = no stream yet), refreshing
+    /// the snapshot once at least `policy.SnapshotEvery` events were folded past it.
+    member _.LoadState<'TEvent, 'State>
+            (fold: 'State -> 'TEvent -> 'State, zero: 'State, policy: SnapshotPolicy, streamId: string)
+            : Task<'State * int> =
+        task {
+            let! loaded = loadSnapshotted fold zero policy streamId
+            return unbox<'State> loaded.State, loaded.Version
+        }
+
+    /// Snapshot-aware `TransactWithProjection`. The snapshot refresh runs after the commit, so a
+    /// failing snapshot write can never roll back the appended events.
+    member this.TransactWithProjection<'TEvent, 'State>
+            (fold: 'State -> 'TEvent -> 'State, zero: 'State, policy: SnapshotPolicy,
+             decider: 'State -> 'TEvent list * (NpgsqlConnection -> NpgsqlTransaction -> Task) option,
+             streamId: string)
+            : Task<'TEvent list * 'State> =
+        task {
+            let mutable result = None
+            while result.IsNone do
+                let! loaded = loadSnapshotted fold zero policy streamId
+                let state = unbox<'State> loaded.State
+                let (newEvents, projection) = decider state
+                if newEvents.IsEmpty then
+                    result <- Some ([], state)
+                else
+                    let proj =
+                        match projection with
+                        | Some p -> p
+                        | None   -> fun _ _ -> Task.CompletedTask
+                    match! this.TryAppendWithProjection(streamId, loaded.Version, newEvents, proj) with
+                    | Ok _ ->
+                        let finalState = newEvents |> List.fold fold state
+                        let newVersion = loaded.Version + newEvents.Length
+                        let! snapshotVersion =
+                            if newVersion - loaded.SnapshotVersion >= policy.SnapshotEvery then
+                                task {
+                                    use conn = new NpgsqlConnection(connString)
+                                    let! written = tryWriteSnapshot conn Activity.Current policy streamId newVersion finalState
+                                    return if written then newVersion else loaded.SnapshotVersion
+                                }
+                            else Task.FromResult loaded.SnapshotVersion
+                        stateCachePut streamId
+                            { loaded with State = box finalState; Version = newVersion; SnapshotVersion = snapshotVersion }
+                        result <- Some (newEvents, finalState)
+                    | Error ConcurrencyConflict ->
+                        // Stale read lost the version race — the retry must re-read from the DB.
+                        stateCacheEvict streamId
+            return result.Value
+        }
+
+    /// Snapshot-aware `Transact` (no projection).
+    member this.Transact<'TEvent, 'State>
+            (fold: 'State -> 'TEvent -> 'State, zero: 'State, policy: SnapshotPolicy,
+             decider: 'State -> 'TEvent list, streamId: string)
+            : Task<'TEvent list * 'State> =
+        this.TransactWithProjection(fold, zero, policy, (fun s -> decider s, None), streamId)
+
 /// Companion module — SRTP convenience that resolves Fold/Zero from the state type
 /// at compile time, so callers don't have to thread them through every callsite.
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
@@ -416,3 +689,21 @@ module EventStore =
              and 'State : (static member Fold : 'State * 'TEvent -> 'State) =
         let fold s e = 'State.Fold(s, e)
         store.TransactWithProjection(fold, 'State.Zero, decider, streamId)
+
+    /// SRTP wrapper for `store.LoadState`; type arguments are explicit because `'TEvent` can't be inferred.
+    let inline loadSnapshottedState<'TEvent, 'State
+                when 'State : (static member Zero : 'State)
+                 and 'State : (static member Fold : 'State * 'TEvent -> 'State)>
+            (store: EventStore) (policy: SnapshotPolicy) (streamId: string) : Task<'State * int> =
+        let fold s e = 'State.Fold(s, e)
+        store.LoadState<'TEvent, 'State>(fold, 'State.Zero, policy, streamId)
+
+    /// Snapshot-aware `appendEventWithProjection`.
+    let inline appendSnapshottedEventWithProjection
+            (store: EventStore) (policy: SnapshotPolicy) (streamId: string)
+            (decider: 'State -> 'TEvent list * (NpgsqlConnection -> NpgsqlTransaction -> Task) option)
+            : Task<'TEvent list * 'State>
+            when 'State : (static member Zero : 'State)
+             and 'State : (static member Fold : 'State * 'TEvent -> 'State) =
+        let fold s e = 'State.Fold(s, e)
+        store.TransactWithProjection(fold, 'State.Zero, policy, decider, streamId)
