@@ -670,8 +670,9 @@ ORDER BY stream_id, stream_version
                         let! snapshotVersion =
                             if newVersion - loaded.SnapshotVersion >= policy.SnapshotEvery then
                                 task {
+                                    use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.snapshotWrite")
                                     use conn = new NpgsqlConnection(connString)
-                                    let! written = tryWriteSnapshot conn Activity.Current policy streamId newVersion finalState
+                                    let! written = tryWriteSnapshot conn activity policy streamId newVersion finalState
                                     return if written then newVersion else loaded.SnapshotVersion
                                 }
                             else Task.FromResult loaded.SnapshotVersion

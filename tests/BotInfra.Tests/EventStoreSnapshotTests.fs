@@ -267,6 +267,27 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``a failed snapshot write on append is reported on its own span, never on the caller's``() = task {
+        use callerSource = new ActivitySource("BotInfra.Tests.Caller")
+        let stopped = ConcurrentQueue<Activity>()
+        use listener =
+            new ActivityListener(
+                ShouldListenTo = (fun s -> s.Name = callerSource.Name || s.Name = "BotInfra.EventStore"),
+                Sample = (fun _ -> ActivitySamplingResult.AllDataAndRecorded),
+                ActivityStopped = (fun a -> stopped.Enqueue a))
+        ActivitySource.AddActivityListener listener
+        let broken = EventStore(db.ConnectionString, "event", jsonOpts, "broken_snapshot")
+        let caller = callerSource.StartActivity("caller")
+        let! _ = broken.Transact(fold, Tally.Zero, policy 1, (fun _ -> [ Added {| amount = 1 |} ]), newStream ())
+        caller.Stop()
+        Assert.Equal(ActivityStatusCode.Unset, caller.Status)
+        Assert.Empty(caller.Events)
+        let write = stopped |> Seq.find (fun a -> a.OperationName = "eventStore.snapshotWrite")
+        Assert.Equal(ActivityStatusCode.Error, write.Status)
+        Assert.True(hasEvent "snapshot.write_failed" write)
+    }
+
+    [<Fact>]
     member _.``concurrent snapshot transacts on one stream lose no events``() = task {
         let sid = newStream ()
         let p = policy 2
