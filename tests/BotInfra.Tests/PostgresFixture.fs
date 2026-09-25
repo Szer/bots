@@ -6,8 +6,8 @@ open Npgsql
 open Testcontainers.PostgreSql
 open Xunit
 
-/// Event + snapshot tables exactly as EVENTSTORE.md prescribes. `broken_snapshot` rejects every
-/// write, to prove a failing snapshot write never fails a load or an append.
+/// Event + snapshot tables exactly as EVENTSTORE.md prescribes, plus two sabotaged snapshot tables:
+/// `broken_snapshot` rejects every write, `undeletable_snapshot` rejects every delete.
 let private schemaSql =
     """
 CREATE TABLE event (
@@ -32,6 +32,11 @@ CREATE TABLE event_snapshot (
 
 CREATE TABLE broken_snapshot (LIKE event_snapshot INCLUDING ALL);
 ALTER TABLE broken_snapshot ADD CONSTRAINT always_fails CHECK (false);
+
+CREATE TABLE undeletable_snapshot (LIKE event_snapshot INCLUDING ALL);
+CREATE FUNCTION refuse_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN RAISE EXCEPTION 'deletes refused'; END $$;
+CREATE TRIGGER refuse_delete BEFORE DELETE ON undeletable_snapshot FOR EACH ROW EXECUTE FUNCTION refuse_delete();
 """
 
 type PostgresFixture() =

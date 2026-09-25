@@ -29,7 +29,7 @@ module internal EventStoreTelemetry =
     let private snapshotOpsCounter =
         meter.CreateCounter<int64>(
             "eventstore_snapshot_ops_total", "ops",
-            "Aggregate-snapshot outcomes, tagged by state_type and op (hit|miss|written|discarded_ahead|discarded_unreadable|write_failed)")
+            "Aggregate-snapshot outcomes, tagged by state_type and op (hit|miss|written|discarded_ahead|discarded_unreadable|write_failed|delete_failed)")
 
     /// Records a load and tags the (possibly null) load span with its provenance.
     let recordLoad (activity: Activity) (source: string) (streamId: string) (version: int) (eventCount: int) =
@@ -217,6 +217,19 @@ ON CONFLICT (stream_id, state_type) DO UPDATE
     OR {snapshotTable}.stream_version < EXCLUDED.stream_version
 """
 
+    // Discard path only: the stored row is known-bad (ahead of its log or unreadable), so the guard
+    // that keeps snapshots monotonic must not protect it.
+    let snapshotForceWriteSql =
+        $"""
+INSERT INTO {snapshotTable} (stream_id, state_type, schema_version, stream_version, state)
+VALUES (@streamId, @stateType, @schemaVersion, @streamVersion, @state::JSONB)
+ON CONFLICT (stream_id, state_type) DO UPDATE
+   SET schema_version = EXCLUDED.schema_version,
+       stream_version = EXCLUDED.stream_version,
+       state          = EXCLUDED.state,
+       updated_at     = now()
+"""
+
     let snapshotDeleteSql =
         $"""
 DELETE FROM {snapshotTable}
@@ -293,13 +306,13 @@ WHERE stream_id = @streamId AND state_type = @stateType
 
     /// Upserts a snapshot. A failure is recorded (metric + span error) and swallowed: snapshots
     /// are a cache, so a failed write must never fail the load or the committed append.
-    let tryWriteSnapshot (conn: NpgsqlConnection) (activity: Activity) (policy: SnapshotPolicy)
+    let tryWriteSnapshot (conn: NpgsqlConnection) (activity: Activity) (policy: SnapshotPolicy) (force: bool)
                          (streamId: string) (version: int) (state: 'State) : Task<bool> =
         task {
             try
                 let json = JsonSerializer.Serialize<'State>(state, jsonOptions)
                 let! _ =
-                    conn.ExecuteAsync(snapshotWriteSql,
+                    conn.ExecuteAsync((if force then snapshotForceWriteSql else snapshotWriteSql),
                         {| streamId = streamId; stateType = policy.StateType; schemaVersion = policy.SchemaVersion
                            streamVersion = version; state = json |})
                 EventStoreTelemetry.recordSnapshot activity policy.StateType "written"
@@ -311,8 +324,24 @@ WHERE stream_id = @streamId AND state_type = @stateType
                 return false
         }
 
+    /// Removes a known-bad snapshot of an empty stream; failures are recorded and swallowed.
+    let tryDeleteSnapshot (conn: NpgsqlConnection) (activity: Activity) (policy: SnapshotPolicy)
+                          (streamId: string) (badVersion: int) : Task =
+        task {
+            try
+                let! _ =
+                    conn.ExecuteAsync(snapshotDeleteSql,
+                        {| streamId = streamId; stateType = policy.StateType
+                           schemaVersion = policy.SchemaVersion; streamVersion = badVersion |})
+                ()
+            with ex ->
+                EventStoreTelemetry.recordSnapshot activity policy.StateType "delete_failed"
+                if not (isNull activity) then
+                    %activity.AddException(ex).SetStatus(ActivityStatusCode.Error, "snapshot delete failed")
+        }
+
     /// Loads aggregate state as snapshot + tail. A snapshot that is ahead of its log or can't be
-    /// deserialized is deleted and the stream is replayed from scratch.
+    /// deserialized is ignored, the stream replayed from scratch, and the row overwritten.
     let loadSnapshotted (fold: 'State -> 'TEvent -> 'State) (zero: 'State) (policy: SnapshotPolicy)
                         (streamId: string) : Task<LoadedState> =
         task {
@@ -357,12 +386,8 @@ WHERE stream_id = @streamId AND state_type = @stateType
                         | Ok None ->
                             EventStoreTelemetry.recordSnapshot activity policy.StateType "miss"
                             return zero, 0, tail
-                        | Error (op, badVersion) ->
+                        | Error (op, _) ->
                             EventStoreTelemetry.recordSnapshot activity policy.StateType op
-                            let! _ =
-                                conn.ExecuteAsync(snapshotDeleteSql,
-                                    {| streamId = streamId; stateType = policy.StateType
-                                       schemaVersion = policy.SchemaVersion; streamVersion = badVersion |})
                             let! raws = conn.QueryAsync<RawEvent>(selectAllSql, {| streamId = streamId |})
                             return zero, 0, (raws |> Seq.map (fun r -> r.stream_version, r.data) |> List.ofSeq)
                     }
@@ -374,12 +399,23 @@ WHERE stream_id = @streamId AND state_type = @stateType
                     | Some (v, _) -> v
                     | None -> baseVersion
                 let! snapshotVersion =
-                    if version - baseVersion >= policy.SnapshotEvery then
+                    match fromSnapshot with
+                    | Error (_, badVersion) when version = 0 ->
                         task {
-                            let! written = tryWriteSnapshot conn activity policy streamId version state
+                            do! tryDeleteSnapshot conn activity policy streamId badVersion
+                            return 0
+                        }
+                    | Error _ ->
+                        task {
+                            let! written = tryWriteSnapshot conn activity policy true streamId version state
+                            return if written then version else 0
+                        }
+                    | Ok _ when version - baseVersion >= policy.SnapshotEvery ->
+                        task {
+                            let! written = tryWriteSnapshot conn activity policy false streamId version state
                             return if written then version else baseVersion
                         }
-                    else Task.FromResult baseVersion
+                    | Ok _ -> Task.FromResult baseVersion
                 EventStoreTelemetry.recordLoad activity "db" streamId version (List.length events)
                 if not (isNull activity) then %activity.SetTag("snapshot_version", baseVersion)
                 let entry =
@@ -672,7 +708,7 @@ ORDER BY stream_id, stream_version
                                 task {
                                     use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.snapshotWrite")
                                     use conn = new NpgsqlConnection(connString)
-                                    let! written = tryWriteSnapshot conn activity policy streamId newVersion finalState
+                                    let! written = tryWriteSnapshot conn activity policy false streamId newVersion finalState
                                     return if written then newVersion else loaded.SnapshotVersion
                                 }
                             else Task.FromResult loaded.SnapshotVersion

@@ -223,6 +223,38 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``a discarded snapshot that cannot be deleted neither fails the load nor sticks around``() = task {
+        let stubborn = EventStore(db.ConnectionString, "event", jsonOpts, "undeletable_snapshot")
+        let sid = newStream ()
+        do! appendRaw sid (added 4)
+        let! _ = stubborn.LoadState(fold, Tally.Zero, policy 1, sid)
+        do! exec "UPDATE undeletable_snapshot SET stream_version = 999 WHERE stream_id = @streamId" sid
+
+        let! (state, version) = stubborn.LoadState(fold, Tally.Zero, policy 1, sid)
+        Assert.Equal(10, state.Total)
+        Assert.Equal(4, version)
+        let! row = snapshotRow "undeletable_snapshot" sid
+        Assert.Equal(Some 4, row |> Option.map _.stream_version)
+    }
+
+    [<Fact>]
+    member _.``a snapshot of a stream with no events is dropped, even when deleting it fails``() = task {
+        for table in [ "event_snapshot"; "undeletable_snapshot" ] do
+            let s = EventStore(db.ConnectionString, "event", jsonOpts, table)
+            let sid = newStream ()
+            use conn = new NpgsqlConnection(db.ConnectionString)
+            let! _ =
+                conn.ExecuteAsync(
+                    $"INSERT INTO {table} (stream_id, state_type, schema_version, stream_version, state) VALUES (@streamId, 'Tally', 1, 3, '{{\"Total\": 9, \"Count\": 3}}')",
+                    {| streamId = sid |})
+            let! (state, version) = s.LoadState(fold, Tally.Zero, policy 1, sid)
+            Assert.Equal(Tally.Zero, state)
+            Assert.Equal(0, version)
+            let! row = snapshotRow table sid
+            Assert.Equal((if table = "event_snapshot" then None else Some 3), row |> Option.map _.stream_version)
+    }
+
+    [<Fact>]
     member _.``an unreadable snapshot is discarded and rebuilt``() = task {
         let sid = newStream ()
         do! appendRaw sid (added 4)
