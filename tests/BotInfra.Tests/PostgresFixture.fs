@@ -30,6 +30,21 @@ CREATE TABLE event_snapshot (
     PRIMARY KEY (stream_id, state_type)
 );
 
+-- Snapshots are only valid for an append-only log: any in-place rewrite of events drops them.
+CREATE OR REPLACE FUNCTION event_snapshot_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        TRUNCATE event_snapshot;
+    ELSE
+        DELETE FROM event_snapshot WHERE stream_id = OLD.stream_id OR stream_id = NEW.stream_id;
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE OR REPLACE TRIGGER event_snapshot_invalidate AFTER UPDATE OR DELETE ON event
+    FOR EACH ROW EXECUTE FUNCTION event_snapshot_invalidate();
+CREATE OR REPLACE TRIGGER event_snapshot_invalidate_truncate AFTER TRUNCATE ON event
+    FOR EACH STATEMENT EXECUTE FUNCTION event_snapshot_invalidate();
+
 CREATE TABLE broken_snapshot (LIKE event_snapshot INCLUDING ALL);
 ALTER TABLE broken_snapshot ADD CONSTRAINT always_fails CHECK (false);
 

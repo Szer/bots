@@ -521,6 +521,22 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``rewriting or deleting events in place drops the stream's snapshots``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 4)
+        let! _ = load (policy 1) sid
+        do! exec """UPDATE event SET data = jsonb_set(data, '{amount}', '100') WHERE stream_id = @streamId AND stream_version = 1""" sid
+        let! (rewritten, _) = load (policy 100) sid
+        Assert.Equal(109, rewritten.Total)
+
+        let! _ = load (policy 1) sid
+        do! exec "DELETE FROM event WHERE stream_id = @streamId AND stream_version = 4" sid
+        let! (trimmed, version) = load (policy 100) sid
+        Assert.Equal(105, trimmed.Total)
+        Assert.Equal(3, version)
+    }
+
+    [<Fact>]
     member _.``snapshot policy requires a snapshot table``() =
         let plain = EventStore(db.ConnectionString, "event", jsonOpts)
         Assert.ThrowsAsync<InvalidOperationException>(fun () ->

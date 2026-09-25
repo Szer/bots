@@ -164,6 +164,21 @@ CREATE TABLE event_snapshot (
     PRIMARY KEY (stream_id, state_type)
 );
 GRANT SELECT, INSERT, UPDATE, DELETE ON event_snapshot TO <bot_service_role>;
+
+-- Snapshots are only valid for an append-only log: any in-place rewrite of events drops them.
+CREATE OR REPLACE FUNCTION event_snapshot_invalidate() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'TRUNCATE' THEN
+        TRUNCATE event_snapshot;
+    ELSE
+        DELETE FROM event_snapshot WHERE stream_id = OLD.stream_id OR stream_id = NEW.stream_id;
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE OR REPLACE TRIGGER event_snapshot_invalidate AFTER UPDATE OR DELETE ON event
+    FOR EACH ROW EXECUTE FUNCTION event_snapshot_invalidate();
+CREATE OR REPLACE TRIGGER event_snapshot_invalidate_truncate AFTER TRUNCATE ON event
+    FOR EACH STATEMENT EXECUTE FUNCTION event_snapshot_invalidate();
 ```
 
 ```fsharp
@@ -187,8 +202,14 @@ Rules the implementation guarantees:
   commit so it can never roll back events.
 - **Stale snapshots are detected and discarded.** A row whose `schema_version`
   differs from the policy is ignored (and overwritten by the next write). A row
-  that is ahead of its log or doesn't deserialize is deleted and the stream is
-  replayed (`op="discarded_ahead" | "discarded_unreadable"`).
+  that is ahead of its log or doesn't deserialize is ignored, the stream is
+  replayed and the row force-overwritten (`op="discarded_ahead" |
+  "discarded_unreadable"`); a failure there is recorded, never thrown.
+- **Rewriting history drops snapshots.** The triggers above delete a stream's
+  snapshots on any `UPDATE`/`DELETE` of its events (and `TRUNCATE` clears the
+  table), so a data-fix migration can never leave a snapshot that disagrees
+  with the rewritten log. The bot role never updates events, so the triggers
+  only fire during migrations.
 - **Snapshots only move forward** within a schema version (upsert guard), so a
   slow writer can't regress a newer snapshot. A different schema version (new
   code or a rollback) always overwrites.
@@ -200,7 +221,15 @@ Rules the implementation guarantees:
   get snapshotted lazily on their first slow load, no backfill needed.
 - **Request scope.** `BeginRequestScope` caches snapshot-loaded states next to
   raw streams; every committed append (through any API) drops both cached views
-  of that stream, then the appending path re-populates its own.
+  of that stream, then the appending path re-populates its own. A load only
+  publishes into the cache if no append invalidated the stream since it read
+  the DB, so a slow parallel load can't put pre-append state back. A disposed
+  scope stops caching, so fire-and-forget work that captured it reads the DB.
+- **Known costs.** While pods with two different `SchemaVersion`s run side by
+  side (rolling deploy of a bump), each treats the other's row as a miss, so
+  long streams replay until the rollout finishes. `TryAppend` with an
+  `expectedVersion` above the head can create a version gap; the Transact
+  loops never do — prefer them.
 
 ### Versioning — the one thing you must not forget
 
@@ -211,8 +240,11 @@ snapshots. Enforce it with two pin tests next to the aggregate (see
 `tests/VahterBanBot.Unit.Tests/UserSnapshotTests.fs`):
 
 1. `SnapshotShape.describe typeof<State>` pinned per schema version.
-2. The fold of a canonical event sequence (covering every case) pinned per
-   schema version.
+2. A fold *transcript* pinned per schema version: the snapshot JSON of every
+   intermediate state of a canonical sequence (every event case plus edge
+   cases), and of each event applied to `Zero` and to a fully-populated state.
+   Pinning only a final state misses changes whose effect is overwritten later;
+   pinning JSON also catches serializer-option changes.
 
 Both assert the *latest* pin's version equals the policy's, so changing the
 type or the fold fails until the version is bumped and a new pin appended.
