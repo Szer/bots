@@ -1,6 +1,7 @@
 namespace BotInfra
 
 open System
+open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
 open System.Diagnostics.Metrics
@@ -87,10 +88,11 @@ type internal LoadedState =
       SnapshotVersion: int }
 
 /// Request-scoped identity map: raw event lists and snapshot-loaded states, keyed by stream id.
+/// Concurrent: one handler may append to several streams in parallel within its scope.
 [<AllowNullLiteral>]
 type internal RequestCache() =
-    member val Raws = Dictionary<string, RawEvent list * int>()
-    member val States = Dictionary<string, LoadedState>()
+    member val Raws = ConcurrentDictionary<string, RawEvent list * int>()
+    member val States = ConcurrentDictionary<string, LoadedState>()
 
 /// Append-only event store wrapper. One instance per (connection-string, event-table)
 /// pair. Each bot owns its own event table — this wrapper does not attempt to merge them.
@@ -215,7 +217,7 @@ WHERE stream_id = @streamId AND state_type = @stateType
     let cacheEvict (streamId: string) =
         let c = scopedCache.Value
         if not (isNull c) then
-            if c.Raws.Remove streamId then EventStoreTelemetry.recordMutation "evicted" streamId
+            if c.Raws.TryRemove(streamId) |> fst then EventStoreTelemetry.recordMutation "evicted" streamId
 
     // Snapshot-loaded states live in the same scope; every committed append drops both views.
     let stateCacheTryGet (streamId: string) (stateType: string) : LoadedState option =
@@ -233,15 +235,15 @@ WHERE stream_id = @streamId AND state_type = @stateType
     let stateCacheEvict (streamId: string) =
         let c = scopedCache.Value
         if not (isNull c) then
-            if c.States.Remove streamId then EventStoreTelemetry.recordMutation "evicted" streamId
+            if c.States.TryRemove(streamId) |> fst then EventStoreTelemetry.recordMutation "evicted" streamId
 
     /// Drops every cached view of a stream after a committed append; the caller re-populates
     /// whichever view it maintains, so no other view can serve pre-append data.
     let invalidateStream (streamId: string) =
         let c = scopedCache.Value
         if not (isNull c) then
-            %c.Raws.Remove streamId
-            %c.States.Remove streamId
+            %c.Raws.TryRemove streamId
+            %c.States.TryRemove streamId
 
     /// Reflects an append into the cache (if a scope is active) by synthesizing the new rows in
     /// memory, so a subsequent load in the same handle is free and reflects our own write.

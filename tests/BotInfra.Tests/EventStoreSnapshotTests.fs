@@ -3,6 +3,7 @@ module BotInfra.Tests.EventStoreSnapshotTests
 open System
 open System.Collections.Concurrent
 open System.Diagnostics
+open System.Text.Json
 open System.Text.Json.Serialization
 open System.Threading.Tasks
 open Dapper
@@ -91,6 +92,20 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
 
     let increment p streamId amount =
         store.Transact(fold, Tally.Zero, p, (fun _ -> [ Added {| amount = amount |} ]), streamId)
+
+    /// The core invariant: a stored snapshot always equals the fold of the log up to its version.
+    let assertSnapshotMatchesLog (streamId: string) = task {
+        match! snapshotRow "event_snapshot" streamId with
+        | None -> ()
+        | Some row ->
+            let! (raws, _) = EventStore(db.ConnectionString, "event", jsonOpts).GetRawEventsForStream streamId
+            let expected =
+                raws
+                |> List.filter (fun r -> r.stream_version <= row.stream_version)
+                |> List.map (fun r -> JsonSerializer.Deserialize<TallyEvent>(r.data, jsonOpts))
+                |> List.fold fold Tally.Zero
+            Assert.Equal(expected, JsonSerializer.Deserialize<Tally>(row.state, jsonOpts))
+    }
 
     [<Fact>]
     member _.``first load replays the stream and snapshots it once the tail reaches SnapshotEvery``() = task {
@@ -290,6 +305,74 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
         let! (raws, version) = store.GetRawEventsForStream sid
         Assert.Equal(3, version)
         Assert.Equal(3, raws.Length)
+    }
+
+    [<Fact>]
+    member _.``concurrent loads and appends never store a snapshot that disagrees with the log``() = task {
+        let sid = newStream ()
+        for round in 1 .. 5 do
+            let work =
+                [ for i in 1 .. 16 ->
+                    let p = policy (1 + i % 3)
+                    if i % 4 = 0 then load p sid :> Task
+                    else increment p sid 1 :> Task ]
+            do! Task.WhenAll work
+            do! assertSnapshotMatchesLog sid
+            let! (state, version) = load (policy 1) sid
+            let! expected = replay sid
+            Assert.Equal(expected, state)
+            Assert.Equal(round * 12, version)
+            Assert.Equal(round * 12, state.Total)
+    }
+
+    [<Fact>]
+    member _.``raw and snapshot writers racing on one stream stay consistent``() = task {
+        let sid = newStream ()
+        let work =
+            [ for i in 1 .. 30 ->
+                if i % 2 = 0 then increment (policy 2) sid 1 :> Task
+                else store.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 1 |} ]), sid) :> Task ]
+        do! Task.WhenAll work
+        do! assertSnapshotMatchesLog sid
+        let! (state, version) = load (policy 2) sid
+        Assert.Equal(30, state.Total)
+        Assert.Equal(30, version)
+    }
+
+    [<Fact>]
+    member _.``a stale scoped state conflicts, re-reads the log and appends on top``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 2)
+        let otherPod = EventStore(db.ConnectionString, "event", jsonOpts, "event_snapshot")
+        use _scope = store.BeginRequestScope()
+        let! _ = load (policy 1) sid
+        let! _ = otherPod.Transact(fold, Tally.Zero, policy 1, (fun _ -> [ Added {| amount = 100 |} ]), sid)
+
+        let mutable decisions = 0
+        let! (_, state) =
+            store.Transact(fold, Tally.Zero, policy 1, (fun _ -> decisions <- decisions + 1; [ Added {| amount = 10 |} ]), sid)
+        Assert.Equal(2, decisions)
+        Assert.Equal(113, state.Total)
+        let! (reloaded, version) = load (policy 1) sid
+        Assert.Equal(113, reloaded.Total)
+        Assert.Equal(4, version)
+        do! assertSnapshotMatchesLog sid
+    }
+
+    [<Fact>]
+    member _.``parallel appends to many streams inside one request scope are all cached correctly``() = task {
+        let sids = [ for _ in 1 .. 200 -> newStream () ]
+        use _scope = store.BeginRequestScope()
+        let! _ =
+            Task.WhenAll [
+                for sid in sids do
+                    yield task { let! _ = increment (policy 1) sid 5 in () }
+                    yield task { let! _ = store.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 1 |} ]), $"{sid}:raw") in () } ]
+        for sid in sids do
+            let! (state, _) = load (policy 1) sid
+            Assert.Equal(5, state.Total)
+            let! raw = store.FoldEvents(fold, Tally.Zero, $"{sid}:raw")
+            Assert.Equal(1, raw.Total)
     }
 
     [<Fact>]
