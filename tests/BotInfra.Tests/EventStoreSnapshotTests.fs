@@ -560,6 +560,33 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``rebuilding a snapshot replays the whole log and repairs a wrong snapshot at the same version``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 25)
+        let! _ = load (policy 1) sid
+        do! exec """UPDATE event_snapshot SET state = jsonb_set(state, '{Total}', '1000') WHERE stream_id = @streamId""" sid
+
+        let! (state, version) = store.RebuildSnapshot(fold, Tally.Zero, policy 20, sid)
+        let! expected = replay sid
+        Assert.Equal(expected, state)
+        Assert.Equal(25, version)
+        do! assertSnapshotMatchesLog sid
+        let! (loaded, _) = load (policy 20) sid
+        Assert.Equal(expected, loaded)
+    }
+
+    [<Fact>]
+    member _.``rebuilding skips streams shorter than SnapshotEvery``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 3)
+        let! (state, version) = store.RebuildSnapshot(fold, Tally.Zero, policy 5, sid)
+        Assert.Equal(6, state.Total)
+        Assert.Equal(3, version)
+        let! row = snapshotRow "event_snapshot" sid
+        Assert.Equal(None, row)
+    }
+
+    [<Fact>]
     member _.``snapshot policy requires a snapshot table``() =
         let plain = EventStore(db.ConnectionString, "event", jsonOpts)
         Assert.ThrowsAsync<InvalidOperationException>(fun () ->
