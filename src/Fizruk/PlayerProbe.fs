@@ -13,10 +13,9 @@ module PlayerProbe =
             match game.Players.Type with
             | ProbeType.None -> return PlayersProbeResult.NotConfigured
             | ProbeType.Rcon ->
-                let envName = game.Players.PasswordEnv |> Option.defaultValue ""
-                match Environment.GetEnvironmentVariable envName with
-                | null -> return PlayersProbeResult.Error $"env var {envName} not set"
-                | password ->
+                match Rcon.passwordFor game.Players with
+                | Error e -> return PlayersProbeResult.Error e
+                | Ok password ->
                     let! result = Rcon.probeAsync game.Players.Host game.Players.Port password timeout
                     return
                         match result with

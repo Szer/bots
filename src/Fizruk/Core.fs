@@ -37,6 +37,7 @@ module private StatusText =
         (pod: PodInfo option)
         (node: NodeInfo option)
         (players: PlayersProbeResult)
+        (detailLines: string list)
         (listenerLines: string list)
         (now: DateTimeOffset)
         : string =
@@ -53,6 +54,7 @@ module private StatusText =
                     [ $"{prefix}: running."
                       formatNodeLine node now
                       formatPlayersLine players
+                      yield! detailLines
                       $"Address: {game.Address}" ]
                 |> String.concat "\n"
 
@@ -166,7 +168,11 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
             let game = gameConfig gameId
             let! desired, pod, node, players = this.GetState gameId
             let! listenerLines = this.GetListenerLines game
-            return StatusText.formatStatus game desired pod node players listenerLines (time.GetUtcNow())
+            let! detailLines =
+                match pod with
+                | Some p when p.Ready -> StatusDetails.fetchAll game
+                | _ -> Task.FromResult []
+            return StatusText.formatStatus game desired pod node players detailLines listenerLines (time.GetUtcNow())
         }
 
     /// Deletes a game's ListenerSet, if it has one, swallowing (and logging) any

@@ -7,8 +7,8 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 
-/// Source RCON client for Factorio's "/players online" console command. Packet
-/// framing and response parsing are pure so they're unit-testable without a socket.
+/// Source RCON client: authenticates, runs one console command, returns its output.
+/// Packet framing and response parsing are pure so they're unit-testable without a socket.
 module Rcon =
 
     [<Literal>]
@@ -72,9 +72,9 @@ module Rcon =
             | None -> return failwith "RCON auth response not received within packet budget"
         }
 
-    /// Runs the auth+exec protocol over any Stream — a real NetworkStream in
-    /// production, a fake in-memory one in tests — so this needs no socket to test.
-    let runProtocol (stream: Stream) (password: string) (ct: CancellationToken) : Task<Result<string list, string>> =
+    /// Runs the auth+exec protocol for one command over any Stream — a real
+    /// NetworkStream in production, a fake in-memory one in tests.
+    let runCommand (stream: Stream) (password: string) (command: string) (ct: CancellationToken) : Task<Result<string, string>> =
         task {
             let readExact (buf: byte[]) =
                 task {
@@ -101,22 +101,43 @@ module Rcon =
             if authId = -1 then
                 return Error "RCON authentication failed"
             else
-                let execPacket = encodePacket 2 ServerdataExecCommand "/players online"
+                let execPacket = encodePacket 2 ServerdataExecCommand command
                 do! stream.WriteAsync(execPacket.AsMemory(), ct)
                 let! _, _, body = readPacket ()
-                return Ok(parsePlayersResponse body)
+                return Ok body
         }
 
-    /// Connects, then delegates to runProtocol for the auth+exec exchange.
-    let probeAsync (host: string) (port: int) (password: string) (timeout: TimeSpan) : Task<Result<string list, string>> =
+    /// "/players online" over any Stream, parsed into player names.
+    let runProtocol (stream: Stream) (password: string) (ct: CancellationToken) : Task<Result<string list, string>> =
+        task {
+            let! result = runCommand stream password "/players online" ct
+            return result |> Result.map parsePlayersResponse
+        }
+
+    /// Connects and runs one command, mapping timeouts and socket errors to Error.
+    let execAsync (host: string) (port: int) (password: string) (command: string) (timeout: TimeSpan) : Task<Result<string, string>> =
         task {
             use cts = new CancellationTokenSource(timeout)
             try
                 use client = new TcpClient()
                 do! client.ConnectAsync(host, port, cts.Token)
                 use stream = client.GetStream()
-                return! runProtocol stream password cts.Token
+                return! runCommand stream password command cts.Token
             with
-            | :? OperationCanceledException -> return Error "RCON probe timed out"
+            | :? OperationCanceledException -> return Error "RCON request timed out"
             | ex -> return Error ex.Message
         }
+
+    /// Connects and returns the names from "/players online".
+    let probeAsync (host: string) (port: int) (password: string) (timeout: TimeSpan) : Task<Result<string list, string>> =
+        task {
+            let! result = execAsync host port password "/players online" timeout
+            return result |> Result.map parsePlayersResponse
+        }
+
+    /// Reads the RCON password from the env var a game's players block names.
+    let passwordFor (players: PlayersConfig) : Result<string, string> =
+        let envName = players.PasswordEnv |> Option.defaultValue ""
+        match Environment.GetEnvironmentVariable envName with
+        | null -> Error $"env var {envName} not set"
+        | password -> Ok password

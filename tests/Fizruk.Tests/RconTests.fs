@@ -88,3 +88,22 @@ let ``runProtocol reports auth failure only once the real auth response id is -1
 
         Assert.Equal(Error "RCON authentication failed", result)
     }
+
+[<Fact>]
+let ``runCommand sends the given command and returns the raw response body`` () =
+    task {
+        let authOkPacket = Rcon.encodePacket 1 Rcon.ServerdataAuthResponse ""
+        let responsePacket = Rcon.encodePacket 2 Rcon.ServerdataResponseValue "steel-processing\t1\t0.5\n"
+        use readSource = new MemoryStream(Array.append authOkPacket responsePacket)
+        use writeSink = new MemoryStream()
+        use duplex = new DuplexTestStream(readSource, writeSink)
+
+        let! result = Rcon.runCommand duplex "secret" "/sc rcon.print(1)" CancellationToken.None
+
+        Assert.Equal(Ok "steel-processing\t1\t0.5\n", result)
+        let written = writeSink.ToArray()
+        let execPayload = written.[(Rcon.encodePacket 1 Rcon.ServerdataAuth "secret").Length + 4 ..]
+        let _, packetType, body = Rcon.decodePacket execPayload
+        Assert.Equal(Rcon.ServerdataExecCommand, packetType)
+        Assert.Equal("/sc rcon.print(1)", body)
+    }

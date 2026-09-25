@@ -171,3 +171,26 @@ let ``an empty listeners array configures no listener and doesn't require a gate
     let config = Config.parse json
     Assert.True(config.Games.["g"].Listeners.IsEmpty)
     Assert.True(config.Games.["g"].Gateway.IsNone)
+
+let private rconPlayers =
+    """"players": { "type": "rcon", "host": "h", "port": 27015, "passwordEnv": "PW" },"""
+
+[<Fact>]
+let ``a game without a details block has no status details`` () =
+    let config = Config.parse (minimalGame "x" rconPlayers)
+    Assert.Empty(config.Games.["g"].Details)
+
+[<Fact>]
+let ``factorio-research detail parses for an rcon game`` () =
+    let config = Config.parse (minimalGame "x" (rconPlayers + """ "details": [ { "type": "factorio-research" } ],"""))
+    Assert.Equal<StatusDetail list>([ StatusDetail.FactorioResearch ], config.Games.["g"].Details)
+
+[<Fact>]
+let ``factorio-research detail without an rcon players block raises ConfigError`` () =
+    let json = minimalGame "x" """"players": { "type": "none" }, "details": [ { "type": "factorio-research" } ],"""
+    Assert.Throws<ConfigError>(fun () -> Config.parse json |> ignore) |> ignore
+
+[<Fact>]
+let ``unknown details type raises ConfigError`` () =
+    let json = minimalGame "x" (rconPlayers + """ "details": [ { "type": "weather" } ],""")
+    Assert.Throws<ConfigError>(fun () -> Config.parse json |> ignore) |> ignore

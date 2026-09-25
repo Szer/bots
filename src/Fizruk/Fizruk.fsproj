@@ -10,6 +10,7 @@
     <Compile Include="Rcon.fs" />
     <Compile Include="RakNet.fs" />
     <Compile Include="PlayerProbe.fs" />
+    <Compile Include="StatusDetails.fs" />
     <Compile Include="IdleDecision.fs" />
     <Compile Include="Notifier.fs" />
     <Compile Include="Core.fs" />
