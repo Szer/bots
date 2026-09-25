@@ -1,7 +1,6 @@
 namespace BotInfra
 
 open System
-open System.Collections.Concurrent
 open System.Collections.Generic
 open System.Diagnostics
 open System.Diagnostics.Metrics
@@ -87,12 +86,45 @@ type internal LoadedState =
       Version:         int
       SnapshotVersion: int }
 
-/// Request-scoped identity map: raw event lists and snapshot-loaded states, keyed by stream id.
-/// Concurrent: one handler may append to several streams in parallel within its scope.
+/// Request-scoped identity map (raw streams + snapshot-loaded states). Access is serialized; a put
+/// only lands if its stream wasn't invalidated since the caller observed `Generation`.
 [<AllowNullLiteral>]
 type internal RequestCache() =
-    member val Raws = ConcurrentDictionary<string, RawEvent list * int>()
-    member val States = ConcurrentDictionary<string, LoadedState>()
+    let gate = obj ()
+    let raws = Dictionary<string, RawEvent list * int>()
+    let states = Dictionary<string, LoadedState>()
+    let generations = Dictionary<string, int64>()
+    let mutable disposed = false
+    let generation streamId =
+        match generations.TryGetValue streamId with
+        | true, g -> g
+        | _ -> 0L
+    let tryFind (d: Dictionary<string, 'T>) streamId =
+        match d.TryGetValue streamId with
+        | true, v when not disposed -> Some v
+        | _ -> None
+
+    member _.Generation(streamId: string) = lock gate (fun () -> generation streamId)
+    member _.TryGetRaws(streamId: string) = lock gate (fun () -> tryFind raws streamId)
+    member _.TryGetState(streamId: string) = lock gate (fun () -> tryFind states streamId)
+    member _.PutRaws(streamId: string, observed: int64, entry) =
+        lock gate (fun () -> if not disposed && generation streamId = observed then raws[streamId] <- entry)
+    member _.PutState(streamId: string, observed: int64, entry) =
+        lock gate (fun () -> if not disposed && generation streamId = observed then states[streamId] <- entry)
+    /// Drops both views of the stream; returns the new generation and whether anything was cached.
+    member _.Invalidate(streamId: string) : int64 * bool =
+        lock gate (fun () ->
+            let next = generation streamId + 1L
+            generations[streamId] <- next
+            let removedRaws = raws.Remove streamId
+            let removedState = states.Remove streamId
+            next, (removedRaws || removedState))
+    /// Work that outlives the scope (fire-and-forget) keeps the reference; it must stop caching.
+    member _.Dispose() =
+        lock gate (fun () ->
+            disposed <- true
+            raws.Clear()
+            states.Clear())
 
 /// Append-only event store wrapper. One instance per (connection-string, event-table)
 /// pair. Each bot owns its own event table — this wrapper does not attempt to merge them.
@@ -202,55 +234,50 @@ WHERE stream_id = @streamId AND state_type = @stateType
     // synthesized in-memory below without a re-read.
     let scopedCache = AsyncLocal<RequestCache>()
 
-    let cacheTryGet (streamId: string) : (RawEvent list * int) voption =
-        let c = scopedCache.Value
-        if isNull c then ValueNone
-        else
-            match c.Raws.TryGetValue streamId with
-            | true, v -> ValueSome v
-            | _ -> ValueNone
+    /// The current scope's generation for `streamId`, captured before a DB read (None outside a scope).
+    let observeGeneration (streamId: string) : int64 option =
+        match scopedCache.Value with
+        | null -> None
+        | c -> Some (c.Generation streamId)
 
-    let cachePut (streamId: string) (entry: RawEvent list * int) =
-        let c = scopedCache.Value
-        if not (isNull c) then c.Raws[streamId] <- entry
+    let cacheTryGet (streamId: string) : (RawEvent list * int) option =
+        match scopedCache.Value with
+        | null -> None
+        | c -> c.TryGetRaws streamId
 
-    let cacheEvict (streamId: string) =
-        let c = scopedCache.Value
-        if not (isNull c) then
-            if c.Raws.TryRemove(streamId) |> fst then EventStoreTelemetry.recordMutation "evicted" streamId
+    let cachePut (streamId: string) (observed: int64 option) (entry: RawEvent list * int) =
+        match scopedCache.Value, observed with
+        | null, _ | _, None -> ()
+        | c, Some g -> c.PutRaws(streamId, g, entry)
 
     // Snapshot-loaded states live in the same scope; every committed append drops both views.
     let stateCacheTryGet (streamId: string) (stateType: string) : LoadedState option =
-        let c = scopedCache.Value
-        if isNull c then None
-        else
-            match c.States.TryGetValue streamId with
-            | true, e when e.StateType = stateType -> Some e
-            | _ -> None
+        match scopedCache.Value with
+        | null -> None
+        | c -> c.TryGetState streamId |> Option.filter (fun e -> e.StateType = stateType)
 
-    let stateCachePut (streamId: string) (entry: LoadedState) =
-        let c = scopedCache.Value
-        if not (isNull c) then c.States[streamId] <- entry
+    let stateCachePut (streamId: string) (observed: int64 option) (entry: LoadedState) =
+        match scopedCache.Value, observed with
+        | null, _ | _, None -> ()
+        | c, Some g -> c.PutState(streamId, g, entry)
 
-    let stateCacheEvict (streamId: string) =
-        let c = scopedCache.Value
-        if not (isNull c) then
-            if c.States.TryRemove(streamId) |> fst then EventStoreTelemetry.recordMutation "evicted" streamId
+    /// Drops every cached view of a stream; returns the generation the caller may put under.
+    let invalidateStream (streamId: string) : int64 option =
+        match scopedCache.Value with
+        | null -> None
+        | c -> Some (fst (c.Invalidate streamId))
 
-    /// Drops every cached view of a stream after a committed append; the caller re-populates
-    /// whichever view it maintains, so no other view can serve pre-append data.
-    let invalidateStream (streamId: string) =
-        let c = scopedCache.Value
-        if not (isNull c) then
-            %c.Raws.TryRemove streamId
-            %c.States.TryRemove streamId
+    /// Same as `invalidateStream` after a lost version race, counted as an eviction.
+    let cacheEvict (streamId: string) =
+        match scopedCache.Value with
+        | null -> ()
+        | c -> if snd (c.Invalidate streamId) then EventStoreTelemetry.recordMutation "evicted" streamId
 
     /// Reflects an append into the cache (if a scope is active) by synthesizing the new rows in
     /// memory, so a subsequent load in the same handle is free and reflects our own write.
     /// Synthesized rows carry meaningful `data` + `stream_version` only (see note above).
-    let cacheAppend (streamId: string) (priorRaws: RawEvent list) (baseVersion: int) (newEvents: 'TEvent list) =
-        let c = scopedCache.Value
-        if not (isNull c) then
+    let cacheAppend (streamId: string) (observed: int64 option) (priorRaws: RawEvent list) (baseVersion: int) (newEvents: 'TEvent list) =
+        if observed.IsSome then
             let synthesized =
                 newEvents
                 |> List.mapi (fun i e ->
@@ -261,7 +288,7 @@ WHERE stream_id = @streamId AND state_type = @stateType
                       data = JsonSerializer.Serialize<'TEvent>(e, jsonOptions)
                       created_at = Unchecked.defaultof<DateTime> })
             let newVersion = baseVersion + List.length newEvents
-            c.Raws[streamId] <- (priorRaws @ synthesized, newVersion)
+            cachePut streamId observed (priorRaws @ synthesized, newVersion)
             EventStoreTelemetry.recordMutation "appended" streamId
 
     /// Upserts a snapshot. A failure is recorded (metric + span error) and swallowed: snapshots
@@ -297,6 +324,7 @@ WHERE stream_id = @streamId AND state_type = @stateType
                 return entry
             | None ->
                 use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.load")
+                let observed = observeGeneration streamId
                 use conn = new NpgsqlConnection(connString)
                 let keyArgs =
                     {| streamId = streamId; stateType = policy.StateType; schemaVersion = policy.SchemaVersion |}
@@ -357,19 +385,20 @@ WHERE stream_id = @streamId AND state_type = @stateType
                 let entry =
                     { StateType = policy.StateType; State = box state
                       Version = version; SnapshotVersion = snapshotVersion }
-                stateCachePut streamId entry
+                stateCachePut streamId observed entry
                 return entry
         }
 
     let readStream (streamId: string) : Task<RawEvent list * int> =
         task {
             match cacheTryGet streamId with
-            | ValueSome (events, version) ->
+            | Some (events, version) ->
                 use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.load")
                 EventStoreTelemetry.recordLoad activity "cache" streamId version (List.length events)
                 return events, version
-            | ValueNone ->
+            | None ->
                 use activity = EventStoreTelemetry.activitySource.StartActivity("eventStore.load")
+                let observed = observeGeneration streamId
                 use conn = new NpgsqlConnection(connString)
                 let! rows = conn.QueryAsync<RawEvent>(selectAllSql, {| streamId = streamId |})
                 let events = List.ofSeq rows
@@ -378,7 +407,7 @@ WHERE stream_id = @streamId AND state_type = @stateType
                     |> List.tryLast
                     |> Option.map (fun e -> e.stream_version)
                     |> Option.defaultValue 0
-                cachePut streamId (events, version)
+                cachePut streamId observed (events, version)
                 EventStoreTelemetry.recordLoad activity "db" streamId version (List.length events)
                 return events, version
         }
@@ -399,13 +428,37 @@ WHERE stream_id = @streamId AND state_type = @stateType
             return insertedCount
         }
 
+    /// Inserts + optional in-TX projection; on commit invalidates the scoped cache and returns the
+    /// generation the appender may re-populate it under.
+    let tryAppendCore (streamId: string) (expectedVersion: int) (events: 'TEvent list)
+                      (projection: NpgsqlConnection -> NpgsqlTransaction -> Task) : Task<Result<int64 option, ConcurrencyConflict>> =
+        task {
+            if events.IsEmpty then return Ok (observeGeneration streamId)
+            else
+            use conn = new NpgsqlConnection(connString)
+            do! conn.OpenAsync()
+            use! tx = conn.BeginTransactionAsync()
+            let! inserted = insertEvents conn tx streamId expectedVersion events
+            if inserted < events.Length then
+                do! tx.RollbackAsync()
+                return Error ConcurrencyConflict
+            else
+                do! projection conn tx
+                do! tx.CommitAsync()
+                return Ok (invalidateStream streamId)
+        }
+
     /// Begins a request-scoped identity-map scope. Repeated loads of the same stream within the
     /// returned scope are served from memory; dispose restores the prior scope (supports nesting).
     /// Intended to wrap one update handle — see the webhook entry point.
     member _.BeginRequestScope() : IDisposable =
         let prev = scopedCache.Value
-        scopedCache.Value <- RequestCache()
-        { new IDisposable with member _.Dispose() = scopedCache.Value <- prev }
+        let cache = RequestCache()
+        scopedCache.Value <- cache
+        { new IDisposable with
+            member _.Dispose() =
+                cache.Dispose()
+                scopedCache.Value <- prev }
 
     /// Returns the highest stream_version for the given stream, or 0 if the stream is empty.
     member _.GetStreamVersion(streamId: string) : Task<int> =
@@ -489,19 +542,9 @@ ORDER BY stream_id, stream_version
             (streamId: string, expectedVersion: int, events: 'TEvent list)
             : Task<Result<unit, ConcurrencyConflict>> =
         task {
-            if events.IsEmpty then return Ok ()
-            else
-            use conn = new NpgsqlConnection(connString)
-            do! conn.OpenAsync()
-            use! tx = conn.BeginTransactionAsync()
-            let! inserted = insertEvents conn tx streamId expectedVersion events
-            if inserted < events.Length then
-                do! tx.RollbackAsync()
-                return Error ConcurrencyConflict
-            else
-                do! tx.CommitAsync()
-                invalidateStream streamId
-                return Ok ()
+            match! tryAppendCore streamId expectedVersion events (fun _ _ -> Task.CompletedTask) with
+            | Ok _ -> return Ok ()
+            | Error e -> return Error e
         }
 
     /// Same as TryAppend, but runs `projection conn tx` after the inserts succeed and
@@ -514,20 +557,9 @@ ORDER BY stream_id, stream_version
              projection: NpgsqlConnection -> NpgsqlTransaction -> Task)
             : Task<Result<unit, ConcurrencyConflict>> =
         task {
-            if events.IsEmpty then return Ok ()
-            else
-            use conn = new NpgsqlConnection(connString)
-            do! conn.OpenAsync()
-            use! tx = conn.BeginTransactionAsync()
-            let! inserted = insertEvents conn tx streamId expectedVersion events
-            if inserted < events.Length then
-                do! tx.RollbackAsync()
-                return Error ConcurrencyConflict
-            else
-                do! projection conn tx
-                do! tx.CommitAsync()
-                invalidateStream streamId
-                return Ok ()
+            match! tryAppendCore streamId expectedVersion events projection with
+            | Ok _ -> return Ok ()
+            | Error e -> return Error e
         }
 
     /// Read-decide-append-retry loop with optimistic concurrency. On conflict the
@@ -551,9 +583,9 @@ ORDER BY stream_id, stream_version
                 if newEvents.IsEmpty then
                     result <- ValueSome ([], state)
                 else
-                    match! this.TryAppend(streamId, version, newEvents) with
-                    | Ok _ ->
-                        cacheAppend streamId raws version newEvents
+                    match! tryAppendCore streamId version newEvents (fun _ _ -> Task.CompletedTask) with
+                    | Ok observed ->
+                        cacheAppend streamId observed raws version newEvents
                         let finalState = newEvents |> List.fold fold state
                         result <- ValueSome (newEvents, finalState)
                     | Error ConcurrencyConflict ->
@@ -589,9 +621,9 @@ ORDER BY stream_id, stream_version
                         match projection with
                         | Some p -> p
                         | None   -> fun _ _ -> Task.CompletedTask
-                    match! this.TryAppendWithProjection(streamId, version, newEvents, proj) with
-                    | Ok _ ->
-                        cacheAppend streamId raws version newEvents
+                    match! tryAppendCore streamId version newEvents proj with
+                    | Ok observed ->
+                        cacheAppend streamId observed raws version newEvents
                         let finalState = newEvents |> List.fold fold state
                         result <- ValueSome (newEvents, finalState)
                     | Error ConcurrencyConflict ->
@@ -631,8 +663,8 @@ ORDER BY stream_id, stream_version
                         match projection with
                         | Some p -> p
                         | None   -> fun _ _ -> Task.CompletedTask
-                    match! this.TryAppendWithProjection(streamId, loaded.Version, newEvents, proj) with
-                    | Ok _ ->
+                    match! tryAppendCore streamId loaded.Version newEvents proj with
+                    | Ok observed ->
                         let finalState = newEvents |> List.fold fold state
                         let newVersion = loaded.Version + newEvents.Length
                         let! snapshotVersion =
@@ -643,12 +675,12 @@ ORDER BY stream_id, stream_version
                                     return if written then newVersion else loaded.SnapshotVersion
                                 }
                             else Task.FromResult loaded.SnapshotVersion
-                        stateCachePut streamId
+                        stateCachePut streamId observed
                             { loaded with State = box finalState; Version = newVersion; SnapshotVersion = snapshotVersion }
                         result <- Some (newEvents, finalState)
                     | Error ConcurrencyConflict ->
                         // Stale read lost the version race — the retry must re-read from the DB.
-                        stateCacheEvict streamId
+                        cacheEvict streamId
             return result.Value
         }
 

@@ -5,6 +5,7 @@ open System.Collections.Concurrent
 open System.Diagnostics
 open System.Text.Json
 open System.Text.Json.Serialization
+open System.Threading
 open System.Threading.Tasks
 open Dapper
 open Npgsql
@@ -55,6 +56,19 @@ type private LoadSpans() =
 
 let private tag (key: string) (a: Activity) = a.GetTagItem key |> string
 let private hasEvent (name: string) (a: Activity) = a.Events |> Seq.exists (fun e -> e.Name = name)
+
+/// A fold that parks its first call until released — holds a load between its query and its cache put.
+let private parkedFold () =
+    let entered = new SemaphoreSlim(0)
+    let release = new SemaphoreSlim(0)
+    let mutable first = true
+    let f s e =
+        if first then
+            first <- false
+            %entered.Release()
+            release.Wait()
+        fold s e
+    f, entered, release
 
 type SnapshotRow = { schema_version: int; stream_version: int; state: string }
 
@@ -373,6 +387,61 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
             Assert.Equal(5, state.Total)
             let! raw = store.FoldEvents(fold, Tally.Zero, $"{sid}:raw")
             Assert.Equal(1, raw.Total)
+    }
+
+    [<Fact>]
+    member _.``a load that read before a parallel append cannot overwrite the fresher cached state``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 2)
+        use _scope = store.BeginRequestScope()
+        let parked, entered, release = parkedFold ()
+        let slowLoad = store.LoadState(parked, Tally.Zero, policy 100, sid)
+        do! entered.WaitAsync()
+        let! _ = increment (policy 100) sid 10
+        %release.Release()
+        let! (_, slowVersion) = slowLoad
+        Assert.Equal(2, slowVersion)
+        let! (state, version) = load (policy 100) sid
+        Assert.Equal(13, state.Total)
+        Assert.Equal(3, version)
+    }
+
+    [<Fact>]
+    member _.``a load that read before a parallel raw append cannot leave the two cached views disagreeing``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 2)
+        use _scope = store.BeginRequestScope()
+        let parked, entered, release = parkedFold ()
+        let slowLoad = store.LoadState(parked, Tally.Zero, policy 100, sid)
+        do! entered.WaitAsync()
+        let! _ = store.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 10 |} ]), sid)
+        %release.Release()
+        let! _ = slowLoad
+        let! (state, version) = load (policy 100) sid
+        let! (_, rawVersion) = store.GetRawEventsForStream sid
+        Assert.Equal(3, rawVersion)
+        Assert.Equal(3, version)
+        Assert.Equal(13, state.Total)
+    }
+
+    [<Fact>]
+    member _.``work outliving its request scope stops using the scope's cache``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 2)
+        let otherPod = EventStore(db.ConnectionString, "event", jsonOpts, "event_snapshot")
+        let go = new SemaphoreSlim(0)
+        let scope = store.BeginRequestScope()
+        let! _ = load (policy 100) sid
+        let background = task {
+            do! go.WaitAsync()
+            return! load (policy 100) sid
+        }
+        scope.Dispose()
+        let! _ = otherPod.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 10 |} ]), sid)
+        %go.Release()
+        let! (state, version) = background
+        Assert.Equal(3, version)
+        Assert.Equal(13, state.Total)
     }
 
     [<Fact>]
