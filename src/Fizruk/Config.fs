@@ -18,6 +18,13 @@ type PlayersConfig =
       /// Env var holding the RCON password. Set only when Type = Rcon.
       PasswordEnv: string option }
 
+/// Extra game-specific facts appended to a running game's /status reply. Each case
+/// has its own fetcher in StatusDetails; add a case per new kind of detail.
+[<RequireQualifiedAccess>]
+type StatusDetail =
+    /// Current research and its progress, read over the game's RCON endpoint.
+    | FactorioResearch
+
 /// The shared Envoy Gateway a game's ListenerSet attaches to.
 type GatewayConfig = { Name: string; Namespace: string }
 
@@ -46,6 +53,7 @@ type GameConfig =
       /// Empty when the game has no public port. `Gateway` is `Some` iff non-empty.
       Listeners: ListenerConfig list
       Gateway: GatewayConfig option
+      Details: StatusDetail list
       ActivityRegex: Regex
       IdleGraceMinutes: int
       IdleWindowMinutes: int
@@ -176,6 +184,20 @@ module Config =
             | Some g -> listeners, Some g
             | None -> raise (ConfigError $"{ctx}: listeners require a top-level 'gateway' to be configured")
 
+    /// The optional `details` array: `[{ "type": "factorio-research" }]`. Details that
+    /// talk RCON reuse the endpoint declared in `players`, so they require type=rcon.
+    let private parseDetails (ctx: string) (players: PlayersConfig) (el: JsonElement option) : StatusDetail list =
+        let parseEntry (entry: JsonElement) =
+            match (requireString entry ctx "type").ToLowerInvariant() with
+            | "factorio-research" ->
+                if players.Type <> ProbeType.Rcon then
+                    raise (ConfigError $"{ctx}: details type 'factorio-research' requires players.type=rcon")
+                StatusDetail.FactorioResearch
+            | other -> raise (ConfigError $"{ctx}: unknown details type '{other}'")
+        match el with
+        | None -> []
+        | Some arr -> arr.EnumerateArray() |> Seq.map parseEntry |> List.ofSeq
+
     let private parseGame (gateway: GatewayConfig option) (id: string) (el: JsonElement) : GameConfig =
         let ctx = $"games.{id}"
         let regexStr = requireString el ctx "activityRegex"
@@ -184,6 +206,7 @@ module Config =
             with :? ArgumentException as ex ->
                 raise (ConfigError $"{ctx}: invalid activityRegex '{regexStr}': {ex.Message}")
         let listeners, gameGateway = parseListeners ctx id gateway (prop el "listener") (prop el "listeners")
+        let players = parsePlayers ctx (prop el "players")
         { Id = id
           DisplayName = requireString el ctx "displayName"
           Namespace = requireString el ctx "namespace"
@@ -192,9 +215,10 @@ module Config =
           Container = requireString el ctx "container"
           NodeLabelSelector = requireString el ctx "nodeLabelSelector"
           Address = requireString el ctx "address"
-          Players = parsePlayers ctx (prop el "players")
+          Players = players
           Listeners = listeners
           Gateway = gameGateway
+          Details = parseDetails ctx players (prop el "details")
           ActivityRegex = regex
           IdleGraceMinutes = requireInt el ctx "idleGraceMinutes"
           IdleWindowMinutes = requireInt el ctx "idleWindowMinutes"
