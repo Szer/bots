@@ -498,6 +498,29 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``a slow writer never regresses a newer snapshot and does not count as written``() = task {
+        let sid = newStream ()
+        do! appendRaw sid (added 2)
+        let otherPod = EventStore(db.ConnectionString, "event", jsonOpts, "event_snapshot")
+        use spans = new LoadSpans()
+        let parked, entered, release = parkedFold ()
+        let slowLoad = store.LoadState(parked, Tally.Zero, policy 1, sid)
+        do! entered.WaitAsync()
+        do! appendRaw sid (added 3)
+        let! _ = otherPod.LoadState(fold, Tally.Zero, policy 1, sid)
+        %release.Release()
+        let! (_, slowVersion) = slowLoad
+        Assert.Equal(2, slowVersion)
+
+        let! row = snapshotRow "event_snapshot" sid
+        Assert.Equal(Some 5, row |> Option.map _.stream_version)
+        do! assertSnapshotMatchesLog sid
+        let slowSpan = spans.All |> List.find (fun a -> tag "stream_version" a = "2" && hasEvent "snapshot.miss" a)
+        Assert.True(hasEvent "snapshot.skipped" slowSpan)
+        Assert.False(hasEvent "snapshot.written" slowSpan)
+    }
+
+    [<Fact>]
     member _.``snapshot policy requires a snapshot table``() =
         let plain = EventStore(db.ConnectionString, "event", jsonOpts)
         Assert.ThrowsAsync<InvalidOperationException>(fun () ->

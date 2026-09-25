@@ -29,7 +29,7 @@ module internal EventStoreTelemetry =
     let private snapshotOpsCounter =
         meter.CreateCounter<int64>(
             "eventstore_snapshot_ops_total", "ops",
-            "Aggregate-snapshot outcomes, tagged by state_type and op (hit|miss|written|discarded_ahead|discarded_unreadable|write_failed|delete_failed)")
+            "Aggregate-snapshot outcomes, tagged by state_type and op (hit|miss|written|skipped|discarded_ahead|discarded_unreadable|write_failed|delete_failed)")
 
     /// Records a load and tags the (possibly null) load span with its provenance.
     let recordLoad (activity: Activity) (source: string) (streamId: string) (version: int) (eventCount: int) =
@@ -311,12 +311,14 @@ WHERE stream_id = @streamId AND state_type = @stateType
         task {
             try
                 let json = JsonSerializer.Serialize<'State>(state, jsonOptions)
-                let! _ =
+                let! affected =
                     conn.ExecuteAsync((if force then snapshotForceWriteSql else snapshotWriteSql),
                         {| streamId = streamId; stateType = policy.StateType; schemaVersion = policy.SchemaVersion
                            streamVersion = version; state = json |})
-                EventStoreTelemetry.recordSnapshot activity policy.StateType "written"
-                return true
+                // 0 rows = the monotonic guard kept a newer snapshot another writer stored first.
+                let op = if affected > 0 then "written" else "skipped"
+                EventStoreTelemetry.recordSnapshot activity policy.StateType op
+                return affected > 0
             with ex ->
                 EventStoreTelemetry.recordSnapshot activity policy.StateType "write_failed"
                 if not (isNull activity) then
