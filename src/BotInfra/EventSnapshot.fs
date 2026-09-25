@@ -51,6 +51,10 @@ module SnapshotShape =
                         |> sprintf "[%s]"
                 %visiting.Remove t
                 name + body
+        elif t.IsGenericType then
+            let name = t.Name.Substring(0, t.Name.IndexOf '`')
+            let args = t.GetGenericArguments() |> Array.map (render visiting) |> String.concat ", "
+            $"{name}<{args}>"
         elif t.IsEnum then
             let names = Enum.GetNames t |> String.concat ","
             $"{t.Name}<{names}>"

@@ -39,3 +39,15 @@ let ``describe changes when an optional field is added`` () =
     let a = SnapshotShape.describe typeof<Sample>
     let b = SnapshotShape.describe typeof<SampleWithExtraField>
     Assert.NotEqual<string>(a.Replace("SampleWithExtraField", "Sample"), b.Replace("SampleWithExtraField", "Sample"))
+
+type WithCollections =
+    { Tags: Map<string, int list>
+      Seen: Set<DateTime>
+      Pair: System.Collections.Generic.KeyValuePair<string, int64> }
+
+[<Fact>]
+let ``describe renders generic collections without assembly versions`` () =
+    Assert.Equal(
+        "WithCollections{Tags: FSharpMap<System.String, list<System.Int32>>; Seen: FSharpSet<System.DateTime>; "
+        + "Pair: KeyValuePair<System.String, System.Int64>}",
+        SnapshotShape.describe typeof<WithCollections>)
