@@ -537,6 +537,29 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
     }
 
     [<Fact>]
+    member _.``pods on two schema versions racing on one stream each read only their own snapshots``() = task {
+        let sid = newStream ()
+        let v1 = policy 2
+        let v2 = { policy 2 with SchemaVersion = 2 }
+        let newPod = EventStore(db.ConnectionString, "event", jsonOpts, "event_snapshot")
+        let work =
+            [ for i in 1 .. 24 ->
+                match i % 4 with
+                | 0 -> load v1 sid :> Task
+                | 1 -> increment v1 sid 1 :> Task
+                | 2 -> newPod.LoadState(fold, Tally.Zero, v2, sid) :> Task
+                | _ -> newPod.Transact(fold, Tally.Zero, v2, (fun _ -> [ Added {| amount = 1 |} ]), sid) :> Task ]
+        do! Task.WhenAll work
+        do! assertSnapshotMatchesLog sid
+        let! expected = replay sid
+        let! (old, _) = load v1 sid
+        let! (fresh, _) = newPod.LoadState(fold, Tally.Zero, v2, sid)
+        Assert.Equal(expected, old)
+        Assert.Equal(expected, fresh)
+        Assert.Equal(12, expected.Total)
+    }
+
+    [<Fact>]
     member _.``snapshot policy requires a snapshot table``() =
         let plain = EventStore(db.ConnectionString, "event", jsonOpts)
         Assert.ThrowsAsync<InvalidOperationException>(fun () ->
