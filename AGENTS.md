@@ -1,6 +1,6 @@
 # Bots Monorepo — Agent Instructions
 
-Monorepo for F# Telegram bots: **VahterBanBot** (spam moderation), **CouponHubBot** (coupon management), and **AlitaBot** (conversational chatbot).
+Monorepo for F# Telegram bots: **VahterBanBot** (spam moderation), **CouponHubBot** (coupon management), **AlitaBot** (conversational chatbot), and **Fizruk** (starts/stops on-demand game servers; no database).
 
 ## Repository Structure
 
@@ -10,17 +10,24 @@ src/
   VahterBanBot/        — VahterBanBot application
   CouponHubBot/        — CouponHubBot application
   AlitaBot/            — AlitaBot application (see AlitaBot/README.md, AlitaBot/docs/)
-  vahter-bot/          — VahterBanBot Helm chart + migrations
-  coupon-hub-bot/      — CouponHubBot Helm chart + migrations
-  alita-bot/           — AlitaBot Helm chart + migrations + dev bot_setting seed
+  Fizruk/              — Fizruk application
+  vahter-bot/          — VahterBanBot migrations + dev DB init
+  coupon-hub-bot/      — CouponHubBot migrations + dev DB init, dev compose, dev bot_setting seed
+  alita-bot/           — AlitaBot migrations + dev DB init, dev compose, dev bot_setting seed
   Dockerfile.bot       — shared multi-stage Dockerfile (BOT_PROJECT build arg)
 tests/
   BotTestInfra/        — shared test infrastructure (containers, helpers)
+  BotInfra.Tests/      — BotInfra tests (EventStore snapshots, against Postgres)
   VahterBanBot.Tests/  — VahterBanBot integration tests
+  VahterBanBot.Unit.Tests/ — VahterBanBot container-free unit tests
+  SerializationCompat.Tests/ — Telegram payload (de)serialization compatibility tests
   CouponHubBot.Tests/  — CouponHubBot integration tests
   CouponHubBot.Ocr.Tests/ — CouponHubBot OCR unit tests
+  CouponHubBot.RealTests/ — CouponHubBot real-Telegram tests (manual only)
   AlitaBot.Tests/      — AlitaBot hermetic integration tests (Testcontainers + fakes, the PR gate)
   AlitaBot.RealTests/  — AlitaBot real-Telegram/real-LLM tests (manual/dev-iteration only, paid calls)
+  Fizruk.Tests/        — Fizruk tests
+  MultiPodTests/       — cross-pod tests on 2-instance VahterBanBot/CouponHubBot fixtures
   FakeTgApi/           — fake Telegram API for testing
   FakeAzureOcrApi/     — fake Azure OCR + OpenAI API for testing (also doubles as AlitaBot's fake LLM/embeddings/image backend)
 scripts/
@@ -32,7 +39,7 @@ scripts/
 
 - **F# / .NET 10**, ASP.NET Core (webhook receivers)
 - **PostgreSQL** + Dapper, Flyway migrations
-- **Telegram.Bot** — Telegram Bot API
+- **Funogram** — Telegram Bot API (through `BotInfra.ITelegramApi`)
 - **Docker** — containerization, Testcontainers for E2E tests
 - **GitHub Actions** — CI/CD with reusable workflows
 - **ArgoCD** — GitOps deployment to Kubernetes
@@ -54,12 +61,11 @@ scripts/
 
 ## Comment-Ratio Gate
 
-Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comment-ratio.conf`: (1) net new `//` comment lines per language (tokei-based before/after delta) fail at ≥5 lines AND >5% of net new non-blank lines — `///` doc comments are exempt here; (2) any single added comment block (incl. `///`) longer than 2 lines fails outright, regardless of ratio. Enforced by `.githooks/pre-commit` and CI (`comment-lint.yml`); run `make install-hooks` once per clone to arm it locally. Comments state constraints and invariants only — never transient facts such as incident names, dates, or PR/issue numbers; those belong in commit messages and PR descriptions.
+Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comment-ratio.conf`: (1) net new comment lines per language (tokei-based before/after delta) fail at ≥5 lines AND a comment share above 5% (30% for SQL/YAML) — `///` doc comments are exempt here; (2) any single added comment block (incl. `///`) longer than 2 lines fails outright, regardless of ratio. Enforced by `.githooks/pre-commit` and CI (`comment-lint.yml`); run `make install-hooks` once per clone to arm it locally. Comments state constraints and invariants only — never transient facts such as incident names, dates, or PR/issue numbers; those belong in commit messages and PR descriptions.
 
 ## Development Environment
 
-- **Windows** with PowerShell as default shell
-- Avoid bash heredoc syntax in shell commands — use `;` to chain `git` and `dotnet` commands
+- The owner works on **Linux (Bazzite)** with rootless **podman** — Testcontainers runs against the podman socket, and the Makefile falls back to `podman` when `docker` isn't a real binary
 - F# code uses 4-space indentation
 - Russian text in tests: always parse JSON with `JsonDocument` / `JsonSerializer` before comparing — never compare raw JSON strings containing Cyrillic
 
@@ -67,11 +73,11 @@ Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comme
 
 - Run tests: `dotnet test -c Release`. **This is safe by default at the solution level** — it never spends real money, even on a machine where `~/.alita-test/env` / `~/.coupon-test/env` are fully populated with working credentials. See "Real/paid tests" below for why.
 - Run specific bot tests: `dotnet test tests/VahterBanBot.Tests -c Release` or `dotnet test tests/CouponHubBot.Tests -c Release`
-- When tests fail, check container logs in `test-artifacts/<ProjectName>/<Fixture>/` (app.log, postgres.log, flyway.log)
+- When tests fail, check container logs in `test-artifacts/<ProjectName>/<Fixture>/` (bot.log, postgres.log, flyway.log, fake-tg-api.log)
 - **Prefer black-box integration tests** — send HTTP to bot pod, observe behavior (messages sent/deleted, bans applied). Do NOT write unit tests against internal implementation.
 - Tests use xUnit v3 with assembly fixtures and Testcontainers (PostgreSQL, Flyway, FakeTgApi, bot)
 - When debugging runtime errors, write a minimal repro test FIRST, then fix. Don't exhaustively query databases.
-- `tests/MultiPodTests` (PR gate, `multipod-build.yml`) proves the multi-instance harness (`BotTestInfra.MultiPodContainerBase`) that cross-pod feature tests (settings propagation, reminder lease, debounce, spam-text) build on — one 2-instance VahterBanBot fixture and one 2-instance CouponHubBot fixture, smoke-tested only. Run with `dotnet test tests/MultiPodTests -c Release`.
+- `tests/MultiPodTests` (PR gate, `multipod-build.yml`) holds the cross-pod tests (settings propagation, reminder lease, debounce, spam-text) on 2-instance VahterBanBot and CouponHubBot fixtures built on `BotTestInfra.MultiPodContainerBase`. Run with `dotnet test tests/MultiPodTests -c Release`.
 
 ### Real/paid tests — explicit opt-in required, never automated
 
@@ -80,16 +86,16 @@ Two independent rules in `scripts/check-comment-ratio.sh`, thresholds in `.comme
 1. Credentials are present (`~/.alita-test/env` / `~/.coupon-test/env`).
 2. The project's opt-in env var is explicitly set: `ALITA_REAL_TESTS=1` / `COUPON_REAL_TESTS=1`.
 
-Credential presence alone is deliberately **not** enough — a machine with a fully populated `~/.alita-test/env` (the normal state on a maintainer's dev box) must still see `dotnet test -c Release` at the solution level skip every real test, with zero real Telegram/LLM calls made. This was a real incident: a plain solution-wide `dotnet test` burned real API cost (~$6/day incident) because credential presence was the only gate. The opt-in check happens once, in each project's `RealAssemblyFixture` (`SkipUnlessCore`/`InitializeAsync`), not per-test — do not add per-test gating, and do not bypass the fixture.
+Credential presence alone is deliberately **not** enough — a machine with a fully populated `~/.alita-test/env` (the normal state on a maintainer's dev box) must still see `dotnet test -c Release` at the solution level skip every real test, with zero real Telegram/LLM calls made. The opt-in check happens once, in each project's `RealAssemblyFixture` (`SkipUnlessCore`/`InitializeAsync`), not per-test — do not add per-test gating, and do not bypass the fixture.
 
 These tests are for **deliberate feature work and manual dev-iteration only** (`make real-test` / `make coupon-real-test`, which set the opt-in var themselves) or the two `workflow_dispatch`-only CI workflows (`alita-real-test.yml`, `coupon-real-test.yml`), which also set it. **Agents/automation must never set `ALITA_REAL_TESTS` or `COUPON_REAL_TESTS`** — if a task seems to call for running the real suites, stop and ask a human rather than opting in yourself.
 
 ## Database
 
 - Migration files: `V{N}__{description}.sql` (sequential number, double underscore, snake_case)
-- New tables/sequences must be granted to the service role — either in the creating migration or in a dedicated later grants migration (e.g. `V3__missing_grants.sql`, `V17__grant_permissions.sql`, which also use catch-all `GRANT … ON ALL TABLES/SEQUENCES` + `ALTER DEFAULT PRIVILEGES`). The Testcontainers suite runs every migration, so a genuinely missing grant fails CI; absence of a `GRANT` in a single file is not by itself a defect.
+- New tables/sequences must be granted to the service role — either in the creating migration or in a dedicated later grants migration (e.g. coupon's `V3__missing_grants.sql`; vahter's `V17__grant_permissions.sql` also uses catch-all `GRANT … ON ALL TABLES/SEQUENCES` + `ALTER DEFAULT PRIVILEGES`). The Testcontainers suite runs every migration, so a genuinely missing grant fails CI; absence of a `GRANT` in a single file is not by itself a defect.
 - Use parameterized SQL only — never string-interpolate user input into SQL
-- VahterBanBot DB: `vahter_db_v2`, role: `vahter_bot_service`
+- VahterBanBot DB: `vahter_db_v2` (`vahter_db` in tests/dev), role: `vahter_bot_ban_service`
 - CouponHubBot DB: `coupon_hub_bot`, role: `coupon_hub_bot_service`
 - AlitaBot DB: `alita_bot`, role: `alita_bot_service` (pgvector-backed — `message_embedding`/`interaction_memory` use the `vector` extension, `pgvector/pgvector:pg17` everywhere AlitaBot provisions its own Postgres)
 
@@ -103,9 +109,9 @@ Deploy (`flyway/flyway:13.4.0`) runs `migrate` with `-postgresql.transactional.l
 
 ## Settings configuration
 
-- All **non-secret** bot configuration lives in the `bot_setting` table. Env vars are only for secrets (`BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`, `AZURE_OCR_KEY`, `GITHUB_TOKEN`, `DATABASE_URL`, etc.).
-- Each bot registers `BotConfiguration` (and `BotOcrConfig` where OCR is used) as `IOptions<_>` via `BotInfra.LiveOptions<_>`. Services inject `IOptions<T>` and read `.Value` — this lets `POST /reload-settings` pick up changes without a pod restart.
-- **DB-only settings** — keys with no env fallback — become silently wrong if missing from `bot_setting`. When adding such a setting in `buildBotConf`, either (a) give it an env fallback via `getEnvOr`, or (b) ship a seed INSERT in the same migration as the code change. Current DB-only keys in CouponHubBot: `OCR_ENABLED`, `OCR_MAX_FILE_SIZE_BYTES`, `REMINDER_HOUR_DUBLIN`, `REMINDER_RUN_ON_START`, `ADD_COUPON_REMINDER_LOOKBACK_DAYS`, `TEST_MODE`, `MAX_TAKEN_COUPONS`, `FEEDBACK_GITHUB_ISSUES`.
+- All **non-secret** configuration of the database-backed bots lives in the `bot_setting` table. Env vars are only for secrets (`BOT_TELEGRAM_TOKEN`, `BOT_AUTH_TOKEN`, `AZURE_OCR_KEY`, `GITHUB_TOKEN`, `DATABASE_URL`, etc.). Fizruk has no database and reads a config file (`FIZRUK_CONFIG_PATH`).
+- Each database-backed bot registers `BotConfiguration` (and `BotOcrConfig` where OCR is used) as `IOptions<_>` via `BotInfra.LiveOptions<_>`. Services inject `IOptions<T>` and read `.Value` — this lets `POST /reload-settings` pick up changes without a pod restart.
+- **DB-only settings** — keys with no env fallback — become silently wrong if missing from `bot_setting`. When adding such a setting in `buildBotConf`, either (a) give it an env fallback via `getEnvOr`, or (b) ship a seed INSERT in the same migration as the code change. Current DB-only keys in CouponHubBot: `OCR_ENABLED`, `OCR_MAX_FILE_SIZE_BYTES`, `REMINDER_HOUR_DUBLIN`, `REMINDER_RUN_ON_START`, `ADD_COUPON_REMINDER_LOOKBACK_DAYS`, `TEST_MODE`, `MAX_TAKEN_COUPONS`, `FEEDBACK_GITHUB_ISSUES`, `BATCH_DEBOUNCE_MS`.
 - Never add `AddSingleton<BotConfiguration>(record)` — it captures a frozen copy, defeating reload. The `LiveOptions<_>` wrapper is the only correct registration.
 
 ## Security
@@ -118,22 +124,22 @@ Deploy (`flyway/flyway:13.4.0`) runs `migrate` with `-postgresql.transactional.l
 ## CI/CD
 
 - Reusable workflows: `_bot-build.yml` (PR builds), `_bot-deploy.yml` (deploy on push to main), `_sre-agent.yml` (deploy-failure incident response, see Agentic Workflows below)
-- Per-bot build/deploy: `vahter-build.yml`/`vahter-deploy.yml`, `coupon-build.yml`/`coupon-deploy.yml`, `alita-build.yml`/`alita-deploy.yml` — each is a thin wrapper passing bot-specific `with:`/`secrets:` into the shared reusable workflows
-- Deploy pipeline: test → migrate DB → build & push Docker image to GHCR → verify deployment
+- Per-bot build/deploy: `vahter-build.yml`/`vahter-deploy.yml`, `coupon-build.yml`/`coupon-deploy.yml`, `alita-build.yml`/`alita-deploy.yml`, `fizruk-build.yml`/`fizruk-deploy.yml` — each is a thin wrapper passing bot-specific `with:`/`secrets:` into the shared reusable workflows
+- Deploy pipeline: test → migrate DB (skipped with `has-database: false`) → build & push Docker image to GHCR → verify deployment
 - Post-deploy verification checks ArgoCD sync, pod health, Loki errors, and Prometheus 5xx rate
 - VahterBanBot upstream sync: `vahter-upstream-sync.yml` creates PRs to the `fsharplang-ru/vahter-bot` mirror repo. The mirror must stay independently **buildable and testable** (build + all three vahter suites: `VahterBanBot.Tests`, `VahterBanBot.Unit.Tests`, `SerializationCompat.Tests`) but never deploys — deploy is monorepo-only. When you add a vahter-relevant project, add it to the sync's `cp`/`dotnet sln add` lists, its path trigger, AND `.github/upstream/build.yml`'s test command, or the mirror silently stops covering it.
-- **Mirror sync is deploy-gated and self-merging.** `vahter-upstream-sync.yml` is a `workflow_call` reusable workflow invoked by `vahter-deploy.yml` as `needs: [deploy]`, so the mirror only receives code that actually reached prod. It opens the PR, enables GitHub native auto-merge (`--auto --squash`), and exits — it never idles a runner waiting for the mirror's ~4 min build. Its own `push` trigger is narrowed to mirror-infrastructure paths (`.github/upstream/**`, `LICENSE`, `_bot-build.yml`) that never reach prod and so would otherwise never sync. **The mirror's branch protection must require the context `build / build`, not `build`** — a reusable workflow's check is named `<caller-job> / <called-job>`, and requiring `build` is unsatisfiable, which leaves every sync PR permanently `BLOCKED` and auto-merge queued forever (this was the case until 2026-07-27).
+- **Mirror sync is deploy-gated and self-merging.** `vahter-upstream-sync.yml` is a `workflow_call` reusable workflow invoked by `vahter-deploy.yml` as `needs: [deploy]`, so the mirror only receives code that actually reached prod. It opens the PR, enables GitHub native auto-merge (`--auto --squash`), and exits — it never idles a runner waiting for the mirror's ~4 min build. Its own `push` trigger is narrowed to mirror-infrastructure paths (e.g. `.github/upstream/**`, `LICENSE`, `_bot-build.yml`) that never reach prod and so would otherwise never sync. **The mirror's branch protection must require the context `build / build`, not `build`** — a reusable workflow's check is named `<caller-job> / <called-job>`, and requiring `build` is unsatisfiable, which leaves every sync PR permanently `BLOCKED` and auto-merge queued forever.
 - `vahter-mirror-reconcile.yml` (daily) is the observer for that fire-and-forget merge: it reports `NO-CHECKS` / `RED` / `GREEN-UNMERGED` / `STUCK-PENDING` as *separate* states on any open `sync/monorepo-*` PR, opens or comments on a `mirror-sync`-labelled issue, and fails the run. `NO-CHECKS` is deliberately reported at any age with no grace period — an absent status check is blindness, not health, and it is the signature of an unloadable workflow.
-- **Files generated *into* the mirror live in `.github/upstream/` as tracked files, never as heredocs.** `.github/upstream/build.yml` (the mirror's CI) and `.github/upstream/README.md` are copied verbatim by the sync. A heredoc inside a `run: |` block gets dedented twice (once by the block scalar, once by any `sed` cleanup), which silently corrupted the generated `build.yml` into invalid YAML and made every mirror CI run a **jobless `startup_failure` for ~3 months** with no error surfaced in the API. `lint-workflows.yml` runs actionlint on `.github/upstream/**` explicitly (the default sweep only covers `.github/workflows/`), and the sync step `yaml.safe_load`s the generated workflows before committing.
+- **Files generated *into* the mirror live in `.github/upstream/` as tracked files, never as heredocs.** `.github/upstream/build.yml` (the mirror's CI) and `.github/upstream/README.md` are copied verbatim by the sync. A heredoc inside a `run: |` block gets dedented twice (once by the block scalar, once by any `sed` cleanup), which can silently turn a generated workflow into invalid YAML — every mirror CI run then becomes a **jobless `startup_failure`** with no error surfaced in the API. `lint-workflows.yml` runs actionlint on `.github/upstream/**` explicitly (the default sweep only covers `.github/workflows/`), and the sync step `yaml.safe_load`s the generated workflows before committing.
 - AlitaBot also has `alita-real-test.yml` — `workflow_dispatch`-only full E2E (real Telegram + paid LLM/media calls) against a transient AKS deployment; NOT a PR gate, see `src/AlitaBot/docs/TESTING.md`
 
 ## Agentic Workflows
 
-- GPT-5-mini agents run via `openai/codex-action@v1` on Microsoft Foundry — SRE (`_sre-agent.yml`), Project (`project.yml`), Product (`product.yml`), Monitor (`monitor.yml`). See `src/CouponHubBot/docs/PROJECT-AGENT.md` for the full design, and `.github/AGENT-FLOWS-REDESIGN.md` for the in-flight redesign of this area.
-- **SRE coverage is automatic for every bot** that uses `_bot-deploy.yml`. `_sre-agent.yml` is a reusable workflow called directly from `_bot-deploy.yml` when the deploy or its post-deploy verification fails — bot identity (`bot`, `argocd-app-name`, `container-name`, `docker-image`, `commit`, `run-url`) is passed in as workflow inputs, not read from an issue body. `verify-deploy.sh` failing still opens a `deploy-failure` issue as the incident record; its number is passed to the SRE agent when available so it can comment/close. `sre-manual.yml` (`workflow_dispatch`) gives the same agent a hand-triggered entry point for incidents outside a deploy. Opt-out of the deploy-triggered path by passing `sre-enabled: false` to `_bot-deploy.yml`.
-- Project and Product agents are coupon-only for now; AlitaBot has no project/product coverage yet (§3.8 of the redesign doc: insufficient chat signal for a product agent). Both rely on `AZURE_OPENAI_API_KEY` (secret) + `AZURE_OPENAI_BASE_URL` (var, base URL only — no `/responses` suffix) — as does the SRE agent.
+- GPT-5-mini agents run via `openai/codex-action@v1` on Microsoft Foundry — SRE (`_sre-agent.yml`), Project (`project.yml`), Product (`product.yml`), Monitor (`monitor.yml`). See `src/CouponHubBot/docs/PROJECT-AGENT.md` for per-agent details and `.github/AGENT-FLOWS-REDESIGN.md` for the design rationale behind the current (implemented) setup.
+- **SRE coverage is automatic for every bot** that uses `_bot-deploy.yml`. `_sre-agent.yml` is a reusable workflow called directly from `_bot-deploy.yml` when the deploy or its post-deploy verification fails — bot identity (`bot`, `argocd-app-name`, `container-name`, `docker-image`, `commit`, `run-url`) is passed in as workflow inputs, not read from an issue body. `verify-deploy.sh` failing still opens a `deploy-failure` issue as the incident record; its number is passed to the SRE agent when available so it can comment/close. `sre-manual.yml` (`workflow_dispatch`) gives the same agent a hand-triggered entry point for incidents outside a deploy. Opt-out of the deploy-triggered path (issue + agent) by passing `sre-enabled: false` to `_bot-deploy.yml`, as `fizruk-deploy.yml` does.
+- Project is a weekly repo-wide assessment covering every bot in `.github/bots.yml`; Product runs per bot whose `roles` include `product` (VahterBanBot, CouponHubBot — AlitaBot is excluded: insufficient chat signal, §3.8 of the redesign doc). All agents rely on the `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_BASE_URL` secrets (base URL only — no `/responses` suffix).
 - **Monitor is runtime anomaly watch, per bot, baseline-relative** — every 4 hours for every bot whose `roles` include `monitor`, except AlitaBot which runs DAILY only (`traffic_class: dormant` — the cron only actually invokes it in the first slot of the UTC day, or on manual `workflow_dispatch`; the dormant carve-out also disables volume-based rules entirely for it, since 0 log lines on most days is normal, not an anomaly). Baseline history (7d/28d medians, ratios, z-scores) lives as one JSONL-per-bot-per-month file on the orphan `agent-state` branch, written by `scripts/gather/baseline.sh`. A mechanical (non-LLM) P1 check — no healthy replicas, or an extreme error burst — escalates straight to the SRE agent (`_sre-agent.yml`) regardless of the monitor agent's own judgment. `backfill-baseline.yml` (`workflow_dispatch`-only, `dry_run` default `true`) can pre-warm up to ~28 days of `agent-state` history from Loki/Postgres so baselines aren't cold on day one.
-- `.github/bots.yml` is the single-source-of-truth bot registry read by every gatherer/workflow/prompt (`container`, `db_name`, `traffic_class`, `roles`, etc.) — adding a bot to Monitor/Project/Product coverage is a registry entry, not a workflow edit.
+- `.github/bots.yml` is the single-source-of-truth bot registry read by every gatherer/workflow/prompt (`container`, `db_name`, `traffic_class`, `roles`, etc.) — adding a bot to Monitor/Project/Product coverage is a registry entry, not a workflow edit. Fizruk is not registered, so Monitor and Product don't cover it.
 
 ## Code Review Rules
 
@@ -149,9 +155,9 @@ Do NOT flag: style preferences, minor formatting, subjective naming choices.
 
 Telegram bot for spam deletion and administrative functions in Russian-speaking F# community chats.
 
-Commands: `/ban` (delete + global ban), `/sban [hours]` (soft-ban/mute), `/unban <user_id>`, `/ban ping` (health check).
+Commands: `/ban` (delete + global ban), `/sban [hours]` (soft-ban/mute), `/unban <user_id>`, `/ban ping` (health check), `/vahter_report` (public ephemeral stats, flag-gated); `/vahter <subcommand>` in the admin channel.
 
-Uses LLM-based spam detection (OpenAI API) with configurable verdicts (SPAM/NOT_SPAM/SKIP).
+Spam detection: an ML.NET classifier scores messages; scores in the warning band go to Azure OpenAI LLM triage (SPAM/NOT_SPAM/SKIP), plus deterministic rules (spam-text cache, invisible mentions, suspicious attachments).
 
 ## CouponHubBot — Specific Notes
 
@@ -159,9 +165,9 @@ Telegram bot for collaborative coupon management in a private community. All UI 
 
 - **Gender-neutral Russian UI text** — users are mostly women. Never address the user with a gendered verb/adjective («ты уверен», «если передумал»), never narrate the bot's own actions in gendered past tense («Добавил», «Отметил»), and don't use «(а)» double forms. Prefer impersonal/passive («Купон добавлен», «Купон отмечен как использованный») or gender-free phrasings (imperatives «Аннулируй»; 2nd-person future «Если передумаешь»). Forms that agree with a noun (e.g. «взятый купон») are fine — they encode the noun's gender, not the user's.
 
-Commands: `/add`, `/list`, `/my`, `/stats`, `/feedback`, `/take <id>`, `/used <id>`, `/return <id>`.
+Commands: `/add`, `/list`, `/my`, `/added`, `/stats`, `/feedback`, `/report`, `/take <id>`, `/used <id>`, `/return <id>`, `/void <id>`; admin-only `/debug`, `/undo`, `/whois`, `/balances`.
 
-Callback data uses colon-separated format: `"action:param1:param2"`. Wizard flows persist state in `PendingAddFlow` table.
+Callback data uses colon-separated format: `"action:param1:param2"`. Wizard flows persist state in the `pending_add` table (albums: `pending_add_batch`).
 
 See `src/CouponHubBot/docs/` for detailed architecture, testing, database, OCR, and deployment documentation.
 
@@ -172,8 +178,8 @@ Conversational Telegram chatbot for a ~30-person IT chat: replies when mentioned
 - Persona/config is entirely `bot_setting`-driven and hot-reloadable (`POST /reload-settings`) — see this file's "Settings configuration" section. Prompts (`SYSTEM_PROMPT`, `ROAST_PROMPT`, etc.) are tuned live in prod; `src/alita-bot/dev-bot-settings.sql` only seeds dev/test values.
 - Features beyond the core responder: image generation (`/img`, Azure or Gemini via `IMAGE_PROVIDER`), per-message semantic memory + `/ask` (pgvector embeddings), per-person "dossiers" from nightly fact extraction, a small social-features set (`/roast`, `/awards`, `/quote`, `/karma`), and opt-in proactive behavior (morning digest, willingness-gated interjections, meme reactions) — all default OFF/0.0 except the core reactive responder.
 - Commands: `/img`, `/model`, `/summary` (`/tldr`), `/usage`, `/ask`, `/say`, `/song`, `/sql` (admin-only), `/dossier`, `/forget-me`, `/roast`, `/awards`, `/quote`, `/karma`, `/help` (`/start`) — see `src/AlitaBot/README.md`'s "Commands" table for full details.
-- Uses `AZURE_FOUNDRY_ENDPOINT` (`szer-foundry.cognitiveservices.azure.com`), the **same Foundry resource CouponHubBot's project/product agents use** — every AlitaBot deployment name is prefixed `alita-` purely to avoid collisions in that shared account's flat deployment list.
+- Uses `AZURE_FOUNDRY_ENDPOINT` (`szer-foundry.cognitiveservices.azure.com`), the **same Foundry resource the agentic workflows use** — every AlitaBot deployment name is prefixed `alita-` purely to avoid collisions in that shared account's flat deployment list.
 - Testing tiers (same model as VahterBanBot/CouponHubBot, but with two additional real-mode tiers given the paid LLM/image/voice APIs involved): hermetic (`tests/AlitaBot.Tests`, the PR gate, `alita-build.yml`), developer real-Telegram (`tests/AlitaBot.RealTests` via `make real-test`, deliberate/scoped runs only), and full AKS E2E (`alita-real-test.yml`, `workflow_dispatch`-only). See `src/AlitaBot/docs/TESTING.md`.
-- Not yet covered by the Project/Product agents (insufficient chat signal — see `.github/AGENT-FLOWS-REDESIGN.md` §3.8); SRE coverage on deploy failure is automatic like every other bot on `_bot-deploy.yml`, though `alita-deploy.yml` currently sets `sre-enabled: false` until the bot has settled in prod.
+- Not covered by the Product agent (insufficient chat signal — see `.github/AGENT-FLOWS-REDESIGN.md` §3.8); Monitor runs it daily as a dormant bot, and SRE coverage on deploy failure is on (`alita-deploy.yml` sets `sre-enabled: true`).
 
 See `src/AlitaBot/README.md` and `src/AlitaBot/docs/` (`OBSERVABILITY.md`, `TECH-DEBT.md`, `TESTING.md`) for detailed architecture, testing, and operational documentation.
