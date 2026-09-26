@@ -127,6 +127,17 @@ fail_connectivity() {
     exit 1
 }
 
+scaled_to_zero_with_tag() {
+    local body
+    body=$(curl -sS -m 15 "${ARGOCD_URL}${APP_PATH}/managed-resources" -H "${AUTH_HEADER}" 2>/dev/null) || return 1
+    echo "$body" | jq -e --arg tag "$EXPECTED_IMAGE_TAG" '
+        [.items[]? | select(.kind == "Deployment") | .liveState | fromjson? // empty] as $deps
+        | ($deps | length) > 0
+          and ($deps | all(.spec.replicas == 0))
+          and ($deps | all([.spec.template.spec.containers[].image] | any(contains($tag))))
+    ' >/dev/null 2>&1
+}
+
 # ─── Phase 1: Wait for ArgoCD to sync with expected image tag ────────────────
 
 log "Phase 1: Waiting for ArgoCD sync (app=${APP_NAME}, expected tag contains ${EXPECTED_IMAGE_TAG:0:12}...)"
@@ -156,6 +167,22 @@ while [ "$elapsed" -lt "$SYNC_TIMEOUT" ]; do
             summary ""
             synced=true
             break
+        fi
+
+        # A parked app has no pods, so no running image can ever match; the
+        # template check still proves the new tag reached the cluster.
+        if [ "$SYNC_STATUS" = "Synced" ] && scaled_to_zero_with_tag; then
+            log "Phase 1 PASSED: Deployment is scaled to zero and its template references the new tag."
+            log "SKIPPED: Phases 2-3 (readiness, logs, metrics) — no pods to verify."
+            echo "::warning title=Deploy verification skipped::${APP_NAME} is scaled to zero (replicas: 0); only image delivery was verified."
+            summary "### ✅ Phase 1: ArgoCD Sync"
+            summary "- **Status:** Synced"
+            summary "- **Image Tag Match:** Deployment template only (replicas: 0)"
+            summary "- **Elapsed Time:** ${elapsed}s"
+            summary ""
+            summary "### ⏭ Phases 2–3 SKIPPED: scaled to zero"
+            summary "- \`${APP_NAME}\` runs \`replicas: 0\`, so there is no pod, readiness, log or metric to check."
+            exit 0
         fi
     else
         # Could not observe ArgoCD — this is connectivity, not "not synced yet".
