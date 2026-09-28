@@ -28,6 +28,22 @@ type CouponFlowHandler(
 ) =
     let sendText = BotHelpers.sendText tg
 
+    let downloadOcrPhoto filePath =
+        task {
+            use activity = botActivity.StartActivity("couponOcr.download")
+            try
+                let! bytes = tg.DownloadFile filePath
+                if not (isNull activity) then
+                    %activity.SetTag("image.size_bytes", bytes.Length)
+                return bytes
+            with ex ->
+                if not (isNull activity) then
+                    %activity.SetTag("error.type", ex.GetType().FullName)
+                    %activity.SetStatus(ActivityStatusCode.Error)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(ex)
+                return Unchecked.defaultof<byte[]>
+        }
+
     // Best-effort wrappers for cosmetic Telegram calls whose failure should
     // never fail the surrounding flow (e.g. deleting an already-gone placeholder).
     let tryDeleteMessage (chatId: int64) (messageId: int64) : Task =
@@ -123,7 +139,7 @@ type CouponFlowHandler(
                     if String.IsNullOrWhiteSpace filePath then
                         return null
                     else
-                        let! bytes = tg.DownloadFile filePath
+                        let! bytes = downloadOcrPhoto filePath
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                             return null
                         else
@@ -239,7 +255,7 @@ type CouponFlowHandler(
                             "Выбери скидку и минимальный чек.\nИли просто напиши следующим сообщением: \"10 50\" или \"10/50\"."
                             (BotHelpers.addWizardDiscountKeyboard())
                 else
-                    let! bytes = tg.DownloadFile filePath
+                    let! bytes = downloadOcrPhoto filePath
 
                     if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                         do!
@@ -545,7 +561,7 @@ type CouponFlowHandler(
                     if String.IsNullOrWhiteSpace filePath then
                         do! writeNeedsInput "OCR failed" "failed"
                     else
-                        let! bytes = tg.DownloadFile filePath
+                        let! bytes = downloadOcrPhoto filePath
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                             do! writeNeedsInput "OCR failed" "failed"
                         else

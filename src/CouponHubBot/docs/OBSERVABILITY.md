@@ -34,6 +34,8 @@ All custom metrics are defined in `src/CouponHubBot/Telemetry.fs` under the `Cou
 ## Tracing
 
 - OpenTelemetry traces configured in `Telemetry.fs`
+- OCR spans cover full photo download (`couponOcr.download`), recognition, image loading/preprocessing/resizing, each ZXing decode attempt, Azure SDK execution including retries, and text parsing.
+- `couponOcr.barcode.decode` tags identify the strategy, image dimensions, and success; `couponOcr.barcode` records the attempt count and outcome without recording barcode values.
 - Includes Npgsql instrumentation for database query tracing
 - Traces shipped to **Tempo**. Query directly over the VPN (no auth) at
   `http://tempo.monitoring.svc.cluster.local:3200` (TraceQL `/api/search`, `/api/traces/{id}`).
