@@ -59,16 +59,16 @@ let private hasEvent (name: string) (a: Activity) = a.Events |> Seq.exists (fun 
 
 /// A fold that parks its first call until released — holds a load between its query and its cache put.
 let private parkedFold () =
-    let entered = new SemaphoreSlim(0)
+    let entered = TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)
     let release = new SemaphoreSlim(0)
     let mutable first = true
     let f s e =
         if first then
             first <- false
-            %entered.Release()
-            release.Wait()
+            entered.SetResult()
+            Assert.True(release.Wait(TimeSpan.FromSeconds 30.0), "The concurrent operation did not release the parked fold")
         fold s e
-    f, entered, release
+    f, entered.Task, release
 
 type SnapshotRow = { schema_version: int; stream_version: int; state: string }
 
@@ -448,10 +448,13 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
         do! appendRaw sid (added 2)
         use _scope = store.BeginRequestScope()
         let parked, entered, release = parkedFold ()
-        let slowLoad = store.LoadState(parked, Tally.Zero, policy 100, sid)
-        do! entered.WaitAsync()
-        let! _ = increment (policy 100) sid 10
-        %release.Release()
+        let slowLoad = Task.Run<Tally * int>(fun () -> store.LoadState(parked, Tally.Zero, policy 100, sid))
+        try
+            do! entered.WaitAsync(TimeSpan.FromSeconds 30.0)
+            let! _ = increment (policy 100) sid 10
+            ()
+        finally
+            %release.Release()
         let! (_, slowVersion) = slowLoad
         Assert.Equal(2, slowVersion)
         let! (state, version) = load (policy 100) sid
@@ -465,10 +468,13 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
         do! appendRaw sid (added 2)
         use _scope = store.BeginRequestScope()
         let parked, entered, release = parkedFold ()
-        let slowLoad = store.LoadState(parked, Tally.Zero, policy 100, sid)
-        do! entered.WaitAsync()
-        let! _ = store.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 10 |} ]), sid)
-        %release.Release()
+        let slowLoad = Task.Run<Tally * int>(fun () -> store.LoadState(parked, Tally.Zero, policy 100, sid))
+        try
+            do! entered.WaitAsync(TimeSpan.FromSeconds 30.0)
+            let! _ = store.Transact(fold, Tally.Zero, (fun _ -> [ Added {| amount = 10 |} ]), sid)
+            ()
+        finally
+            %release.Release()
         let! _ = slowLoad
         let! (state, version) = load (policy 100) sid
         let! (_, rawVersion) = store.GetRawEventsForStream sid
@@ -504,11 +510,14 @@ type EventStoreSnapshotTests(db: PostgresFixture) =
         let otherPod = EventStore(db.ConnectionString, "event", jsonOpts, "event_snapshot")
         use spans = new LoadSpans()
         let parked, entered, release = parkedFold ()
-        let slowLoad = store.LoadState(parked, Tally.Zero, policy 1, sid)
-        do! entered.WaitAsync()
-        do! appendRaw sid (added 3)
-        let! _ = otherPod.LoadState(fold, Tally.Zero, policy 1, sid)
-        %release.Release()
+        let slowLoad = Task.Run<Tally * int>(fun () -> store.LoadState(parked, Tally.Zero, policy 1, sid))
+        try
+            do! entered.WaitAsync(TimeSpan.FromSeconds 30.0)
+            do! appendRaw sid (added 3)
+            let! _ = otherPod.LoadState(fold, Tally.Zero, policy 1, sid)
+            ()
+        finally
+            %release.Release()
         let! (_, slowVersion) = slowLoad
         Assert.Equal(2, slowVersion)
 

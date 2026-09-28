@@ -27,6 +27,7 @@
     <PackageReference Include="SixLabors.ImageSharp" />
     <PackageReference Include="ZXing.Net" />
     <PackageReference Include="ZXing.Net.Bindings.ImageSharp.V3" />
+    <PackageReference Include="ZXingCpp" />
     <!-- FakeTimeProvider for the test-only /test/clock/advance endpoint. Stable, ~30KB. -->
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
   </ItemGroup>

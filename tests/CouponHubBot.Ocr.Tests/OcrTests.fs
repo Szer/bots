@@ -8,10 +8,14 @@ open System.Net.Http
 open System.Text
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
+open SixLabors.ImageSharp
+open SixLabors.ImageSharp.PixelFormats
+open SixLabors.ImageSharp.Processing
 open Xunit
 
 open CouponHubBot
 open CouponHubBot.Services
+open CouponHubBot.Utils
 open BotInfra
 
 module private XUnitLogging =
@@ -179,6 +183,12 @@ module private Parsing =
 
 type OcrTests(output: ITestOutputHelper) =
 
+    let buildCpuOnlyEngine () =
+        let azure =
+            { new IBotOcr with
+                member _.AnalyzeImageBytes _ = task { return null } }
+        CouponOcrEngine(azure, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, TimeProvider.System)
+
     let buildEngine (imageFileName: string) =
         let logs = ResizeArray<string>()
         let endpoint = Environment.GetEnvironmentVariable("AZURE_OCR_ENDPOINT")
@@ -212,6 +222,34 @@ type OcrTests(output: ITestOutputHelper) =
         let engine: CouponOcrEngine =
             CouponOcrEngine(azure, XUnitLogging.XUnitLogger<CouponOcrEngine>(output, logs), timeProvider)
         engine, http, logs
+
+    [<Theory>]
+    [<InlineData(0)>]
+    [<InlineData(90)>]
+    [<InlineData(180)>]
+    [<InlineData(270)>]
+    member _.``Coupon barcode is recognized without OCR at any right angle``(angle: int) =
+        task {
+            let path = Path.Combine(AppContext.BaseDirectory, "Images", "10_50_01-04_01-13_2706602781191.jpg")
+            use image = Image.Load<Rgba32>(path)
+            image.Mutate(fun ctx -> %ctx.Rotate(float32 angle))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal("2706602781191", result.barcode)
+        }
+
+    [<Theory>]
+    [<InlineData(1, 1)>]
+    [<InlineData(120, 80)>]
+    member _.``Blank image does not invent a barcode``(width: int, height: int) =
+        task {
+            use image = new Image<L8>(width, height, L8(255uy))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Null(result.barcode)
+        }
 
     [<Theory>]
     [<InlineData("10_50_01-04_01-13_2706602781191.jpg")>]

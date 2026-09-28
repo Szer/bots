@@ -210,8 +210,71 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
     let someMoney (v: decimal) : Nullable<decimal> = Nullable(v)
     let someDate (v: DateTime) : Nullable<DateTime> = Nullable(v)
 
-    let tryDecodeBarcode (imageBytes: ReadOnlyMemory<byte>) =
-        use activity = botActivity.StartActivity("couponOcr.barcode")
+    let tryDecodeNative (imageBytes: ReadOnlyMemory<byte>) =
+        use activity = botActivity.StartActivity("couponOcr.barcode.native")
+        try
+            // Resolve the library before constructing objects with native finalizers.
+            let format = ZXingCpp.BarcodeFormat.Parse("EAN13")
+            use ms = new MemoryStream(imageBytes.ToArray())
+            use image = Image.Load<L8>(ms)
+            let pixels = Array.zeroCreate<byte> (image.Width * image.Height)
+            image.CopyPixelDataTo(pixels)
+            use reader = new ZXingCpp.BarcodeReader()
+            reader.Formats <- ZXingCpp.BarcodeFormats(format)
+            reader.TryHarder <- true
+            reader.TryRotate <- true
+            reader.TryInvert <- false
+            reader.TryDownscale <- true
+            reader.MaxNumberOfSymbols <- 1
+            reader.MinLineCount <- 2
+            reader.ReturnErrors <- false
+            // ImageView borrows the pixel buffer throughout native decoding.
+            use _pin = Memory<byte>(pixels).Pin()
+            let decode x y width height =
+                let offset = y * image.Width + x
+                let length = (height - 1) * image.Width + width
+                let region = ReadOnlySpan<byte>(pixels, offset, length)
+                let view = ZXingCpp.ImageView(region, width, height, ZXingCpp.ImageFormat.Lum, image.Width)
+                let results =
+                    try reader.From(view)
+                    finally GC.KeepAlive(view)
+                try
+                    results
+                    |> Array.tryPick (fun barcode ->
+                        if barcode.IsValid && not (String.IsNullOrWhiteSpace barcode.Text) then
+                            Some barcode.Text
+                        else
+                            None)
+                finally
+                    for barcode in results do
+                        barcode.Dispose()
+
+            let result =
+                match decode 0 0 image.Width image.Height with
+                | Some text -> Some text
+                | None ->
+                    let bands = [| 0.0, 0.50; 0.0, 0.60; 0.20, 0.70; 0.30, 0.80; 0.45, 1.0; 0.55, 1.0; 0.65, 1.0 |]
+                    [| 0.0; 0.10; 0.20 |]
+                    |> Array.tryPick (fun margin ->
+                        bands
+                        |> Array.tryPick (fun (top, bottom) ->
+                            let x = int (Math.Round(float image.Width * margin))
+                            let y = min (image.Height - 1) (int (Math.Round(float image.Height * top)))
+                            let width = image.Width - 2 * x
+                            let height = max 1 (int (Math.Round(float image.Height * bottom)) - y)
+                            decode x y width height))
+            if not (isNull activity) then
+                %activity.SetTag("barcode.found", result.IsSome)
+            result
+        with ex ->
+            if not (isNull activity) then
+                %activity.SetTag("error.type", ex.GetType().FullName)
+                %activity.SetStatus(ActivityStatusCode.Error)
+            logger.LogWarning(ex, "Native barcode decode failed; trying managed decoder")
+            None
+
+    let tryDecodeManaged (imageBytes: ReadOnlyMemory<byte>) =
+        use activity = botActivity.StartActivity("couponOcr.barcode.managed")
         let mutable attempts = 0
         try
             use original =
@@ -224,12 +287,12 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let opts = DecodingOptions()
             opts.TryHarder <- true
             opts.PossibleFormats <- [| BarcodeFormat.EAN_13 |]
-            opts.TryInverted <- true
+            opts.TryInverted <- false
             let reader = BarcodeReader<Rgba32>()
             reader.Options <- opts
             reader.AutoRotate <- true
 
-            let decode (label: string) (img: Image<Rgba32>) =
+            let decode (label: string) (img: LuminanceSource) =
                 use attempt = botActivity.StartActivity("couponOcr.barcode.decode")
                 attempts <- attempts + 1
                 if not (isNull attempt) then
@@ -248,12 +311,12 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
             let clamp (v: int) (minv: int) (maxv: int) = max minv (min maxv v)
 
-            let cropTry (baseLabel: string) (img: Image<Rgba32>) (rect: Rectangle) =
+            let cropTry (baseLabel: string) (img: LuminanceSource) (rect: Rectangle) =
                 let x = clamp rect.X 0 (img.Width - 1)
                 let y = clamp rect.Y 0 (img.Height - 1)
                 let w = clamp rect.Width 1 (img.Width - x)
                 let h = clamp rect.Height 1 (img.Height - y)
-                use cropped = img.Clone(fun ctx -> ctx.Crop(Rectangle(x, y, w, h)) |> ignore)
+                let cropped = img.crop(x, y, w, h)
                 decode baseLabel cropped
 
             let tryOnImage (labelPrefix: string) (img: Image<Rgba32>) =
@@ -263,7 +326,8 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 // - Middle band crops (covers centre region)
                 // - Bottom crops (useful for app screenshots)
                 // - Center-narrowed variants of the above (avoid noise on sides)
-                match decode (labelPrefix + ":full") img with
+                let luminance = ImageSharpLuminanceSource<Rgba32>(img)
+                match decode (labelPrefix + ":full") luminance with
                 | Some t -> Some t
                 | None ->
                     let w = img.Width
@@ -312,7 +376,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
                     allRects
                     |> Array.mapi (fun i r -> (i, r))
-                    |> Array.tryPick (fun (i, r) -> cropTry $"{labelPrefix}:crop{i}" img r)
+                    |> Array.tryPick (fun (i, r) -> cropTry $"{labelPrefix}:crop{i}" luminance r)
 
             let tryAll () =
                 match tryOnImage "orig" original with
@@ -368,6 +432,16 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 %activity.SetStatus(ActivityStatusCode.Error)
             logger.LogWarning(ex, "Barcode decode failed")
             noneBarcode
+
+    let tryDecodeBarcode (imageBytes: ReadOnlyMemory<byte>) =
+        use activity = botActivity.StartActivity("couponOcr.barcode")
+        let result =
+            match tryDecodeNative imageBytes with
+            | Some text -> text
+            | None -> tryDecodeManaged imageBytes
+        if not (isNull activity) then
+            %activity.SetTag("barcode.found", not (String.IsNullOrWhiteSpace result))
+        result
 
     let parseFromText (nowUtc: DateTime) (ocrText: string) =
         let amounts = CouponOcrParsing.findEuroAmounts ocrText
