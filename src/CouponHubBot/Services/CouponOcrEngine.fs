@@ -1,12 +1,15 @@
 namespace CouponHubBot.Services
 
 open System
+open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Text.RegularExpressions
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open CouponHubBot
+open CouponHubBot.Telemetry
+open CouponHubBot.Utils
 open BotInfra
 
 open SixLabors.ImageSharp
@@ -208,9 +211,16 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
     let someDate (v: DateTime) : Nullable<DateTime> = Nullable(v)
 
     let tryDecodeBarcode (imageBytes: ReadOnlyMemory<byte>) =
+        use activity = botActivity.StartActivity("couponOcr.barcode")
+        let mutable attempts = 0
         try
-            use ms = new MemoryStream(imageBytes.ToArray())
-            use original = Image.Load<Rgba32>(ms)
+            use original =
+                use load = botActivity.StartActivity("couponOcr.image.load")
+                use ms = new MemoryStream(imageBytes.ToArray())
+                Image.Load<Rgba32>(ms)
+            if not (isNull activity) then
+                %activity.SetTag("image.width", original.Width)
+                %activity.SetTag("image.height", original.Height)
             let opts = DecodingOptions()
             opts.TryHarder <- true
             opts.PossibleFormats <- [| BarcodeFormat.EAN_13 |]
@@ -220,7 +230,15 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             reader.AutoRotate <- true
 
             let decode (label: string) (img: Image<Rgba32>) =
+                use attempt = botActivity.StartActivity("couponOcr.barcode.decode")
+                attempts <- attempts + 1
+                if not (isNull attempt) then
+                    %attempt.SetTag("barcode.strategy", label)
+                    %attempt.SetTag("image.width", img.Width)
+                    %attempt.SetTag("image.height", img.Height)
                 let res = reader.Decode(img)
+                if not (isNull attempt) then
+                    %attempt.SetTag("barcode.found", not (isNull res) && not (String.IsNullOrWhiteSpace res.Text))
                 if isNull res || String.IsNullOrWhiteSpace res.Text then
                     logger.LogDebug("Barcode not found by ZXing ({label})", label)
                     None
@@ -303,6 +321,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                     // Preprocess: grayscale + contrast helps with noisy receipt photos
                     // where ghost text bleeds through from the back of the paper.
                     use preprocessed =
+                        use preprocess = botActivity.StartActivity("couponOcr.image.preprocess")
                         original.Clone(fun ctx ->
                             ctx.Grayscale() |> ignore
                             ctx.Contrast(1.5f) |> ignore)
@@ -319,7 +338,12 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                             else
                                 let scale = float targetWidth / float source.Width
                                 let targetHeight = max 1 (int (Math.Round(float source.Height * scale)))
-                                use resized = source.Clone(fun ctx -> ctx.Resize(targetWidth, targetHeight) |> ignore)
+                                use resized =
+                                    use resize = botActivity.StartActivity("couponOcr.image.resize")
+                                    if not (isNull resize) then
+                                        %resize.SetTag("image.width", targetWidth)
+                                        %resize.SetTag("image.height", targetHeight)
+                                    source.Clone(fun ctx -> ctx.Resize(targetWidth, targetHeight) |> ignore)
                                 tryOnImage $"{label}{targetWidth}" resized
 
                         let resizeTargets = [| 1000; 800; 1400 |]
@@ -330,10 +354,18 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                             | Some t -> Some t
                             | None -> tryResize "gw" preprocessed tw)
 
-            match tryAll () with
+            let result = tryAll ()
+            if not (isNull activity) then
+                %activity.SetTag("barcode.attempts", attempts)
+                %activity.SetTag("barcode.found", result.IsSome)
+            match result with
             | Some text -> text
             | None -> noneBarcode
         with ex ->
+            if not (isNull activity) then
+                %activity.SetTag("barcode.attempts", attempts)
+                %activity.SetTag("error.type", ex.GetType().FullName)
+                %activity.SetStatus(ActivityStatusCode.Error)
             logger.LogWarning(ex, "Barcode decode failed")
             noneBarcode
 
@@ -371,6 +403,9 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
     member _.Recognize(imageBytes: ReadOnlyMemory<byte>) =
         task {
+            use activity = botActivity.StartActivity("couponOcr.recognize")
+            if not (isNull activity) then
+                %activity.SetTag("image.size_bytes", imageBytes.Length)
             let nowUtc = time.GetUtcNow().UtcDateTime
             let barcode = tryDecodeBarcode imageBytes
 
@@ -381,15 +416,20 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             // The ZXing barcode above is independent of Azure and may still be set.
             let! ocrAnalysis, backendFailed =
                 task {
+                    use azure = botActivity.StartActivity("couponOcr.azure")
                     try
                         let! a = azureTextOcr.AnalyzeImageBytes(imageBytes)
                         return a, false
                     with ex ->
+                        if not (isNull azure) then
+                            %azure.SetTag("error.type", ex.GetType().FullName)
+                            %azure.SetStatus(ActivityStatusCode.Error)
                         logger.LogWarning(ex, "Azure OCR backend call failed after retries")
                         return (null: OcrAnalysis | null), true
                 }
 
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
+            use parse = botActivity.StartActivity("couponOcr.parse")
 
             let couponValue, minCheck, validFrom, validTo =
                 if String.IsNullOrWhiteSpace ocrText then
@@ -418,4 +458,3 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                   barcode = barcode
                   backendFailed = backendFailed }
         }
-
