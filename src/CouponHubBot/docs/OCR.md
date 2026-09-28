@@ -6,9 +6,12 @@
 
 ## Components
 
-- **ZXing.Net** + ImageSharp bindings — barcode/QR code scanning
+- **ZXingCpp** + ImageSharp — EAN-13 scanning on grayscale images, followed by horizontal crops
+- **ZXing.Net** + ImageSharp bindings — fallback with rotation, contrast and resizing; luminance is shared across crops
 - **AzureOcrService** — calls Azure Computer Vision `imageanalysis:analyze` endpoint
 - **CouponOcrEngine** — orchestrates both, returns `CouponOCR` record
+
+Native library load or decode failures fall back to the managed decoder. The Linux native binaries require glibc 2.38 and libstdc++ with GLIBCXX_3.4.31; the Noble runtime image provides both.
 
 ## OCR Result
 
