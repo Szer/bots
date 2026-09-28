@@ -722,38 +722,9 @@ VALUES ('callback:' || @callbackId, 1,
         return ()
     }
 
-    /// Runs the same orphaned callback cleanup as DB.expireOrphanedCallbacks.
-    member this.CleanupOrphanedCallbacks(howOld: TimeSpan) = task {
-        use conn = new NpgsqlConnection(this.DbConnectionString)
-        //language=postgresql
-        let findSql =
-            """
-SELECT REPLACE(stream_id, 'callback:', '')::UUID
-FROM event
-WHERE event_type = 'CallbackCreated'
-  AND created_at < @cutoff
-  AND NOT EXISTS (
-      SELECT 1 FROM event e2
-      WHERE e2.stream_id = event.stream_id
-        AND e2.event_type IN ('CallbackResolved', 'CallbackExpired')
-  )
-            """
-        let! orphanedIds = conn.QueryAsync<Guid>(findSql, {| cutoff = DateTime.UtcNow.Subtract howOld |})
-        let ids = Array.ofSeq orphanedIds
-        //language=postgresql
-        let expireSql =
-            """
-INSERT INTO event(stream_id, stream_version, data)
-VALUES ('callback:' || @callbackId,
-        (SELECT MAX(stream_version) FROM event WHERE stream_id = 'callback:' || @callbackId) + 1,
-        '{"Case":"CallbackExpired"}'::JSONB)
-ON CONFLICT (stream_id, stream_version) DO NOTHING
-            """
-        for id in ids do
-            let! _ = conn.ExecuteAsync(expireSql, {| callbackId = id |})
-            ()
-        return ids.Length
-    }
+    member this.CleanupOrphanedCallbacks(howOld: TimeSpan) =
+        let db = VahterBanBot.DbService(this.DbConnectionString, TimeProvider.System)
+        db.ExpireOrphanedCallbacks(howOld)
 
     /// Checks if a CallbackExpired event exists for the given callback.
     member this.HasCallbackExpired(callbackId: Guid) = task {

@@ -909,20 +909,9 @@ WHERE e.event_type = 'CallbackCreated'
             //language=postgresql
             let sql =
                 """
-SELECT REPLACE(e.stream_id, 'callback:', '')::UUID
-FROM event e
-WHERE e.event_type = 'CallbackCreated'
-  AND e.created_at < @cutoff
-  AND NOT EXISTS (
-      SELECT 1 FROM event e2
-      WHERE e2.stream_id = e.stream_id
-        AND e2.event_type = 'CallbackMessagePosted'
-  )
-  AND NOT EXISTS (
-      SELECT 1 FROM event e3
-      WHERE e3.stream_id = e.stream_id
-        AND e3.event_type IN ('CallbackResolved', 'CallbackExpired')
-  )
+SELECT REPLACE(stream_id, 'callback:', '')::UUID
+FROM active_callback
+WHERE NOT message_posted AND created_at < @cutoff
                 """
 
             let! result = conn.QueryAsync<Guid>(sql, {| cutoff = utcNow().Subtract age |})
@@ -937,23 +926,10 @@ WHERE e.event_type = 'CallbackCreated'
             //language=postgresql
             let sql =
                 """
-SELECT
-    REPLACE(e.stream_id, 'callback:', '')::UUID AS id,
-    (e.data->>'actionChannelId')::BIGINT AS action_channel_id,
-    (SELECT (e3.data->>'actionMessageId')::BIGINT
-     FROM event e3
-     WHERE e3.stream_id = e.stream_id
-       AND e3.event_type = 'CallbackMessagePosted'
-     LIMIT 1) AS action_message_id
-FROM event e
-WHERE e.event_type = 'CallbackCreated'
-  AND (e.data->>'actionChannelId')::BIGINT = @channelId
-  AND e.created_at < @cutoff
-  AND NOT EXISTS (
-      SELECT 1 FROM event e2
-      WHERE e2.stream_id = e.stream_id
-        AND e2.event_type IN ('CallbackResolved', 'CallbackExpired')
-  )
+SELECT REPLACE(stream_id, 'callback:', '')::UUID AS id,
+       action_channel_id, action_message_id
+FROM active_callback
+WHERE action_channel_id = @channelId AND created_at < @cutoff
                 """
 
             let! result = conn.QueryAsync<ActiveCallbackInfo>(sql, {| channelId = channelId; cutoff = utcNow().Subtract age |})
@@ -993,14 +969,8 @@ WHERE e.event_type = 'CallbackMessagePosted'
             let sql =
                 """
 SELECT REPLACE(stream_id, 'callback:', '')::UUID
-FROM event
-WHERE event_type = 'CallbackCreated'
-  AND created_at < @cutoff
-  AND NOT EXISTS (
-      SELECT 1 FROM event e2
-      WHERE e2.stream_id = event.stream_id
-        AND e2.event_type IN ('CallbackResolved', 'CallbackExpired')
-  )
+FROM active_callback
+WHERE created_at < @cutoff
                 """
 
             let! orphanedIds = conn.QueryAsync<Guid>(sql, {| cutoff = utcNow().Subtract howOld |})
