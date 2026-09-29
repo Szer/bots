@@ -2,9 +2,12 @@ namespace CouponHubBot.Services
 
 open System
 open System.Collections.Concurrent
+open System.Diagnostics
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
+open BotInfra
+open CouponHubBot.Telemetry
 
 /// Per-batch debounce timer for the album upload flow. Re-arming an existing
 /// batch cancels the previous timer and starts fresh — this is how we "wait
@@ -19,6 +22,10 @@ type BatchDebounce(logger: ILogger<BatchDebounce>, time: TimeProvider) =
     let pending = ConcurrentDictionary<int64, CancellationTokenSource>()
 
     member _.Schedule(batchId: int64, debounceMs: int, work: Func<Task>) : unit =
+        let scheduledAt = DateTimeOffset.UtcNow
+        let parentContext =
+            if isNull Activity.Current then ActivityContext()
+            else Activity.Current.Context
         let cts = new CancellationTokenSource()
         match pending.TryGetValue batchId with
         | true, existing ->
@@ -28,13 +35,24 @@ type BatchDebounce(logger: ILogger<BatchDebounce>, time: TimeProvider) =
         pending[batchId] <- cts
         let runLoop () : Task =
             task {
-                try
-                    do! Task.Delay(TimeSpan.FromMilliseconds(float debounceMs), time, cts.Token)
+                let! elapsed = task {
+                    use wait = botActivity.StartActivity("batchDebounce.wait", ActivityKind.Internal, parentContext, startTime = scheduledAt)
+                    if not (isNull wait) then
+                        %wait.SetTag("batchId", batchId)
+                        %wait.SetTag("debounce.delay_ms", debounceMs)
+                    try
+                        do! Task.Delay(TimeSpan.FromMilliseconds(float debounceMs), time, cts.Token)
+                        if not (isNull wait) then %wait.SetTag("debounce.outcome", "elapsed")
+                        return true
+                    with :? OperationCanceledException ->
+                        if not (isNull wait) then %wait.SetTag("debounce.outcome", "superseded")
+                        return false
+                }
+                if elapsed then
                     pending.TryRemove batchId |> ignore
                     try
                         do! work.Invoke()
                     with ex ->
                         logger.LogError(ex, "FinalizeBatch failed for batch {BatchId}", batchId)
-                with :? OperationCanceledException -> ()
             } :> Task
         Task.Run<Task>(Func<Task>(runLoop)) |> ignore

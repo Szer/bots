@@ -35,6 +35,8 @@ All custom metrics are defined in `src/CouponHubBot/Telemetry.fs` under the `Cou
 
 - OpenTelemetry traces configured in `Telemetry.fs`
 - OCR spans cover full photo download (`couponOcr.download`), recognition, image loading/preprocessing/resizing, each ZXing decode attempt, Azure SDK execution including retries, and text parsing.
+- Album timers emit `batchDebounce.wait` from scheduling through elapsed or superseded waits; `batchId` joins these spans to OCR and finalization across traces.
+- `finalizeBatch` records `outcome` for completion, fallback, deferral, an unclaimed batch, a missing batch, or failed membership; deferred waits include `debounce.delay_ms`.
 - `couponOcr.barcode.decode` tags identify the strategy, image dimensions, and success; `couponOcr.barcode` records the attempt count and outcome without recording barcode values.
 - Includes Npgsql instrumentation for database query tracing
 - Traces shipped to **Tempo**. Query directly over the VPN (no auth) at
