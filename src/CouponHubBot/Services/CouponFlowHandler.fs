@@ -716,11 +716,16 @@ type CouponFlowHandler(
                 | _ -> None
 
             if deferForMs.IsSome then
+                if not (isNull a) then
+                    %a.SetTag("outcome", "deferred")
+                    %a.SetTag("debounce.delay_ms", deferForMs.Value)
                 batchDebounce.Schedule(batchId, deferForMs.Value, Func<Task>(fun () -> this.FinalizeBatch batchId))
             else
 
             let! won = db.TryFlipBatchToAwaiting batchId
-            if not won then () else
+            if not won then
+                if not (isNull a) then %a.SetTag("outcome", "not_claimed")
+            else
 
             let! claimedCount = db.ClaimPendingItemsAsTimeout batchId
             if claimedCount > 0 then
@@ -728,10 +733,12 @@ type CouponFlowHandler(
 
             let! batchOpt = db.GetBatchById batchId
             match batchOpt with
-            | None -> ()
+            | None ->
+                if not (isNull a) then %a.SetTag("outcome", "batch_missing")
             | Some batch ->
                 let! isMember = membership.IsMember(batch.user_id)
                 if not isMember then
+                    if not (isNull a) then %a.SetTag("outcome", "not_member")
                     logger.LogWarning("Batch {BatchId} dropped: user {UserId} is not a community member", batchId, batch.user_id)
                     do! db.ClearBatch batchId
                 else
