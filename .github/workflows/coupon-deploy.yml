@@ -40,6 +40,7 @@ jobs:
   deploy:
     uses: ./.github/workflows/_bot-deploy.yml
     with:
+      runner: ubuntu-24.04-arm
       test-command: |
         dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx"
