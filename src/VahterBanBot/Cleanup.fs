@@ -123,7 +123,7 @@ type CleanupService(
                 // Check scheduled jobs
                 do! tryRunJob "daily_cleanup" (TimeSpan.FromHours botConf.Value.CleanupScheduledHour) runCleanup
                 do! tryRunJob "moderation_quality_daily" (TimeSpan.FromHours botConf.Value.CleanupScheduledHour) (fun () -> task {
-                    let! _ = quality.Run(None, ct)
+                    let! _ = quality.Run(QualityHistoryMode.Daily, ct)
                     ()
                 })
                 do! tryRunJob "daily_stats" (TimeSpan.FromHours botConf.Value.StatsScheduledHour) runStats

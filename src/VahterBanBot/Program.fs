@@ -223,7 +223,7 @@ WebhookHost.configureSharedServices webhookCfg builder
 %builder.Services
     .AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
     .AddSingleton<ModerationQualityHistory>(fun sp ->
-        ModerationQualityHistory(connString, sp.GetRequiredService<TimeProvider>()))
+        ModerationQualityHistory(connString, sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ILogger<ModerationQualityHistory>>()))
     .AddSingleton<DbService>(fun sp ->
         DbService(connString, sp.GetRequiredService<TimeProvider>()))
     .AddSingleton<IOcrCache>(fun _ -> OcrCacheRepository(connString) :> IOcrCache)
@@ -320,23 +320,29 @@ SettingsDump.mapConfigDumpEndpoint
         SettingsDump.toJson eventJsonOpts live)
     app
 
+let parseQualityHistoryMode (ctx: HttpContext) =
+    let raw = string ctx.Request.Query["day"]
+    let parsed = DateTime.TryParseExact(raw, "yyyy-MM-dd", Globalization.CultureInfo.InvariantCulture,
+                                       Globalization.DateTimeStyles.AssumeUniversal ||| Globalization.DateTimeStyles.AdjustToUniversal)
+    match string ctx.Request.Query["mode"], raw, parsed with
+    | ("" | "daily"), "", _ -> Some QualityHistoryMode.Daily
+    | "backfill", "", _ -> Some QualityHistoryMode.Backfill
+    | ("" | "rebuild"), _, (true, day) -> Some (QualityHistoryMode.Rebuild day)
+    | _ -> None
+
 %app.MapPost("/quality-history", Func<HttpContext, Task<IResult>>(fun ctx -> task {
     if not (WebhookHost.validateApiKey webhookCfg.SecretToken ctx) then
         return Results.Text("Access Denied", statusCode = 401)
     else
-        let raw = string ctx.Request.Query["day"]
-        let parsed = DateTime.TryParseExact(raw, "yyyy-MM-dd", Globalization.CultureInfo.InvariantCulture,
-                                           Globalization.DateTimeStyles.AssumeUniversal ||| Globalization.DateTimeStyles.AdjustToUniversal)
-        match raw, parsed with
-        | "", _ | _, (true, _) ->
+        match parseQualityHistoryMode ctx with
+        | Some mode ->
             try
-                let day = if raw = "" then None else Some (snd parsed)
-                let! count = ctx.RequestServices.GetRequiredService<ModerationQualityHistory>().Run(day, ctx.RequestAborted)
+                let! count = ctx.RequestServices.GetRequiredService<ModerationQualityHistory>().Run(mode, ctx.RequestAborted)
                 return Results.Ok {| completedDays = count |}
             with
             | :? ArgumentException as ex -> return Results.BadRequest ex.Message
             | :? InvalidOperationException as ex -> return Results.Conflict ex.Message
-        | _ -> return Results.BadRequest "Expected day=yyyy-MM-dd, or omit day to backfill missing days"
+        | None -> return Results.BadRequest "Use mode=daily, mode=backfill, or day=yyyy-MM-dd"
 }))
 
 // Backfill/repair of the snapshot_* read models and aggregate snapshots from the event log.

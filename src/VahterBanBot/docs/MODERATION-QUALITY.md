@@ -23,24 +23,24 @@ Whole-pipeline rows measure automatic deletions, so human-caught spam without an
 
 ## Scheduling and backfill
 
-The existing scheduler runs the job at `CLEANUP_SCHEDULED_HOUR_UTC`. `QUALITY_SETTLING_DAYS` defaults to 14 full UTC days after a day ends; the latest eligible day is therefore today minus 15 days.
+The existing scheduler runs at `CLEANUP_SCHEDULED_HOUR_UTC`. Every daily run replaces today and the previous 14 UTC days, plus older affected days. Today is partial as of `computed_at`; recent days are provisional because reviewers can still correct decisions.
 
-The job fills missing eligible days from the first recorded ML score, oldest first. `QUALITY_BACKFILL_DAYS` defaults to 7 and is capped at 31 per invocation; once caught up, one day becomes eligible each day. These settings are read from `bot_setting` on each run.
+An event-table insert trigger atomically enqueues relevant message, scoring, moderation, and unban events. The job resolves their original scoring days, persists them in `moderation_quality_dirty_day`, and acknowledges only the pending event IDs it read, in one transaction. Late commits remain pending regardless of event-ID order.
 
-Authenticated `POST /quality-history` processes another bounded batch. Repeat until `completedDays` is zero to backfill without waiting for the daily schedule. `POST /quality-history?day=YYYY-MM-DD` replaces one eligible day, including corrections that arrived after its previous calculation.
+Each day uses a repeatable-read transaction to replace its rows and remove its dirty marker together. New events during rebuilding remain pending for the next run. Failed or interrupted rebuilds leave dirty days available for retry; older edits and corrections are covered without a maximum age.
 
-No settling period guarantees that corrections are final. A correction older than the settling window requires rebuilding its original scoring day. Increasing the window does not remove already-computed rows; dashboard eligibility should use the same window.
+Authenticated `POST /quality-history` (or `?mode=daily`) runs a refresh. `POST /quality-history?day=YYYY-MM-DD` replaces one day up to and including today. A session advisory lock serializes scheduled, backfill, and manual jobs across pods.
 
-Each day uses one repeatable-read transaction and atomically replaces its rows. Completed days survive interruption, empty days get zero rows, and retries cannot multiply counts. A database session advisory lock serializes scheduled and manual runs across pods; the dedicated unpooled connection releases it on disposal.
+One-time backfill is explicit: `POST /quality-history?mode=backfill` fills missing days before the rolling window, oldest first. `QUALITY_BACKFILL_DAYS` defaults to 7 and is capped at 31 per invocation. Repeat until `completedDays` is zero; completed and empty days are persisted, so retries resume safely. Daily refresh does not run this backfill.
 
-The job reads indexed event ranges and batches message streams. Dashboard reads use the aggregate table's day-leading unique index; no event replay occurs in a dashboard query. The existing event-type/time and stream indexes support backfill.
+Structured completion logs include mode, completed-day count, and elapsed seconds. Daily refresh warns when it exceeds the 30-second performance budget; it continues to finish its work. Dashboard queries read the day-indexed aggregate table and never replay events.
 
 ## Dashboard SQL
 
 Use half-open UTC dates, `$1` inclusive and `$2` exclusive. Parameters are bound by the dashboard/query client. Return NULL for empty denominators.
 
 ```sql
-SELECT day,
+SELECT day, day >= CURRENT_DATE - 14 AS provisional, max(computed_at) AS computed_at,
        sum(tp) AS tp, sum(tn) AS tn, sum(fp) AS fp, sum(fn) AS fn,
        100.0 * sum(tp) / nullif(sum(tp + fp), 0) AS precision_pct,
        100.0 * sum(tp) / nullif(sum(tp + fn), 0) AS recall_pct,
@@ -53,7 +53,7 @@ GROUP BY day
 ORDER BY day;
 ```
 
-For an interval, remove `day` from SELECT and remove GROUP BY/ORDER BY. Sum counts first; do not average daily percentages or multiply ML and LLM precision.
+For an interval, remove `day`, replace the provisional expression with `bool_or(day >= CURRENT_DATE - 14)`, and remove GROUP BY/ORDER BY. Sum counts first; do not average daily percentages or multiply ML and LLM precision.
 
 ```sql
 SELECT system, llm_model,
@@ -68,4 +68,4 @@ GROUP BY system, llm_model
 ORDER BY llm_model, system;
 ```
 
-For the latest 30 settled days at the default window, bind `$1 = CURRENT_DATE - 44` and `$2 = CURRENT_DATE - 14` with the database session in UTC. Show the covered date range and missing days alongside the metrics while backfill is catching up.
+For 30 days including today, bind `$1 = CURRENT_DATE - 29` and `$2 = CURRENT_DATE + 1` with the database session in UTC. For 30 complete days, use `$1 = CURRENT_DATE - 30` and `$2 = CURRENT_DATE`. Show coverage, missing days, and `computed_at`; even older days can change after edits or corrections.
