@@ -7,6 +7,7 @@
     <Compile Include="Services/DbService.fs" />
     <Compile Include="Services/MembershipService.fs" />
     <Compile Include="Services/NotificationService.fs" />
+    <Compile Include="Services/CouponBarcodeReader.fs" />
     <Compile Include="Services/CouponOcrEngine.fs" />
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />

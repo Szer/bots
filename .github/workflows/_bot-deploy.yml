@@ -3,6 +3,10 @@ name: "Bot: Deploy"
 on:
   workflow_call:
     inputs:
+      runner:
+        type: string
+        default: ubuntu-22.04-arm
+        description: "Runner image for build and tests"
       test-command:
         required: true
         type: string
@@ -72,7 +76,7 @@ env:
 
 jobs:
   deploy:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ${{ inputs.runner }}
     # VPN peer is single-occupancy per bot (PR #369 / my-infra#111 gave every
     # bot its own dedicated WireGuard peer — WIREGUARD_CONFIG_VAHTER/_COUPON/
     # _ALITA — so bots no longer share one peer). This group is scoped per

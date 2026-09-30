@@ -224,6 +224,30 @@ type OcrTests(output: ITestOutputHelper) =
         engine, http, logs
 
     [<Theory>]
+    [<InlineData("5_25_2026-01-11_2026-01-17_2706653336241.jpg")>]
+    [<InlineData("5_25_2026-01-20_2026-01-26_2706680353051.jpg")>]
+    [<InlineData("5_25_2026-02-08_2026-02-14_2706726228947.jpg")>]
+    [<InlineData("5_25_2026-04-05_2026-04-15_2706873139950.jpg")>]
+    member _.``Barcode search handles difficult coupon images without failing``(fileName: string) =
+        let bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Images", fileName))
+        match CouponBarcodeReader.tryDecode(ReadOnlyMemory<byte>(bytes)) with
+        | Some barcode ->
+            let expected = Path.GetFileNameWithoutExtension(fileName).Split('_') |> Array.last
+            Assert.Equal(expected, barcode)
+        | None -> ()
+
+    [<Theory>]
+    [<InlineData(120, 80)>]
+    [<InlineData(960, 1280)>]
+    [<InlineData(1, 1)>]
+    [<InlineData(3, 5)>]
+    member _.``Barcode reader returns no result for a blank image``(width: int, height: int) =
+        use image = new Image<L8>(width, height, L8(255uy))
+        use stream = new MemoryStream()
+        image.SaveAsPng(stream)
+        Assert.Equal(None, CouponBarcodeReader.tryDecode(ReadOnlyMemory<byte>(stream.ToArray())))
+
+    [<Theory>]
     [<InlineData(0)>]
     [<InlineData(90)>]
     [<InlineData(180)>]
