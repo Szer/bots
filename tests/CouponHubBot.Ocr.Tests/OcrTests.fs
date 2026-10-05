@@ -6,6 +6,7 @@ open System.IO
 open System.Net
 open System.Net.Http
 open System.Text
+open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open SixLabors.ImageSharp
@@ -46,7 +47,7 @@ module private XUnitLogging =
                         else "\n" + ex.ToString()
 
                     let line = $"[{logLevel}] {category}: {msg}{exText}"
-                    sink.Add(line)
+                    lock sink (fun () -> sink.Add(line))
                     output.WriteLine(line)
                 with _ ->
                     // Never let logging break tests
@@ -261,6 +262,63 @@ type OcrTests(output: ITestOutputHelper) =
             image.SaveAsPng(stream)
             let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
             Assert.Equal("2706602781191", result.barcode)
+        }
+
+    [<Theory>]
+    [<InlineData(0)>]
+    [<InlineData(180)>]
+    member _.``Low contrast coupon is recognized without OCR upright or inverted``(angle: int) =
+        task {
+            let path = Path.Combine(AppContext.BaseDirectory, "Images", "5_25_2026-02-08_2026-02-14_2706726228947.jpg")
+            use image = Image.Load<Rgba32>(path)
+            image.Mutate(fun ctx -> %ctx.Rotate(float32 angle))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal("2706726228947", result.barcode)
+        }
+
+    [<Fact>]
+    member _.``Concurrent recognition keeps coupon barcodes separate``() =
+        task {
+            let files =
+                [| "5_25_2026-02-08_2026-02-14_2706726228947.jpg"
+                   "10_50_01-04_01-13_2706602781191.jpg" |]
+            let engine = buildCpuOnlyEngine ()
+            let inputs =
+                files
+                |> Array.map (fun file ->
+                    let bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Images", file))
+                    let expected = Path.GetFileNameWithoutExtension(file).Split('_') |> Array.last
+                    bytes, expected)
+            let jobs =
+                Array.init 8 (fun i ->
+                    Task.Run(Func<Task>(fun () ->
+                        task {
+                            let bytes, expected = inputs[i % inputs.Length]
+                            let! result = engine.Recognize(ReadOnlyMemory<byte>(bytes))
+                            Assert.Equal(expected, result.barcode)
+                        } :> Task)))
+            do! Task.WhenAll jobs
+        }
+
+    [<Theory>]
+    [<InlineData(17)>]
+    [<InlineData(33)>]
+    [<InlineData(65)>]
+    member _.``Patterned images do not invent a barcode``(width: int) =
+        task {
+            use image = new Image<Rgba32>(width, 49)
+            image.ProcessPixelRows(fun pixels ->
+                for y = 0 to pixels.Height - 1 do
+                    let row = pixels.GetRowSpan y
+                    for x = 0 to row.Length - 1 do
+                        let value = if (x / 3 + y / 4) % 2 = 0 then 32uy else 224uy
+                        row[x] <- Rgba32(value, value, value))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Null(result.barcode)
         }
 
     [<Theory>]

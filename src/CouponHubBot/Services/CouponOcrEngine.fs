@@ -5,6 +5,7 @@ open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Text.RegularExpressions
+open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open CouponHubBot
@@ -235,22 +236,27 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             if not (isNull activity) then
                 %activity.SetTag("image.width", original.Width)
                 %activity.SetTag("image.height", original.Height)
-            let opts = DecodingOptions()
-            opts.TryHarder <- true
-            opts.PossibleFormats <- [| BarcodeFormat.EAN_13 |]
-            opts.TryInverted <- false
-            let reader = BarcodeReader<Rgba32>()
-            reader.Options <- opts
-            reader.AutoRotate <- true
+            let createReader () =
+                let opts = DecodingOptions()
+                opts.TryHarder <- true
+                opts.PossibleFormats <- [| BarcodeFormat.EAN_13 |]
+                opts.TryInverted <- false
+                let reader = BarcodeReaderGeneric(null, (fun source -> BarcodeBinarizer(source) :> Binarizer), null)
+                reader.Options <- opts
+                reader.AutoRotate <- true
+                reader
 
-            let decode (label: string) (img: LuminanceSource) =
+            let reader = createReader ()
+            let parallelOptions = ParallelOptions(MaxDegreeOfParallelism = Environment.ProcessorCount)
+
+            let decode (decoder: BarcodeReaderGeneric) (label: string) (img: LuminanceSource) =
                 use attempt = botActivity.StartActivity("couponOcr.barcode.decode")
-                attempts <- attempts + 1
+                %Interlocked.Increment(&attempts)
                 if not (isNull attempt) then
                     %attempt.SetTag("barcode.strategy", label)
                     %attempt.SetTag("image.width", img.Width)
                     %attempt.SetTag("image.height", img.Height)
-                let res = reader.Decode(img)
+                let res = decoder.Decode(img)
                 if not (isNull attempt) then
                     %attempt.SetTag("barcode.found", not (isNull res) && not (String.IsNullOrWhiteSpace res.Text))
                 if isNull res || String.IsNullOrWhiteSpace res.Text then
@@ -262,13 +268,13 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
             let clamp (v: int) (minv: int) (maxv: int) = max minv (min maxv v)
 
-            let cropTry (baseLabel: string) (img: LuminanceSource) (rect: Rectangle) =
+            let cropTry (decoder: BarcodeReaderGeneric) (baseLabel: string) (img: LuminanceSource) (rect: Rectangle) =
                 let x = clamp rect.X 0 (img.Width - 1)
                 let y = clamp rect.Y 0 (img.Height - 1)
                 let w = clamp rect.Width 1 (img.Width - x)
                 let h = clamp rect.Height 1 (img.Height - y)
                 let cropped = img.crop(x, y, w, h)
-                decode baseLabel cropped
+                decode decoder baseLabel cropped
 
             let tryOnImage (labelPrefix: string) (img: Image<Rgba32>) =
                 // Strategy:
@@ -277,8 +283,8 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 // - Middle band crops (covers centre region)
                 // - Bottom crops (useful for app screenshots)
                 // - Center-narrowed variants of the above (avoid noise on sides)
-                let luminance = ImageSharpLuminanceSource<Rgba32>(img)
-                match decode (labelPrefix + ":full") luminance with
+                let luminance = BarcodeLuminanceSource(ImageSharpLuminanceSource<Rgba32>(img))
+                match decode reader (labelPrefix + ":full") luminance with
                 | Some t -> Some t
                 | None ->
                     let w = img.Width
@@ -325,9 +331,25 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                     let allRects =
                         Array.append fullWidthCrops centerCrops
 
-                    allRects
-                    |> Array.mapi (fun i r -> (i, r))
-                    |> Array.tryPick (fun (i, r) -> cropTry $"{labelPrefix}:crop{i}" luminance r)
+                    match parallelOptions.MaxDegreeOfParallelism with
+                    | 1 ->
+                        allRects
+                        |> Array.mapi (fun i r -> (i, r))
+                        |> Array.tryPick (fun (i, r) -> cropTry reader $"{labelPrefix}:crop{i}" luminance r)
+                    | _ ->
+                        let results = Array.create allRects.Length None
+                        %Parallel.For<BarcodeReaderGeneric>(
+                            0, allRects.Length, parallelOptions,
+                            Func<BarcodeReaderGeneric>(createReader),
+                            Func<int, ParallelLoopState, BarcodeReaderGeneric, BarcodeReaderGeneric>(fun i state decoder ->
+                                let result = cropTry decoder $"{labelPrefix}:crop{i}" luminance allRects[i]
+                                results[i] <- result
+                                if result.IsSome then
+                                    state.Break()
+                                decoder),
+                            Action<BarcodeReaderGeneric>(fun _ -> ()))
+                        // Break completes lower indices so crop priority is independent of scheduling.
+                        results |> Array.tryPick id
 
             let tryAll () =
                 match tryOnImage "orig" original with
