@@ -455,14 +455,9 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             if not (isNull activity) then
                 %activity.SetTag("image.size_bytes", imageBytes.Length)
             let nowUtc = time.GetUtcNow().UtcDateTime
-            let barcode = tryDecodeBarcode imageBytes
 
-            // The Azure OCR SDK already retried transient failures; if one still surfaces (network,
-            // timeout, or a non-2xx response after retries) AnalyzeImageBytes re-throws it. Catch it
-            // here (don't crash) and record that the OCR *backend* failed, so callers can tell "Azure
-            // was down/timed out/errored" apart from "Azure answered 200 but found no usable text".
-            // The ZXing barcode above is independent of Azure and may still be set.
-            let! ocrAnalysis, backendFailed =
+            // OCR runs while the local barcode decoder works; backend failure stays separate from empty text.
+            let ocrTask =
                 task {
                     use azure = botActivity.StartActivity("couponOcr.azure")
                     try
@@ -476,6 +471,8 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                         return (null: OcrAnalysis | null), true
                 }
 
+            let barcode = tryDecodeBarcode imageBytes
+            let! ocrAnalysis, backendFailed = ocrTask
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
             use parse = botActivity.StartActivity("couponOcr.parse")
 
