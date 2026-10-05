@@ -243,7 +243,8 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 opts.TryInverted <- false
                 let reader = BarcodeReaderGeneric(null, (fun source -> BarcodeBinarizer(source) :> Binarizer), null)
                 reader.Options <- opts
-                reader.AutoRotate <- true
+                // The EAN-13 reader retains its own rotation fallback through RotateSupported.
+                reader.AutoRotate <- false
                 reader
 
             let reader = createReader ()
