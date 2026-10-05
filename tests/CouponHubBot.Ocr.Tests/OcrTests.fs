@@ -303,6 +303,66 @@ type OcrTests(output: ITestOutputHelper) =
         }
 
     [<Theory>]
+    [<InlineData("success")>]
+    [<InlineData("empty")>]
+    [<InlineData("failure")>]
+    [<InlineData("canceled")>]
+    member _.``Recognition awaits pending OCR and preserves the local barcode``(outcome: string) =
+        task {
+            let bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Images", "5_25_2026-02-08_2026-02-14_2706726228947.jpg"))
+            let completion = TaskCompletionSource<OcrAnalysis | null>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable requests = 0
+            let azure =
+                { new IBotOcr with
+                    member _.AnalyzeImageBytes _ =
+                        requests <- requests + 1
+                        completion.Task }
+            let time = BotInfra.Time.FixedTimeProvider(DateTimeOffset(2026, 2, 8, 0, 0, 0, TimeSpan.Zero))
+            let engine = CouponOcrEngine(azure, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, time)
+            let recognition = engine.Recognize(ReadOnlyMemory<byte>(bytes))
+            Assert.Equal(1, requests)
+            Assert.False(recognition.IsCompleted)
+
+            match outcome with
+            | "success" ->
+                completion.SetResult(
+                    { RawJson = "{}"
+                      Text = "€5 OFF €25\nValid 8 Feb - 14 Feb\n2706602781191" })
+            | "empty" -> completion.SetResult(null: OcrAnalysis | null)
+            | "failure" -> completion.SetException(InvalidOperationException("OCR unavailable"))
+            | "canceled" -> completion.SetCanceled()
+            | _ -> failwith "Unexpected OCR outcome"
+
+            let! result = recognition
+            Assert.Equal("2706726228947", result.barcode)
+            Assert.Equal(outcome = "failure" || outcome = "canceled", result.backendFailed)
+            match outcome with
+            | "success" ->
+                Assert.Equal(Nullable 5m, result.couponValue)
+                Assert.Equal(Nullable 25m, result.minCheck)
+                Assert.Equal(Nullable(DateTime(2026, 2, 8)), result.validFrom)
+                Assert.Equal(Nullable(DateTime(2026, 2, 14)), result.validTo)
+            | _ ->
+                Assert.False(result.couponValue.HasValue)
+                Assert.False(result.minCheck.HasValue)
+                Assert.False(result.validFrom.HasValue)
+                Assert.False(result.validTo.HasValue)
+        }
+
+    [<Fact>]
+    member _.``Immediate OCR failure preserves the local barcode``() =
+        task {
+            let bytes = File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Images", "5_25_2026-02-08_2026-02-14_2706726228947.jpg"))
+            let azure =
+                { new IBotOcr with
+                    member _.AnalyzeImageBytes _ = raise (InvalidOperationException("OCR unavailable")) }
+            let engine = CouponOcrEngine(azure, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, TimeProvider.System)
+            let! result = engine.Recognize(ReadOnlyMemory<byte>(bytes))
+            Assert.Equal("2706726228947", result.barcode)
+            Assert.True(result.backendFailed)
+        }
+
+    [<Theory>]
     [<InlineData(17)>]
     [<InlineData(33)>]
     [<InlineData(65)>]
