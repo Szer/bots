@@ -8,6 +8,8 @@
     <Compile Include="Services/MembershipService.fs" />
     <Compile Include="Services/NotificationService.fs" />
     <Compile Include="Services/CouponBarcodeReader.fs" />
+    <Compile Include="Services/BarcodeLuminanceSource.fs" />
+    <Compile Include="Services/BarcodeBinarizer.fs" />
     <Compile Include="Services/CouponOcrEngine.fs" />
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />
@@ -31,6 +33,10 @@
     <PackageReference Include="ZXingCpp" />
     <!-- FakeTimeProvider for the test-only /test/clock/advance endpoint. Stable, ~30KB. -->
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="ThirdPartyNotices.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
