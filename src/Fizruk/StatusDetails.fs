@@ -2,7 +2,10 @@ namespace Fizruk
 
 open System
 open System.Globalization
+open System.Net.Http
+open System.Text.Json
 open System.Text.RegularExpressions
+open System.Threading
 open System.Threading.Tasks
 
 /// Factorio's current research over RCON. The command and parsing are pure so
@@ -66,6 +69,52 @@ module FactorioResearch =
                 return format (result |> Result.bind parse)
         }
 
+module FactorioUps =
+
+    let private http = new HttpClient()
+
+    let private parse (body: string) : float option =
+        try
+            use doc = JsonDocument.Parse body
+            let root = doc.RootElement
+            if root.GetProperty("status").GetString() <> "success" then None
+            else
+                let data = root.GetProperty "data"
+                let result = data.GetProperty "result"
+                if data.GetProperty("resultType").GetString() <> "vector" || result.GetArrayLength() <> 1 then None
+                else
+                    let sample = result[0].GetProperty "value"
+                    let value = sample[1].GetString()
+                    match Double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture) with
+                    | true, ups when Double.IsFinite ups && ups >= 0.0 -> Some ups
+                    | _ -> None
+        with
+        | :? JsonException | :? Collections.Generic.KeyNotFoundException
+        | :? InvalidOperationException | :? IndexOutOfRangeException -> None
+
+    let fetch (config: FactorioUpsConfig) (timeout: TimeSpan) : Task<string> =
+        task {
+            let! value =
+                task {
+                    try
+                        // Require a recent active measurement so a paused or disconnected
+                        // server cannot report its last known UPS as current performance.
+                        let selector = config.MetricSelector
+                        let query = $"avg(avg_over_time({selector}[5m]) and (time() - timestamp({selector}) < 30))"
+                        let url = config.PrometheusUrl.AbsoluteUri.TrimEnd('/') + "/api/v1/query?query=" + Uri.EscapeDataString query
+                        use cancellation = new CancellationTokenSource(timeout)
+                        let! body = http.GetStringAsync(url, cancellation.Token)
+                        return parse body
+                    with
+                    | :? HttpRequestException | :? OperationCanceledException -> return None
+                }
+            let result =
+                match value with
+                | Some ups -> ups.ToString("0.0", CultureInfo.InvariantCulture)
+                | None -> "unavailable"
+            return $"Avg UPS (last 5m, active): {result}."
+        }
+
 /// A running game's configured `details` lines, in config order. Fetchers render
 /// their own failures as "unknown", so one broken detail never hides /status.
 module StatusDetails =
@@ -75,6 +124,7 @@ module StatusDetails =
     let fetchLine (game: GameConfig) (detail: StatusDetail) : Task<string> =
         match detail with
         | StatusDetail.FactorioResearch -> FactorioResearch.fetch game timeout
+        | StatusDetail.FactorioUps config -> FactorioUps.fetch config timeout
 
     let fetchAll (game: GameConfig) : Task<string list> =
         task {

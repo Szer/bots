@@ -27,6 +27,15 @@ let private minimalGame (activityRegex: string) (playersJson: string) =
     }
     """
 
+[<Theory>]
+[<InlineData("file:///tmp/metrics", "simulation_ups")>]
+[<InlineData("http://user:password@metrics.example.test", "simulation_ups")>]
+[<InlineData("http://metrics.example.test?token=example", "simulation_ups")>]
+[<InlineData("http://metrics.example.test", " ")>]
+let ``UPS detail rejects invalid endpoint or empty selector`` (url, selector) =
+    let details = $$""""details":[{"type":"factorio-ups","prometheusUrl":"{{url}}","metricSelector":"{{selector}}"}],"""
+    Assert.Throws<ConfigError>(fun () -> Config.parse (minimalGame "JOIN" details) |> ignore) |> ignore
+
 [<Fact>]
 let ``valid config parses every game and chat`` () =
     let config = sampleConfig ()

@@ -2,6 +2,7 @@ namespace Fizruk
 
 open System
 open System.Collections.Concurrent
+open System.Globalization
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
@@ -20,7 +21,12 @@ module private StatusText =
                 match n.CreationTimestamp with
                 | Some ts -> $"{int (now - ts).TotalMinutes}m"
                 | None -> "unknown"
-            $"Node: {n.Name} ({readyText}, age {ageText})"
+            let cpu = n.CpuCount |> Option.map (fun count -> count.ToString("0.##", CultureInfo.InvariantCulture) + " vCPU")
+            let region = n.Region |> Option.map (fun region -> $"region {region}")
+            let zone = n.Zone |> Option.map (fun zone -> $"zone {zone}")
+            let facts = [ cpu; region; zone ] |> List.choose id
+            let suffix = if facts.IsEmpty then "" else "; " + String.concat ", " facts
+            $"Node: {n.Name} ({readyText}, age {ageText}{suffix})"
 
     let formatPlayersLine (players: PlayersProbeResult) =
         match players with
@@ -170,7 +176,7 @@ type GameCore(config: FizrukConfig, k8s: IK8sGateway, notifier: INotifier, time:
             let! listenerLines = this.GetListenerLines game
             let! detailLines =
                 match pod with
-                | Some p when p.Ready -> StatusDetails.fetchAll game
+                | Some p when desired > 0 && p.Ready -> StatusDetails.fetchAll game
                 | _ -> Task.FromResult []
             return StatusText.formatStatus game desired pod node players detailLines listenerLines (time.GetUtcNow())
         }
