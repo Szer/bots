@@ -18,12 +18,17 @@ type PlayersConfig =
       /// Env var holding the RCON password. Set only when Type = Rcon.
       PasswordEnv: string option }
 
+type FactorioUpsConfig =
+    { PrometheusUrl: Uri
+      MetricSelector: string }
+
 /// Extra game-specific facts appended to a running game's /status reply. Each case
 /// has its own fetcher in StatusDetails; add a case per new kind of detail.
 [<RequireQualifiedAccess>]
 type StatusDetail =
     /// Current research and its progress, read over the game's RCON endpoint.
     | FactorioResearch
+    | FactorioUps of FactorioUpsConfig
 
 /// The shared Envoy Gateway a game's ListenerSet attaches to.
 type GatewayConfig = { Name: string; Namespace: string }
@@ -193,6 +198,17 @@ module Config =
                 if players.Type <> ProbeType.Rcon then
                     raise (ConfigError $"{ctx}: details type 'factorio-research' requires players.type=rcon")
                 StatusDetail.FactorioResearch
+            | "factorio-ups" ->
+                let url = requireString entry ctx "prometheusUrl"
+                let endpoint =
+                    match Uri.TryCreate(url, UriKind.Absolute) with
+                    | true, uri when (uri.Scheme = "http" || uri.Scheme = "https")
+                                     && uri.UserInfo = "" && uri.Query = "" && uri.Fragment = "" -> uri
+                    | _ -> raise (ConfigError $"{ctx}: prometheusUrl must be an HTTP(S) base URL without credentials, query or fragment")
+                let selector = requireString entry ctx "metricSelector"
+                if String.IsNullOrWhiteSpace selector then
+                    raise (ConfigError $"{ctx}: metricSelector must not be empty")
+                StatusDetail.FactorioUps { PrometheusUrl = endpoint; MetricSelector = selector }
             | other -> raise (ConfigError $"{ctx}: unknown details type '{other}'")
         match el with
         | None -> []

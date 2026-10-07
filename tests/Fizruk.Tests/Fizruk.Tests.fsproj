@@ -18,6 +18,7 @@
     <Compile Include="K8sGatewayTests.fs" />
     <Compile Include="ListenerSetTests.fs" />
     <Compile Include="CoreFlowTests.fs" />
+    <Compile Include="StatusFlowTests.fs" />
     <Compile Include="ListenerSetFlowTests.fs" />
     <Compile Include="FakeCallHelpers.fs" />
     <Compile Include="FizrukContainerFixture.fs" />

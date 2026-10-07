@@ -34,6 +34,13 @@ module K8sGateway =
         let utc = if dt.Kind = DateTimeKind.Unspecified then DateTime.SpecifyKind(dt, DateTimeKind.Utc) else dt
         DateTimeOffset utc
 
+    let tryValue (key: string) (values: IDictionary<string, 'T>) : 'T option =
+        if isNull values then None
+        else
+            match values.TryGetValue key with
+            | true, value -> Some value
+            | false, _ -> None
+
     let private tryProp (el: JsonElement) (name: string) : JsonElement option =
         match el.TryGetProperty name with
         | true, v -> Some v
@@ -130,7 +137,10 @@ type KubernetesGateway(client: Kubernetes) =
                     |> Seq.map (fun n ->
                         { Name = n.Metadata.Name
                           Ready = isNodeReady n.Status.Conditions
-                          CreationTimestamp = n.Metadata.CreationTimestamp |> Option.ofNullable |> Option.map K8sGateway.asUtcOffset })
+                          CreationTimestamp = n.Metadata.CreationTimestamp |> Option.ofNullable |> Option.map K8sGateway.asUtcOffset
+                          CpuCount = n.Status.Capacity |> K8sGateway.tryValue "cpu" |> Option.map (fun quantity -> quantity.ToDecimal())
+                          Region = n.Metadata.Labels |> K8sGateway.tryValue "topology.kubernetes.io/region"
+                          Zone = n.Metadata.Labels |> K8sGateway.tryValue "topology.kubernetes.io/zone" })
                     |> List.ofSeq
             }
 

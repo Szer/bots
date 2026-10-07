@@ -14,7 +14,10 @@ type PodInfo =
 type NodeInfo =
     { Name: string
       Ready: bool
-      CreationTimestamp: DateTimeOffset option }
+      CreationTimestamp: DateTimeOffset option
+      CpuCount: decimal option
+      Region: string option
+      Zone: string option }
 
 /// What a player probe found: named players (RCON) or just a headcount (RakNet).
 [<RequireQualifiedAccess>]
