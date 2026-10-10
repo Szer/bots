@@ -61,17 +61,13 @@ type FizrukContainerFixture() =
                 [ "FAKE_PROJECT", "FakeTgApi"; "FAKE_PORT", "8080" ])
     let fakeTgContainer = createFakeTgApiContainer fakeTgImage network fakeAlias
 
-    let botImage, botBuildLogger =
-        getOrCreateImageSpec "fizruk-tests-bot" (fun () ->
-            buildImageSpec solutionDir "./src/Dockerfile.bot" "fizruk-tests-bot" true true [ "BOT_PROJECT", "Fizruk" ])
-
     // A host-file bind mount, not WithResourceMapping — the latter's docker-cp
     // tar-stream copy 500s ("broken pipe") against this podman version.
     let configFilePath = Path.Combine(Path.GetTempPath(), $"fizruk-test-config-{Guid.NewGuid()}.json")
     do File.WriteAllText(configFilePath, ConfigJson)
 
     let botContainer =
-        ContainerBuilder(botImage)
+        ContainerBuilder("fizruk-tests-bot")
             .WithNetwork(network)
             .WithPortBinding(80, true)
             .WithBindMount(configFilePath, "/config/fizruk.json", AccessMode.ReadOnly)
@@ -89,9 +85,9 @@ type FizrukContainerFixture() =
             .Build()
 
     /// Same image/config, BOT_WEBHOOK_URL set — exercises webhook self-registration
-    /// without a second image build (Testcontainers caches botImage by name).
+    /// without a second image build.
     let webhookBotContainer =
-        ContainerBuilder(botImage)
+        ContainerBuilder("fizruk-tests-bot")
             .WithNetwork(network)
             .WithPortBinding(80, true)
             .WithBindMount(configFilePath, "/config/fizruk.json", AccessMode.ReadOnly)
@@ -117,7 +113,7 @@ type FizrukContainerFixture() =
             ValueTask(task {
                 testArtifactsDir <- Path.Combine(solutionDirPath, "test-artifacts", "Fizruk.Tests", "ContainerTests")
 
-                let botBuildTask = buildImageOncePerProcess "fizruk-tests-bot" testArtifactsDir "bot" botImage botBuildLogger
+                let botBuildTask = buildBotImageOncePerProcess solutionDirPath "Fizruk" "fizruk-tests-bot" testArtifactsDir
                 let fakeTgBuildTask =
                     buildImageOncePerProcess "fizruk-tests-fake-tg-api" testArtifactsDir "fake-tg-api" fakeTgImage fakeTgBuildLogger
                 do! Task.WhenAll(botBuildTask, fakeTgBuildTask)

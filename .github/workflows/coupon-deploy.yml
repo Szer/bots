@@ -51,6 +51,7 @@ jobs:
       argocd-app-name: coupon-bot
       container-name: coupon-bot
     secrets:
+      SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
       # Dedicated single-occupancy peer (Szer/my-infra#111) — do not point
       # this back at the shared WIREGUARD_CONFIG secret; concurrent bot
       # deploys over one peer flap the WG endpoint (issue #368).

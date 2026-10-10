@@ -37,6 +37,7 @@ on:
       - 'tests/Dockerfile.fake'
       - 'tests/Directory.Build.targets'
       - '.gitignore'
+      - '.dockerignore'
       - 'LICENSE'
       - '.github/workflows/_bot-build.yml'
       - '.github/upstream/**'
@@ -94,6 +95,7 @@ jobs:
         cp ../monorepo/Directory.Packages.props .
         cp ../monorepo/global.json .
         cp ../monorepo/.gitignore .
+        cp ../monorepo/.dockerignore .
         cp ../monorepo/LICENSE .
         cp ../monorepo/.github/upstream/README.md README.md
 
