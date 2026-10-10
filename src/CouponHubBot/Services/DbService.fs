@@ -1442,6 +1442,70 @@ RETURNING id;
             return ()
         }
 
+    /// One row per admin a feedback message was forwarded to — resolves a later /reply
+    /// (Telegram reply to that forwarded copy) back to the feedback row.
+    member _.SaveFeedbackDelivery(feedbackId: int64, adminChatId: int64, adminMessageId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO feedback_delivery (feedback_id, admin_chat_id, admin_message_id)
+VALUES (@feedback_id, @admin_chat_id, @admin_message_id);
+"""
+            let! _ = conn.ExecuteAsync(sql,
+                {| feedback_id = feedbackId
+                   admin_chat_id = adminChatId
+                   admin_message_id = adminMessageId |})
+            return ()
+        }
+
+    /// Resolves the target of a /reply: the admin's chat id + the message id they replied to
+    /// must match a forwarded feedback copy in feedback_delivery.
+    member _.GetFeedbackDeliveryTarget(adminChatId: int64, adminMessageId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+SELECT fd.feedback_id, uf.user_id, uf.telegram_message_id
+FROM feedback_delivery fd
+JOIN user_feedback uf ON uf.id = fd.feedback_id
+WHERE fd.admin_chat_id = @admin_chat_id AND fd.admin_message_id = @admin_message_id;
+"""
+            let! rows = conn.QueryAsync<FeedbackReplyTarget>(sql, {| admin_chat_id = adminChatId; admin_message_id = adminMessageId |})
+            return rows |> Seq.tryHead
+        }
+
+    /// The forwarded-copy message id for a given admin, so a reply notification can be sent
+    /// as a reply to THEIR own copy rather than unanchored.
+    member _.GetFeedbackDeliveryForAdmin(feedbackId: int64, adminChatId: int64) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql = "SELECT admin_message_id FROM feedback_delivery WHERE feedback_id = @feedback_id AND admin_chat_id = @admin_chat_id;"
+            let! rows = conn.QueryAsync<int64>(sql, {| feedback_id = feedbackId; admin_chat_id = adminChatId |})
+            return rows |> Seq.tryHead
+        }
+
+    /// Records an admin's /reply attempt, including delivery failures (blocked bot, etc.).
+    member _.SaveFeedbackReply(feedbackId: int64, adminId: int64, replyText: string, delivered: bool) =
+        task {
+            use! conn = openConn()
+            //language=postgresql
+            let sql =
+                """
+INSERT INTO feedback_reply (feedback_id, admin_id, reply_text, delivered)
+VALUES (@feedback_id, @admin_id, @reply_text, @delivered);
+"""
+            let! _ = conn.ExecuteAsync(sql,
+                {| feedback_id = feedbackId
+                   admin_id = adminId
+                   reply_text = replyText
+                   delivered = delivered |})
+            return ()
+        }
+
     // ── Album upload batches ─────────────────────────────────────────────
 
     /// Atomic per-user "create-or-find batch + abandon any other active batches"

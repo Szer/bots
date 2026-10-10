@@ -480,6 +480,46 @@ type CommandHandler(
                         "Следующее твоё сообщение в этом чате (в любом виде: текст, фото, голосовое и т.д.) я отправлю моим авторам. Если передумаешь — просто введи любую команду (например /help)."
         }
 
+    // Admin-only: replies to a user's /feedback via bot DM. Requires a Telegram-level reply
+    // to the admin's own forwarded copy — feedback_delivery resolves the target user/message.
+    let handleReply (adminId: int64) (adminChatId: int64) (replyToMessage: Message option) (replyText: string) =
+        task {
+            if options.Value.FeedbackAdminIds |> Array.contains adminId then
+                let hint = "Ответь этой командой на пересланное сообщение с фидбэком: /reply текст"
+                let text = replyText.Trim()
+                match replyToMessage, text with
+                | Some target, t when t <> "" ->
+                    match! db.GetFeedbackDeliveryTarget(adminChatId, target.MessageId) with
+                    | None -> do! sendText adminChatId hint
+                    | Some ft ->
+                        let! delivered =
+                            task {
+                                try
+                                    do! BotHelpers.sendTextReply tg ft.user_id $"Ответ авторов на твой фидбэк:\n\n{t}" ft.telegram_message_id
+                                    return true
+                                with ex ->
+                                    logger.LogWarning(ex, "Failed to deliver feedback reply to user {UserId}", ft.user_id)
+                                    return false
+                            }
+                        do! db.SaveFeedbackReply(ft.feedback_id, adminId, t, delivered)
+                        Metrics.feedbackReplyTotal.Add(1L, KeyValuePair("delivered", box (if delivered then "true" else "false")))
+                        if delivered then
+                            do! sendText adminChatId "Отправлено."
+                            for otherAdminId in options.Value.FeedbackAdminIds do
+                                if otherAdminId <> adminId then
+                                    try
+                                        let note = $"Ответ на фидбэк отправлен:\n\n{t}"
+                                        match! db.GetFeedbackDeliveryForAdmin(ft.feedback_id, otherAdminId) with
+                                        | Some otherMessageId -> do! BotHelpers.sendTextReply tg otherAdminId note otherMessageId
+                                        | None -> do! sendText otherAdminId note
+                                    with ex ->
+                                        logger.LogWarning(ex, "Failed to notify admin {AdminId} of feedback reply", otherAdminId)
+                        else
+                            do! sendText adminChatId "⚠️ Не удалось доставить ответ (пользователь, возможно, заблокировал бота)."
+                | _ -> do! sendText adminChatId hint
+            // else silently ignore for non-admins
+        }
+
     member _.HandleTake (taker: DbUser) (chatId: int64) (couponId: int) = handleTake taker chatId couponId
     member _.HandleReturn (user: DbUser) (chatId: int64) (couponId: int) = handleReturn user chatId couponId
     member _.HandleUsed (user: DbUser) (chatId: int64) (couponId: int) = handleUsed user chatId couponId
@@ -608,6 +648,18 @@ type CommandHandler(
                 let arg = t.Substring("/whois ".Length).Trim()
                 if arg <> "" then
                     do! handleWhois user.id msg.Chat.Id arg
+            | Some t when t.StartsWith("/reply ") ->
+                recordCommand "reply"
+                do! handleReply user.id msg.Chat.Id msg.ReplyToMessage (t.Substring("/reply ".Length))
+            | Some t when t.StartsWith("/r ") ->
+                recordCommand "reply"
+                do! handleReply user.id msg.Chat.Id msg.ReplyToMessage (t.Substring("/r ".Length))
+            | Some "/reply" ->
+                recordCommand "reply"
+                do! handleReply user.id msg.Chat.Id msg.ReplyToMessage ""
+            | Some "/r" ->
+                recordCommand "reply"
+                do! handleReply user.id msg.Chat.Id msg.ReplyToMessage ""
             | _ ->
                 let hasPhoto = msg.Photo |> Option.exists (fun p -> p.Length > 0)
                 let captionIsAdd =

@@ -269,7 +269,7 @@ type Tg() =
 
     // ── Message factories (CouponHubBot-style) ──────────────────────────────
 
-    static member dmMessage(text: string, fromUser: User, ?forwardOrigin: MessageOrigin) =
+    static member dmMessage(text: string, fromUser: User, ?forwardOrigin: MessageOrigin, ?replyToMessageId: int64, ?replyToMessage: Message) =
         let chat = Tg.privateChat(id = fromUser.Id)
         Update.Create(
             updateId = next(),
@@ -280,7 +280,12 @@ type Tg() =
                     chat = chat,
                     from = fromUser,
                     text = text,
-                    ?forwardOrigin = forwardOrigin
+                    ?forwardOrigin = forwardOrigin,
+                    ?replyToMessage =
+                        (replyToMessage
+                         |> Option.orElse (
+                             replyToMessageId
+                             |> Option.map (fun rid -> Message.Create(messageId = rid, date = DateTime.UtcNow, chat = chat))))
                 )
         )
 
