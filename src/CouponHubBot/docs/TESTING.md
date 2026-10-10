@@ -17,6 +17,13 @@ E2E tests live in `tests/CouponHubBot.Tests/`. They use Testcontainers to spin u
 
 All containers run in a shared Docker network. Tests interact via HTTP against mapped host ports.
 
+### Build license
+
+Set `SIXLABORS_LICENSE_KEY` to the complete contents of the issued Six Labors license for `CouponHubBot`; Release builds validate it.
+GitHub Actions uses the repository secret of the same name, and container builds pass it through a build secret mount.
+
+Bot test images use the Docker or Podman CLI. Set `BOT_CONTAINER_ENGINE` to an executable path when neither CLI is on `PATH`.
+
 ### Running Tests
 
 ```bash

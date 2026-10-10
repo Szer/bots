@@ -14,3 +14,5 @@ jobs:
         dotnet test tests/CouponHubBot.Tests/CouponHubBot.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
         dotnet test tests/CouponHubBot.Ocr.Tests/CouponHubBot.Ocr.Tests.fsproj -c Release --logger "trx;LogFileName=test-results.trx" --logger "console;verbosity=detailed"
       bot-paths-regex: '^(src/(BotInfra|CouponHubBot)/|src/Dockerfile\.bot$|tests/(CouponHubBot\.Tests|CouponHubBot\.Ocr\.Tests|BotTestInfra|FakeTgApi|FakeAzureOcrApi)/|Directory\.Build\.props$|Directory\.Packages\.props$|global\.json$)'
+    secrets:
+      SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}

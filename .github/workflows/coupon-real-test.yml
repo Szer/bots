@@ -164,6 +164,8 @@ jobs:
 
     - name: Build and push test image
       uses: docker/build-push-action@v5
+      env:
+        SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
       with:
         push: true
         # test-<sha> tag — never collides with prod's `:<sha>`/`:latest` tags
@@ -171,6 +173,8 @@ jobs:
         # convention as alita-real-test.yml.
         tags: ${{ env.IMAGE }}:test-${{ github.sha }}
         file: ./src/Dockerfile.bot
+        secret-envs: |
+          sixlabors-license=SIXLABORS_LICENSE_KEY
         build-args: BOT_PROJECT=CouponHubBot
         platforms: linux/arm64
 
@@ -432,6 +436,7 @@ jobs:
         # — this workflow is the one deliberate, workflow_dispatch-only path that is
         # meant to set it. Never set this for any other job/workflow.
         COUPON_REAL_TESTS: "1"
+        SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
         COUPON_REAL_MODE: remote
         COUPON_TEST_BOT_USERNAME: ${{ secrets.COUPON_CI_BOT_USERNAME }}
         COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}

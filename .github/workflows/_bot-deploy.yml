@@ -46,6 +46,8 @@ on:
         default: true
         description: "Open a deploy-failure issue (wakes the SRE agent) when verify-deploy fails"
     secrets:
+      SIXLABORS_LICENSE_KEY:
+        required: false
       WIREGUARD_CONFIG:
         required: true
         description: >-
@@ -169,6 +171,8 @@ jobs:
         global-json-file: global.json
 
     - name: Tests
+      env:
+        SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
       run: ${{ inputs.test-command }}
 
     - name: Upload dotnet test results
@@ -244,10 +248,13 @@ jobs:
 
     - name: Build and push to GHCR
       uses: docker/build-push-action@v5
+      env:
+        SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
       with:
         push: true
         tags: ${{ inputs.docker-image }}:${{ github.sha }}, ${{ inputs.docker-image }}:latest
         file: ./src/Dockerfile.bot
+        secret-envs: ${{ inputs.bot-project == 'CouponHubBot' && 'sixlabors-license=SIXLABORS_LICENSE_KEY' || '' }}
         build-args: BOT_PROJECT=${{ inputs.bot-project }}
         platforms: linux/arm64
 

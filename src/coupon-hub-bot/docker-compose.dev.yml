@@ -58,6 +58,8 @@ services:
       dockerfile: src/Dockerfile.bot
       args:
         BOT_PROJECT: CouponHubBot
+      secrets:
+        - sixlabors-license
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,3 +92,7 @@ services:
 
 volumes:
   postgres_data:
+
+secrets:
+  sixlabors-license:
+    environment: SIXLABORS_LICENSE_KEY
