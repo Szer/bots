@@ -291,7 +291,7 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
     }
     
     [<Fact>]
-    let ``User will be autobanned after four distinct spam messages`` () = task {
+    let ``User will be autobanned after consecutive spam`` () = task {
         let user = Tg.user()
         for index in 1 .. 4 do
             let update = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "66666666", from = user)
