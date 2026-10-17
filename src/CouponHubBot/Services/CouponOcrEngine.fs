@@ -112,12 +112,23 @@ module private CouponOcrParsing =
                 let m2 =
                     Regex.Match(
                         text,
-                        @"(?i)\bvalid\s+from\s+(?<a>\d{1,4}[./-]\d{1,2}[./-]\d{1,4})\s+to\s+(?<b>\d{1,4}[./-]\d{1,2}[./-]\d{1,4})\b"
+                        @"(?i)\bvalid\s+from\s+(?<a>\d{1,4}[./-]\d{1,2}[./-]\d{1,4})\s+to\s+(?<b>\d{1,4}[./-]\d{1,2}(?:[./-]\d{1,4})?)\b(?!\d|[./-]\d)"
                     )
                 if m2.Success then
-                    match tryParseDateAny nowUtc m2.Groups.["a"].Value, tryParseDateAny nowUtc m2.Groups.["b"].Value with
-                    | Some a, Some b -> Some(a.Date, b.Date)
-                    | _ -> None
+                    match tryParseDateAny nowUtc m2.Groups.["a"].Value with
+                    | Some a ->
+                        let endText = m2.Groups.["b"].Value
+                        let parts = endText.Split([| '/'; '.'; '-' |])
+                        let endDate =
+                            match parts with
+                            | [| day; month |] ->
+                                // Receipt ranges use day/month; a missing end year follows the start date.
+                                match tryParseDateAny nowUtc $"{day}/{month}/{a.Year}" with
+                                | Some b when b < a -> tryParseDateAny nowUtc $"{day}/{month}/{a.Year + 1}"
+                                | result -> result
+                            | _ -> tryParseDateAny nowUtc endText
+                        endDate |> Option.map (fun b -> a.Date, b.Date)
+                    | None -> None
                 else
                     None
 

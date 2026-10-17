@@ -454,6 +454,42 @@ type OcrTests(output: ITestOutputHelper) =
         }
 
     [<Theory>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10/26", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10/26.", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10.", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/2026 to 03/10/2026", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24.09.26 to 03.10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24-09-26 to 03-10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 2026-09-24 to 2026-10-03", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 01/10/26 to 03/10", "2026-10-01", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/12/26 to 03/01", "2026-12-24", "2027-01-03")>]
+    [<InlineData("Coupon valid from 24/12/26 to 03/01/27", "2026-12-24", "2027-01-03")>]
+    [<InlineData("Coupon valid from\n24/09/26\nto\n03/10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Valid 24 Sep - 3 Oct", "2030-09-24", "2030-10-03")>]
+    member _.``Labelled validity range takes precedence over receipt return deadline``(range: string, startDate: string, endDate: string) =
+        task {
+            let azure =
+                { new IBotOcr with
+                    member _.AnalyzeImageBytes _ =
+                        task {
+                            return
+                                { RawJson = "{}"
+                                  Text = $"Qualifying items can be returned up to\n21/10/26\nSAVE €10\nWhen you spend €50\n{range}" }
+                        } }
+            let time = BotInfra.Time.FixedTimeProvider(DateTimeOffset(2030, 1, 15, 0, 0, 0, TimeSpan.Zero))
+            let engine = CouponOcrEngine(azure, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, time)
+            use image = new Image<L8>(1, 1, L8(255uy))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = engine.Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal(Nullable(Parsing.parseDate startDate), result.validFrom)
+            Assert.Equal(Nullable(Parsing.parseDate endDate), result.validTo)
+            Assert.Equal(Nullable 10m, result.couponValue)
+            Assert.Equal(Nullable 50m, result.minCheck)
+        }
+
+    [<Theory>]
     // Low-quality images: assert only fields that are reliable for this file.
     // Pass null for fields we intentionally do not assert.
     [<InlineData("5_25_2026-01-11_2026-01-17_2706653336241.jpg", "5", "25", "2026-01-11", null, null)>]
