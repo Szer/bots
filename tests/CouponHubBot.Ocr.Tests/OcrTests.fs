@@ -455,6 +455,7 @@ type OcrTests(output: ITestOutputHelper) =
 
     [<Theory>]
     [<InlineData("Coupon valid from 24/09/26 to 03/10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("upon valid from 07/09/26 to 13/09/", "2026-09-07", "2026-09-13")>]
     [<InlineData("Coupon valid from 24/09/26 to 03/10/26", "2026-09-24", "2026-10-03")>]
     [<InlineData("Coupon valid from 24/09/26 to 03/10/26.", "2026-09-24", "2026-10-03")>]
     [<InlineData("Coupon valid from 24/09/26 to 03/10.", "2026-09-24", "2026-10-03")>]
