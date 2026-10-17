@@ -410,6 +410,7 @@ type OcrTests(output: ITestOutputHelper) =
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198838.jpg")>]
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198845.jpg")>]
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198821.jpg")>]
+    [<InlineData("10_50_2026-09-24_2026-10-03_2707322589159.jpg")>]
     member _.``OCR engine recognizes coupon from file``(fileName: string) =
         task {
             let imagesDir = Path.Combine(AppContext.BaseDirectory, "Images")
