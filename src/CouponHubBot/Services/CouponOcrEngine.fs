@@ -449,7 +449,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
         couponValue, minCheck, validFrom, validTo
 
-    member _.Recognize(imageBytes: ReadOnlyMemory<byte>) =
+    member _.Recognize(imageBytes: ReadOnlyMemory<byte>, ?saveResponse: string -> Task<unit>) =
         task {
             use activity = botActivity.StartActivity("couponOcr.recognize")
             if not (isNull activity) then
@@ -460,15 +460,22 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             let ocrTask =
                 task {
                     use azure = botActivity.StartActivity("couponOcr.azure")
-                    try
-                        let! a = azureTextOcr.AnalyzeImageBytes(imageBytes)
-                        return a, false
-                    with ex ->
-                        if not (isNull azure) then
-                            %azure.SetTag("error.type", ex.GetType().FullName)
-                            %azure.SetStatus(ActivityStatusCode.Error)
-                        logger.LogWarning(ex, "Azure OCR backend call failed after retries")
-                        return (null: OcrAnalysis | null), true
+                    let! analysis, failed =
+                        task {
+                            try
+                                let! a = azureTextOcr.AnalyzeImageBytes(imageBytes)
+                                return a, false
+                            with ex ->
+                                if not (isNull azure) then
+                                    %azure.SetTag("error.type", ex.GetType().FullName)
+                                    %azure.SetStatus(ActivityStatusCode.Error)
+                                logger.LogWarning(ex, "Azure OCR backend call failed after retries")
+                                return (null: OcrAnalysis | null), true
+                        }
+                    match Option.ofObj analysis, saveResponse with
+                    | Some response, Some save -> do! save response.RawJson
+                    | _ -> ()
+                    return analysis, failed
                 }
 
             let barcode = tryDecodeBarcode imageBytes

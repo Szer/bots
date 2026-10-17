@@ -21,6 +21,73 @@ type OcrAddFlowTests(fixture: OcrCouponHubTestContainers) =
     let readAzureCacheJson (fileName: string) =
         File.ReadAllText(Path.Combine(solutionDirPath, "tests", "CouponHubBot.Ocr.Tests", "AzureCache", fileName + ".azure.json"))
 
+    [<Theory>]
+    [<InlineData("single")>]
+    [<InlineData("manual")>]
+    [<InlineData("album")>]
+    let ``Raw OCR response is saved by photo before confirmation and survives coupon cleanup`` (flow: string) =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            do! fixture.TruncateBatches()
+            do! fixture.ResetAzureOcr()
+            let userId =
+                match flow with
+                | "single" -> 681L
+                | "manual" -> 682L
+                | "album" -> 683L
+                | _ -> failwith "Unexpected flow"
+            let user = Tg.user(id = userId, username = "ocr_history", firstName = "History")
+            do! fixture.SetChatMemberStatus(user.Id, "member")
+            let fileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
+            let fileId = $"history-{flow}-{Guid.NewGuid():N}"
+            let bytes = readImageBytes fileName
+            let rawJson = readAzureCacheJson fileName
+            do! fixture.SetTelegramFile(fileId, bytes)
+            do! fixture.SetAzureOcrResponse(200, rawJson)
+            let makeUpdate () =
+                match flow with
+                | "single" -> Tg.dmPhotoWithCaption("", user, fileId = fileId)
+                | "manual" -> Tg.dmPhotoWithCaption("/add 5 25 2026-02-01", user, fileId = fileId)
+                | "album" -> Tg.dmAlbumPhoto(user, $"history-{Guid.NewGuid():N}", fileId = fileId)
+                | _ -> failwith "Unexpected flow"
+            let! response = fixture.SendUpdate(makeUpdate ())
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+            if flow = "album" then
+                let! batchId = BatchTestHelpers.waitForBatchByUser fixture user.Id 5000
+                do! BatchTestHelpers.waitForAllItemsTerminal fixture batchId 10000
+            let sql = """
+SELECT raw_response = CAST(@raw AS jsonb)
+FROM coupon_ocr WHERE photo_file_id = @photo;
+"""
+            let! saved = fixture.QuerySingle<bool>(sql, {| raw = rawJson; photo = fileId |})
+            Assert.True(saved)
+            if flow = "single" then
+                let! _ = fixture.SendUpdate(Tg.dmCallback("addflow:ocr:yes", user))
+                ()
+            if flow <> "album" then
+                let! linked = fixture.QuerySingle<int64>(
+                    "SELECT count(*) FROM coupon c JOIN coupon_ocr o USING (photo_file_id) WHERE c.photo_file_id = @photo",
+                    {| photo = fileId |})
+                Assert.Equal(1L, linked)
+            do! fixture.TruncateBatches()
+            do! fixture.TruncateCoupons()
+            let! retained = fixture.QuerySingle<int64>("SELECT count(*) FROM coupon_ocr WHERE photo_file_id = @photo", {| photo = fileId |})
+            Assert.Equal(1L, retained)
+            let updated = System.Text.Json.Nodes.JsonNode.Parse(rawJson)
+            updated["modelVersion"] <- System.Text.Json.Nodes.JsonValue.Create("updated-model")
+            let updatedJson = updated.ToJsonString()
+            do! fixture.SetAzureOcrResponse(200, updatedJson)
+            let! repeated = fixture.SendUpdate(makeUpdate ())
+            Assert.Equal(HttpStatusCode.OK, repeated.StatusCode)
+            if flow = "album" then
+                let! batchId = BatchTestHelpers.waitForBatchByUser fixture user.Id 5000
+                do! BatchTestHelpers.waitForAllItemsTerminal fixture batchId 10000
+            let! replaced = fixture.QuerySingle<bool>(sql, {| raw = updatedJson; photo = fileId |})
+            Assert.True(replaced)
+            do! fixture.TruncateBatches()
+        }
+
     /// Returns Azure OCR JSON with any 13-digit barcode text line removed,
     /// so the OCR text fallback won't find a barcode either.
     let stripBarcodeFromAzureJson (azureJson: string) =
