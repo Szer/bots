@@ -410,6 +410,8 @@ type OcrTests(output: ITestOutputHelper) =
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198838.jpg")>]
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198845.jpg")>]
     [<InlineData("10_50_2026-01-17_2026-01-26_2706688198821.jpg")>]
+    [<InlineData("10_50_2026-09-24_2026-10-03_2707322589159.jpg")>]
+    [<InlineData("5_25_2026-09-07_2026-09-13_2707288849571.jpg")>]
     member _.``OCR engine recognizes coupon from file``(fileName: string) =
         task {
             let imagesDir = Path.Combine(AppContext.BaseDirectory, "Images")
@@ -450,6 +452,43 @@ type OcrTests(output: ITestOutputHelper) =
                 let dump = String.concat "\n" (Seq.toList logs)
                 failwithf "Expected barcode from '%s'\n\nLogs:\n%s" nameNoExt dump
             Assert.Equal(expected.Barcode, res.barcode)
+        }
+
+    [<Theory>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("upon valid from 07/09/26 to 13/09/", "2026-09-07", "2026-09-13")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10/26", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10/26.", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/26 to 03/10.", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/09/2026 to 03/10/2026", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24.09.26 to 03.10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24-09-26 to 03-10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 2026-09-24 to 2026-10-03", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Coupon valid from 01/10/26 to 03/10", "2026-10-01", "2026-10-03")>]
+    [<InlineData("Coupon valid from 24/12/26 to 03/01", "2026-12-24", "2027-01-03")>]
+    [<InlineData("Coupon valid from 24/12/26 to 03/01/27", "2026-12-24", "2027-01-03")>]
+    [<InlineData("Coupon valid from\n24/09/26\nto\n03/10", "2026-09-24", "2026-10-03")>]
+    [<InlineData("Valid 24 Sep - 3 Oct", "2030-09-24", "2030-10-03")>]
+    member _.``Labelled validity range takes precedence over receipt return deadline``(range: string, startDate: string, endDate: string) =
+        task {
+            let azure =
+                { new IBotOcr with
+                    member _.AnalyzeImageBytes _ =
+                        task {
+                            return
+                                { RawJson = "{}"
+                                  Text = $"Qualifying items can be returned up to\n21/10/26\nSAVE €10\nWhen you spend €50\n{range}" }
+                        } }
+            let time = BotInfra.Time.FixedTimeProvider(DateTimeOffset(2030, 1, 15, 0, 0, 0, TimeSpan.Zero))
+            let engine = CouponOcrEngine(azure, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, time)
+            use image = new Image<L8>(1, 1, L8(255uy))
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = engine.Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal(Nullable(Parsing.parseDate startDate), result.validFrom)
+            Assert.Equal(Nullable(Parsing.parseDate endDate), result.validTo)
+            Assert.Equal(Nullable 10m, result.couponValue)
+            Assert.Equal(Nullable 50m, result.minCheck)
         }
 
     [<Theory>]
