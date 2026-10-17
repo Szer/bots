@@ -21,6 +21,10 @@ Wizard state for `/add` flow:
 
 Event types: `added`, `taken`, `returned`, `used`, `voided`
 
+### coupon_ocr table
+
+Stores the latest raw Azure OCR JSON response per Telegram `photo_file_id`, immediately after recognition and before parsing. Rows survive wizard cleanup and coupon changes.
+
 ### chat_message table
 
 Stores messages from the community group chat for product analysis. Only the community chat (`COMMUNITY_CHAT_ID`) is monitored. Bot messages are excluded.

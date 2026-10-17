@@ -195,6 +195,17 @@ VALUES (@coupon_id, @user_id, @event_type, @subject_user_id);
 """
         conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId; event_type = eventType; subject_user_id = Option.toNullable subjectUserId |}, tx) |> taskIgnore
 
+    member _.SaveCouponOcr(photoFileId: string, rawResponse: string) =
+        task {
+            use! conn = openConn()
+            let sql = """
+INSERT INTO coupon_ocr (photo_file_id, raw_response)
+VALUES (@photoFileId, CAST(@rawResponse AS jsonb))
+ON CONFLICT (photo_file_id) DO UPDATE SET raw_response = EXCLUDED.raw_response;
+"""
+            do! conn.ExecuteAsync(sql, {| photoFileId = photoFileId; rawResponse = rawResponse |}) |> taskIgnore
+        }
+
     member _.UpsertUser(user: DbUser) =
         task {
             use! conn = openConn()

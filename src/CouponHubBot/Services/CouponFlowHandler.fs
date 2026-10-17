@@ -44,6 +44,11 @@ type CouponFlowHandler(
                 return Unchecked.defaultof<byte[]>
         }
 
+    let recognizePhoto (photoFileId: string) (bytes: byte[]) =
+        couponOcr.Recognize(
+            ReadOnlyMemory<byte>(bytes),
+            saveResponse = fun rawResponse -> db.SaveCouponOcr(photoFileId, rawResponse))
+
     // Best-effort wrappers for cosmetic Telegram calls whose failure should
     // never fail the surrounding flow (e.g. deleting an already-gone placeholder).
     let tryDeleteMessage (chatId: int64) (messageId: int64) : Task =
@@ -143,7 +148,7 @@ type CouponFlowHandler(
                         if int64 bytes.Length > ocrConfig.OcrMaxFileSizeBytes then
                             return null
                         else
-                            let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                            let! ocr = recognizePhoto photoFileId bytes
                             let barcodeText =
                                 if String.IsNullOrWhiteSpace ocr.barcode then null else ocr.barcode
                             logger.LogInformation(
@@ -269,7 +274,7 @@ type CouponFlowHandler(
                         // throwing — so a slow Azure OCR can't crash the handler. The
                         // barcode from ZXing may still be present, in which case the wizard
                         // falls through to manual discount/min-check entry below.
-                        let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                        let! ocr = recognizePhoto photoFileId bytes
 
                         let valueOpt =
                             if ocr.couponValue.HasValue then
@@ -568,7 +573,7 @@ type CouponFlowHandler(
                             // Transient/timeout failures are retried by the OCR HTTP
                             // resilience pipeline; Recognize then degrades to a null-field
                             // result, which falls through to needs_input below.
-                            let! ocr = couponOcr.Recognize(ReadOnlyMemory<byte>(bytes))
+                            let! ocr = recognizePhoto photoFileId bytes
 
                             // Barcode comes from ZXing on the raw image bytes — independent of
                             // Azure OCR. If Azure fails (e.g. 403, VNet block) ZXing can still
