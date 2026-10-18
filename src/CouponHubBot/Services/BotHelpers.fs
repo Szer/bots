@@ -663,6 +663,7 @@ let singleTakenKeyboard (c: Coupon) =
     inlineKb [|
         [| btn "Вернуть" $"return:{c.id}:del"
            btn "Использован" $"used:{c.id}:del" |]
+        [| btn "⚠️ Не сработал" $"report:{c.id}" |]
     |]
 
 /// "Какой купон уже использован?" step: one button per currently-held coupon plus «Отмена».

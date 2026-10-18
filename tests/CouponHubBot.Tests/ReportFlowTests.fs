@@ -163,6 +163,47 @@ type ReportFlowTests(fixture: DefaultCouponHubTestContainers) =
             Assert.Equal("reported", status)
         }
 
+    [<Fact>]
+    let ``Holder reports directly from the coupon photo after confirmation`` () =
+        task {
+            do! fixture.ClearFakeCalls()
+            do! fixture.TruncateCoupons()
+            let owner = Tg.user(id = 9791L, username = "report_photo_owner")
+            let taker = Tg.user(id = 9792L, username = "report_photo_taker")
+            do! fixture.SetChatMemberStatus(owner.Id, "member")
+            do! fixture.SetChatMemberStatus(taker.Id, "member")
+
+            let! _ = fixture.SendUpdate(Tg.dmPhotoWithCaption("/add 10 50 2026-01-25", owner))
+            let! couponId = getLatestCouponId ()
+            do! fixture.ClearFakeCalls()
+            let! _ = fixture.SendUpdate(Tg.dmMessage($"/take {couponId}", taker))
+            let! photos = fixture.GetFakeCalls("sendPhoto")
+            let photo = Assert.Single(photos)
+            use doc = JsonDocument.Parse(photo.Body)
+            let rows = doc.RootElement.GetProperty("reply_markup").GetProperty("inline_keyboard")
+            Assert.Equal(2, rows.GetArrayLength())
+            Assert.Equal(2, rows[0].GetArrayLength())
+            Assert.Equal($"return:{couponId}:del", rows[0][0].GetProperty("callback_data").GetString())
+            Assert.Equal($"used:{couponId}:del", rows[0][1].GetProperty("callback_data").GetString())
+            Assert.Equal(1, rows[1].GetArrayLength())
+            Assert.Equal("⚠️ Не сработал", rows[1][0].GetProperty("text").GetString())
+            let callback = rows[1][0].GetProperty("callback_data").GetString()
+
+            do! fixture.ClearFakeCalls()
+            let! response = fixture.SendUpdate(Tg.dmCallback(callback, taker))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+            let! calls = fixture.GetFakeCalls("sendMessage")
+            Assert.True(findCallWithText calls taker.Id "Подтвердить?")
+            let! pendingStatus = getCouponStatus couponId
+            Assert.Equal("taken", pendingStatus)
+
+            let! _ = fixture.SendUpdate(Tg.dmCallback($"report:{couponId}:confirm", taker))
+            let! status = getCouponStatus couponId
+            Assert.Equal("reported", status)
+            let! usedCount = getEventCount couponId "used"
+            Assert.Equal(0L, usedCount)
+        }
+
     // ── 3. Non-holder cannot report ─────────────────────────────────────────
 
     [<Fact>]
