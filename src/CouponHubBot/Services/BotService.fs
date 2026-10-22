@@ -124,11 +124,15 @@ type BotService(
                                 logger.LogError(ex, "Failed to save user feedback to database")
                                 task { return 0L }
 
-                        // 2. Forward to admins (existing behavior)
+                        // 2. Forward to admins, remembering each forwarded copy's message id
+                        // so a later /reply can resolve back to this feedback row.
                         for adminId in botConfig.FeedbackAdminIds do
                             try
-                                do! tg.CallExn(Funogram.Telegram.Req.ForwardMessage.Make(adminId, msg.Chat.Id, msg.MessageId)) |> taskIgnore
-                            with _ -> ()
+                                let! fwdMsg = tg.CallExn(Funogram.Telegram.Req.ForwardMessage.Make(adminId, msg.Chat.Id, msg.MessageId))
+                                if feedbackId > 0L then
+                                    do! db.SaveFeedbackDelivery(feedbackId, adminId, fwdMsg.MessageId)
+                            with ex ->
+                                logger.LogWarning(ex, "Failed to forward feedback to admin {AdminId}", adminId)
 
                         // 3. Create GitHub issue (best-effort, anonymous — no username)
                         if gitHub.IsConfigured && feedbackId > 0L then

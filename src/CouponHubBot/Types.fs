@@ -142,6 +142,14 @@ type UserFeedbackRow =
       github_issue_number: Nullable<int>
       created_at: DateTime }
 
+/// Resolves an admin's `/reply` (Telegram-level reply to their forwarded copy) back to the
+/// feedback row and its author, via feedback_delivery joined to user_feedback.
+[<CLIMutable>]
+type FeedbackReplyTarget =
+    { feedback_id: int64
+      user_id: int64
+      telegram_message_id: int64 }
+
 /// Used by FakeTgApi test endpoints (serialize minimal info)
 [<CLIMutable>]
 type ApiCallLog =
