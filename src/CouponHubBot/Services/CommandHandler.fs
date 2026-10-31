@@ -224,6 +224,23 @@ type CommandHandler(
                         (BotHelpers.singleTakenKeyboard coupon)
         }
 
+    let handleBarcode (user: DbUser) (chatId: int64) (couponId: int) =
+        task {
+            match! db.GetCouponById couponId with
+            | Some coupon when coupon.owner_id = user.id || (coupon.taken_by.HasValue && coupon.taken_by.Value = user.id) ->
+                match CouponBarcodeImage.tryRender coupon.barcode_text with
+                | Some bytes ->
+                    do!
+                        tg.CallExn(Funogram.Telegram.Req.SendDocument.Make(
+                            chatId, InputFile.FileBytes($"coupon-{couponId}.png", bytes),
+                            caption = $"Баркод купона ID:{couponId}", disableContentTypeDetection = true))
+                        |> taskIgnore
+                | None ->
+                    do! sendText chatId "Не удалось сгенерировать баркод: нужен сохранённый 13-значный номер с правильной контрольной цифрой."
+            | _ ->
+                do! sendText chatId "Купон не найден или недоступен."
+        }
+
     let handleUsed (user: DbUser) (chatId: int64) (couponId: int) =
         task {
             let! updated = db.MarkUsed(couponId, user.id)
@@ -481,6 +498,7 @@ type CommandHandler(
         }
 
     member _.HandleTake (taker: DbUser) (chatId: int64) (couponId: int) = handleTake taker chatId couponId
+    member _.HandleBarcode (user: DbUser) (chatId: int64) (couponId: int) = handleBarcode user chatId couponId
     member _.HandleReturn (user: DbUser) (chatId: int64) (couponId: int) = handleReturn user chatId couponId
     member _.HandleUsed (user: DbUser) (chatId: int64) (couponId: int) = handleUsed user chatId couponId
     member _.HandleVoid (user: DbUser) (chatId: int64) (couponId: int) (isAdmin: bool) (deleteMsg: bool) (msgIdToDelete: int64 option) = handleVoid user chatId couponId isAdmin deleteMsg msgIdToDelete

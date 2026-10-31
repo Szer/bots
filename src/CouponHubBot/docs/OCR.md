@@ -17,6 +17,11 @@ Native library load or decode failures fall back to the managed decoder. The Lin
 
 `CouponOCR` contains optional fields: `value`, `min_check`, `expires_at`, `barcode_text`. Any combination may be present. The result is **always a pre-fill suggestion** — the user confirms final values in the wizard.
 
+## Barcode images
+
+The individual coupon menu’s «Сгенерировать баркод» button sends a lossless EAN-13 PNG to the owner or holder in private chat, with quiet zones, extended guard bars and readable digits.
+Generation checks the stored number’s length and checksum and decodes the rendered image back to the same number; it does not check expiry or redemption status.
+
 ## Caching (for tests)
 
 `tests/CouponHubBot.Ocr.Tests/AzureCache/` stores Azure OCR responses as `*.azure.json` files. These are git-tracked so tests can run without Azure API keys (cache-only mode).

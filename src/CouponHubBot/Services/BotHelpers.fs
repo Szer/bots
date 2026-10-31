@@ -663,6 +663,7 @@ let singleTakenKeyboard (c: Coupon) =
     inlineKb [|
         [| btn "Вернуть" $"return:{c.id}:del"
            btn "Использован" $"used:{c.id}:del" |]
+        [| btn "Сгенерировать баркод" $"barcode:{c.id}" |]
         [| btn "⚠️ Не сработал" $"report:{c.id}" |]
     |]
 

@@ -8,6 +8,7 @@
     <Compile Include="Services/MembershipService.fs" />
     <Compile Include="Services/NotificationService.fs" />
     <Compile Include="Services/CouponBarcodeReader.fs" />
+    <Compile Include="Services/CouponBarcodeImage.fs" />
     <Compile Include="Services/BarcodeLuminanceSource.fs" />
     <Compile Include="Services/BarcodeBinarizer.fs" />
     <Compile Include="Services/CouponOcrEngine.fs" />
