@@ -19,8 +19,8 @@ Native library load or decode failures fall back to the managed decoder. The Lin
 
 ## Barcode images
 
-The individual coupon menu’s «Сгенерировать баркод» button sends a lossless EAN-13 PNG to the owner or holder in private chat, with quiet zones, extended guard bars and readable digits.
-Generation checks the stored number’s length and checksum and decodes the rendered image back to the same number; it does not check expiry or redemption status.
+The individual coupon menu’s «Сгенерировать баркод» button sends a lossless Dunnes-style coupon card with stored amounts and validity dates, a spending condition and an EAN-13 barcode with quiet zones and readable digits.
+Generation checks the number’s format and checksum and decodes the image back to the same number; owner/holder access is required, while expiry and redemption status are not checked and an unknown start date is omitted.
 
 ## Caching (for tests)
 

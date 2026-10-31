@@ -1,64 +1,87 @@
 namespace CouponHubBot.Services
 
 open System
+open System.Globalization
 open System.IO
+open System.Numerics
+open BotInfra
+open CouponHubBot
+open SixLabors.Fonts
 open SixLabors.ImageSharp
+open SixLabors.ImageSharp.Drawing.Processing
 open SixLabors.ImageSharp.PixelFormats
+open SixLabors.ImageSharp.Processing
 open ZXing
 open ZXing.OneD
 
 module CouponBarcodeImage =
-    let private digits =
-        [| [| "01110"; "10001"; "10011"; "10101"; "11001"; "10001"; "01110" |]
-           [| "00100"; "01100"; "00100"; "00100"; "00100"; "00100"; "01110" |]
-           [| "01110"; "10001"; "00001"; "00010"; "00100"; "01000"; "11111" |]
-           [| "11110"; "00001"; "00001"; "01110"; "00001"; "00001"; "11110" |]
-           [| "00010"; "00110"; "01010"; "10010"; "11111"; "00010"; "00010" |]
-           [| "11111"; "10000"; "10000"; "11110"; "00001"; "00001"; "11110" |]
-           [| "01110"; "10000"; "10000"; "11110"; "10001"; "10001"; "01110" |]
-           [| "11111"; "00001"; "00010"; "00100"; "01000"; "01000"; "01000" |]
-           [| "01110"; "10001"; "10001"; "01110"; "10001"; "10001"; "01110" |]
-           [| "01110"; "10001"; "10001"; "01111"; "00001"; "00001"; "01110" |] |]
+    let private fonts =
+        lazy
+            let collection = FontCollection()
+            let load name =
+                use stream = typeof<Coupon>.Assembly.GetManifestResourceStream($"CouponHubBot.Fonts.{name}.ttf")
+                collection.Add stream
+            let family = load "Regular"
+            %load "Bold"
+            family
 
-    let tryRender (value: string | null) =
-        if isNull value || value.Length <> 13
-           || not (value |> Seq.forall (fun c -> c >= '0' && c <= '9'))
-           || (value |> Seq.mapi (fun i c -> (int c - int '0') * (if i % 2 = 0 then 1 else 3)) |> Seq.sum) % 10 <> 0 then
+    let private money (value: decimal) = value.ToString("0.##", CultureInfo.InvariantCulture)
+
+    let formatValidity (validFrom: DateOnly option) (expiresAt: DateOnly) =
+        let date (value: DateOnly) format = value.ToString(format, CultureInfo.InvariantCulture)
+        let finish = date expiresAt "d MMM yyyy"
+        match validFrom with
+        | Some start ->
+            let format = if start.Year = expiresAt.Year then "d MMM" else "d MMM yyyy"
+            $"Valid {date start format} – {finish}"
+        | None -> $"Valid until {finish}"
+
+    let tryRender (barcode: string | null) (value: decimal) (minimum: decimal) (validFrom: DateOnly option) (expiresAt: DateOnly) =
+        if isNull barcode || barcode.Length <> 13
+           || not (barcode |> Seq.forall (fun c -> c >= '0' && c <= '9'))
+           || (barcode |> Seq.mapi (fun i c -> (int c - int '0') * (if i % 2 = 0 then 1 else 3)) |> Seq.sum) % 10 <> 0 then
             None
         else
-            let modules = EAN13Writer().encode value
+            let modules = EAN13Writer().encode barcode
             let scale = 8
-            let padding = 8
-            let left = padding + 11
-            let barHeight = 70
-            use image = new Image<L8>((left + modules.Length + 7 + padding) * scale, (padding + barHeight + 9 + padding) * scale, L8(255uy))
-            let rectangle x y width height =
-                for py in y * scale .. (y + height) * scale - 1 do
-                    for px in x * scale .. (x + width) * scale - 1 do
-                        image[px, py] <- L8(0uy)
-
-            // EAN-13 guards extend five modules below the bars; quiet zones remain white.
+            let left = 160
+            let top = 580
+            let barHeight = 70 * scale
+            use image = new Image<L8>(1080, 1400, L8(255uy))
+            // Quiet zones surround the bars; guards extend five modules below them.
             for i in 0 .. modules.Length - 1 do
                 if modules[i] then
                     let guard = i < 3 || (i >= 45 && i < 50) || i >= 92
-                    rectangle (left + i) padding 1 (barHeight + if guard then 5 else 0)
+                    let height = barHeight + if guard then 5 * scale else 0
+                    for y in top .. top + height - 1 do
+                        for x in left + i * scale .. left + (i + 1) * scale - 1 do
+                            image[x, y] <- L8(0uy)
 
-            for i in 0 .. value.Length - 1 do
-                let x =
-                    match i with
-                    | 0 -> left - 9
-                    | n when n <= 6 -> left + 4 + (n - 1) * 7
-                    | n -> left + 51 + (n - 7) * 7
-                let glyph = digits[int value[i] - int '0']
-                for row in 0 .. 6 do
-                    for col in 0 .. 4 do
-                        if glyph[row][col] = '1' then
-                            rectangle (x + col) (padding + barHeight + 2 + row) 1 1
+            let family = fonts.Value
+            image.Mutate(fun ctx ->
+                %ctx.Paint(fun canvas ->
+                    let text (style: FontStyle) size x y alignment color maxWidth (content: string) =
+                        let mutable font = family.CreateFont(size, style)
+                        let width = TextMeasurer.MeasureAdvance(content, TextOptions(font)).Width
+                        if width > maxWidth then font <- family.CreateFont(size * maxWidth / width, style)
+                        let options = RichTextOptions(font)
+                        options.Origin <- Vector2(x, y)
+                        options.HorizontalAlignment <- alignment
+                        canvas.DrawText(options, content, Brushes.Solid(color), null)
+                    let centered style size y color content =
+                        text style size 540.f y HorizontalAlignment.Center color 940.f content
+                    text FontStyle.Bold 50.f 70.f 60.f HorizontalAlignment.Left Color.Black 300.f "DUNNES"
+                    text FontStyle.Regular 28.f 297.f 112.f HorizontalAlignment.Right Color.Black 200.f "STORES"
+                    centered FontStyle.Bold 64.f 230.f Color.Black $"€{money value} OFF €{money minimum}"
+                    centered FontStyle.Regular 42.f 350.f Color.Black (formatValidity validFrom expiresAt)
+                    centered FontStyle.Regular 36.f 460.f Color.DimGray $"When you spend €{money minimum} or more on Groceries."
+                    centered FontStyle.Regular 44.f 1210.f Color.Black $"{barcode[..6]} {barcode[7..10]} {barcode[11..]}"
+                    centered FontStyle.Regular 34.f 1320.f Color.DimGray "Terms and conditions apply."))
 
             let reader = ZXing.ImageSharp.BarcodeReader<L8>()
             reader.Options.PossibleFormats <- [| BarcodeFormat.EAN_13 |]
             let decoded = reader.Decode image
-            if isNull decoded || decoded.Text <> value then
+            if isNull decoded || decoded.Text <> barcode then
                 invalidOp "Generated EAN-13 image failed its decode check."
             use output = new MemoryStream()
             image.SaveAsPng output

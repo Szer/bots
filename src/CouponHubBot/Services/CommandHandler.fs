@@ -228,7 +228,7 @@ type CommandHandler(
         task {
             match! db.GetCouponById couponId with
             | Some coupon when coupon.owner_id = user.id || (coupon.taken_by.HasValue && coupon.taken_by.Value = user.id) ->
-                match CouponBarcodeImage.tryRender coupon.barcode_text with
+                match CouponBarcodeImage.tryRender coupon.barcode_text coupon.value coupon.min_check (Option.ofNullable coupon.valid_from) coupon.expires_at with
                 | Some bytes ->
                     do!
                         tg.CallExn(Funogram.Telegram.Req.SendDocument.Make(
