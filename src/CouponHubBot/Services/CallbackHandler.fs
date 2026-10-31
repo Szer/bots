@@ -190,6 +190,14 @@ type CallbackHandler(
                             do! commandHandler.HandleTake user chatId couponId
                         | None ->
                             ()
+                    elif isPrivateChat && hasData && data.StartsWith("barcode:") then
+                        match data.Split(':') with
+                        | [| "barcode"; id |] ->
+                            match BotHelpers.parseInt id with
+                            | Some couponId when couponId > 0 ->
+                                do! commandHandler.HandleBarcode user chatId couponId
+                            | _ -> do! sendText chatId "Не удалось определить купон."
+                        | _ -> do! sendText chatId "Не удалось определить купон."
                     elif isPrivateChat && hasData && data.StartsWith("addflow:bulk:") then
                         do! this.HandleBulkCallback user chatId data
                     elif isPrivateChat && hasData && data.StartsWith("addflow:") then
