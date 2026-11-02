@@ -54,3 +54,5 @@ Holding for at least 24 hours then returning with at most one day left is amber 
 ## Phone layout
 
 Phones open on the member list, with separate personal and community views. Sorting selects the metric shown beside every member; tapping a member expands averages and return details. Filters are collapsible, and all list operations use the loaded snapshot. Wider screens show the comparison table.
+
+The minimum sample follows the selected sort metric and shares its sample definition with metric coloring. Addition metrics use additions, return share uses takes, holding time uses resolved takes, and return-specific metrics use returns; sorting by name uses takes plus additions. The activity filter does not change this sample.
