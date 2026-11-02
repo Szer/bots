@@ -31,6 +31,7 @@ type BotConfiguration =
       /// working untouched with no config present.
       WebhookUrl: string
       DashboardUrl: string
+      DashboardEnabled: bool
       TestMode: bool
       MaxTakenCoupons: int
       BatchDebounceMs: int }

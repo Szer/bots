@@ -29,6 +29,7 @@ type GitHubServiceIsConfiguredTests() =
           FeedbackGitHubIssues = false
           WebhookUrl = ""
           DashboardUrl = ""
+          DashboardEnabled = false
           TestMode = true
           MaxTakenCoupons = 6
           BatchDebounceMs = 5000 }

@@ -13,6 +13,9 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Options
 
 module DashboardEndpoints =
+    let private disabled () =
+        Results.Json({| error = "dashboard_disabled" |}, statusCode = StatusCodes.Status403Forbidden)
+
     let configure (builder: WebApplicationBuilder) =
         %builder.Services.AddRateLimiter(fun limiter ->
             limiter.RejectionStatusCode <- StatusCodes.Status429TooManyRequests
@@ -60,10 +63,13 @@ module DashboardEndpoints =
                     let communityId = options.Value.CommunityChatId
                     match DashboardAuth.validate options.Value.BotToken (time.GetUtcNow()) (String(buffer, 0, length)) with
                     | None -> return Results.Unauthorized()
+                    | Some userId when not (DashboardAuth.isEnabledFor options.Value userId) -> return disabled()
                     | Some userId ->
                         let! isMember = membership.IsMember(userId, TimeSpan.FromMinutes 1.0)
                         if not isMember || communityId <> options.Value.CommunityChatId then
                             return Results.StatusCode(StatusCodes.Status403Forbidden)
+                        elif not (DashboardAuth.isEnabledFor options.Value userId) then
+                            return disabled()
                         else
                             let! session = service.CreateSession(userId, communityId)
                             return Results.Json session
@@ -82,6 +88,7 @@ module DashboardEndpoints =
                     else Task.FromResult None
                 match userId with
                 | None -> return Results.Unauthorized()
+                | Some userId when not (DashboardAuth.isEnabledFor options.Value userId) -> return disabled()
                 | Some userId ->
                     let! isMember = membership.IsMember(userId, TimeSpan.FromMinutes 1.0)
                     if not isMember then return Results.StatusCode(StatusCodes.Status403Forbidden)
@@ -91,6 +98,8 @@ module DashboardEndpoints =
                             let! snapshot = service.GetSnapshot days
                             if communityId <> options.Value.CommunityChatId then
                                 return Results.StatusCode(StatusCodes.Status403Forbidden)
+                            elif not (DashboardAuth.isEnabledFor options.Value userId) then
+                                return disabled()
                             else
                                 return Results.Json
                                     {| asOf = snapshot.AsOf; refreshAfter = snapshot.RefreshAfter; periodDays = snapshot.PeriodDays

@@ -12,6 +12,9 @@ open BotInfra
 module DashboardAuth =
     let maxInitDataLength = 16384
 
+    let isEnabledFor (config: CouponHubBot.BotConfiguration) userId =
+        config.DashboardEnabled || Array.contains userId config.FeedbackAdminIds
+
     let validate (botToken: string) (now: DateTimeOffset) (initData: string) : int64 option =
         try
             if String.IsNullOrEmpty initData || initData.Length > maxInitDataLength then

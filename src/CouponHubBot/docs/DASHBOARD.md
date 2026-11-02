@@ -6,6 +6,10 @@ The public page contains no member statistics. A normal browser shows a link to 
 
 ## Access
 
+`DASHBOARD_ENABLED` is a DB feature flag, seeded `false`. Members listed in `FEEDBACK_ADMINS` bypass the flag; everyone else needs it enabled. Changes take effect through `/reload-settings` and propagate to every replica without restarting.
+
+The flag gates bot launch buttons, new sessions, and every statistics request, including existing sessions and cached snapshots. The public login shell remains reachable so administrators can authenticate; administrators still need verified Telegram identity and community membership.
+
 `POST /dashboard/api/session` accepts `text/plain` init data. The server verifies Telegram's HMAC-SHA256 signature, rejects duplicate fields, and requires `auth_date` within five minutes, allowing thirty seconds of forward clock skew.
 
 The verified user must pass `getChatMember` for the configured community. The bot must be a community administrator for reliable checks; owners, administrators, and members are accepted, matching the bot's existing membership policy.
