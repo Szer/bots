@@ -32,7 +32,7 @@
     { key: "unresolvedExpired", title: "Истекли на руках", short: "Истекли на руках", kind: "expired", extra: true },
     { key: "voidClosed", title: "Взятия, закрытые аннулированием", short: "Аннулировано на руках", kind: "count", extra: true }
   ];
-  const state = { token: null, expiresAt: 0, viewerId: null, payload: null, selectedId: null, sort: "takes", descending: true, signal: "all", generation: 0, request: 0, timer: null, controller: null };
+  const state = { token: null, expiresAt: 0, viewerId: null, payload: null, selectedId: null, sort: "takes", descending: true, signal: "all", generation: 0, request: 0, timer: null, controller: null, expandedId: null };
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -123,8 +123,8 @@
     const own = state.payload.members.some((member) => member.id === state.viewerId);
     byId("show-me").hidden = !own;
     if (!row) {
-      byId("comparison-title").textContent = "Выбери имя в таблице";
-      byId("personal-values").replaceChildren(element("p", "muted", "Нажми имя участника для сравнения с сообществом."));
+      byId("comparison-title").textContent = state.selectedId === state.viewerId ? "Мои показатели" : "Выбери участника";
+      byId("personal-values").replaceChildren(element("p", "muted", state.selectedId === state.viewerId ? "Пока нет действий для сравнения с сообществом." : "Нажми имя участника для сравнения с сообществом."));
       return;
     }
     byId("comparison-title").textContent = row.name + (row.id === state.viewerId ? " · это ты" : "") + (row.username ? " · @" + row.username : "");
@@ -137,6 +137,97 @@
     });
     values.push(element("p", "personal-detail", "Взято: " + integer.format(row.takes) + " · возвращено: " + integer.format(row.returns) + " · добавлено: " + integer.format(row.adds) + " · на руках без закрытия: " + integer.format(row.unresolved) + " (истекло: " + integer.format(row.unresolvedExpired) + ") · держали ≥24 ч и вернули ≤1 дня: " + integer.format(row.heldDayLateReturns)));
     byId("personal-values").replaceChildren(...values);
+  }
+
+  function showView(view) {
+    byId("dashboard").dataset.mobileView = view;
+    document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === view)));
+    window.scrollTo({ top: 0, behavior: "instant" });
+    if (view === "personal") {
+      state.selectedId = state.viewerId;
+      renderPersonal();
+    }
+  }
+
+  function metricUnit(key) {
+    if (key.endsWith("Pct")) return "%";
+    if (key.endsWith("Hours")) return "ч";
+    if (key.endsWith("Days")) return "дн.";
+    return "";
+  }
+
+  function mobileDetails(row) {
+    const content = element("div", "member-details");
+    const metrics = element("div", "member-metrics");
+    primaryMetrics.forEach((metric) => {
+      const card = element("div", "member-metric");
+      card.append(element("p", "personal-label", metric.title), metricBadge(row, metric, metric.unit));
+      card.append(element("p", "personal-baseline", "Общее: " + format(state.payload.community[metric.key], metric.unit)));
+      const sample = row[metric.sample];
+      const baseline = state.payload.community[metric.key];
+      let explanation = integer.format(sample) + " действий";
+      if (sample < 10) explanation += " · мало для оценки";
+      else if (present(row[metric.key]) && present(baseline) && baseline > 0) {
+        const delta = (row[metric.key] / baseline - 1) * 100;
+        explanation += " · " + format(Math.abs(delta), "%") + (delta >= 0 ? " выше" : " ниже");
+      }
+      if (metric.key === "returnPct" && present(row.returnHoldHours) && row.returnHoldHours < 1) explanation += ". Возвраты быстрее часа: без негативной оценки.";
+      card.append(element("p", "metric-explanation", explanation));
+      metrics.append(card);
+    });
+    content.append(metrics);
+    const facts = element("dl", "member-facts");
+    columns.filter((column) => column.kind !== "name" && !primaryMetrics.some((metric) => metric.key === column.key)).forEach((column) => {
+      const pair = element("div");
+      const value = element("dd");
+      value.append(column.kind === "metric" ? metricBadge(row, column, metricUnit(column.key)) : element("span", "metric " + countTone(row, column), format(row[column.key], metricUnit(column.key))));
+      pair.append(element("dt", "", column.title), value);
+      facts.append(pair);
+    });
+    const more = element("details", "member-more");
+    const heading = element("summary");
+    heading.append(element("span", "", "Все действия и возвраты"), element("span", "", "+"));
+    more.append(heading, facts);
+    content.append(more);
+    return content;
+  }
+
+  function renderMobileList(rows) {
+    const column = columns.find((item) => item.key === state.sort);
+    const metric = column.kind === "name" ? columns.find((item) => item.key === "takes") : column;
+    const baseline = byId("mobile-baseline");
+    baseline.replaceChildren(element("span", "", metric.title));
+    baseline.append(element("strong", "", (metric.kind === "metric" || metric.kind === "number" ? "Среднее: " : "Всего: ") + format(state.payload.community[metric.key], metricUnit(metric.key))));
+    byId("member-list").replaceChildren(...rows.map((row) => {
+      const card = element("details", "member-card" + (row.id === state.viewerId ? " is-me" : ""));
+      card.dataset.memberId = row.id;
+      const summary = element("summary", "member-summary");
+      const name = element("span", "member-identity");
+      name.append(element("span", "mobile-member-name", row.name + (row.id === state.viewerId ? " · ты" : "")));
+      if (row.username) name.append(element("span", "member-username", "@" + row.username));
+      name.append(element("span", "member-activity", "Взято " + integer.format(row.takes) + " · добавлено " + integer.format(row.adds)));
+      const value = element("span", "member-highlight");
+      value.append(metric.kind === "metric" ? metricBadge(row, metric, metricUnit(metric.key)) : element("span", "metric " + countTone(row, metric), format(row[metric.key], metricUnit(metric.key))));
+      if (metric.key === "returnPct") value.append(element("span", "cell-note", integer.format(row.returns) + " из " + integer.format(row.takes)));
+      const chevron = element("span", "member-chevron", "+");
+      chevron.setAttribute("aria-hidden", "true");
+      summary.append(name, value, chevron);
+      card.append(summary);
+      let loaded = false;
+      const expand = () => {
+        if (!loaded) { card.append(mobileDetails(row)); loaded = true; }
+      };
+      if (row.id === state.expandedId) { expand(); card.open = true; }
+      card.addEventListener("toggle", () => {
+        if (!card.isConnected || !state.payload) return;
+        if (card.open) {
+          expand();
+          state.expandedId = row.id;
+          byId("member-list").querySelectorAll("details[open]").forEach((other) => { if (other !== card) other.open = false; });
+        } else if (state.expandedId === row.id) state.expandedId = null;
+      });
+      return card;
+    }));
   }
 
   function rowSignal(row, signal) {
@@ -234,8 +325,11 @@
       visibleColumns.forEach((column) => tr.append(renderCell(row, column)));
       return tr;
     }));
+    renderMobileList(rows);
+    const filters = Number(byId("activity").value !== "all") + Number(byId("sample").value !== "0") + Number(state.signal !== "all");
+    byId("filter-count").textContent = filters ? "· " + filters : "";
     byId("empty").hidden = rows.length !== 0;
-    byId("row-count").textContent = "Показано " + integer.format(rows.length) + " из " + integer.format(state.payload.members.length) + " · среднее сообщества не зависит от фильтров";
+    byId("row-count").textContent = "Показано " + integer.format(rows.length) + " из " + integer.format(state.payload.members.length);
     byId("sort").value = state.sort;
     byId("sort-direction").textContent = state.descending ? "↓" : "↑";
     byId("sort-direction").setAttribute("aria-label", state.descending ? "По убыванию. Изменить на возрастание" : "По возрастанию. Изменить на убывание");
@@ -261,7 +355,8 @@
     state.viewerId = null;
     state.payload = null;
     state.selectedId = null;
-    ["averages", "personal-values", "table-head", "table-body"].forEach((id) => byId(id).replaceChildren());
+    state.expandedId = null;
+    ["averages", "personal-values", "table-head", "table-body", "member-list", "mobile-baseline"].forEach((id) => byId(id).replaceChildren());
     ["community-volume", "row-count", "as-of", "comparison-title"].forEach((id) => { byId(id).textContent = ""; });
     byId("search").value = "";
     byId("dashboard").hidden = true;
@@ -401,6 +496,7 @@
   byId("sort").addEventListener("change", () => setSort(byId("sort").value, byId("sort").value !== "name"));
   byId("sort-direction").addEventListener("click", () => setSort(state.sort, !state.descending));
   ["search", "activity", "sample", "more-columns"].forEach((id) => byId(id).addEventListener(id === "search" ? "input" : "change", renderTable));
+  document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => showView(button.dataset.view)));
   byId("period").addEventListener("change", loadStats);
   byId("refresh").addEventListener("click", loadStats);
   byId("retry-auth").addEventListener("click", authenticate);
