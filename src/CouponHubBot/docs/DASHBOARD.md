@@ -50,3 +50,7 @@ Holding for at least 24 hours then returning with at most one day left is amber 
 ## Verification
 
 `dotnet test tests/CouponHubBot.Tests -c Release` exercises forged and stale login data, nonmember access, two-replica sessions, membership revocation, expiry, community binding, snapshot caching, launch buttons, and analytics with synthetic event histories.
+
+## Phone layout
+
+Phones open on the member list, with separate personal and community views. Sorting selects the metric shown beside every member; tapping a member expands averages and return details. Filters are collapsible, and all list operations use the loaded snapshot. Wider screens show the comparison table.
