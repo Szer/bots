@@ -19,6 +19,7 @@ type BotCommandsSetupService(tg: ITelegramApi, logger: ILogger<BotCommandsSetupS
                            BotCommand.Create("my", "Мои купоны")
                            BotCommand.Create("added", "Мои добавленные")
                            BotCommand.Create("stats", "Моя статистика")
+                           BotCommand.Create("dashboard", "Статистика сообщества")
                            BotCommand.Create("feedback", "Фидбэк авторам бота")
                            BotCommand.Create("report", "Купон уже использован кем-то другим") |]
                     let scope = BotCommandScope.AllPrivateChats(BotCommandScopeAllPrivateChats.Create("all_private_chats"))

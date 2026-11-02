@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Купоны · Сообщество</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+  <script src="https://telegram.org/js/telegram-web-app.js" defer></script>
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#members">К таблице участников</a>
+  <header class="site-header">
+    <a class="brand" href="/dashboard" aria-label="Купоны — главная"><span class="brand-mark" aria-hidden="true">%</span><span>Купоны<span class="brand-secondary"> / сообщество</span></span></a>
+    <span class="private-badge"><span aria-hidden="true">●</span> Только для своих</span>
+  </header>
+  <main>
+    <section id="gate" class="gate" aria-labelledby="gate-title">
+      <div class="gate-symbol" aria-hidden="true">↗</div>
+      <p class="eyebrow">Статистика сообщества</p>
+      <h1 id="gate-title">Купоны в добрых руках</h1>
+      <p id="gate-message" role="status">Проверяем доступ через Telegram…</p>
+      <a id="open-bot" class="button primary" hidden rel="noreferrer">Открыть в Telegram <span aria-hidden="true">↗</span></a>
+      <button id="retry-auth" class="button" hidden type="button">Повторить проверку</button>
+      <p class="gate-hint">В боте: <strong>/dashboard</strong> → «Открыть статистику». Доступ есть только у участников сообщества.</p>
+    </section>
+
+    <div id="dashboard" hidden>
+      <section class="intro" aria-labelledby="page-title">
+        <div><p class="eyebrow">Прозрачно. Наглядно. Для своих.</p><h1 id="page-title">Кто берёт. Кто делится.</h1><p class="intro-description">Личные показатели рядом со средними по сообществу.</p></div>
+        <div class="period-control"><label for="period">Период действий</label><select id="period"><option value="0">За всё время</option><option value="30">Последние 30 дней</option><option value="90">Последние 90 дней</option><option value="365">Последний год</option></select></div>
+      </section>
+
+      <div class="section-label"><h2>В среднем по сообществу</h2><span id="community-volume"></span></div>
+      <section id="averages" class="averages" aria-label="Средние показатели сообщества"></section>
+
+      <section class="comparison" aria-labelledby="comparison-title">
+        <div class="comparison-heading"><div><p class="eyebrow">Личное / общее</p><h2 id="comparison-title">Выбери имя в таблице</h2></div><button id="show-me" class="text-button" type="button">Мои показатели <span aria-hidden="true">↗</span></button></div>
+        <div id="personal-values" class="personal-values"><p class="muted">Здесь появится сравнение с сообществом.</p></div>
+      </section>
+
+      <section id="members" class="members-section" aria-labelledby="members-title">
+        <div class="members-heading"><div><h2 id="members-title">Все участники</h2><p id="row-count" aria-live="polite"></p></div><button id="refresh" class="button refresh" type="button"><span aria-hidden="true">↻</span> Обновить</button></div>
+        <div id="load-status" class="load-status" role="status" hidden></div>
+        <div class="toolbar">
+          <div class="search-field"><label for="search">Поиск</label><input id="search" type="search" placeholder="Имя или @username" autocomplete="off" maxlength="120"></div>
+          <div><label for="activity">Активность</label><select id="activity"><option value="all">Все участники</option><option value="active">Есть действия</option><option value="takes">Есть взятые купоны</option><option value="adds">Есть добавленные купоны</option></select></div>
+          <div><label for="sample">Минимум действий</label><select id="sample"><option value="0">Без ограничения</option><option value="10">10 и больше</option><option value="30">30 и больше</option><option value="100">100 и больше</option></select></div>
+          <div class="sort-field"><label for="sort">Сортировка</label><select id="sort"></select></div>
+          <button id="sort-direction" class="button sort-direction" type="button" aria-label="Изменить направление сортировки" title="Изменить направление сортировки">↓</button>
+        </div>
+        <div class="table-options"><div class="signal-filters" role="group" aria-label="Фильтр по цветовым сигналам"><button type="button" data-signal="all" class="signal-filter active" aria-pressed="true">Все</button><button type="button" data-signal="good" class="signal-filter" aria-pressed="false"><span class="signal-dot good" aria-hidden="true"></span>Зелёные показатели</button><button type="button" data-signal="bad" class="signal-filter" aria-pressed="false"><span class="signal-dot bad" aria-hidden="true"></span>Красные показатели</button></div><label class="checkbox-label"><input id="more-columns" type="checkbox"> Подробнее о возвратах</label></div>
+        <div class="quick-legend" aria-label="Цветовые подсказки"><span><i class="legend-swatch good"></i> Лучше среднего</span><span><i class="legend-swatch warn"></i> Хуже среднего</span><span><i class="legend-swatch bad"></i> Сильное отклонение</span><span class="legend-note">Средние окрашены от 10 действий</span></div>
+        <div class="table-scroll" tabindex="0" role="region" aria-label="Таблица участников. На узком экране прокручивается по горизонтали."><table id="member-table"><caption class="visually-hidden">Показатели участников. Нажми заголовок столбца для сортировки, имя — для личного сравнения.</caption><thead id="table-head"></thead><tbody id="table-body"></tbody></table><p id="empty" class="empty" hidden>По этим условиям никого нет. Попробуй изменить фильтры.</p></div>
+        <div class="table-footer"><span>Нажми заголовок, чтобы сортировать. Имя — чтобы сравнить.</span><button id="reset-filters" class="text-button" type="button">Сбросить фильтры</button></div>
+      </section>
+
+      <details class="methodology"><summary><span>Как читать цвета и цифры</span><span aria-hidden="true">+</span></summary><div class="methodology-content">
+        <div class="legend"><span><i class="legend-swatch good"></i> Лучше среднего</span><span><i class="legend-swatch warn"></i> Хуже среднего</span><span><i class="legend-swatch bad"></i> Сильное отклонение</span><span><i class="legend-swatch muted"></i> Мало данных / без отклонения</span></div>
+        <div class="method-grid">
+          <div><h3>Четыре главных показателя</h3><p><strong>Остаток при взятии:</strong> сколько дней оставалось до истечения. Меньше — чаще забираются «горящие» купоны.</p><p><strong>Время в руках:</strong> от взятия до отметки об использовании, возврате или проблеме. Меньше — быстрее освобождаются купоны. Незакрытые взятия в это среднее не входят.</p><p><strong>Возвраты:</strong> число возвратов / число взятий. Повторное взятие — отдельный случай. Быстрый возврат не всегда плох: при среднем времени возврата меньше часа повышенная доля возвратов не подсвечивается.</p><p><strong>Остаток при добавлении:</strong> сколько дней оставалось на момент публикации. Больше — больше времени у остальных.</p></div>
+          <div><h3>Сравнение с сообществом</h3><p>Средние считаются по всем действиям за выбранный период, а не как среднее личных средних. Поиск и фильтры их не меняют.</p><p>Для времени в руках, остатка при взятии и долей: зелёный — на 25% ниже среднего; жёлтый — на 25% выше; красный — на 50% выше. Для остатка при добавлении: зелёный — на 10% выше, жёлтый — на 25% ниже, красный — на 50% ниже.</p><p>Окраска средних включается с 10 соответствующих действий. Подсказка к ячейке показывает размер выборки и сравнение. Серый прочерк означает отсутствие данных, а не ноль.</p></div>
+          <div><h3>Что значит «перед истечением»</h3><p><strong>Добавлено ≤1 дня:</strong> до истечения оставалось не больше одного дня: сегодня или завтра. Просроченные записи тоже учитываются. Даты считаются по Дублину.</p><p><strong>Держали ≥24 ч → вернули ≤1 дня:</strong> купон находился на руках минимум сутки и вернулся накануне истечения, в день истечения или позже. Один случай отмечается жёлтым, три и больше — красным.</p><p><strong>Истекли на руках:</strong> взятие не закрыто и срок уже прошёл. Это отдельный сигнал, не скрытый в среднем времени.</p></div>
+        </div>
+        <p class="method-footnote">Период относится к моменту взятия или добавления. Учитываются последующие действия до времени снимка; отменённые администратором действия исключены. Здесь история зарегистрированных пользователей бота, включая тех, кто уже вышел из сообщества. Время отметки в боте может отличаться от времени покупки.</p>
+      </div></details>
+      <footer class="data-footer"><span id="as-of"></span><span>Без автообновления · снимки сохраняются на 15 минут</span></footer>
+    </div>
+    <noscript><p class="noscript">Для входа через Telegram, сортировки и фильтров нужен JavaScript.</p></noscript>
+  </main>
+</body>
+</html>

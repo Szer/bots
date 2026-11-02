@@ -17,14 +17,13 @@ type TelegramMembershipService(
     logger: ILogger<TelegramMembershipService>,
     time: TimeProvider
 ) =
-    // userId -> (isMember, cachedAtUtc)
-    let cache = ConcurrentDictionary<int64, bool * DateTime>()
+    let cache = ConcurrentDictionary<struct (int64 * int64), bool * DateTime>()
     // 1h cache TTL bounds the stale window if a chat_member push is missed;
     // the daily full-cache invalidation below is a backstop, not the main defense.
     let expiry = TimeSpan.FromHours(1.0)
 
-    let isFresh (cachedAt: DateTime) =
-        time.GetUtcNow().UtcDateTime - cachedAt < expiry
+    let isFresh maxAge (cachedAt: DateTime) =
+        time.GetUtcNow().UtcDateTime - cachedAt < maxAge
 
     let isMemberOfChat (cm: ChatMember) =
         match cm with
@@ -44,7 +43,7 @@ type TelegramMembershipService(
             let uid = (Tg.chatMemberUser update.NewChatMember).Id
             let status = Tg.chatMemberStatus update.NewChatMember
             let isMember = isMemberOfChat update.NewChatMember
-            cache[uid] <- (isMember, time.GetUtcNow().UtcDateTime)
+            cache[struct (update.Chat.Id, uid)] <- (isMember, time.GetUtcNow().UtcDateTime)
             %span.SetTag("userId", uid)
             %span.SetTag("isMember", isMember)
             %span.SetTag("status", status)
@@ -56,20 +55,24 @@ type TelegramMembershipService(
         else
             None
 
-    member _.IsMember(userId) =
+    member _.IsMember(userId, maxAge: TimeSpan) =
         task {
-            match cache.TryGetValue(userId) with
-            | true, (isMember, cachedAt) when isFresh cachedAt -> return isMember
+            let chatId = options.Value.CommunityChatId
+            let key = struct (chatId, userId)
+            match cache.TryGetValue(key) with
+            | true, (isMember, cachedAt) when isFresh maxAge cachedAt -> return isMember
             | _ ->
                 try
-                    let! cm = tg.CallExn(Funogram.Telegram.Req.GetChatMember.Make(options.Value.CommunityChatId, userId))
+                    let! cm = tg.CallExn(Funogram.Telegram.Req.GetChatMember.Make(chatId, userId))
                     let isMember = isMemberOfChat cm
-                    cache[userId] <- (isMember, time.GetUtcNow().UtcDateTime)
+                    cache[key] <- (isMember, time.GetUtcNow().UtcDateTime)
                     return isMember
                 with ex ->
                     logger.LogWarning(ex, "Failed to check membership for {UserId}", userId)
                     return false
         }
+
+    member this.IsMember(userId) = this.IsMember(userId, expiry)
 
 /// Clears membership cache on startup and then once per day (insurance against missed updates).
 type MembershipCacheInvalidationService(membership: TelegramMembershipService, logger: ILogger<MembershipCacheInvalidationService>) =

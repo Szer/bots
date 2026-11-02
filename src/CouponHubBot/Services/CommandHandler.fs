@@ -176,13 +176,24 @@ type CommandHandler(
             // else silently ignore for non-admins
         }
 
+    let handleDashboard (chatId: int64) =
+        task {
+            match Uri.TryCreate(options.Value.DashboardUrl, UriKind.Absolute) with
+            | true, url when url.Scheme = Uri.UriSchemeHttps ->
+                let keyboard =
+                    InlineKeyboardMarkup.Create
+                        [| [| InlineKeyboardButton.Create("Открыть статистику", webApp = WebAppInfo.Create(url.AbsoluteUri)) |] |]
+                do! BotHelpers.sendTextMarkup tg chatId "Средние показатели, сравнение участников и история возвратов." keyboard
+            | _ -> do! sendText chatId "Статистика сообщества пока недоступна."
+        }
+
     let handleStart (chatId: int64) =
         sendText chatId
-            "Привет! Я бот для совместного управления купонами Dunnes.\n\nКоманды:\n/add (или /a) — добавить купон\n/list (или /l) — доступные купоны\n/my (или /m) — мои купоны\n/added (или /ad) — мои добавленные\n/stats (или /s) — моя статистика\n/feedback (или /f) — фидбэк авторам\n\nДополнительно (не в меню):\n/take <id>\n/used <id>\n/return <id>\n/void <id>\n/report <id> — сообщить, что купон уже использован кем-то другим\n/help"
+            "Привет! Я бот для совместного управления купонами Dunnes.\n\nКоманды:\n/add (или /a) — добавить купон\n/list (или /l) — доступные купоны\n/my (или /m) — мои купоны\n/added (или /ad) — мои добавленные\n/stats (или /s) — моя статистика\n/dashboard — статистика сообщества\n/feedback (или /f) — фидбэк авторам\n\nДополнительно (не в меню):\n/take <id>\n/used <id>\n/return <id>\n/void <id>\n/report <id> — сообщить, что купон уже использован кем-то другим\n/help"
 
     let handleHelp (chatId: int64) =
         sendText chatId
-            "Команды (все в личке):\n/add (/a)\n/list (/l)\n/my (/m)\n/added (/ad)\n/stats (/s)\n/feedback (/f)\n\nДополнительно:\n/take <id> (или /take для списка)\n/used <id>\n/return <id>\n/void <id>\n/report <id>\n/help"
+            "Команды (все в личке):\n/add (/a)\n/list (/l)\n/my (/m)\n/added (/ad)\n/stats (/s)\n/dashboard\n/feedback (/f)\n\nДополнительно:\n/take <id> (или /take для списка)\n/used <id>\n/return <id>\n/void <id>\n/report <id>\n/help"
 
     let handleCoupons (chatId: int64) =
         task {
@@ -525,6 +536,9 @@ type CommandHandler(
             // user.id always equals msg.From.Id here: BotService only dispatches private
             // messages whose From is present, and `user` is upserted from that From.
             match msg.Text with
+            | Some "/dashboard" | Some "/start dashboard" ->
+                recordCommand "dashboard"
+                do! handleDashboard msg.Chat.Id
             | Some "/start" ->
                 recordCommand "start"
                 do! handleStart msg.Chat.Id

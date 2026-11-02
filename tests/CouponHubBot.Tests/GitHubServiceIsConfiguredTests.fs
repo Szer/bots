@@ -28,6 +28,7 @@ type GitHubServiceIsConfiguredTests() =
           GitHubRepo = "Szer/bots"
           FeedbackGitHubIssues = false
           WebhookUrl = ""
+          DashboardUrl = ""
           TestMode = true
           MaxTakenCoupons = 6
           BatchDebounceMs = 5000 }

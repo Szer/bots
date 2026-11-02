@@ -6,6 +6,8 @@
     <Compile Include="Types.fs" />
     <Compile Include="Services/DbService.fs" />
     <Compile Include="Services/MembershipService.fs" />
+    <Compile Include="Services/DashboardAuth.fs" />
+    <Compile Include="Services/DashboardService.fs" />
     <Compile Include="Services/NotificationService.fs" />
     <Compile Include="Services/CouponBarcodeReader.fs" />
     <Compile Include="Services/CouponBarcodeImage.fs" />
@@ -24,6 +26,7 @@
     <Compile Include="Services/BotService.fs" />
     <Compile Include="Services/BotCommandsSetup.fs" />
     <Compile Include="Services/WebhookRegistration.fs" />
+    <Compile Include="DashboardEndpoints.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -39,6 +42,7 @@
 
   <ItemGroup>
     <Content Include="ThirdPartyNotices.txt" CopyToOutputDirectory="PreserveNewest" />
+    <EmbeddedResource Include="Services/DashboardStats.sql" LogicalName="CouponHubBot.DashboardStats.sql" />
     <EmbeddedResource Include="Fonts/LiberationSans-Regular.ttf" LogicalName="CouponHubBot.Fonts.Regular.ttf" />
     <EmbeddedResource Include="Fonts/LiberationSans-Bold.ttf" LogicalName="CouponHubBot.Fonts.Bold.ttf" />
     <Content Include="Fonts/LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />

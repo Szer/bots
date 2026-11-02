@@ -69,6 +69,7 @@ let buildBotConf () =
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/bots")
       FeedbackGitHubIssues = getSettingOr "FEEDBACK_GITHUB_ISSUES" "false" |> bool.Parse
       WebhookUrl = getSettingOr "WEBHOOK_URL" (getEnvOr "WEBHOOK_URL" "")
+      DashboardUrl = getSettingOr "DASHBOARD_URL" ""
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
       BatchDebounceMs = getSettingOr "BATCH_DEBOUNCE_MS" "5000" |> int }
@@ -105,6 +106,7 @@ let webhookCfg: WebhookConfig =
 let builder = WebApplication.CreateBuilder()
 
 WebhookHost.configureSharedServices webhookCfg builder
+DashboardEndpoints.configure builder
 
 %builder.Services.AddSingleton<IOptions<BotConfiguration>>(botConfOptions)
 
@@ -152,6 +154,8 @@ if botConfOptions.Value.TestMode then
         let opts = sp.GetRequiredService<IOptions<BotConfiguration>>()
         DbService(connString, sp.GetRequiredService<TimeProvider>(), opts.Value.MaxTakenCoupons))
     .AddSingleton<TelegramMembershipService>()
+    .AddSingleton<DashboardService>(fun sp ->
+        new DashboardService(connString, sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ITelegramApi>()))
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheInvalidationService>()
     .AddHostedService<BotCommandsSetupService>()
@@ -185,6 +189,7 @@ if botConfOptions.Value.TestMode then
             sp.GetRequiredService<ILogger<SettingsListenerHostedService>>()))
 
 let app = builder.Build()
+DashboardEndpoints.map app
 
 %app.MapGet("/healthz", Func<string>(fun () -> "OK"))
 

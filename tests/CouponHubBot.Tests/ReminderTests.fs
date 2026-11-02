@@ -392,17 +392,17 @@ ON CONFLICT (id) DO NOTHING;
                 conn.ExecuteAsync(
                     """
 INSERT INTO "user"(id, username, first_name, created_at, updated_at)
-VALUES (701,'u701','U701',NOW(),NOW())
+VALUES (27101,'u27101','U27101',NOW(),NOW())
 ON CONFLICT (id) DO NOTHING;
 
 -- Coupon for seeding event
 INSERT INTO coupon(id, owner_id, photo_file_id, value, min_check, expires_at, status)
-VALUES (9101,701,'p-9101',10.00,50.00,'2026-02-01','used')
+VALUES (271010,27101,'p-271010',10.00,50.00,'2026-02-01','used')
 ON CONFLICT (id) DO NOTHING;
 
 -- User used a coupon yesterday
 INSERT INTO coupon_event(coupon_id, user_id, event_type, created_at)
-VALUES (9101,701,'used','2026-01-18T10:00:00Z');
+VALUES (271010,27101,'used','2026-01-18T10:00:00Z');
 """
                 )
                 :> Task
@@ -411,8 +411,8 @@ VALUES (9101,701,'used','2026-01-18T10:00:00Z');
             do! runReminder (Some "2026-01-19T08:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
-            Assert.True(findCallWithText calls 701L "Не забудь добавить купоны в бота",
-                "Expected add-coupon reminder DM to user 701")
+            Assert.True(findCallWithText calls 27101L "Не забудь добавить купоны в бота",
+                "Expected add-coupon reminder DM to user 27101")
         }
 
     [<Fact>]

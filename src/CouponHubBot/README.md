@@ -10,6 +10,7 @@ Telegram bot for collaborative coupon management in a private Russian-speaking c
 - `/list` (alias `/l`, legacy `/coupons`) — available coupons (expired hidden)
 - `/my` (alias `/m`) — my coupons: photo album + description with buttons
 - `/stats` (alias `/s`) — user statistics
+- `/dashboard` — [member-only interactive community dashboard](docs/DASHBOARD.md)
 - `/feedback` (alias `/f`) — send feedback to admins (next message is forwarded)
 - `/help` — help
 
