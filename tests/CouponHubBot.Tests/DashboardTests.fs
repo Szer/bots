@@ -68,6 +68,7 @@ type DashboardTestContainers() =
             do! seed
             use conn = new NpgsqlConnection(connString)
             do! conn.OpenAsync()
+            do! conn.ExecuteAsync("UPDATE bot_setting SET value = 'true' WHERE key = 'DASHBOARD_ENABLED'") :> Task
             do! conn.ExecuteAsync(
                 "UPDATE bot_setting SET value = @url WHERE key = 'DASHBOARD_URL'",
                 {| url = "https://coupon.example/dashboard" |}) :> Task
@@ -126,7 +127,46 @@ VALUES (@couponId, @userId, @eventType, @at)
             do! addCoupon 20003L "2025-07-03" [ 20003L, "added", "2025-07-01T23:30:00Z" ]
         } :> Task
 
+type DashboardDefaultFlagTests(fixture: DefaultCouponHubTestContainers) =
+    [<Fact>]
+    let ``Dashboard feature flag is seeded off and loaded off by default`` () =
+        task {
+            let! stored = fixture.QuerySingle<string>("SELECT value FROM bot_setting WHERE key = 'DASHBOARD_ENABLED'", null)
+            Assert.Equal("false", stored)
+            let! dump = fixture.GetSettingsDump 0
+            use parsed = JsonDocument.Parse dump
+            Assert.False(parsed.RootElement.GetProperty("DashboardEnabled").GetBoolean())
+        }
+
 type DashboardTests(fixture: DashboardTestContainers) =
+    let setDashboardEnabled enabled =
+        task {
+            let! _ = fixture.Execute("UPDATE bot_setting SET value = @value WHERE key = 'DASHBOARD_ENABLED'",
+                                     {| value = if enabled then "true" else "false" |})
+            use content = new StringContent("")
+            use! response = fixture.Bot.PostAsync("/reload-settings", content)
+            %response.EnsureSuccessStatusCode()
+            let deadline = DateTime.UtcNow.AddSeconds 5.0
+            let mutable propagated = false
+            while not propagated && DateTime.UtcNow < deadline do
+                let! dump = fixture.GetSettingsDump 1
+                use parsed = JsonDocument.Parse dump
+                propagated <- parsed.RootElement.GetProperty("DashboardEnabled").GetBoolean() = enabled
+                if not propagated then do! Task.Delay 25
+            Assert.True(propagated, "Dashboard flag must propagate to the other replica")
+        }
+
+    let withDashboardDisabled action =
+        task {
+            do! setDashboardEnabled false
+            try
+                do! action()
+            with error ->
+                do! setDashboardEnabled true
+                return raise error
+            do! setDashboardEnabled true
+        }
+
     let postProof pod proof =
         task {
             use content = new StringContent(proof, Encoding.UTF8, "text/plain")
@@ -156,6 +196,57 @@ type DashboardTests(fixture: DashboardTestContainers) =
             Assert.Equal(HttpStatusCode.OK, response.StatusCode)
             return! DashboardTestData.json response
         }
+
+    [<Fact>]
+    let ``Disabled dashboard blocks new and existing member sessions on both replicas but allows admins`` () =
+        task {
+            let! memberToken = login 22001L
+            let! adminToken = login 900L
+            use! warm = getStats 0 memberToken 0
+            Assert.Equal(HttpStatusCode.OK, warm.StatusCode)
+            do! withDashboardDisabled (fun () -> task {
+                for pod in [ 0; 1 ] do
+                    use! deniedLogin = postProof pod (DashboardTestData.proof fixture.Now 22001L)
+                    Assert.Equal(HttpStatusCode.Forbidden, deniedLogin.StatusCode)
+                    let! reason = DashboardTestData.json deniedLogin
+                    Assert.Equal("dashboard_disabled", reason.GetProperty("error").GetString())
+                    use! deniedStats = getStats pod memberToken 0
+                    Assert.Equal(HttpStatusCode.Forbidden, deniedStats.StatusCode)
+                    use! adminLogin = postProof pod (DashboardTestData.proof fixture.Now 900L)
+                    Assert.Equal(HttpStatusCode.OK, adminLogin.StatusCode)
+                    use! adminStats = getStats pod adminToken 0
+                    Assert.Equal(HttpStatusCode.OK, adminStats.StatusCode)
+            })
+            use! enabledAgain = getStats 1 memberToken 0
+            Assert.Equal(HttpStatusCode.OK, enabledAgain.StatusCode)
+        }
+
+    [<Fact>]
+    let ``Admin bypass does not bypass Telegram authentication or community membership`` () =
+        withDashboardDisabled (fun () -> task {
+            do! fixture.SetChatMemberStatus(901L, "left")
+            use! forged = postProof 0 (DashboardTestData.sign "123:wrong" (DashboardTestData.fields fixture.Now 900L))
+            Assert.Equal(HttpStatusCode.Unauthorized, forged.StatusCode)
+            use! nonmemberAdmin = postProof 0 (DashboardTestData.proof fixture.Now 901L)
+            Assert.Equal(HttpStatusCode.Forbidden, nonmemberAdmin.StatusCode)
+        })
+
+    [<Fact>]
+    let ``Disabled dashboard commands only issue launch buttons to admins`` () =
+        withDashboardDisabled (fun () -> task {
+            for command in [ "/dashboard"; "/start dashboard" ] do
+                do! fixture.ClearFakeCalls()
+                for userId in [ 22002L; 900L ] do
+                    use! response = fixture.SendUpdate(Tg.dmMessage(command, Tg.user(id = userId)))
+                    Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+                let! calls = fixture.GetFakeCalls "sendMessage"
+                for userId, expected in [ 22002L, false; 900L, true ] do
+                    let hasButton = calls |> Array.exists (fun call ->
+                        use doc = JsonDocument.Parse call.Body
+                        doc.RootElement.GetProperty("chat_id").GetInt64() = userId
+                        && (doc.RootElement.TryGetProperty "reply_markup" |> fst))
+                    Assert.Equal(expected, hasButton)
+        })
 
     [<Fact>]
     let ``Public shell and assets contain no private statistics and API requires bearer session`` () =

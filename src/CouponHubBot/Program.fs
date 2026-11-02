@@ -70,6 +70,7 @@ let buildBotConf () =
       FeedbackGitHubIssues = getSettingOr "FEEDBACK_GITHUB_ISSUES" "false" |> bool.Parse
       WebhookUrl = getSettingOr "WEBHOOK_URL" (getEnvOr "WEBHOOK_URL" "")
       DashboardUrl = getSettingOr "DASHBOARD_URL" ""
+      DashboardEnabled = getSettingOr "DASHBOARD_ENABLED" "false" |> bool.Parse
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
       BatchDebounceMs = getSettingOr "BATCH_DEBOUNCE_MS" "5000" |> int }

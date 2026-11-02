@@ -176,10 +176,10 @@ type CommandHandler(
             // else silently ignore for non-admins
         }
 
-    let handleDashboard (chatId: int64) =
+    let handleDashboard (userId: int64) (chatId: int64) =
         task {
             match Uri.TryCreate(options.Value.DashboardUrl, UriKind.Absolute) with
-            | true, url when url.Scheme = Uri.UriSchemeHttps ->
+            | true, url when url.Scheme = Uri.UriSchemeHttps && DashboardAuth.isEnabledFor options.Value userId ->
                 let keyboard =
                     InlineKeyboardMarkup.Create
                         [| [| InlineKeyboardButton.Create("Открыть статистику", webApp = WebAppInfo.Create(url.AbsoluteUri)) |] |]
@@ -538,7 +538,7 @@ type CommandHandler(
             match msg.Text with
             | Some "/dashboard" | Some "/start dashboard" ->
                 recordCommand "dashboard"
-                do! handleDashboard msg.Chat.Id
+                do! handleDashboard user.id msg.Chat.Id
             | Some "/start" ->
                 recordCommand "start"
                 do! handleStart msg.Chat.Id

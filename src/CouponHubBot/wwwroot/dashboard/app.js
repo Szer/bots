@@ -286,6 +286,11 @@
     } catch { /* The bot command remains available when discovery is unavailable. */ }
   }
 
+  async function denialMessage(response, fallback) {
+    const body = await response.json().catch(() => null);
+    return body?.error === "dashboard_disabled" ? "Статистика пока доступна только администраторам." : fallback;
+  }
+
   async function loadStats() {
     if (!state.token || Date.now() >= state.expiresAt) {
       clearPrivate("Сессия закончилась. Открой статистику заново через бота.");
@@ -303,7 +308,11 @@
       const response = await fetch("/dashboard/api/stats?days=" + days, { headers: { Authorization: "Bearer " + state.token }, cache: "no-store", credentials: "omit", redirect: "error", signal: controller.signal });
       if (generation !== state.generation || request !== state.request) return;
       if (response.status === 401 || response.status === 403) {
-        clearPrivate(response.status === 403 ? "Доступ есть только у участников сообщества. Если это ошибка, открой бота и проверь участие в чате." : "Сессия закончилась. Открой статистику заново через бота.");
+        const message = response.status === 403
+          ? await denialMessage(response, "Доступ есть только у участников сообщества. Если это ошибка, открой бота и проверь участие в чате.")
+          : "Сессия закончилась. Открой статистику заново через бота.";
+        if (generation !== state.generation || request !== state.request) return;
+        clearPrivate(message);
         return;
       }
       if (!response.ok) throw new Error("Statistics unavailable");
@@ -358,7 +367,11 @@
       const response = await fetch("/dashboard/api/session", { method: "POST", headers: { "Content-Type": "text/plain;charset=UTF-8" }, body: app.initData, cache: "no-store", credentials: "omit", redirect: "error" });
       if (generation !== state.generation) return;
       if (response.status === 401 || response.status === 403) {
-        clearPrivate(response.status === 403 ? "Статистика доступна только участникам сообщества." : "Не удалось подтвердить вход. Закрой страницу и открой её заново через бота.");
+        const message = response.status === 403
+          ? await denialMessage(response, "Статистика доступна только участникам сообщества.")
+          : "Не удалось подтвердить вход. Закрой страницу и открой её заново через бота.";
+        if (generation !== state.generation) return;
+        clearPrivate(message);
         return;
       }
       if (!response.ok) throw new Error("Authentication unavailable");
