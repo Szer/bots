@@ -13,25 +13,37 @@
     { key: "addDays", title: "Остаток при добавлении", unit: "дн.", sample: "adds", direction: "high", hint: "Больше времени для других", icon: "↑" }
   ];
   const columns = [
-    { key: "name", title: "Участник", short: "Участник", kind: "name" },
-    { key: "takes", title: "Взято купонов", short: "Взято", kind: "count" },
+    { key: "name", sample: "actions", title: "Участник", short: "Участник", kind: "name" },
+    { key: "takes", sample: "takes", title: "Взято купонов", short: "Взято", kind: "count" },
     { key: "takeDays", title: "Остаток при взятии, дней", short: "Остаток при взятии · дн. ↓", kind: "metric", sample: "takes", direction: "low" },
     { key: "holdHours", title: "Время в руках, часов", short: "Время в руках · ч ↓", kind: "metric", sample: "resolved", direction: "low" },
     { key: "returnPct", title: "Доля возвратов, %", short: "Возвраты · % ↓", kind: "metric", sample: "takes", direction: "low" },
-    { key: "adds", title: "Добавлено купонов", short: "Добавлено", kind: "count" },
+    { key: "adds", sample: "adds", title: "Добавлено купонов", short: "Добавлено", kind: "count" },
     { key: "addDays", title: "Остаток при добавлении, дней", short: "Остаток при добавлении · дн. ↑", kind: "metric", sample: "adds", direction: "high" },
     { key: "lateAddPct", title: "Добавлено с остатком ≤1 дня, %", short: "Добавлено ≤1 дня · % ↓", kind: "metric", sample: "adds", direction: "low" },
-    { key: "heldDayLateReturns", title: "Держали ≥24 ч → вернули ≤1 дня", short: "Держали ≥24 ч → вернули ≤1 дня", kind: "late" },
-    { key: "unresolved", title: "Незакрытые взятия", short: "На руках / истекло", kind: "open" },
-    { key: "returns", title: "Количество возвратов", short: "Возвратов", kind: "count", extra: true },
-    { key: "resolved", title: "Закрытые взятия", short: "Закрыто взятий", kind: "count", extra: true },
-    { key: "returnHoldHours", title: "Время до возврата, часов", short: "До возврата · ч", kind: "number", extra: true },
-    { key: "returnDays", title: "Остаток при возврате, дней", short: "Остаток при возврате · дн.", kind: "number", extra: true },
-    { key: "lateReturns", title: "Все возвраты с остатком ≤1 дня", short: "Все возвраты ≤1 дня", kind: "count", extra: true },
-    { key: "lateAdds", title: "Добавлено с остатком ≤1 дня, количество", short: "Добавлено ≤1 дня · шт.", kind: "count", extra: true },
-    { key: "unresolvedExpired", title: "Истекли на руках", short: "Истекли на руках", kind: "expired", extra: true },
-    { key: "voidClosed", title: "Взятия, закрытые аннулированием", short: "Аннулировано на руках", kind: "count", extra: true }
+    { key: "heldDayLateReturns", sample: "returns", title: "Держали ≥24 ч → вернули ≤1 дня", short: "Держали ≥24 ч → вернули ≤1 дня", kind: "late" },
+    { key: "unresolved", sample: "takes", title: "Незакрытые взятия", short: "На руках / истекло", kind: "open" },
+    { key: "returns", sample: "returns", title: "Количество возвратов", short: "Возвратов", kind: "count", extra: true },
+    { key: "resolved", sample: "resolved", title: "Закрытые взятия", short: "Закрыто взятий", kind: "count", extra: true },
+    { key: "returnHoldHours", sample: "returns", title: "Время до возврата, часов", short: "До возврата · ч", kind: "number", extra: true },
+    { key: "returnDays", sample: "returns", title: "Остаток при возврате, дней", short: "Остаток при возврате · дн.", kind: "number", extra: true },
+    { key: "lateReturns", sample: "returns", title: "Все возвраты с остатком ≤1 дня", short: "Все возвраты ≤1 дня", kind: "count", extra: true },
+    { key: "lateAdds", sample: "adds", title: "Добавлено с остатком ≤1 дня, количество", short: "Добавлено ≤1 дня · шт.", kind: "count", extra: true },
+    { key: "unresolvedExpired", sample: "takes", title: "Истекли на руках", short: "Истекли на руках", kind: "expired", extra: true },
+    { key: "voidClosed", sample: "takes", title: "Взятия, закрытые аннулированием", short: "Аннулировано на руках", kind: "count", extra: true }
   ];
+  const sampleLabels = {
+    actions: "Минимум действий (взято + добавлено)",
+    takes: "Минимум взятий",
+    adds: "Минимум добавлений",
+    resolved: "Минимум закрытых взятий",
+    returns: "Минимум возвратов"
+  };
+
+  function sampleCount(row, metric) {
+    return metric.sample === "actions" ? row.takes + row.adds : row[metric.sample];
+  }
+
   const state = { token: null, expiresAt: 0, viewerId: null, payload: null, selectedId: null, sort: "takes", descending: true, signal: "all", generation: 0, request: 0, timer: null, controller: null, expandedId: null };
 
   function element(tag, className, text) {
@@ -52,7 +64,7 @@
   function tone(row, metric) {
     const value = row[metric.key];
     const baseline = state.payload?.community[metric.key];
-    if (!present(value) || !present(baseline) || baseline <= 0 || row[metric.sample] < 10) return "muted";
+    if (!present(value) || !present(baseline) || baseline <= 0 || sampleCount(row, metric) < 10) return "muted";
     if (metric.key === "returnPct" && value > baseline && present(row.returnHoldHours) && row.returnHoldHours < 1) return "neutral";
     const ratio = value / baseline;
     if (metric.direction === "high") {
@@ -242,13 +254,13 @@
     const query = byId("search").value.trim().replace(/^@/, "").toLocaleLowerCase("ru");
     const activity = byId("activity").value;
     const minimum = Number(byId("sample").value);
+    const metric = columns.find((column) => column.key === state.sort);
     return state.payload.members.filter((row) => {
       if (query && !(row.name + " " + (row.username || "")).toLocaleLowerCase("ru").includes(query)) return false;
       if (activity === "active" && row.takes + row.adds === 0) return false;
       if (activity === "takes" && row.takes === 0) return false;
       if (activity === "adds" && row.adds === 0) return false;
-      const sample = activity === "takes" ? row.takes : activity === "adds" ? row.adds : row.takes + row.adds;
-      return sample >= minimum && rowSignal(row, state.signal);
+      return sampleCount(row, metric) >= minimum && rowSignal(row, state.signal);
     }).sort((a, b) => {
       const av = a[state.sort];
       const bv = b[state.sort];
@@ -304,6 +316,7 @@
 
   function renderTable() {
     if (!state.payload) return;
+    byId("sample-label").textContent = sampleLabels[columns.find((column) => column.key === state.sort).sample];
     const visibleColumns = columns.filter((column) => !column.extra || byId("more-columns").checked);
     const header = element("tr");
     visibleColumns.forEach((column) => {
