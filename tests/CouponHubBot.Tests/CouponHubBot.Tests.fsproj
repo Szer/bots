@@ -10,6 +10,7 @@
   <ItemGroup>
     <Compile Include="ContainerTestBase.fs" />
     <Compile Include="FakeCallHelpers.fs" />
+    <Compile Include="DashboardTests.fs" />
     <Compile Include="BatchTestHelpers.fs" />
     <Compile Include="MembershipTests.fs" />
     <Compile Include="OcrAddFlowTests.fs" />

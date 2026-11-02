@@ -4,6 +4,8 @@
 
 Coupon Hub Bot is a Telegram bot running as an ASP.NET Core webhook server. Users interact via private messages; notifications go to a community group chat.
 
+The [community dashboard](DASHBOARD.md) runs at `/dashboard` with Telegram authentication and server-side membership checks.
+
 ## Key Modules
 
 ```

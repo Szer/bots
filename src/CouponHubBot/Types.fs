@@ -30,6 +30,7 @@ type BotConfiguration =
       /// production's webhook is set once, manually (README.dev.md), and must keep
       /// working untouched with no config present.
       WebhookUrl: string
+      DashboardUrl: string
       TestMode: bool
       MaxTakenCoupons: int
       BatchDebounceMs: int }

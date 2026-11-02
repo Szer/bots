@@ -165,7 +165,7 @@ Telegram bot for collaborative coupon management in a private community. All UI 
 
 - **Gender-neutral Russian UI text** — users are mostly women. Never address the user with a gendered verb/adjective («ты уверен», «если передумал»), never narrate the bot's own actions in gendered past tense («Добавил», «Отметил»), and don't use «(а)» double forms. Prefer impersonal/passive («Купон добавлен», «Купон отмечен как использованный») or gender-free phrasings (imperatives «Аннулируй»; 2nd-person future «Если передумаешь»). Forms that agree with a noun (e.g. «взятый купон») are fine — they encode the noun's gender, not the user's.
 
-Commands: `/add`, `/list`, `/my`, `/added`, `/stats`, `/feedback`, `/report`, `/take <id>`, `/used <id>`, `/return <id>`, `/void <id>`; admin-only `/debug`, `/undo`, `/whois`, `/balances`.
+Commands: `/add`, `/list`, `/my`, `/added`, `/stats`, `/dashboard`, `/feedback`, `/report`, `/take <id>`, `/used <id>`, `/return <id>`, `/void <id>`; admin-only `/debug`, `/undo`, `/whois`, `/balances`.
 
 Callback data uses colon-separated format: `"action:param1:param2"`. Wizard flows persist state in the `pending_add` table (albums: `pending_add_batch`).
 

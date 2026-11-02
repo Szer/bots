@@ -35,8 +35,8 @@ module private CouponTestConfig =
           PostgresImage = "postgres:17.10" }
 
 [<AbstractClass>]
-type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool) =
-    inherit BotContainerBase(CouponTestConfig.makeConfig ocrEnabled)
+type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool, ?instanceCount: int) =
+    inherit BotContainerBase(CouponTestConfig.makeConfig ocrEnabled, ?instanceCount = instanceCount)
 
     let fixedDate = CouponTestConfig.fixedUtcNow.UtcDateTime.Date
     let fixedDateIso = fixedDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
