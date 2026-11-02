@@ -62,7 +62,6 @@ input::placeholder { color:#829087; }
 .refresh span { font-size:19px; line-height:1; }
 .toolbar { display:grid; grid-template-columns:minmax(200px,1.45fr) minmax(160px,1fr) minmax(145px,.85fr) minmax(200px,1.1fr) 42px; gap:12px; padding:0 20px 10px; align-items:end; }
 .sort-direction { height:42px; font-size:20px; padding:8px; }
-.table-options { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:0 20px 10px; }
 .signal-filters { display:flex; flex-wrap:wrap; gap:6px; }
 .signal-filter { display:flex; align-items:center; gap:6px; font-size:11px; font-weight:550; padding:7px 11px; border:1px solid transparent; background:transparent; border-radius:7px; color:var(--muted); }
 .signal-filter:hover { background:#f2f5ed; }
