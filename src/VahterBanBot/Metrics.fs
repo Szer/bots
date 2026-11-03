@@ -88,13 +88,13 @@ let tagsForLlmVerdictCache (result: string) (scope: string) =
 let jevTokensCounter =
     meter.CreateCounter<int64>(
         "vahter_jev_tokens_total",
-        description = "Token usage reported by Jev, including rejected answers and calls that fall through to another layer"
+        description = "Input and output token usage reported by Jev (direction=input|output), including calls that fall through to another layer"
     )
 
 let jevUsageUnavailableCounter =
     meter.CreateCounter<int64>(
         "vahter_jev_usage_unavailable_total",
-        description = "Jev HTTP attempts without a valid token count for the tagged direction"
+        description = "Jev request attempts without a valid token count for the tagged direction (input|output)"
     )
 
 let recordJevUsage (model: string) (inputTokens: int option) (outputTokens: int option) =
