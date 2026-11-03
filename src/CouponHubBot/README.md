@@ -27,7 +27,7 @@ Telegram bot for collaborative coupon management in a private Russian-speaking c
 
 ### Notifications
 
-- **Group**: morning reminder about expiring coupons; Monday weekly stats (used + added)
+- **Group**: morning reminder about expiring coupons; all-time stats (used + added) on the first Tuesday of each month
 - **DM**: morning reminder for users holding coupons in `taken` status > 1 day
 
 ## Deployment

@@ -78,7 +78,7 @@ type ReminderService(
                 do! tg.CallExn(Funogram.Telegram.Req.SendMessage.Make(options.Value.CommunityChatId, msg)) |> taskIgnore
                 anySent <- true
 
-            if nowUtc.DayOfWeek = DayOfWeek.Monday && nowUtc.Day <= 7 then
+            if nowUtc.DayOfWeek = DayOfWeek.Tuesday && nowUtc.Day <= 7 then
                 // All-time stats: no lower bound (None), not a DateTime.MinValue sentinel.
                 let! usedRows = db.GetUserEventCounts("used", None, nowUtc)
                 let! addedRows = db.GetUserEventCounts("added", None, nowUtc)

@@ -589,8 +589,7 @@ VALUES
                 )
                 :> Task
 
-            // 2026-02-02 is the first Monday of February 2026.
-            do! runReminderAt "2026-02-02T10:00:00Z"
+            do! runReminderAt "2026-02-03T10:00:00Z"
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let ownerLine = findLeaderboardLine calls "@owner_a"
@@ -637,7 +636,7 @@ VALUES
                 )
                 :> Task
 
-            do! runReminderAt "2026-02-02T10:00:00Z"
+            do! runReminderAt "2026-02-03T10:00:00Z"
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let ownerLine = findLeaderboardLine calls "@owner_c"
@@ -676,7 +675,7 @@ VALUES
                     "UPDATE coupon_event SET created_at = '2026-01-18T10:00:00Z'::timestamptz WHERE coupon_id IN (@id1, @id2)",
                     {| id1 = couponId1; id2 = couponId2 |})
 
-            do! runReminderAt "2026-02-02T10:00:00Z"
+            do! runReminderAt "2026-02-03T10:00:00Z"
 
             let! calls = fixture.GetFakeCalls("sendMessage")
             let takerLine = findLeaderboardLine calls "@report_lb_taker"
