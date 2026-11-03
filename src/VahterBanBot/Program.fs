@@ -16,6 +16,7 @@ open VahterBanBot.OcrCache
 open VahterBanBot.LlmVerdictCache
 open VahterBanBot.SpamTextCache
 open VahterBanBot.LlmTriage
+open VahterBanBot.LlmTriagePipeline
 open VahterBanBot.ProfileFetcher
 open VahterBanBot.Telemetry
 open VahterBanBot.Types
@@ -130,6 +131,7 @@ let buildBotConf () =
       RichMessageSpamDetectionEnabled = getSettingOr "RICH_MESSAGE_SPAM_DETECTION_ENABLED" "true" |> bool.Parse
       // LLM shadow triage
       LlmTriageEnabled      = getSettingOr "LLM_TRIAGE_ENABLED" "false" |> bool.Parse
+      LlmTriageLayers       = getSettingOr "LLM_TRIAGE_LAYERS" "[\"azure-sol\"]" |> parseLayerOrder
       AzureOpenAiEndpoint   = getSettingOr "AZURE_OPENAI_ENDPOINT" ""
       AzureOpenAiKey        = getEnvOr "AZURE_OPENAI_KEY" ""
       AzureOpenAiDeployment = getSettingOr "AZURE_OPENAI_DEPLOYMENT" "gpt-4o-mini"
@@ -268,10 +270,8 @@ WebhookHost.configureSharedServices webhookCfg builder
         sp.GetRequiredService<ILogger<AzureBotOcr>>(),
         null) :> IBotOcr)
 %builder.Services.AddSingleton<IComputerVision, BotOcrComputerVision>()
-// Both LLM classifiers talk to Azure OpenAI through the Azure.AI.OpenAI SDK, which carries its own
-// retry pipeline (honors Retry-After on 429) — see LlmTriage.fs. Singleton so the per-instance
-// single-flight/verdict-cache state and the memoized ChatClient are shared across requests.
-%builder.Services.AddSingleton<ILlmTriage, AzureLlmTriage>()
+%builder.Services.AddSingleton<ILlmTriageLayer, AzureSolLayer>()
+%builder.Services.AddSingleton<ILlmTriage, LayeredLlmTriage>()
 %builder.Services.AddSingleton<IReactionTriageClassifier, AzureReactionTriage>()
 %builder.Services.AddSingleton<IUserProfileFetcher, UserProfileFetcher>()
 

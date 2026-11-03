@@ -12,7 +12,8 @@ open VahterBanBot.SpamTextCache
 type CachedVerdict =
     { Verdict:   string
       Reason:    string option
-      ModelName: string option
+      Source: (string * string) option
+      PolicyHash: string option
       CreatedAt: DateTime }
 
 /// MD5 of the NORMALIZED text (D5, SpamTextCache.normalize) — shared by LlmTriage.fs (builds
@@ -27,14 +28,14 @@ let globalKey (text: string) : string = sprintf "text:global:%s" (textHash text)
 let senderKey (senderId: int64) (text: string) : string = sprintf "text:%d:%s" senderId (textHash text)
 
 [<CLIMutable>]
-type private LlmVerdictCacheRow = { verdict: string; reason: string; model_name: string; created_at: DateTime }
+type private LlmVerdictCacheRow = { verdict: string; reason: string | null; model_name: string | null; prompt_hash: string | null; policy_hash: string | null; created_at: DateTime }
 
 [<AllowNullLiteral>]
 type ILlmVerdictCache =
     /// Returns the cached verdict for this key if it was stored within `maxAge`, else None.
     abstract member TryGet: cacheKey: string * maxAge: TimeSpan -> Task<CachedVerdict option>
     /// Stores (or refreshes) the verdict for this key. Only SPAM/SKIP verdicts should be cached.
-    abstract member Save: cacheKey: string * verdict: string * reason: string option * modelName: string option -> Task<unit>
+    abstract member Save: cacheKey: string * verdict: string * reason: string option * modelName: string option * promptHash: string * policyHash: string -> Task<unit>
     /// Deletes the row for `cacheKey`, optionally only when it currently holds `verdict` (None =
     /// any). Idempotent — a missing/non-matching row is not an error (D2 human-correction invalidation).
     abstract member Invalidate: cacheKey: string * verdict: string option -> Task<unit>
@@ -47,7 +48,7 @@ type LlmVerdictCacheRepository(connString: string) =
             //language=postgresql
             let sql =
                 """
-SELECT verdict, reason, model_name, created_at FROM llm_verdict_cache
+SELECT verdict, reason, model_name, prompt_hash, policy_hash, created_at FROM llm_verdict_cache
 WHERE cache_key = @cacheKey AND created_at > NOW() - make_interval(secs => @maxAgeSeconds)
                 """
 
@@ -60,21 +61,23 @@ WHERE cache_key = @cacheKey AND created_at > NOW() - make_interval(secs => @maxA
                 |> Option.map (fun r ->
                     { Verdict   = r.verdict
                       Reason    = Option.ofObj r.reason
-                      ModelName = Option.ofObj r.model_name
+                      Source = Option.map2 (fun model prompt -> model, prompt) (Option.ofObj r.model_name) (Option.ofObj r.prompt_hash)
+                      PolicyHash = Option.ofObj r.policy_hash
                       CreatedAt = r.created_at })
         }
 
-        member _.Save(cacheKey, verdict, reason, modelName) = task {
+        member _.Save(cacheKey, verdict, reason, modelName, promptHash, policyHash) = task {
             use conn = new NpgsqlConnection(connString)
 
             //language=postgresql
             let sql =
                 """
-INSERT INTO llm_verdict_cache (cache_key, verdict, reason, model_name)
-VALUES (@cacheKey, @verdict, @reason, @modelName)
+INSERT INTO llm_verdict_cache (cache_key, verdict, reason, model_name, prompt_hash, policy_hash)
+VALUES (@cacheKey, @verdict, @reason, @modelName, @promptHash, @policyHash)
 ON CONFLICT (cache_key) DO UPDATE
     SET verdict = EXCLUDED.verdict, reason = EXCLUDED.reason,
-        model_name = EXCLUDED.model_name, created_at = NOW()
+        model_name = EXCLUDED.model_name, prompt_hash = EXCLUDED.prompt_hash,
+        policy_hash = EXCLUDED.policy_hash, created_at = NOW()
                 """
 
             let! _ =
@@ -83,7 +86,9 @@ ON CONFLICT (cache_key) DO UPDATE
                     {| cacheKey  = cacheKey
                        verdict   = verdict
                        reason    = Option.toObj reason
-                       modelName = Option.toObj modelName |})
+                       modelName = Option.toObj modelName
+                       promptHash = promptHash
+                       policyHash = policyHash |})
             return ()
         }
 

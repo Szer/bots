@@ -303,7 +303,7 @@ type AutoVerdict =
     | NotSpam of score: float * actor: Actor
     /// Uncertain — route to human triage channel. `reason` is the LLM's SKIP phrase, when any;
     /// `cacheScope` (D4) is Some "global"|"sender" when the verdict was cache-served.
-    | Uncertain of score: float * reason: string option * cacheScope: string option
+    | Uncertain of score: float * modelName: string option * reason: string option * cacheScope: string option
 
 type ModerationEvent =
     | VahterActed      of {| vahterId: int64; actionType: VahterAction; targetUserId: int64; chatId: int64; messageId: int64 |}
@@ -502,6 +502,7 @@ type BotConfiguration =
       RichMessageSpamDetectionEnabled: bool
       // LLM shadow triage
       LlmTriageEnabled: bool
+      LlmTriageLayers: string list
       AzureOpenAiEndpoint: string
       AzureOpenAiKey: string
       AzureOpenAiDeployment: string
