@@ -170,14 +170,18 @@ type TypesafeJev114Layer(clients: IHttpClientFactory, logger: ILogger<TypesafeJe
                 else
                     let! body = response.Content.ReadAsStringAsync(deadline.Token)
                     let result = JsonSerializer.Deserialize<JevResponse>(body, wireJsonOptions)
-                    if result.Model <> TypesafeJevModel then invalidOp "Unexpected Jev model"
-                    let answer = result.Answers.Verdict
-                    let verdict, probability, margin = evaluateAnswer conf.Jev answer
-                    let inputTokens = result.Usage |> Option.bind _.InputTokens |> Option.defaultValue 0 |> max 0
-                    let outputTokens = result.Usage |> Option.bind _.OutputTokens |> Option.defaultValue 0 |> max 0
-                    logger.LogInformation("Jev proposed={Proposed} decision={Decision} confidence={Confidence} probability={Probability} margin={Margin}",
-                                          answer.Choice.StoredValue, verdict, answer.Confidence, probability, margin)
-                    return finish verdict inputTokens outputTokens
+                    match result.Model with
+                    | TypesafeJevModel ->
+                        let answer = result.Answers.Verdict
+                        let verdict, probability, margin = evaluateAnswer conf.Jev answer
+                        let inputTokens = result.Usage |> Option.bind _.InputTokens |> Option.defaultValue 0 |> max 0
+                        let outputTokens = result.Usage |> Option.bind _.OutputTokens |> Option.defaultValue 0 |> max 0
+                        logger.LogInformation("Jev proposed={Proposed} decision={Decision} confidence={Confidence} probability={Probability} margin={Margin}",
+                                              answer.Choice.StoredValue, verdict, answer.Confidence, probability, margin)
+                        return finish verdict inputTokens outputTokens
+                    | actual ->
+                        logger.LogError("Jev returned model {ActualModel}, expected {ExpectedModel}; skipping layer", actual, TypesafeJevModel)
+                        return finish LlmVerdict.Error 0 0
             with
             | :? OperationCanceledException ->
                 logger.LogWarning("Jev request cancelled or timed out; skipping layer")
@@ -188,6 +192,7 @@ type TypesafeJev114Layer(clients: IHttpClientFactory, logger: ILogger<TypesafeJe
     }
 
     interface ILlmTriageLayer with
+        member _.Id = LlmLayerId.TypesafeJev114
         member _.Configure(conf) =
             { Id = LlmLayerId.TypesafeJev114
               Source = { ModelName = TypesafeJevModel; PromptHash = promptHash }

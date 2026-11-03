@@ -76,6 +76,8 @@ type JevTriageTests(fixture: JevVahterTestContainers) =
     [<InlineData("malformed", 200, 0)>]
     [<InlineData("unauthorized", 401, 0)>]
     [<InlineData("unavailable", 503, 0)>]
+    [<InlineData("retired-model", 422, 0)>]
+    [<InlineData("model-mismatch", 200, 0)>]
     [<InlineData("timeout", 200, 4000)>]
     let ``Jev failures and uncertainty fall through to Sol with unchanged evidence`` outcome status delay = task {
         do! reset ()
@@ -84,6 +86,7 @@ type JevTriageTests(fixture: JevVahterTestContainers) =
             | "skip" -> answer "SKIP"
             | "uncertain" -> (answer "SPAM").Replace("\"confidence\":0.9", "\"confidence\":0.1")
             | "timeout" -> answer "NOT_SPAM"
+            | "model-mismatch" -> (answer "SPAM").Replace("jev-1.14.0", "synthetic-model")
             | _ -> "{}"
         do! script status body delay
         let! msg = send "kill Jev fallback"

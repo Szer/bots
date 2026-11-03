@@ -8,6 +8,7 @@ open System
 open System.ClientModel
 open System.ClientModel.Primitives
 open System.Collections.Concurrent
+open System.Collections.Generic
 open System.Diagnostics
 open System.Security.Cryptography
 open System.Text
@@ -403,6 +404,7 @@ type AzureSol56Layer(logger: ILogger<AzureSol56Layer>) =
     }
 
     interface ILlmTriageLayer with
+        member _.Id = LlmLayerId.AzureSol56
         member _.Configure(conf) =
             let requestParams = selectLlmRequestParams conf.LlmReasoningEffort
             { Id = LlmLayerId.AzureSol56
@@ -410,15 +412,15 @@ type AzureSol56Layer(logger: ILogger<AzureSol56Layer>) =
               CacheIdentity = toJson (conf.AzureOpenAiEndpoint, conf.AzureOpenAiDeployment, promptHash, conf.LlmReasoningEffort, requestParams.MaxOutputTokenCount, spamVerdictSchema.ToString())
               Classify = fun (context, ct) -> classify conf context ct }
 
-type LlmLayerFactory(azureSol56: AzureSol56Layer, jev114: JevTriage.TypesafeJev114Layer) =
+type LlmLayerFactory(layers: ILlmTriageLayer seq) =
+    let registered =
+        layers
+        |> Seq.map (fun layer -> KeyValuePair(layer.Id, layer))
+        |> Dictionary<LlmLayerId, ILlmTriageLayer>
+
     member _.Configure(conf: BotConfiguration) =
         conf.LlmTriageLayers.Layers
-        |> List.map (fun id ->
-            let layer =
-                match id with
-                | LlmLayerId.AzureSol56 -> azureSol56 :> ILlmTriageLayer
-                | LlmLayerId.TypesafeJev114 -> jev114 :> ILlmTriageLayer
-            layer.Configure conf)
+        |> List.map (fun id -> registered[id].Configure conf)
 
 type ILlmTriage =
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmTriageResult>
