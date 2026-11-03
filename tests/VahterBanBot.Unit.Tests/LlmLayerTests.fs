@@ -10,17 +10,20 @@ open BotInfra.JsonSetup
 open VahterBanBot.Utils
 open VahterBanBot.Types
 open VahterBanBot.LlmTriagePipeline
+open VahterBanBot.LlmLayerConfiguration
+open VahterBanBot.LlmVerdictCache
 open Xunit
 
 let private context = { ChatDescription = "\nChat: technical discussion"; UserPrompt = "frozen evidence" }
 let private logger = NullLogger.Instance
 let private result verdict = { Verdict = verdict; PromptTokens = 1; CompletionTokens = 1; LatencyMs = 1 }
 let private layer id classify =
-    { Id = id; ModelName = id + "-model"; PromptHash = id + "-prompt"; CacheIdentity = id
-      Classify = classify }
-let private settings order =
+    { Id = LlmLayerId.AzureSol56
+      Source = { ModelName = id + "-model"; PromptHash = id + "-prompt" }
+      CacheIdentity = id; Classify = classify }
+let private settings () =
     { fromJson<BotConfiguration> "{}" with
-        LlmTriageLayers = order
+        LlmTriageLayers = LlmLayerOrder.Default
         LlmChatDescriptions = Dictionary<int64, string>() }
 
 [<Theory>]
@@ -29,9 +32,9 @@ let private settings order =
 let ``a firm first verdict stops subsequent layers`` verdict = task {
     let first = layer "first" (fun _ -> Task.FromResult(result (LlmVerdict.FromString(verdict, Some "first reason", None))))
     let second = layer "second" (fun _ -> failwith "second layer must not run")
-    let! deciding, actual = runLayers logger true [first; second] context CancellationToken.None
-    Assert.Equal("first-model", deciding.ModelName)
-    Assert.Equal(LlmVerdict.FromString(verdict, Some "first reason", None), actual.Verdict)
+    let! actual = runLayers logger true [first; second] context CancellationToken.None
+    Assert.Equal("first-model", actual.Source.Value.ModelName)
+    Assert.Equal(LlmVerdict.FromString(verdict, Some "first reason", None), actual.Classification.Verdict)
 }
 
 [<Theory>]
@@ -49,9 +52,9 @@ let ``abstentions and failures escalate with identical evidence`` outcome = task
     let second = layer "second" (fun (input, _) ->
         seen.Add input
         Task.FromResult(result (LlmVerdict.Kill (Some "second reason", None))))
-    let! deciding, actual = runLayers logger true [first; second] context CancellationToken.None
-    Assert.Equal("second-model", deciding.ModelName)
-    Assert.Equal(LlmVerdict.Kill (Some "second reason", None), actual.Verdict)
+    let! actual = runLayers logger true [first; second] context CancellationToken.None
+    Assert.Equal("second-model", actual.Source.Value.ModelName)
+    Assert.Equal(LlmVerdict.Kill (Some "second reason", None), actual.Classification.Verdict)
     Assert.Equal(2, seen.Count)
     Assert.Same(context, seen[0])
     Assert.Same(context, seen[1])
@@ -64,9 +67,9 @@ let ``exhausted layers preserve the last human-review outcome`` verdict = task {
     let first = layer "first" (fun _ -> Task.FromResult(result LlmVerdict.Error))
     let expected = LlmVerdict.FromString(verdict, Some "last reason", None)
     let last = layer "last" (fun _ -> Task.FromResult(result expected))
-    let! deciding, actual = runLayers logger true [first; last] context CancellationToken.None
-    Assert.Equal("last", deciding.Id)
-    Assert.Equal(expected, actual.Verdict)
+    let! actual = runLayers logger true [first; last] context CancellationToken.None
+    Assert.Equal("last-model", actual.Source.Value.ModelName)
+    Assert.Equal(expected, actual.Classification.Verdict)
 }
 
 [<Theory>]
@@ -75,8 +78,8 @@ let ``exhausted layers preserve the last human-review outcome`` verdict = task {
 let ``content filter policy controls whether another layer is tried`` contentFilterIsSpam = task {
     let first = layer "first" (fun _ -> Task.FromResult(result (LlmVerdict.ContentFiltered "sexual=high")))
     let second = layer "second" (fun _ -> Task.FromResult(result (LlmVerdict.NotSpam (None, None))))
-    let! deciding, _ = runLayers logger contentFilterIsSpam [first; second] context CancellationToken.None
-    Assert.Equal((if contentFilterIsSpam then "first" else "second"), deciding.Id)
+    let! actual = runLayers logger contentFilterIsSpam [first; second] context CancellationToken.None
+    Assert.Equal((if contentFilterIsSpam then "first-model" else "second-model"), actual.Source.Value.ModelName)
 }
 
 [<Fact>]
@@ -87,46 +90,62 @@ let ``cancellation stops escalation and cannot yield an automatic verdict`` () =
         cts.Cancel()
         Task.FromResult(result (LlmVerdict.Kill (None, None))))
     let second = layer "second" (fun _ -> failwith "cancelled pipeline must not escalate")
-    let! _, actual = runLayers logger true [first; second] context cts.Token
-    Assert.Equal(LlmVerdict.Error, actual.Verdict)
+    let! actual = runLayers logger true [first; second] context cts.Token
+    Assert.Equal(LlmVerdict.Error, actual.Classification.Verdict)
 }
 
 [<Fact>]
-let ``configured order selects the first accepting provider`` () = task {
+let ``pipeline order selects the first accepting provider`` () = task {
     let visited = ResizeArray<string>()
-    let provider id =
-        { new ILlmTriageLayer with
-            member _.Id = id
-            member _.Configure _ = layer id (fun _ ->
-                visited.Add id
-                Task.FromResult(result (LlmVerdict.NotSpam (None, None)))) }
-    let registry = Map ["first", provider "first"; "second", provider "second"]
-    for order in [["first"; "second"]; ["second"; "first"]] do
-        match configureLayers registry (settings order) with
-        | Error error -> failwith error
-        | Ok configured ->
-            let! deciding, _ = runLayers logger true configured context CancellationToken.None
-            Assert.Equal(order.Head, deciding.Id)
+    let provider name = layer name (fun _ ->
+        visited.Add name
+        Task.FromResult(result (LlmVerdict.NotSpam (None, None))))
+    let first, second = provider "first", provider "second"
+    for order in [[first; second]; [second; first]] do
+        let! actual = runLayers logger true order context CancellationToken.None
+        Assert.Equal(Some order.Head.Source, actual.Source)
     Assert.Equal<string list>(["first"; "second"], List.ofSeq visited)
 }
 
 [<Theory>]
 [<InlineData("[]")>]
-[<InlineData("[\"azure-sol\",\"azure-sol\"]")>]
+[<InlineData("[\"azure-sol-5.6\",\"azure-sol-5.6\"]")>]
 [<InlineData("[\"\"]")>]
-let ``empty or duplicate layer orders are rejected`` json =
-    %Assert.Throws<ArgumentException>(fun () -> %(parseLayerOrder json))
+[<InlineData("[\"unknown-layer\"]")>]
+[<InlineData("[null]")>]
+let ``invalid orders fail during settings parsing`` json =
+    %Assert.Throws<ArgumentException>(fun () -> %(json |> fromJson<string list> |> LlmLayerOrder.Parse))
 
 [<Fact>]
-let ``unknown layers invalidate the entire route`` () =
-    let conf = settings ["unknown-layer"]
-    match configureLayers Map.empty conf with
-    | Error _ -> ()
-    | Ok _ -> failwith "An unknown layer must not be silently omitted."
+let ``settings parsing returns the supported versioned layer`` () =
+    let id = LlmLayerId.AzureSol56
+    let order = LlmLayerOrder.Parse [id.SettingValue]
+    Assert.Equal<LlmLayerId list>([id], order.Layers)
+    Assert.Equal(LlmLayerOrder.Default, order)
+
+[<Fact>]
+let ``empty pipeline returns an error without inventing a provider`` () = task {
+    let! actual = runLayers logger true [] context CancellationToken.None
+    Assert.Equal(LlmVerdict.Error, actual.Classification.Verdict)
+    Assert.True(actual.Source.IsNone)
+}
+
+[<Fact>]
+let ``cancelled pipeline never invokes a provider`` () = task {
+    use cts = new CancellationTokenSource()
+    cts.Cancel()
+    let provider = layer "only" (fun _ -> failwith "cancelled pipeline must not call a provider")
+    let! actual = runLayers logger true [provider] context cts.Token
+    Assert.Equal(LlmVerdict.Error, actual.Classification.Verdict)
+}
+
+[<Fact>]
+let ``unknown persisted cache verdicts do not enter the domain`` () =
+    Assert.True((LlmCacheVerdict.TryParse "foo").IsNone)
 
 [<Fact>]
 let ``cache identities isolate order model prompt gate and policy changes`` () =
-    let conf = settings ["first"; "second"]
+    let conf = settings ()
     let first = layer "first" (fun _ -> Task.FromResult(result LlmVerdict.Error))
     let second = layer "second" first.Classify
     let original = pipelineCacheIdentity conf [first; second]
@@ -139,6 +158,6 @@ let ``cache identities isolate order model prompt gate and policy changes`` () =
 [<Fact>]
 let ``disabled content-filter action remains human review after exhaustion`` () = task {
     let provider = layer "only" (fun _ -> Task.FromResult(result (LlmVerdict.ContentFiltered "sexual=high")))
-    let! _, actual = runLayers logger false [provider] context CancellationToken.None
-    Assert.Equal(LlmVerdict.Error, actual.Verdict)
+    let! actual = runLayers logger false [provider] context CancellationToken.None
+    Assert.Equal(LlmVerdict.Error, actual.Classification.Verdict)
 }

@@ -2,6 +2,7 @@ module VahterBanBot.Tests.LlmLayerConfigurationTests
 
 open System
 open System.Threading.Tasks
+open System.Text.Json
 open Npgsql
 open Dapper
 open VahterBanBot.Tests.ContainerTestBase
@@ -11,10 +12,13 @@ open Xunit
 
 type LlmLayerConfigurationTests(fixture: MlEnabledVahterTestContainers, _ml: MlAwaitFixture) =
     let mutable restore = []
-    let change key value = task {
+    let stageSetting key value = task {
         let! previous = fixture.GetBotSetting key
         restore <- (key, previous) :: restore
         do! fixture.SetBotSetting(key, value)
+    }
+    let change key value = task {
+        do! stageSetting key value
         do! fixture.ReloadSettings()
     }
     let reset () = task {
@@ -23,29 +27,34 @@ type LlmLayerConfigurationTests(fixture: MlEnabledVahterTestContainers, _ml: MlA
         do! fixture.ClearLlmVerdictCache()
     }
 
-    [<Fact>]
-    let ``unknown layer fails to human review without using a cached deletion`` () = task {
+    [<Theory>]
+    [<InlineData("[\"unknown-layer\",\"azure-sol-5.6\"]")>]
+    [<InlineData("[\"azure-sol-5.6\",\"azure-sol-5.6\"]")>]
+    [<InlineData("[]")>]
+    [<InlineData("null")>]
+    [<InlineData("{\"layers\":[]}")>]
+    let ``invalid layer settings reject reload and preserve the active pipeline`` setting = task {
         do! reset ()
         let spam () = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = "77", from = Tg.user(firstName = "kill layer-config"))
         let first = spam ()
         let! _ = fixture.SendMessage first
         let! deleted = fixture.MessageIsAutoDeleted first.Message.Value
         Assert.True(deleted)
-        do! change "LLM_TRIAGE_LAYERS" "[\"unknown-layer\",\"azure-sol\"]"
+        do! stageSetting "LLM_TRIAGE_LAYERS" setting
+        use! rejected = fixture.Http.PostAsync("/reload-settings", null)
+        Assert.False(rejected.IsSuccessStatusCode)
+        do! fixture.ClearLlmVerdictCache()
         let next = spam ()
         let! _ = fixture.SendMessage next
         let! deletedNext = fixture.MessageIsAutoDeleted next.Message.Value
-        Assert.False(deletedNext)
-        let! sends = fixture.GetFakeCalls "sendMessage"
-        Assert.Contains(sends, fun c -> c.Body.Contains $"\"chat_id\":{fixture.PotentialSpamChannel.Id}")
+        Assert.True(deletedNext)
         let! calls = fixture.GetAzureLlmCalls()
-        %Assert.Single(calls)
-        do! fixture.SetBotSetting("LLM_TRIAGE_LAYERS", "[\"azure-sol\"]")
-        do! fixture.ReloadSettings()
-        let resumed = spam ()
-        let! _ = fixture.SendMessage resumed
-        let! deletedResumed = fixture.MessageIsAutoDeleted resumed.Message.Value
-        Assert.True(deletedResumed)
+        Assert.Equal(2, calls.Length)
+        use! dump = fixture.Http.GetAsync("/config-dump")
+        %dump.EnsureSuccessStatusCode()
+        let! body = dump.Content.ReadAsStringAsync()
+        use parsed = JsonDocument.Parse body
+        Assert.True(parsed.RootElement.TryGetProperty("LlmTriageLayers") |> fst)
     }
 
     [<Theory>]

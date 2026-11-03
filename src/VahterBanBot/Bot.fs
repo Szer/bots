@@ -467,8 +467,8 @@ type BotService(
         | Actor.User _ when not (String.IsNullOrEmpty msg.Text) ->
             let banSenderKey = LlmVerdictCache.senderKey msg.SenderId msg.Text
             let banGlobalKey = LlmVerdictCache.globalKey msg.Text
-            do! invalidateVerdictCache "manualBan-sender" (fun () -> verdictCache.Invalidate(banSenderKey, Some "NOT_SPAM"))
-            do! invalidateVerdictCache "manualBan-global" (fun () -> verdictCache.Invalidate(banGlobalKey, Some "SKIP"))
+            do! invalidateVerdictCache "manualBan-sender" (fun () -> verdictCache.Invalidate(banSenderKey, Some LlmCacheVerdict.NotSpam))
+            do! invalidateVerdictCache "manualBan-global" (fun () -> verdictCache.Invalidate(banGlobalKey, Some LlmCacheVerdict.Skip))
         | _ -> ()
 
         // delete message
@@ -1892,8 +1892,8 @@ type BotService(
                 do! invalidateVerdictCache $"markSpam-admin (chat={chatId}, msg={messageId})" (fun () -> task {
                     match! db.TryGetMessageTextAndSender(chatId, messageId) with
                     | Some(text, senderId) ->
-                        do! verdictCache.Invalidate(LlmVerdictCache.senderKey senderId text, Some "NOT_SPAM")
-                        do! verdictCache.Invalidate(LlmVerdictCache.globalKey text, Some "SKIP")
+                        do! verdictCache.Invalidate(LlmVerdictCache.senderKey senderId text, Some LlmCacheVerdict.NotSpam)
+                        do! verdictCache.Invalidate(LlmVerdictCache.globalKey text, Some LlmCacheVerdict.Skip)
                     | None -> ()
                 })
 
@@ -2423,8 +2423,8 @@ type BotService(
         if not (String.IsNullOrEmpty tgMsg.Text) then
             let softSpamSenderKey = LlmVerdictCache.senderKey tgMsg.SenderId tgMsg.Text
             let softSpamGlobalKey = LlmVerdictCache.globalKey tgMsg.Text
-            do! invalidateVerdictCache "softSpam-sender" (fun () -> verdictCache.Invalidate(softSpamSenderKey, Some "NOT_SPAM"))
-            do! invalidateVerdictCache "softSpam-global" (fun () -> verdictCache.Invalidate(softSpamGlobalKey, Some "SKIP"))
+            do! invalidateVerdictCache "softSpam-sender" (fun () -> verdictCache.Invalidate(softSpamSenderKey, Some LlmCacheVerdict.NotSpam))
+            do! invalidateVerdictCache "softSpam-global" (fun () -> verdictCache.Invalidate(softSpamGlobalKey, Some LlmCacheVerdict.Skip))
 
         // 2.5. A vahter spam verdict on a (possibly protected) message revokes protection
         // immediately, even though this path doesn't ban — the vahter just judged the user

@@ -10,6 +10,7 @@
     <Compile Include="RichMessageText.fs" />
     <Compile Include="StickerOcr.fs" />
     <Compile Include="TgMessage.fs" />
+    <Compile Include="LlmLayerConfiguration.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="Metrics.fs" />
     <Compile Include="SpamTextCache.fs" />

@@ -26,6 +26,7 @@ open VahterBanBot.Metrics
 open VahterBanBot.SpamTextCache
 open VahterBanBot.LlmVerdictCache
 open VahterBanBot.LlmTriagePipeline
+open VahterBanBot.LlmLayerConfiguration
 open VahterBanBot.ProfileFetcher
 open BotInfra
 open BotInfra.JsonSetup
@@ -33,9 +34,9 @@ open BotInfra.JsonSetup
 // Only SPAM/SKIP are reusable by text; clearances require current message context.
 
 /// SKIP keeps the short TTL; long SPAM text gets the long TTL.
-let selectCacheTtlMinutes (minChars: int) (shortTtlMinutes: int) (longTtlMinutes: int) (verdict: string) (normalizedTextLength: int) : int =
+let selectCacheTtlMinutes (minChars: int) (shortTtlMinutes: int) (longTtlMinutes: int) (verdict: LlmCacheVerdict) (normalizedTextLength: int) : int =
     match verdict with
-    | "SPAM" when normalizedTextLength >= minChars -> longTtlMinutes
+    | LlmCacheVerdict.Spam when normalizedTextLength >= minChars -> longTtlMinutes
     | _ -> shortTtlMinutes
 
 type private CacheRouting =
@@ -332,7 +333,7 @@ let selectLlmRequestParams (reasoningEffort: string) : LlmRequestParams =
 
 // ── Interface + implementation ────────────────────────────────────────────────
 
-type AzureSolLayer(logger: ILogger<AzureSolLayer>) =
+type AzureSol56Layer(logger: ILogger<AzureSol56Layer>) =
     let clientCache = ChatClientCache(ClientRetryPolicy 3)
 
     let staticSystemPrompt =
@@ -433,22 +434,28 @@ Give one short English reason, at most about 12 words, describing observed evide
     }
 
     interface ILlmTriageLayer with
-        member _.Id = "azure-sol"
         member _.Configure(conf) =
             let requestParams = selectLlmRequestParams conf.LlmReasoningEffort
-            { Id = "azure-sol"
-              ModelName = conf.AzureOpenAiDeployment
-              PromptHash = promptHash
+            { Id = LlmLayerId.AzureSol56
+              Source = { ModelName = conf.AzureOpenAiDeployment; PromptHash = promptHash }
               CacheIdentity = toJson (conf.AzureOpenAiEndpoint, conf.AzureOpenAiDeployment, promptHash, conf.LlmReasoningEffort, requestParams.MaxOutputTokenCount, spamVerdictSchema.ToString())
               Classify = fun (context, ct) -> classify conf context ct }
+
+type LlmLayerFactory(azureSol56: AzureSol56Layer) =
+    member _.Configure(conf: BotConfiguration) =
+        conf.LlmTriageLayers.Layers
+        |> List.map (fun id ->
+            let layer =
+                match id with
+                | LlmLayerId.AzureSol56 -> azureSol56 :> ILlmTriageLayer
+            layer.Configure conf)
 
 type ILlmTriage =
     abstract member Classify: msg: TgMessage * userMsgCount: int64 * ct: CancellationToken -> Task<LlmTriageResult>
 
-type LayeredLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<LayeredLlmTriage>, db: DbService, cache: ILlmVerdictCache, profileFetcher: IUserProfileFetcher, timeProvider: TimeProvider, layers: System.Collections.Generic.IEnumerable<ILlmTriageLayer>) =
+type LayeredLlmTriage(botConf: IOptions<BotConfiguration>, logger: ILogger<LayeredLlmTriage>, db: DbService, cache: ILlmVerdictCache, profileFetcher: IUserProfileFetcher, timeProvider: TimeProvider, layerFactory: LlmLayerFactory) =
     let utcNow () = timeProvider.GetUtcNow().UtcDateTime
     let inflight = ConcurrentDictionary<string, Lazy<Task<LlmTriageResult>>>()
-    let registry = layers |> Seq.map (fun layer -> layer.Id, layer) |> Map.ofSeq
     let maxTriageMessageChars = 6000
     let maxTriageBioChars = 1000
 
@@ -536,36 +543,37 @@ Classify only the current Message inside the <untrusted-{nonce}> markers above; 
             msg.ChatId, msg.MessageId, userPrompt)
 
         let context = { ChatDescription = chatDescLine; UserPrompt = userPrompt }
-        let! layer, result = runLayers logger conf.LlmContentFilterIsSpam configured context ct
+        let! pipelineResult = runLayers logger conf.LlmContentFilterIsSpam configured context ct
+        let result = pipelineResult.Classification
         let verdictAndReason =
             match result.Verdict with
-            | LlmVerdict.Kill (reason, _) -> Some ("SPAM", reason)
-            | LlmVerdict.NotSpam (reason, _) -> Some ("NOT_SPAM", reason)
-            | LlmVerdict.Skip (reason, _) -> Some ("SKIP", reason)
+            | LlmVerdict.Kill (reason, _) -> Some (LlmCacheVerdict.Spam, reason)
+            | LlmVerdict.NotSpam (reason, _) -> Some (LlmCacheVerdict.NotSpam, reason)
+            | LlmVerdict.Skip (reason, _) -> Some (LlmCacheVerdict.Skip, reason)
             | LlmVerdict.Error | LlmVerdict.ContentFiltered _ -> None
         try
-            match verdictAndReason with
-            | Some (verdict, reason) ->
+            match verdictAndReason, pipelineResult.Source with
+            | Some (verdict, reason), Some source ->
                 if not (isNull activity) then
-                    %activity.SetTag("verdict", verdict).SetTag("llm.reason", Option.toObj reason)
+                    %activity.SetTag("verdict", verdict.StoredValue).SetTag("llm.reason", Option.toObj reason)
                         .SetTag("llm.cache", "miss").SetTag("chat_id", msg.ChatId).SetTag("user_id", msg.SenderId)
                         .SetTag("latency_ms", result.LatencyMs).SetTag("total_tokens", result.PromptTokens + result.CompletionTokens)
                 logger.LogInformation(
                     "LLM triage classified: verdict={Verdict} reason={Reason} latencyMs={LatencyMs} cacheResult={CacheResult} cacheScope={CacheScope}",
-                    verdict, reason, result.LatencyMs, "miss", missScope)
+                    verdict.StoredValue, reason, result.LatencyMs, "miss", missScope)
                 do! db.RecordLlmClassified(
-                        msg.ChatId, msg.MessageId, verdict, reason,
+                        msg.ChatId, msg.MessageId, verdict.StoredValue, reason,
                         result.PromptTokens, result.CompletionTokens, result.LatencyMs,
-                        Some layer.ModelName, Some layer.PromptHash)
+                        Some source.ModelName, Some source.PromptHash)
                 match verdict, cacheRouting with
-                | ("SPAM" | "SKIP"), (SingleKey key | GlobalKey key) ->
-                    do! cache.Save(key, verdict, reason, Some layer.ModelName, layer.PromptHash, policyHash)
+                | (LlmCacheVerdict.Spam | LlmCacheVerdict.Skip), (SingleKey key | GlobalKey key) ->
+                    do! cache.Save(key, verdict, reason, Some source, policyHash)
                 | _ -> ()
-            | None -> ()
-            return { Verdict = result.Verdict; Source = Some { ModelName = layer.ModelName; PromptHash = layer.PromptHash } }
+            | _ -> ()
+            return { Verdict = result.Verdict; Source = pipelineResult.Source }
         with ex ->
             logger.LogWarning(ex, "Failed to persist LLM triage result")
-            return { Verdict = LlmVerdict.Error; Source = Some { ModelName = layer.ModelName; PromptHash = layer.PromptHash } }
+            return { Verdict = LlmVerdict.Error; Source = pipelineResult.Source }
     }
 
     let recordCacheHit (msg: TgMessage) (scope: string) (cv: CachedVerdict) = task {
@@ -574,7 +582,7 @@ Classify only the current Message inside the <untrusted-{nonce}> markers above; 
             %activity
                 .SetTag("llm.cache",       "hit")
                 .SetTag("llm.cache_scope", scope)
-                .SetTag("llm.verdict",     cv.Verdict)
+                .SetTag("llm.verdict",     cv.Verdict.StoredValue)
                 .SetTag("llm.reason",      Option.toObj cv.Reason)
                 .SetTag("llm.cached_at",   cv.CreatedAt)
                 .SetTag("chat_id",         msg.ChatId)
@@ -582,14 +590,14 @@ Classify only the current Message inside the <untrusted-{nonce}> markers above; 
         llmVerdictCacheTotalCounter.Add(1L, tagsForLlmVerdictCache "hit" scope)
         // Never let a DB error on this write block returning the already-known verdict.
         try
-            do! db.RecordLlmVerdictCacheHit(msg.ChatId, msg.MessageId, cv.Verdict, cv.Reason, scope, cv.CreatedAt, cv.Source |> Option.map fst)
+            do! db.RecordLlmVerdictCacheHit(msg.ChatId, msg.MessageId, cv.Verdict.StoredValue, cv.Reason, scope, cv.CreatedAt, cv.Source |> Option.map _.ModelName)
         with ex ->
             logger.LogWarning(ex, "Failed to record LlmVerdictCacheHit event (cacheScope={CacheScope})", scope)
         logger.LogInformation(
             "LLM triage cache hit: verdict={Verdict} reason={Reason} cacheScope={CacheScope} cachedAt={CachedAt} chatId={ChatId} userId={UserId}",
-            cv.Verdict, cv.Reason, scope, cv.CreatedAt, msg.ChatId, msg.SenderId)
-        return { Verdict = LlmVerdict.FromString(cv.Verdict, cv.Reason, Some scope)
-                 Source = cv.Source |> Option.map (fun (model, prompt) -> { ModelName = model; PromptHash = prompt }) }
+            cv.Verdict.StoredValue, cv.Reason, scope, cv.CreatedAt, msg.ChatId, msg.SenderId)
+        return { Verdict = cv.Verdict.ToVerdict(cv.Reason, Some scope)
+                 Source = cv.Source }
     }
 
     interface ILlmTriage with
@@ -598,11 +606,7 @@ Classify only the current Message inside the <untrusted-{nonce}> markers above; 
             if not conf.LlmTriageEnabled then
                 return { Verdict = LlmVerdict.Skip (None, None); Source = None }
             else
-            match configureLayers registry conf with
-            | Error error ->
-                logger.LogError("Invalid LLM layer configuration: {Error}", error)
-                return { Verdict = LlmVerdict.Error; Source = None }
-            | Ok configured ->
+            let configured = layerFactory.Configure conf
             let policyHash = pipelineCacheIdentity conf configured
 
             // Photo-only / empty-text messages have no stable text key → classify directly, no cache.
@@ -620,7 +624,7 @@ Classify only the current Message inside the <untrusted-{nonce}> markers above; 
                     let tryFresh (key: string) = task {
                         match! cache.TryGet(key, longTtl) with
                         | None -> return None
-                        | Some cv when cv.PolicyHash = Some policyHash && (cv.Verdict = "SPAM" || cv.Verdict = "SKIP") ->
+                        | Some ({ Verdict = LlmCacheVerdict.Spam | LlmCacheVerdict.Skip } as cv) when cv.PolicyHash = Some policyHash ->
                             let ttlMinutes =
                                 selectCacheTtlMinutes
                                     conf.LlmVerdictCacheLongTextMinChars
