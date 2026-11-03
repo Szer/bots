@@ -51,6 +51,8 @@ let ``accepted Jev choice returns the provider verdict and usage`` label = task 
         Assert.Equal(context.UserPrompt, state.["record"].GetValue<string>())
         Assert.Equal(context.ChatDescription, state.["chat_policy"].GetValue<string>())
         Assert.Equal(2, request.["questions"].AsObject().Count)
+        let criteria = request.["questions"].["verdict"].["criteria"].AsObject()
+        Assert.Equal<string array>([| "NOT_SPAM"; "SKIP"; "SPAM" |], criteria |> Seq.map _.Key |> Seq.sort |> Seq.toArray)
         Assert.Contains("FIRST-PASS ROLE", request.["questions"].["verdict"].["instructions"].GetValue<string>())
         Assert.Equal("choice", request.["questions"].["review_focus"].["type"].GetValue<string>())
         return response body
@@ -101,6 +103,46 @@ let ``invalid or uncertain choices never produce automatic decisions`` (field: s
 [<InlineData("not json")>]
 [<InlineData("{\"answers\":{\"verdict\":{\"refusal\":true}}}")>]
 let ``malformed and refused responses fail closed`` body = task {
+    let handler, layer = provider (fun _ _ -> Task.FromResult(response body))
+    use _handler = handler
+    let! result = (layer.Configure(settings ())).Classify(context, CancellationToken.None)
+    Assert.Equal(LlmVerdict.Error, result.Verdict)
+}
+
+[<Theory>]
+[<InlineData("type")>]
+[<InlineData("choice")>]
+[<InlineData("confidence")>]
+[<InlineData("probabilities")>]
+let ``missing required answer fields never become default values`` field = task {
+    let body = JsonNode.Parse answer
+    %body.["answers"].["verdict"].AsObject().Remove(field)
+    let handler, layer = provider (fun _ _ -> Task.FromResult(response (body.ToJsonString())))
+    use _handler = handler
+    let conf = { settings () with Jev = configuration "3000" "0" "0" "0" }
+    let! result = (layer.Configure conf).Classify(context, CancellationToken.None)
+    Assert.Equal(LlmVerdict.Error, result.Verdict)
+}
+
+[<Theory>]
+[<InlineData("null", 0, 0)>]
+[<InlineData("{}", 0, 0)>]
+[<InlineData("{\"input_tokens\":17}", 17, 0)>]
+[<InlineData("{\"output_tokens\":23}", 0, 23)>]
+let ``optional usage is decoded without affecting the verdict`` usage inputTokens outputTokens = task {
+    let body = JsonNode.Parse answer
+    body.["usage"] <- JsonNode.Parse(usage: string)
+    let handler, layer = provider (fun _ _ -> Task.FromResult(response (body.ToJsonString())))
+    use _handler = handler
+    let! result = (layer.Configure(settings ())).Classify(context, CancellationToken.None)
+    Assert.Equal(LlmVerdict.Kill(Some "SPAM probability: 0.750", None), result.Verdict)
+    Assert.Equal(inputTokens, result.PromptTokens)
+    Assert.Equal(outputTokens, result.CompletionTokens)
+}
+
+[<Fact>]
+let ``duplicate probability keys cannot overwrite an invalid distribution`` () = task {
+    let body = answer.Replace("\"SPAM\":0.75", "\"SPAM\":0.01,\"SPAM\":0.75")
     let handler, layer = provider (fun _ _ -> Task.FromResult(response body))
     use _handler = handler
     let! result = (layer.Configure(settings ())).Classify(context, CancellationToken.None)

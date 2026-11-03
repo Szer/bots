@@ -6,6 +6,12 @@ open System.Globalization
 [<Literal>]
 let private AzureSol56Setting = "azure-sol-5.6"
 
+[<Literal>]
+let TypesafeJevModel = "jev-1.14.0"
+
+[<Literal>]
+let private TypesafeJevSetting = "typesafe-" + TypesafeJevModel
+
 [<RequireQualifiedAccess>]
 type LlmLayerId =
     | AzureSol56
@@ -13,11 +19,11 @@ type LlmLayerId =
     member this.SettingValue =
         match this with
         | LlmLayerId.AzureSol56 -> AzureSol56Setting
-        | LlmLayerId.TypesafeJev114 -> "typesafe-jev-1.14.0"
+        | LlmLayerId.TypesafeJev114 -> TypesafeJevSetting
     static member Parse(value: string) =
         match value with
         | AzureSol56Setting -> LlmLayerId.AzureSol56
-        | "typesafe-jev-1.14.0" -> LlmLayerId.TypesafeJev114
+        | TypesafeJevSetting -> LlmLayerId.TypesafeJev114
         | _ -> invalidArg "LLM_TRIAGE_LAYERS" $"Unsupported LLM layer: {value}"
 
 /// Preserves configured order and guarantees a non-empty sequence of unique, supported layers.
