@@ -157,7 +157,7 @@ ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         }
 
     [<Fact>]
-    let ``Monthly all-time stats are posted on first Monday of month`` () =
+    let ``Monthly all-time stats are posted on first Tuesday of month`` () =
         task {
             do! fixture.ClearFakeCalls()
 
@@ -188,8 +188,7 @@ VALUES
                 )
                 :> Task
 
-            // 2026-02-02 is the first Monday of February 2026; 10:00 UTC = 10:00 Dublin (winter/GMT).
-            do! runReminder (Some "2026-02-02T10:00:00Z")
+            do! runReminder (Some "2026-02-03T10:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -207,16 +206,15 @@ VALUES
                 |> Array.exists (fun t -> t.Contains(s))
 
             Assert.True(has "Статистика за всё время (использовано/добавлено)",
-                "Expected all-time stats message in group on first Monday of month")
+                "Expected all-time stats message in group on first Tuesday of month")
         }
 
     [<Fact>]
-    let ``Monthly stats are NOT posted on second Monday`` () =
+    let ``Monthly stats are NOT posted on second Tuesday`` () =
         task {
             do! fixture.ClearFakeCalls()
 
-            // 2026-01-12 is the second Monday of January 2026 (day 12 > 7).
-            do! runReminder (Some "2026-01-12T10:00:00Z")
+            do! runReminder (Some "2026-01-13T10:00:00Z")
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -233,16 +231,17 @@ VALUES
                 |> Array.choose (fun c -> tryGetText c.Body)
                 |> Array.exists (fun t -> t.Contains("Статистика за всё время"))
 
-            Assert.False(hasStats, "Expected NO stats message on the second Monday of month")
+            Assert.False(hasStats, "Expected NO stats message on the second Tuesday of month")
         }
 
-    [<Fact>]
-    let ``Monthly stats are NOT posted on non-Monday first week`` () =
+    [<Theory>]
+    [<InlineData("2026-02-02T10:00:00Z")>]
+    [<InlineData("2026-01-07T10:00:00Z")>]
+    let ``Monthly stats are NOT posted on non-Tuesday first week`` (nowUtc: string) =
         task {
             do! fixture.ClearFakeCalls()
 
-            // 2026-01-07 is a Wednesday (day = 7, first week, but not Monday).
-            do! runReminder (Some "2026-01-07T10:00:00Z")
+            do! runReminder (Some nowUtc)
 
             let! calls = fixture.GetFakeCalls("sendMessage")
 
@@ -259,7 +258,7 @@ VALUES
                 |> Array.choose (fun c -> tryGetText c.Body)
                 |> Array.exists (fun t -> t.Contains("Статистика за всё время"))
 
-            Assert.False(hasStats, "Expected NO stats message on a non-Monday first-week day")
+            Assert.False(hasStats, "Expected NO stats message on a non-Tuesday first-week day")
         }
 
     [<Fact>]
