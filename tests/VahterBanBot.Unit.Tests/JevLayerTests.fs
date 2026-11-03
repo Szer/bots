@@ -94,6 +94,8 @@ let ``invalid or uncertain choices never produce automatic decisions`` (field: s
     match result.Verdict with
     | LlmVerdict.Skip _ | LlmVerdict.Error -> ()
     | verdict -> Assert.Fail($"Unsafe verdict {verdict}")
+    Assert.Equal(123, result.PromptTokens)
+    Assert.Equal(45, result.CompletionTokens)
 }
 
 [<Theory>]
@@ -224,3 +226,20 @@ let ``gate changes affect acceptance and invalidate cache identity`` confidence 
 [<InlineData("1.01")>]
 let ``invalid thresholds reject configuration`` value =
     %Assert.Throws<ArgumentException>(fun () -> %(configuration "3000" value "0.75" "0.30"))
+
+[<Theory>]
+[<InlineData("model", "\"unexpected-model\"")>]
+[<InlineData("model", "null")>]
+[<InlineData("answers", "null")>]
+[<InlineData("answers", "{}")>]
+[<InlineData("answers", "false")>]
+let ``rejected response retains reported usage`` (field: string) value = task {
+    let body = JsonNode.Parse answer
+    body.[field] <- JsonNode.Parse(value: string)
+    let handler, layer = provider (fun _ _ -> Task.FromResult(response (body.ToJsonString())))
+    use _handler = handler
+    let! result = (layer.Configure(settings ())).Classify(context, CancellationToken.None)
+    Assert.Equal(LlmVerdict.Error, result.Verdict)
+    Assert.Equal(123, result.PromptTokens)
+    Assert.Equal(45, result.CompletionTokens)
+}
