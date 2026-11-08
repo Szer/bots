@@ -22,6 +22,9 @@ module Metrics =
     /// Count of user feedback submissions via /feedback flow.
     let feedbackTotal = meter.CreateCounter<int64>("couponhubbot_feedback_total")
 
+    /// Count of admin /reply attempts. Tag: delivered ∈ {"true", "false"}.
+    let feedbackReplyTotal = meter.CreateCounter<int64>("couponhubbot_feedback_reply_total")
+
     // ── Album batch flow ──────────────────────────────────────────────
     // The data the original feature was justified on (size-of-burst, OCR
     // success rate) lived in DB queries. These metrics make the same
