@@ -1,6 +1,7 @@
 namespace MultiPodTests
 
 open System
+open System.Text.Json
 open System.Threading.Tasks
 open BotTestInfra
 open Npgsql
@@ -133,4 +134,51 @@ type VahterMultiPodFeatureTests(fixture: VahterMultiPodContainers) =
 
         let! immune1 = pollForAdminImmunity 1
         Assert.True(immune1, "Instance 1 should ALSO treat id 42 as a chat admin -- proof it read chat_admin, not just its own fetch")
+    }
+
+    [<Fact>]
+    let ``Both pods drain one chat while duplicate join webhooks are acknowledged`` () = task {
+        let chat = fixture.ChatsToMonitor
+        let updates = Array.init 16 (fun _ ->
+            let update = Tg.quickMsg(chat = chat, text = null)
+            { update with Message = Some { update.Message.Value with NewChatMembers = Some [| Tg.user() |] } })
+        let ids = updates |> Array.map (fun u -> u.Message.Value.MessageId)
+        let streams = ids |> Array.map (fun id -> $"join-notification:{chat.Id}:{id}")
+        use conn = new NpgsqlConnection(fixture.DbConnectionString)
+        let completed () = conn.ExecuteScalarAsync<int>(
+            """SELECT count(*) FROM event WHERE stream_id = ANY(@streams) AND event_type = 'JoinNotificationDeleted'""",
+            {| streams = streams |})
+        let delayMs = 4000
+        do! fixture.SetFakeTgMethodDelay("deleteMessage", delayMs)
+        use cleanup = { new IAsyncDisposable with
+                            member _.DisposeAsync() = ValueTask(fixture.SetFakeTgMethodDelay("deleteMessage", 0)) }
+        let! responses =
+            [| for update in updates do
+                   for pod in 0..1 do yield fixture.SendUpdateTo(pod, update) |]
+            |> Task.WhenAll
+        for response in responses do
+            use response = response
+            Assert.Equal(System.Net.HttpStatusCode.OK, response.StatusCode)
+        let! doneAtAck = completed()
+        Assert.Equal(0, doneAtAck)
+
+        let deadline = DateTime.UtcNow.AddSeconds 35
+        let mutable count = 0
+        while count < ids.Length && DateTime.UtcNow < deadline do
+            do! Task.Delay 100
+            let! found = completed()
+            count <- found
+        Assert.Equal(ids.Length, count)
+        let! calls = fixture.GetFakeCalls "deleteMessage"
+        let starts =
+            calls |> Array.choose (fun call ->
+                use body = JsonDocument.Parse call.Body
+                let root = body.RootElement
+                if root.GetProperty("chat_id").GetInt64() = chat.Id
+                   && Array.contains (root.GetProperty("message_id").GetInt64()) ids then Some call.Timestamp
+                else None)
+            |> Array.sort
+        Assert.Equal(ids.Length, starts.Length)
+        let overlap = starts |> Array.windowed 5 |> Array.exists (fun w -> (w[4] - w[0]).TotalMilliseconds < float delayMs)
+        Assert.True(overlap, "Five overlapping deletes require workers on both pods")
     }
