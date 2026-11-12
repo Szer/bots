@@ -174,6 +174,12 @@ type ChatMessageRow =
       reply_to_message_id: Nullable<int64>
       created_at: DateTime }
 
+[<CLIMutable>]
+type MembershipCacheEntry =
+    { revision: Guid
+      is_member: Nullable<bool>
+      checked_at: DateTime }
+
 type DbService(connString: string, timeProvider: TimeProvider, maxTakenCoupons: int) =
     let utcNow () = timeProvider.GetUtcNow().UtcDateTime
     let todayUtc () = DateOnly.FromDateTime(utcNow ())
@@ -194,6 +200,55 @@ INSERT INTO coupon_event (coupon_id, user_id, event_type, subject_user_id)
 VALUES (@coupon_id, @user_id, @event_type, @subject_user_id);
 """
         conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId; event_type = eventType; subject_user_id = Option.toNullable subjectUserId |}, tx) |> taskIgnore
+
+    member _.GetMembershipEntry(chatId: int64, userId: int64) =
+        task {
+            use! conn = openConn()
+            let key = {| chatId = chatId; userId = userId; now = utcNow () |}
+            let! row = conn.QuerySingleOrDefaultAsync<MembershipCacheEntry>(
+                """SELECT revision, is_member, checked_at FROM community_membership_cache
+                   WHERE chat_id = @chatId AND user_id = @userId""", key)
+            if obj.ReferenceEquals(row, null) then
+                return! conn.QuerySingleAsync<MembershipCacheEntry>(
+                    """INSERT INTO community_membership_cache (chat_id, user_id, checked_at)
+                       VALUES (@chatId, @userId, @now)
+                       ON CONFLICT (chat_id, user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+                       RETURNING revision, is_member, checked_at""", key)
+            else
+                return row
+        }
+
+    member _.TryCacheMembership(chatId: int64, userId: int64, revision: Guid, isMember: bool, checkedAt: DateTime) =
+        task {
+            use! conn = openConn()
+            let! rows = conn.ExecuteAsync(
+                """UPDATE community_membership_cache
+                   SET is_member = @isMember, checked_at = @checkedAt, revision = gen_random_uuid()
+                   WHERE chat_id = @chatId AND user_id = @userId AND revision = @revision""",
+                {| chatId = chatId; userId = userId; revision = revision; isMember = isMember; checkedAt = checkedAt |})
+            return rows = 1
+        }
+
+    member _.InvalidateMembership(chatId: int64, userId: int64) =
+        task {
+            use! conn = openConn()
+            do! conn.ExecuteAsync(
+                "DELETE FROM community_membership_cache WHERE chat_id = @chatId AND user_id = @userId",
+                {| chatId = chatId; userId = userId |}) |> taskIgnore
+        }
+
+    member _.ClearMembershipCache() =
+        task {
+            use! conn = openConn()
+            do! conn.ExecuteAsync("DELETE FROM community_membership_cache") |> taskIgnore
+        }
+
+    member _.PruneMembershipCache(maxAge: TimeSpan) =
+        task {
+            use! conn = openConn()
+            do! conn.ExecuteAsync("DELETE FROM community_membership_cache WHERE checked_at <= @cutoff",
+                                  {| cutoff = utcNow () - maxAge |}) |> taskIgnore
+        }
 
     member _.SaveCouponOcr(photoFileId: string, rawResponse: string) =
         task {

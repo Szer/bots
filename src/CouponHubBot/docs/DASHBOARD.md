@@ -16,7 +16,7 @@ The verified user must pass `getChatMember` for the configured community. The bo
 
 Sessions use random 256-bit bearer tokens, expire after fifteen minutes, and are bound to the community. PostgreSQL stores only token hashes so either replica can validate them; expired records are pruned when a session is created.
 
-Every statistics request validates the session and membership before reading cached data. Membership results last at most one minute; membership updates also update the receiving replica's cache. Changing the configured community invalidates existing sessions for subsequent requests.
+Every statistics request validates the session and membership before reading cached data. The dashboard accepts membership results up to one minute old. A membership update on either replica invalidates the shared PostgreSQL entry. Changing the configured community invalidates existing sessions for subsequent requests.
 
 The browser keeps the bearer token in memory and clears private content on expiry or access denial. Session tokens never go in URLs or browser storage; dashboard responses use `Cache-Control: no-store`. Loaded data cannot be recalled after someone leaves the community.
 
