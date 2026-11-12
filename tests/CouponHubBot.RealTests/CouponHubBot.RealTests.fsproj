@@ -19,10 +19,6 @@
          — needs RealAssemblyFixture's type, so it must land after it and before every
          test file that opens CouponHubBot.RealTests and calls into it. -->
     <Compile Include="RealTestHelpers.fs" />
-    <!-- Runs safely anywhere in the default suite: it flips COMMUNITY_CHAT_ID and
-         restores it via POST /test/membership/invalidate (Program.fs), which busts
-         TelegramMembershipService's 1-day cache on both the flip and the restore — see
-         its doc comment. -->
     <Compile Include="MembershipGateRealTests.fs" />
     <Compile Include="SmokeTests.fs" />
     <Compile Include="AddFlowRealTests.fs" />

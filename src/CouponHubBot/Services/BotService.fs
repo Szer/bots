@@ -180,7 +180,8 @@ type BotService(
                     update.UpdateId, update.Message.IsSome, update.CallbackQuery.IsSome)
                 match update.ChatMember, update.CallbackQuery, update.Message with
                 | Some chatMemberUpdated, _, _ ->
-                    match membership.OnChatMemberUpdated(chatMemberUpdated) with
+                    let! transition = membership.OnChatMemberUpdated(chatMemberUpdated)
+                    match transition with
                     | Some true ->
                         // Registers the joining user so coupon history has a "user" row —
                         // mirrors handlePrivateMessage's UpsertUser. Never done on leave/ban.

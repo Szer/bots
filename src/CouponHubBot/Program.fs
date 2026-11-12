@@ -158,7 +158,7 @@ if botConfOptions.Value.TestMode then
     .AddSingleton<DashboardService>(fun sp ->
         new DashboardService(connString, sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ITelegramApi>()))
     .AddSingleton<TelegramNotificationService>()
-    .AddHostedService<MembershipCacheInvalidationService>()
+    .AddHostedService<MembershipCacheCleanupService>()
     .AddHostedService<BotCommandsSetupService>()
     .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
@@ -242,20 +242,16 @@ Readiness.mapReadyEndpoint [ "db", dbPingCheck.CheckAsync ] app
             return Results.Json({| started = CouponScheduledJobs.ReminderJobName |}, statusCode = 202)
     }))
 
-// Test-only hook to clear TelegramMembershipService's in-memory cache immediately.
-// Without this, IsMember(userId) keeps returning a stale cached verdict for up to
-// an hour after COMMUNITY_CHAT_ID changes underneath it (MembershipService.fs's
-// `expiry`), which made the membership-gate real test unable to observe a fresh
-// verdict without a full pod restart. 404 outside TestMode.
-%app.MapPost("/test/membership/invalidate", Func<HttpContext, IResult>(fun ctx ->
-    let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
-    if not opts.Value.TestMode then
-        Results.NotFound()
-    else
-        let membership = ctx.RequestServices.GetRequiredService<TelegramMembershipService>()
-        membership.InvalidateCache()
-        Results.Json({| ok = true |})
-))
+%app.MapPost("/test/membership/invalidate", Func<HttpContext, Task<IResult>>(fun ctx ->
+    task {
+        let opts = ctx.RequestServices.GetRequiredService<IOptions<BotConfiguration>>()
+        if not opts.Value.TestMode then
+            return Results.NotFound()
+        else
+            let db = ctx.RequestServices.GetRequiredService<DbService>()
+            do! db.ClearMembershipCache()
+            return Results.Json({| ok = true |})
+    }))
 
 // Config dump: live effective BotConfiguration as JSON, secret fields (token/key) redacted
 // via BotInfra.SettingsDump. Gated the same as /reload-settings (auth-token header) — coupon

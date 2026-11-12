@@ -136,11 +136,7 @@ type RealAssemblyFixture() =
     /// exposed for MembershipGateRealTests' save-flip-assert-restore sequence.
     member _.ReloadSettingsAsync() = reloadSettingsAsync env
 
-    /// Clears TelegramMembershipService's in-memory cache (Program.fs's
-    /// /test/membership/invalidate — TEST_MODE-gated, same shape as the two hooks
-    /// above). Required around MembershipGateRealTests' COMMUNITY_CHAT_ID flip: without
-    /// this, a stale cached verdict (up to 1 hour old) can mask both the flip itself and
-    /// its restoration — see that test's doc comment.
+    /// Forces the next membership check to query Telegram.
     member _.InvalidateMembershipCacheAsync() =
         task {
             use http = new HttpClient(Timeout = TimeSpan.FromSeconds 10.)
