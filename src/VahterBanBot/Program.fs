@@ -381,14 +381,21 @@ let parseQualityHistoryMode (ctx: HttpContext) =
                 return Results.BadRequest $"unknown scope '{other}' (expected: users)"
     }))
 
-let processUpdate (services: IServiceProvider) update join = task {
+let processUpdate (services: IServiceProvider) (logger: ILogger<Root>) (update: Funogram.Telegram.Types.Update) join = task {
     match join with
     | Some (message: Funogram.Telegram.Types.Message) ->
-        do! services.GetRequiredService<JoinDeletionQueue>().Enqueue(message.Chat.Id, message.MessageId)
+        try
+            do! services.GetRequiredService<JoinDeletionQueue>().Enqueue(message.Chat.Id, message.MessageId)
+            return true
+        with ex ->
+            logger.LogError(ex, "Failed to queue join deletion for chat {ChatId}, message {MessageId}, update {UpdateId}",
+                            message.Chat.Id, message.MessageId, update.UpdateId)
+            return false
     | None ->
         let bot = services.GetRequiredService<BotService>()
         use _ = services.GetRequiredService<DbService>().BeginEventScope()
         do! bot.OnUpdate(update)
+        return true
 }
 
 // Main webhook endpoint with bot-specific update handling
@@ -405,14 +412,13 @@ WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx raw
             logger.LogInformation("Received Telegram update {UpdateId}", update.UpdateId))
         let join = JoinDeletions.target botConfOptions.Value update
         try
-            do! processUpdate ctx.RequestServices update join
-            %topActivity.SetTag("update-error", false)
-            %topActivity.SetStatus(ActivityStatusCode.Ok)
+            let! processed = processUpdate ctx.RequestServices logger update join
+            %topActivity.SetTag("update-error", not processed)
+            %topActivity.SetStatus(if processed then ActivityStatusCode.Ok else ActivityStatusCode.Error)
         with e ->
             logger.LogError(e, "Unexpected error while processing update {UpdateId}", update.UpdateId)
             %topActivity.SetStatus(ActivityStatusCode.Error)
             %topActivity.SetTag("update-error", true)
-            if join.IsSome then System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw e
     }) app
 
 let server = app.RunAsync()
@@ -427,15 +433,10 @@ if botConfOptions.Value.UsePolling then
             try
                 let! updates = tg.CallExn(Req.GetUpdates.Make(offset = offset, timeout = 30L))
                 for update in updates do
-                    let nextOffset = max offset (update.UpdateId + 1L)
-                    match JoinDeletions.target botConfOptions.Value update with
-                    | Some message ->
-                        do! processUpdate app.Services update (Some message)
-                        offset <- nextOffset
-                    | None ->
-                        offset <- nextOffset
-                        if update.Message |> Option.exists _.Text.IsSome then
-                            do! processUpdate app.Services update None
+                    offset <- max offset (update.UpdateId + 1L)
+                    let join = JoinDeletions.target botConfOptions.Value update
+                    if join.IsSome || (update.Message |> Option.exists _.Text.IsSome) then
+                        do! processUpdate app.Services logger update join |> taskIgnore
             with e ->
                 // polling is dev-only; log and keep the loop alive
                 logger.LogWarning(e, "Polling getUpdates iteration failed")

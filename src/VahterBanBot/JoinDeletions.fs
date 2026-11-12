@@ -32,12 +32,14 @@ type JoinDeletionJob =
 type JoinDeletionQueue(connString: string) =
     member _.Enqueue(chatId: int64, messageId: int64) = task {
         use conn = new NpgsqlConnection(connString)
-        let! _ = conn.ExecuteAsync(
+        use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 1.)
+        let! _ = conn.ExecuteAsync(CommandDefinition(
             """INSERT INTO join_deletion_queue (chat_id, message_id)
                SELECT @chatId, @messageId WHERE NOT EXISTS
                    (SELECT 1 FROM event WHERE stream_id = @stream AND event_type = 'JoinNotificationDeleted')
                ON CONFLICT DO NOTHING""",
-            {| chatId = chatId; messageId = messageId; stream = $"join-notification:{chatId}:{messageId}" |})
+            {| chatId = chatId; messageId = messageId; stream = $"join-notification:{chatId}:{messageId}" |},
+            cancellationToken = timeout.Token))
         ()
     }
 

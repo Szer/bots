@@ -156,22 +156,28 @@ type JoinMessageTests(fixture: MlDisabledVahterTestContainers) =
     }
 
     [<Fact>]
-    let ``Unavailable queue returns a retryable webhook failure`` () = task {
+    let ``A blocked join queue acknowledges the notice and the next chat message is processed`` () = task {
         let chat = fixture.ChatsToMonitor[0]
         do! fixture.SetBotSetting("DELETE_JOIN_MESSAGES_IN_CHATS", JsonSerializer.Serialize [|chat.Id|])
         do! fixture.ReloadSettings()
-        let update = joinMessage chat 1
+        let join = joinMessage chat 1
         use admin = new NpgsqlConnection(fixture.AdminDbConnectionString)
-        let sendWithoutInsertGrant () = task {
-            let! _ = admin.ExecuteAsync("REVOKE INSERT ON join_deletion_queue FROM vahter_bot_ban_service")
-            use restore = { new IAsyncDisposable with
-                                member _.DisposeAsync() =
-                                    ValueTask(admin.ExecuteAsync("GRANT INSERT ON join_deletion_queue TO vahter_bot_ban_service")) }
-            return! fixture.SendMessage update
-        }
-        use! response = sendWithoutInsertGrant()
-        Assert.InRange(int response.StatusCode, 500, 599)
-        do! assertDeleted true update
+        do! admin.OpenAsync()
+        use! tx = admin.BeginTransactionAsync()
+        let! _ = admin.ExecuteAsync("LOCK TABLE join_deletion_queue IN SHARE MODE", transaction = tx)
+        use! response = (fixture.SendMessage join).WaitAsync(TimeSpan.FromSeconds 5.)
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+
+        let next = Tg.quickMsg(chat = chat, text = "hello everyone")
+        use! nextResponse = fixture.SendMessage next
+        Assert.Equal(HttpStatusCode.OK, nextResponse.StatusCode)
+        let! stored = fixture.TryGetDbMessage next.Message.Value
+        Assert.True(stored.IsSome)
+        do! tx.CommitAsync()
+        let! queued = admin.ExecuteScalarAsync<bool>(
+            """SELECT EXISTS (SELECT FROM join_deletion_queue WHERE chat_id = @chatId AND message_id = @messageId)""",
+            {| chatId = chat.Id; messageId = join.Message.Value.MessageId |})
+        Assert.False(queued)
     }
 
     interface IAsyncDisposable with
