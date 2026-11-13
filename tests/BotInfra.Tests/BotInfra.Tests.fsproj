@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Compile Include="PostgresFixture.fs" />
+    <Compile Include="ConnectionPoolTests.fs" />
     <Compile Include="SnapshotShapeTests.fs" />
     <Compile Include="EventStoreSnapshotTests.fs" />
     <Compile Include="Program.fs" />

@@ -33,11 +33,7 @@ type Root = class end
 
 Dapper.FSharp.PostgreSQL.OptionTypes.register()
 
-let connString =
-    let settings = Npgsql.NpgsqlConnectionStringBuilder(getEnv "DATABASE_URL")
-    settings.MaxPoolSize <- min settings.MaxPoolSize 4
-    settings.MinPoolSize <- min settings.MinPoolSize settings.MaxPoolSize
-    settings.ConnectionString
+let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString (Some 4)
 
 let loadDbSettings () =
     try

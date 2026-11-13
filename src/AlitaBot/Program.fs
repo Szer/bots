@@ -19,7 +19,7 @@ open BotInfra.DbSettings
 
 type Root = class end
 
-let connString = getEnv "DATABASE_URL"
+let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString None
 
 let parseChatIds (raw: string) =
     if String.IsNullOrWhiteSpace raw then

@@ -20,7 +20,7 @@ type Root = class end
 
 DapperSetup.registerDateOnlyHandler()
 
-let connString = getEnv "DATABASE_URL"
+let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString None
 
 let parseAdmins (raw: string) =
     if String.IsNullOrWhiteSpace raw then

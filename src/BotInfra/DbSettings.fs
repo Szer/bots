@@ -8,6 +8,17 @@ open Npgsql
 /// Shared bot_settings table access.
 module DbSettings =
 
+    let pooledConnectionString (maxPoolSize: int option) (connectionString: string) =
+        let settings = NpgsqlConnectionStringBuilder(connectionString)
+        settings.Pooling <- true
+        match maxPoolSize with
+        | Some limit ->
+            let maximum = min settings.MaxPoolSize limit
+            settings.MinPoolSize <- min settings.MinPoolSize maximum
+            settings.MaxPoolSize <- maximum
+        | None -> ()
+        settings.ConnectionString
+
     /// Loads all key-value pairs from the bot_setting table.
     let loadBotSettings (connString: string) : Task<IReadOnlyDictionary<string, string>> =
         task {
