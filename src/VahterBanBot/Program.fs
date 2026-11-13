@@ -33,7 +33,11 @@ type Root = class end
 
 Dapper.FSharp.PostgreSQL.OptionTypes.register()
 
-let connString = getEnv "DATABASE_URL"
+let connString =
+    let settings = Npgsql.NpgsqlConnectionStringBuilder(getEnv "DATABASE_URL")
+    settings.MaxPoolSize <- min settings.MaxPoolSize 4
+    settings.MinPoolSize <- min settings.MinPoolSize settings.MaxPoolSize
+    settings.ConnectionString
 
 let loadDbSettings () =
     try
@@ -262,12 +266,12 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddSingleton<ILlmVerdictCache>(fun _ -> LlmVerdictCacheRepository(connString) :> ILlmVerdictCache)
     .AddSingleton<BotService>()
     .AddSingleton<JoinDeletionQueue>(fun _ -> JoinDeletionQueue(connString))
-    .AddHostedService<JoinDeletionWorker>()
-    .AddHostedService<JoinHistoryWorker>(fun sp ->
-        new JoinHistoryWorker(connString, botConfOptions, sp.GetRequiredService<ITelegramApi>(), sp.GetRequiredService<ILogger<JoinHistoryWorker>>()))
     // MachineLearning must start before CleanupService (loads model from DB on startup)
     .AddSingleton<MachineLearning>()
     .AddHostedService<MachineLearning>(fun sp -> sp.GetRequiredService<MachineLearning>())
+    .AddHostedService<JoinDeletionWorker>()
+    .AddHostedService<JoinHistoryWorker>(fun sp ->
+        new JoinHistoryWorker(connString, botConfOptions, sp.GetRequiredService<ITelegramApi>(), sp.GetRequiredService<ILogger<JoinHistoryWorker>>()))
     // Single CleanupService instance, exposed both as the hosted scheduler and as
     // the IForcedCleanup used by the /vahter cleanup admin command.
     .AddSingleton<CleanupService>()
