@@ -93,7 +93,7 @@ Container images pin architecture-specific .NET base images (`arm64v8`) for repr
 
 ## Database
 
-Vahter caps the shared Npgsql pool at four connections per process and honors a lower maximum in `DATABASE_URL`. Two replicas can use eight pooled connections; two old and two new processes overlapping can use sixteen. The settings listener, history workers, webhook requests and moderation-quality maintenance all share this budget. Terminating processes keep their own pools until exit.
+The startup setting `DB_MAX_POOL_SIZE` defaults to three connections per Vahter process. `DATABASE_URL` supplies an additional upper bound. Two replicas can use six connections, and four overlapping processes can use twelve. The settings listener, workers and webhook requests share the pool. Changes apply on the next process start.
 
 - **Database**: `vahter_db_v2`
 - **Migrations**: `src/vahter-bot/migrations/` (Flyway)

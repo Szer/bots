@@ -33,19 +33,11 @@ type Root = class end
 
 Dapper.FSharp.PostgreSQL.OptionTypes.register()
 
-let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString (Some 4)
+let connString, initialSettings =
+    DbSettings.loadStartupSettings 3 (getEnv "DATABASE_URL") |> fun t -> t.GetAwaiter().GetResult()
 
-let loadDbSettings () =
-    try
-        // NOTE(project-agent): intentional blocking call. Runs once at module init before the
-        // ASP.NET Core host exists; there is no SynchronizationContext to deadlock against, and
-        // settings must be loaded synchronously to build the DI container. Do not flag.
-        DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
-    with e ->
-        eprintfn "[FATAL] Failed to load bot settings from database: %O" e
-        reraise()
-
-let mutable dbSettings = loadDbSettings()
+let loadDbSettings () = DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
+let mutable dbSettings = initialSettings
 
 let getSettingOr key def =
     let accessor = DbSettings.BotSettingsAccessor(dbSettings)

@@ -20,8 +20,6 @@ type Root = class end
 
 DapperSetup.registerDateOnlyHandler()
 
-let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString None
-
 let parseAdmins (raw: string) =
     if String.IsNullOrWhiteSpace raw then
         [||]
@@ -32,14 +30,11 @@ let parseAdmins (raw: string) =
             | true, v -> Some v
             | _ -> None)
 
-let loadDbSettings () =
-    try
-        DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
-    with e ->
-        eprintfn "[FATAL] Failed to load bot settings from database: %O" e
-        reraise()
+let connString, initialSettings =
+    DbSettings.loadStartupSettings 2 (getEnv "DATABASE_URL") |> fun t -> t.GetAwaiter().GetResult()
 
-let mutable dbSettings = loadDbSettings()
+let loadDbSettings () = DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
+let mutable dbSettings = initialSettings
 
 let getSetting key =
     let accessor = BotSettingsAccessor(dbSettings)

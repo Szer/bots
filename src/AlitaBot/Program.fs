@@ -19,8 +19,6 @@ open BotInfra.DbSettings
 
 type Root = class end
 
-let connString = getEnv "DATABASE_URL" |> DbSettings.pooledConnectionString None
-
 let parseChatIds (raw: string) =
     if String.IsNullOrWhiteSpace raw then
         []
@@ -32,14 +30,11 @@ let parseChatIds (raw: string) =
             | _ -> None)
         |> Array.toList
 
-let loadDbSettings () =
-    try
-        DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
-    with e ->
-        eprintfn "[FATAL] Failed to load bot settings from database: %O" e
-        reraise()
+let connString, initialSettings =
+    DbSettings.loadStartupSettings 1 (getEnv "DATABASE_URL") |> fun t -> t.GetAwaiter().GetResult()
 
-let mutable dbSettings = loadDbSettings()
+let loadDbSettings () = DbSettings.loadBotSettings(connString).GetAwaiter().GetResult()
+let mutable dbSettings = initialSettings
 
 let getSettingOr key def =
     let accessor = BotSettingsAccessor(dbSettings)
