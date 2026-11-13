@@ -37,6 +37,8 @@ Telegram bot for collaborative coupon management in a private Russian-speaking c
 
 ## Database
 
+The startup setting `DB_MAX_POOL_SIZE` defaults to two database connections per process, capped by `DATABASE_URL`. Changes apply on the next process start.
+
 - **Database**: `coupon_hub_bot`
 - **Role**: `coupon_hub_bot_service` (always add `GRANT` in migrations)
 - **Migrations**: `src/coupon-hub-bot/migrations/` (Flyway)

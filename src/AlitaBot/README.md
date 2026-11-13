@@ -26,6 +26,8 @@ Telegram webhook
 `BotConfiguration` is `IOptions<_>`-backed via `BotInfra.LiveOptions` — `POST /reload-settings`
 re-reads `bot_setting` without a pod restart (see AGENTS.md's Settings configuration section).
 
+The startup setting `DB_MAX_POOL_SIZE` defaults to two database connections per process, capped by `DATABASE_URL`. Changes apply on the next process start.
+
 ### Renderers (`Services/ReplyRenderer.fs`)
 
 All three implement `IReplyRenderer.Render` and share one failure policy: `ContentFiltered`
