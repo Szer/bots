@@ -62,6 +62,7 @@ type VahterMultiPodContainers() =
                   "DETECTED_SPAM_CHANNEL_ID", "-102", "FREE_FORM", "CHANNELS"
                   "ALL_LOGS_CHANNEL_ID", "-103", "FREE_FORM", "CHANNELS"
                   "CHATS_TO_MONITOR", """{"pro.hell":"-666"}""", "JSON_BLOB", "CHANNELS"
+                  "JOIN_DELETE_BULK_THRESHOLD", "100", "FREE_FORM", "MODERATION"
                   "DELETE_JOIN_MESSAGES_IN_CHATS", "[-666]", "JSON_BLOB", "MODERATION"
                   "ALLOWED_USERS", """{"vahter_1":"34"}""", "JSON_BLOB", "CHANNELS"
                   "ML_ENABLED", "true", "FEATURE_FLAG", "ML"
