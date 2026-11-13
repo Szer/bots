@@ -205,11 +205,12 @@ type JoinMessageTests(fixture: MlDisabledVahterTestContainers) =
         do! admin.OpenAsync()
         use! tx = admin.BeginTransactionAsync()
         let! _ = admin.ExecuteAsync("LOCK TABLE join_deletion_queue IN ACCESS EXCLUSIVE MODE", transaction = tx)
-        use observer = new NpgsqlConnection(fixture.AdminDbConnectionString)
+        use observer = new NpgsqlConnection(fixture.DbConnectionString)
         let blockedClaims () =
             observer.ExecuteScalarAsync<int>(
                 """SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock'
-                   AND @blocker = ANY(pg_blocking_pids(pid)) AND query LIKE '%FOR UPDATE OF q SKIP LOCKED%'""",
+                   AND datname=current_database() AND usename=current_user
+                   AND @blocker = ANY(pg_blocking_pids(pid)) AND query LIKE 'WITH head AS (%'""",
                 {| blocker = admin.ProcessID |})
         do! waitFor (fun () -> task {
             let! count = blockedClaims()
