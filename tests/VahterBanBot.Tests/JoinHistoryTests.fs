@@ -47,7 +47,7 @@ type JoinHistoryTests(fixture: MlDisabledVahterTestContainers) =
                 member _.Read(_, ids) = task {
                     reads <- reads+1
                     %entered.TrySetResult()
-                    do! release.Task
+                    do! release.Task.WaitAsync(TimeSpan.FromSeconds 10.)
                     return ids |> Array.map (fun id -> match history.TryGetValue id with true,m -> m | _ -> empty id)
                 }
                 member _.Delete(actual, ids) = task {
@@ -64,6 +64,7 @@ type JoinHistoryTests(fixture: MlDisabledVahterTestContainers) =
         do! queue.Enqueue(chat,131L,minute)
         do! run fake
         Assert.Equal(0, reads)
+        let! _ = conn.ExecuteAsync("UPDATE join_deletion_queue SET available_at=now()+interval '1 hour', attempt=attempt+1 WHERE chat_id=@chat",args)
         let! _ = expire()
         do! run fake
         Assert.Equal(0, reads)
