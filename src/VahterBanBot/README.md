@@ -93,7 +93,7 @@ Container images pin architecture-specific .NET base images (`arm64v8`) for repr
 
 ## Database
 
-Vahter caps the shared Npgsql pool at four connections per process and honors a lower maximum in `DATABASE_URL`. Two replicas can use eight pooled connections; two old and two new processes overlapping can use sixteen. The moderation-quality maintenance job opens a separate unpooled session. Terminating processes keep their own pools until exit.
+Vahter caps the shared Npgsql pool at four connections per process and honors a lower maximum in `DATABASE_URL`. Two replicas can use eight pooled connections; two old and two new processes overlapping can use sixteen. The settings listener, history workers, webhook requests and moderation-quality maintenance all share this budget. Terminating processes keep their own pools until exit.
 
 - **Database**: `vahter_db_v2`
 - **Migrations**: `src/vahter-bot/migrations/` (Flyway)
