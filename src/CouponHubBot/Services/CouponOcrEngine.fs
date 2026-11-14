@@ -519,7 +519,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 if String.IsNullOrWhiteSpace ocrText then None
                 else
                     let digits = Regex.Match(ocrText, @"\b(\d{13})\b")
-                    if digits.Success then Some digits.Value else None
+                    if digits.Success && CouponBarcodeReader.isValidEan13 digits.Value then Some digits.Value else None
 
             let barcode =
                 match printed with

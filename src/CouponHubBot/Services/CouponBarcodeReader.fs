@@ -6,6 +6,11 @@ open SixLabors.ImageSharp
 open SixLabors.ImageSharp.PixelFormats
 
 module CouponBarcodeReader =
+    let isValidEan13 (digits: string) =
+        digits.Length = 13
+        && Seq.forall Char.IsAsciiDigit digits
+        && (digits |> Seq.mapi (fun i c -> (int c - int '0') * (if i % 2 = 0 then 1 else 3)) |> Seq.sum) % 10 = 0
+
     let private scan reportErrors evaluate (imageBytes: ReadOnlyMemory<byte>) =
         // Resolve the library before constructing objects with native finalizers.
         let format = ZXingCpp.BarcodeFormat.Parse("EAN13")

@@ -15,6 +15,8 @@ After ordinary scans miss, an explicit EAN-13 checksum error from ZXing enables 
 
 When a managed scan disagrees with the printed digits, the same checksum-gated repair can confirm the printed value. The bot keeps the scan value if repair cannot confirm the digits.
 
+If scanning yields no barcode, the bot accepts the printed digits from OCR only when they pass the EAN-13 checksum. An invalid checksum leads to the existing photo retry.
+
 Native library load or decode failures fall back to the managed decoder. The Linux native binaries require glibc 2.38 and libstdc++ with GLIBCXX_3.4.31; the Noble runtime image provides both.
 
 ## OCR Result
