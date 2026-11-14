@@ -224,12 +224,14 @@ type OcrTests(output: ITestOutputHelper) =
             CouponOcrEngine(azure, XUnitLogging.XUnitLogger<CouponOcrEngine>(output, logs), timeProvider)
         engine, http, logs
 
-    [<Fact>]
-    member _.``Split bar followed by a skipped run pair yields the printed barcode without text OCR``() =
+    [<Theory>]
+    [<InlineData("2054.jpg", "2707300564987")>]
+    [<InlineData("1926.jpg", "2707333279407")>]
+    member _.``Skipped guard runs yield the printed barcode without text OCR``(file: string, expected: string) =
         task {
-            let path = Path.Combine(AppContext.BaseDirectory, "Images", "skipped-runs", "2054.jpg")
+            let path = Path.Combine(AppContext.BaseDirectory, "Images", "skipped-runs", file)
             let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(File.ReadAllBytes(path)))
-            Assert.Equal("2707300564987", result.barcode)
+            Assert.Equal(expected, result.barcode)
         }
 
     [<Theory>]
