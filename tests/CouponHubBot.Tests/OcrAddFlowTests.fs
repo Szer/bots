@@ -531,24 +531,25 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             Assert.Equal("2026-02-03", expiresIso)
         }
 
-    [<Fact>]
-    let ``Bad barcode photo rejected, re-upload good photo succeeds, only one coupon in DB`` () =
+    [<Theory>]
+    [<InlineData(660L, "", null)>]
+    [<InlineData(1660L, "2706688198846", null)>]
+    [<InlineData(2660L, "212 596 939", "prefix/307.jpg")>]
+    let ``Unusable scan and missing or checksum-invalid OCR digits prompt photo retry`` (userId: int64, ocrDigits: string, file: string) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
 
-            let user = Tg.user(id = 660L, username = "barcode_retry", firstName = "Retry")
+            let user = Tg.user(id = userId, username = $"barcode_retry_{userId}", firstName = "Retry")
             do! fixture.SetChatMemberStatus(user.Id, "member")
 
             let goodFileName = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
             let goodAzure = readAzureCacheJson goodFileName
             let goodBytes = readImageBytes goodFileName
-            let badAzure = stripBarcodeFromAzureJson goodAzure
+            let badAzure = goodAzure.Replace("2706688198845", ocrDigits)
 
-            // Step 1: Upload bad photo (invalid bytes → barcode not recognized).
-            // Azure OCR response has barcode text stripped so text fallback won't find it either.
-            let badFileId = "bad-barcode-photo"
-            let badBytes = [| byte 0x00; byte 0x01; byte 0x02; byte 0x03 |]
+            let badFileId = $"bad-barcode-photo-{userId}"
+            let badBytes = if isNull file then [| 0uy; 1uy; 2uy; 3uy |] else readImageBytes file
             do! fixture.SetTelegramFile(badFileId, badBytes)
             do! fixture.SetAzureOcrResponse(200, badAzure)
 
@@ -560,12 +561,14 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             Assert.True(findCallWithText calls1 user.Id "лучшем качестве",
                 "Expected re-upload suggestion")
 
+            Assert.Equal(not (isNull file), findCallWithText calls1 user.Id "22 или 27")
+
             let! count1 = getCouponCount ()
             Assert.Equal(0L, count1)
 
             // Step 2: Upload good photo (valid barcode).
             do! fixture.ClearFakeCalls()
-            let goodFileId = "good-barcode-photo"
+            let goodFileId = $"good-barcode-photo-{userId}"
             do! fixture.SetTelegramFile(goodFileId, goodBytes)
             do! fixture.SetAzureOcrResponse(200, goodAzure)
 

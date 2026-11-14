@@ -20,9 +20,6 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             do! resetOcrFakes fixture
         }
 
-    /// Sends an album where one photo deliberately yields no barcode (by stripping
-    /// the 13-digit barcode line from Azure's response and using an image whose
-    /// ZXing barcode scan also fails).
     [<Fact>]
     let ``1 of 3 photos has no barcode: bulk-confirm shows N-1, one per-photo reply targets the failed photo`` () =
         task {
@@ -33,15 +30,12 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
 
             let mgid = $"mg-skip1-{DateTime.UtcNow.Ticks}"
 
-            // Two good photos + one image with NO barcode (we use an empty-byte
-            // image; ZXing will fail and Azure response is stripped).
             let goodA = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
             let goodB = "10_50_2026-01-17_2026-01-26_2706688198838.jpg"
 
             do! fixture.SetTelegramFile("skip-good-1", readImageBytes goodA)
             do! fixture.SetTelegramFile("skip-good-2", readImageBytes goodB)
-            // Empty bytes → ZXing fails to decode any barcode.
-            do! fixture.SetTelegramFile("skip-bad-1", [| 0uy; 1uy; 2uy; 3uy |])
+            do! fixture.SetTelegramFile("skip-bad-1", readImageBytes "prefix/307.jpg")
 
             // Azure response strips the barcode line → text fallback also fails.
             let strippedAzure = stripBarcodeFromAzureJson (readAzureCacheJson goodA)
@@ -83,6 +77,7 @@ type BatchSkipAndWarnTests(fixture: OcrCouponHubTestContainers) =
             Assert.Equal(1, replies.Length)
             let replyToMid = getReplyToMessageId replies[0].Body
             Assert.Equal(Some mid2, replyToMid)
+            Assert.True(findCallWithText replies user.Id "22 или 27")
         }
 
     [<Fact>]

@@ -71,6 +71,8 @@ type CouponFlowHandler(
     let nudgedAlbumToday     = ConcurrentDictionary<int64, DateOnly>()
     let lastSinglePhotoAt    = ConcurrentDictionary<int64, DateTimeOffset>()
 
+    let prefixHint = "Штрихкод купона Dunnes обычно начинается с 22 или 27. Проверь, что на фото видны цифры под штрихкодом купона."
+
     let addCmdNudgeLine =
         "\n\n_(подсказка: можно просто прислать фото без команды /add)_"
     let albumNudgeLine =
@@ -312,7 +314,6 @@ type CouponFlowHandler(
                             KeyValuePair("outcome", box (ocrReadOutcome recognizedCount 4)))
 
                         if isNull barcodeText then
-                            // Barcode not recognized — photo quality is insufficient.
                             do! db.UpsertPendingAddFlow(
                                     { user_id = user.id
                                       stage = "awaiting_photo"
@@ -324,7 +325,8 @@ type CouponFlowHandler(
                                       valid_from = Nullable()
                                       updated_at = time.GetUtcNow().UtcDateTime }
                                 )
-                            do! sendText chatId "Не удалось распознать штрихкод на фото. Пожалуйста, пришли фото в лучшем качестве или скадрируй картинку ближе к штрихкоду, дате и сумме."
+                            let retry = "Не удалось распознать штрихкод на фото. Пожалуйста, пришли фото в лучшем качестве или скадрируй картинку ближе к штрихкоду, дате и сумме."
+                            do! sendText chatId (if ocr.unexpectedScanPrefix then retry + "\n" + prefixHint else retry)
                         else
 
                         // Persist whatever we managed to recognize, and continue the wizard from the first missing step.
@@ -589,7 +591,8 @@ type CouponFlowHandler(
                                 let note =
                                     // A backend failure (Azure down/timed out, already retried) is distinct
                                     // from a readable photo missing a barcode — report it as such.
-                                    if ocr.backendFailed then "OCR failed"
+                                    if ocr.unexpectedScanPrefix && isNull ocr.barcode then "unexpected barcode prefix"
+                                    elif ocr.backendFailed then "OCR failed"
                                     elif String.IsNullOrWhiteSpace ocr.barcode then "no barcode"
                                     else "partial"
                                 let readOutcome =
@@ -629,6 +632,7 @@ type CouponFlowHandler(
     member private _.NeedsInputReplyText (failureNote: string | null) : string =
         match failureNote with
         | null -> "Не смог распознать этот купон. Пришли его отдельно."
+        | "unexpected barcode prefix" -> $"Не удалось распознать штрихкод. {prefixHint} Пришли этот купон отдельно."
         | s when s = "timeout" -> "Этот купон не успел обработаться — пришли его отдельно."
         | s when s = "OCR failed" -> "Не получилось распознать этот купон. Пришли его отдельно."
         | s when s = "partial" -> "Распознал штрихкод, но не разобрал сумму/срок. Пришли этот купон отдельно через /add."

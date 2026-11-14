@@ -102,3 +102,127 @@ module internal BarcodePrintStreak =
         match candidates with
         | [| value |] -> Some value
         | _ -> None
+
+    let private consensusOnNearbyRows (view: LuminanceSource) y reverse (points: ResizeArray<ResultPoint>) pitch =
+        let reader = EAN13Reader()
+        let left, right = int points[0].X, int points[2].X
+        let step = max 1 (int pitch)
+        let pixels = Array.zeroCreate<byte> view.Width
+        let bits = BitArray(view.Width)
+        let mutable candidate = None
+        let mutable votes = 0
+        let mutable conflict = false
+        for offset in -15 .. 15 do
+            let otherY = y + offset * step
+            if offset <> 0 && otherY >= 0 && otherY < view.Height then
+                let scan = view.getRow(otherY, pixels)
+                let pixel x = scan[if reverse then view.Width - 1 - x else x]
+                let region = [| for x in left .. right -> pixel x |]
+                let threshold = (int (Array.min region) + int (Array.max region)) / 2
+                let dark x = int (pixel x) < threshold
+                for x in 1 .. view.Width - 2 do
+                    let a, b, c = dark (x - 1), dark x, dark (x + 1)
+                    bits[x] <- (a && b) || (a && c) || (b && c)
+                let read = reader.decodeRow(otherY, bits, null)
+                if not (isNull read) && abs (read.ResultPoints[0].X - points[0].X) <= 2.0f * pitch
+                   && abs (read.ResultPoints[1].X - points[2].X) <= 2.0f * pitch then
+                    let l, r = int read.ResultPoints[0].X, int read.ResultPoints[1].X
+                    let mutable transitions = 0
+                    for x in l + 1 .. r do
+                        if bits[x] <> bits[x - 1] then transitions <- transitions + 1
+                    // Both guard midpoints lie in their central spaces on a clean, uniformly spaced row.
+                    if transitions = 56 then
+                        match candidate with
+                        | None ->
+                            candidate <- Some read.Text
+                            votes <- 1
+                        | Some text when text = read.Text -> votes <- votes + 1
+                        | _ -> conflict <- true
+        if votes >= 4 && not conflict then candidate else None
+
+    let private middleGuardEdges (row: BitArray) (points: ResizeArray<ResultPoint>) pitch =
+        let start = max 1 (int (points[0].X - 4.0f * pitch))
+        let dataEnd = int points[1].X
+        let edges = [| for x in start .. dataEnd do if row[x] <> row[x - 1] then yield x |]
+        // Data ends 56 runs after the start guard unless the middle-guard search skipped runs.
+        let alignment =
+            [2; 4] |> List.tryPick (fun extra ->
+                let first = edges.Length - 57 - extra
+                if first >= 0 && edges[edges.Length - 1] = dataEnd && row[edges[first]]
+                   && float32 (edges[first] + edges[first + 3]) / 2.0f = points[0].X then Some (first, extra)
+                else None)
+        edges, alignment
+
+    let private tryRepairMiddle view y reverse (row: BitArray) (points: ResizeArray<ResultPoint>) =
+        let pitch = (points[2].X - points[0].X) / 92.0f
+        let edges, alignment = middleGuardEdges row points pitch
+        let reader = EAN13Reader()
+        let candidates = seq {
+            for first, extra in Option.toList alignment do
+                let narrow = [| for i in first + 3 .. first + 26 + extra do
+                                    if float32 (edges[i + 1] - edges[i]) <= 0.5f * pitch then yield i |]
+                let edits = seq {
+                    for i in narrow do
+                        if extra = 2 then yield [i]
+                        else
+                            for j in narrow do
+                                if j > i + 1 then yield [i; j] }
+                for runs in edits do
+                    let repaired = row.Clone() :?> BitArray
+                    for i in runs do
+                        for x in edges[i] .. edges[i + 1] - 1 do repaired.flip(x)
+                    let read = reader.decodeRow(y, repaired, null)
+                    if not (isNull read) && read.ResultPoints[0].X = points[0].X
+                       && read.ResultPoints[1].X = points[2].X then yield read.Text }
+        match candidates |> Seq.distinct |> Seq.truncate 2 |> Seq.toList with
+        | [text] -> consensusOnNearbyRows view y reverse points pitch |> Option.filter ((=) text)
+        | _ -> None
+
+    let tryDecodeSkippedRuns (img: LuminanceSource) (result: Result) =
+        let first, last = result.ResultPoints[0], result.ResultPoints[1]
+        let vertical = first.X = last.X && first.Y <> last.Y
+        let view = if vertical then img.rotateCounterClockwise() else img
+        let y, firstX, lastX =
+            if vertical then img.Width - 1 - int first.X, first.Y, last.Y
+            else int first.Y, first.X, last.X
+        let row = BarcodeBinarizer(view).getBlackRow(y, null)
+        let reverse = firstX > lastX
+        if reverse then row.reverse()
+        let points = ResizeArray<ResultPoint>()
+        let hints = Dictionary<DecodeHintType, obj>()
+        hints.Add(DecodeHintType.NEED_RESULT_POINT_CALLBACK, ResultPointCallback(points.Add))
+        let replay = EAN13Reader().decodeRow(y, row, hints)
+        let xOf x = if reverse then float32 (row.Size - 1) - x else x
+        if isNull replay || replay.Text <> result.Text || points.Count <> 3
+           || points[0].X <> xOf firstX || points[2].X <> xOf lastX then None
+        else
+            // ZXing reports the end of the digits and the midpoint of the end guard separately.
+            let dataEnd = int points[1].X
+            let afterPair x = row.getNextSet(row.getNextUnset(x))
+            let guardStart = afterPair dataEnd
+            let guardEnd = row.getNextUnset(afterPair guardStart)
+            let immediateEnd = row.getNextUnset(afterPair dataEnd)
+            if float32 (dataEnd + immediateEnd) / 2.0f = points[2].X then
+                tryRepairMiddle view y reverse row points
+            elif dataEnd >= row.Size || not row[dataEnd] || guardEnd >= row.Size
+               || float32 (guardStart + guardEnd) / 2.0f <> points[2].X then None
+            else
+                let confirmedOnRow text =
+                    let reader = EAN13Reader()
+                    let mutable gap = row.getNextUnset(int points[0].X)
+                    let mutable confirmed = false
+                    while not confirmed && gap < dataEnd do
+                        let stop = row.getNextSet(gap)
+                        let filled = row.Clone() :?> BitArray
+                        filled.setRange(gap, stop)
+                        let recovered = reader.decodeRow(y, filled, null)
+                        confirmed <-
+                            not (isNull recovered) && recovered.Text = text
+                            && recovered.ResultPoints[0].X = points[0].X
+                            && recovered.ResultPoints[1].X = points[2].X
+                        gap <- row.getNextUnset(stop)
+                    confirmed
+                let pitch = (points[2].X - points[0].X) / 92.0f
+                match middleGuardEdges row points pitch with
+                | _, Some _ -> consensusOnNearbyRows view y reverse points pitch
+                | _, None -> tryDecode view |> Option.filter confirmedOnRow

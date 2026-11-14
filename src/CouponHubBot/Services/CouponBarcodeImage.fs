@@ -37,9 +37,7 @@ module CouponBarcodeImage =
         | None -> $"Valid until {finish}"
 
     let tryRender (barcode: string | null) (value: decimal) (minimum: decimal) (validFrom: DateOnly option) (expiresAt: DateOnly) =
-        if isNull barcode || barcode.Length <> 13
-           || not (barcode |> Seq.forall (fun c -> c >= '0' && c <= '9'))
-           || (barcode |> Seq.mapi (fun i c -> (int c - int '0') * (if i % 2 = 0 then 1 else 3)) |> Seq.sum) % 10 <> 0 then
+        if isNull barcode || not (CouponBarcodeReader.isValidEan13 barcode) then
             None
         else
             let modules = EAN13Writer().encode barcode
