@@ -103,6 +103,68 @@ module internal BarcodePrintStreak =
         | [| value |] -> Some value
         | _ -> None
 
+    let private corroboratesMiddle (view: LuminanceSource) y reverse (points: ResizeArray<ResultPoint>) pitch candidate =
+        let reader = EAN13Reader()
+        let left, right = int points[0].X, int points[2].X
+        let step = max 1 (int pitch)
+        let pixels = Array.zeroCreate<byte> view.Width
+        let bits = BitArray(view.Width)
+        let mutable votes = 0
+        let mutable conflict = false
+        for offset in -15 .. 15 do
+            let otherY = y + offset * step
+            if offset <> 0 && otherY >= 0 && otherY < view.Height then
+                let scan = view.getRow(otherY, pixels)
+                let pixel x = scan[if reverse then view.Width - 1 - x else x]
+                let region = [| for x in left .. right -> pixel x |]
+                let threshold = (int (Array.min region) + int (Array.max region)) / 2
+                let dark x = int (pixel x) < threshold
+                for x in 1 .. view.Width - 2 do
+                    let a, b, c = dark (x - 1), dark x, dark (x + 1)
+                    bits[x] <- (a && b) || (a && c) || (b && c)
+                let read = reader.decodeRow(otherY, bits, null)
+                if not (isNull read) && abs (read.ResultPoints[0].X - points[0].X) <= 2.0f * pitch
+                   && abs (read.ResultPoints[1].X - points[2].X) <= 2.0f * pitch then
+                    let l, r = int read.ResultPoints[0].X, int read.ResultPoints[1].X
+                    let mutable transitions = 0
+                    for x in l + 1 .. r do
+                        if bits[x] <> bits[x - 1] then transitions <- transitions + 1
+                    // Both guard midpoints lie in their central spaces on a clean, uniformly spaced row.
+                    if transitions = 56 then
+                        if read.Text = candidate then votes <- votes + 1 else conflict <- true
+        votes >= 4 && not conflict
+
+    let private tryRepairMiddle view y reverse (row: BitArray) (points: ResizeArray<ResultPoint>) =
+        let pitch = (points[2].X - points[0].X) / 92.0f
+        let start = max 1 (int (points[0].X - 4.0f * pitch))
+        let dataEnd = int points[1].X
+        let edges = [| for x in start .. dataEnd do if row[x] <> row[x - 1] then yield x |]
+        // Data ends 56 runs after the start guard unless the middle-guard search skipped runs.
+        let reader = EAN13Reader()
+        let candidates = seq {
+            for extra in [2; 4] do
+                let first = edges.Length - 57 - extra
+                if first >= 0 && edges[edges.Length - 1] = dataEnd && row[edges[first]]
+                   && float32 (edges[first] + edges[first + 3]) / 2.0f = points[0].X then
+                    let narrow = [| for i in first + 3 .. first + 26 + extra do
+                                        if float32 (edges[i + 1] - edges[i]) <= 0.5f * pitch then yield i |]
+                    let edits = seq {
+                        for i in narrow do
+                            if extra = 2 then yield [i]
+                            else
+                                for j in narrow do
+                                    if j > i + 1 then yield [i; j] }
+                    for runs in edits do
+                        let repaired = row.Clone() :?> BitArray
+                        for i in runs do
+                            for x in edges[i] .. edges[i + 1] - 1 do repaired.flip(x)
+                        let read = reader.decodeRow(y, repaired, null)
+                        if not (isNull read) && read.ResultPoints[0].X = points[0].X
+                           && read.ResultPoints[1].X = points[2].X then yield read.Text }
+        match candidates |> Seq.distinct |> Seq.truncate 2 |> Seq.toList with
+        | [text] when corroboratesMiddle view y reverse points pitch text -> Some text
+        | _ -> None
+
     let tryDecodeSkippedRuns (img: LuminanceSource) (result: Result) =
         let first, last = result.ResultPoints[0], result.ResultPoints[1]
         let vertical = first.X = last.X && first.Y <> last.Y
@@ -126,7 +188,10 @@ module internal BarcodePrintStreak =
             let afterPair x = row.getNextSet(row.getNextUnset(x))
             let guardStart = afterPair dataEnd
             let guardEnd = row.getNextUnset(afterPair guardStart)
-            if dataEnd >= row.Size || not row[dataEnd] || guardEnd >= row.Size
+            let immediateEnd = row.getNextUnset(afterPair dataEnd)
+            if float32 (dataEnd + immediateEnd) / 2.0f = points[2].X then
+                tryRepairMiddle view y reverse row points
+            elif dataEnd >= row.Size || not row[dataEnd] || guardEnd >= row.Size
                || float32 (guardStart + guardEnd) / 2.0f <> points[2].X then None
             else
                 let confirmedOnRow text =

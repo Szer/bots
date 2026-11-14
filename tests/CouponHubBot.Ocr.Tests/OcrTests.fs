@@ -233,6 +233,23 @@ type OcrTests(output: ITestOutputHelper) =
         }
 
     [<Theory>]
+    [<InlineData(65, "2962392598399")>]
+    [<InlineData(2, "4997781598399")>]
+    member _.``Middle guard repair requires corroborating scan rows``(halfHeight: int, expected: string) =
+        task {
+            let modules = ZXing.OneD.EAN13Writer().encode "2962392598399"
+            use image = new Image<L8>(500, 220, L8(230uy))
+            for y in 110 - halfHeight .. 110 + halfHeight do
+                for x in 40 .. 419 do
+                    let dark = modules[(x - 40) / 4] <> (x = 82 || x = 213)
+                    image[x, y] <- L8(if dark then 25uy else 230uy)
+            use stream = new MemoryStream()
+            image.SaveAsJpeg(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal(expected, result.barcode)
+        }
+
+    [<Theory>]
     [<InlineData(24, true, true)>]
     [<InlineData(52, true, true)>]
     [<InlineData(24, true, false)>]
