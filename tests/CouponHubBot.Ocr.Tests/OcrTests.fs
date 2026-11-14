@@ -225,6 +225,46 @@ type OcrTests(output: ITestOutputHelper) =
         engine, http, logs
 
     [<Theory>]
+    [<InlineData(24, true, true)>]
+    [<InlineData(52, true, true)>]
+    [<InlineData(24, true, false)>]
+    [<InlineData(24, false, true)>]
+    member _.``Print streak repair requires a checksum error and corroborating print`` (firstModule: int, splitPrint: bool, checksumError: bool) =
+        task {
+            let value = "2000000000015"
+            let modules = ZXing.OneD.EAN13Writer().encode value
+            let other = ZXing.OneD.EAN13Writer().encode "2000000000022"
+            let pitch = 8
+            let left = 100
+            let bar =
+                [firstModule .. modules.Length - 3]
+                |> List.find (fun i -> not modules[i - 1] && modules[i] && modules[i + 1])
+            let streak = left + bar * pitch + 2
+            use image = new Image<L8>(960, 540, L8(255uy))
+            for y in 230 .. 330 do
+                for x in left .. left + pitch * modules.Length - 1 do
+                    let i = (x - left) / pitch
+                    // A narrow band encodes the payload with a mismatching check digit.
+                    let ink =
+                        if checksumError && y < 245 then
+                            if i >= 85 then other[i] else modules[i]
+                        else modules[i] && (x < streak || x >= streak + pitch)
+                    if ink then
+                        image[x, y] <- L8(0uy)
+            for top in [80; 130; 410] do
+                for y in top .. top + 5 do
+                    for x in streak - 24 .. streak + 24 do
+                        if not splitPrint || x < streak || x >= streak + pitch then
+                            image[x, y] <- L8(0uy)
+            use stream = new MemoryStream()
+            image.SaveAsPng(stream)
+            let! result = (buildCpuOnlyEngine ()).Recognize(ReadOnlyMemory<byte>(stream.ToArray()))
+            Assert.Equal(checksumError, CouponBarcodeReader.hasChecksumError(ReadOnlyMemory<byte>(stream.ToArray())))
+            if splitPrint && checksumError then Assert.Equal(value, result.barcode)
+            else Assert.Null result.barcode
+        }
+
+    [<Theory>]
     [<InlineData("5_25_2026-01-11_2026-01-17_2706653336241.jpg")>]
     [<InlineData("5_25_2026-01-20_2026-01-26_2706680353051.jpg")>]
     [<InlineData("5_25_2026-02-08_2026-02-14_2706726228947.jpg")>]
