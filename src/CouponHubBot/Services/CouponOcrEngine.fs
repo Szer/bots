@@ -509,7 +509,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                     return analysis, failed
                 }
 
-            let barcode, managed = tryDecodeBarcode imageBytes
+            let scanned, managed = tryDecodeBarcode imageBytes
             let! ocrAnalysis, backendFailed = ocrTask
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
             use parse = botActivity.StartActivity("couponOcr.parse")
@@ -520,26 +520,39 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 else
                     parseFromText nowUtc ocrText
 
+            let knownPrefix (digits: string) =
+                digits.StartsWith("27", StringComparison.Ordinal) || digits.StartsWith("22", StringComparison.Ordinal)
+
+            let unexpectedScanPrefix = not (String.IsNullOrEmpty scanned) && not (knownPrefix scanned)
+            let scan =
+                if unexpectedScanPrefix then
+                    logger.LogWarning("Unexpected ZXing coupon barcode prefix {BarcodePrefix}; checking printed digits", scanned.Substring(0, 2))
+                    noneBarcode
+                else scanned
+
             let printed =
-                if String.IsNullOrWhiteSpace ocrText then None
+                if (not managed && not (isNull scan)) || String.IsNullOrWhiteSpace ocrText then None
                 else
-                    let digits = Regex.Match(ocrText, @"\b(\d{13})\b")
-                    if digits.Success && CouponBarcodeReader.isValidEan13 digits.Value then Some digits.Value else None
+                    Regex.Matches(ocrText, @"\b([0-9]{13})\b")
+                    |> Seq.map (fun digits -> digits.Value)
+                    |> Seq.tryFind CouponBarcodeReader.isValidEan13
 
             let barcode =
                 match printed with
-                | Some text when String.IsNullOrWhiteSpace barcode ->
+                | Some text when isNull scan ->
+                    if not unexpectedScanPrefix && not (knownPrefix text) then
+                        logger.LogWarning("Unexpected OCR coupon barcode prefix {BarcodePrefix}", text.Substring(0, 2))
                     logger.LogDebug("Barcode found via OCR text fallback: {text}", text)
                     text
-                | Some text when managed && text <> barcode ->
+                | Some text when managed && text <> scan ->
                     let source = lazy (
                         use stream = new MemoryStream(imageBytes.ToArray())
                         use image = Image.Load<Rgba32>(stream)
                         BarcodeLuminanceSource(ImageSharpLuminanceSource<Rgba32>(image)) :> LuminanceSource)
                     match tryRepairPrintStreak imageBytes source with
                     | Some repaired when repaired = text -> repaired
-                    | _ -> barcode
-                | _ -> barcode
+                    | _ -> scan
+                | _ -> scan
 
             return
                 { couponValue = couponValue
@@ -547,5 +560,6 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                   validFrom = validFrom
                   validTo = validTo
                   barcode = barcode
+                  unexpectedScanPrefix = unexpectedScanPrefix
                   backendFailed = backendFailed }
         }

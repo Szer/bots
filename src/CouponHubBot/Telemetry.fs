@@ -33,7 +33,7 @@ module Metrics =
     let batchCreatedTotal = meter.CreateCounter<int64>("couponhubbot_batch_created_total")
 
     /// 1 per batch item after OCR reaches a terminal state.
-    /// Tags: outcome ∈ {ok, needs_input}, failure_note ∈ {no barcode, partial,
+    /// Tags: outcome ∈ {ok, needs_input}, failure_note ∈ {no barcode, unexpected barcode prefix, partial,
     /// timeout, OCR failed, OCR disabled} (empty for outcome=ok).
     let batchItemOutcomeTotal = meter.CreateCounter<int64>("couponhubbot_batch_item_outcome_total")
 

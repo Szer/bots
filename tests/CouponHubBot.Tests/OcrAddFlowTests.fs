@@ -532,9 +532,10 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
         }
 
     [<Theory>]
-    [<InlineData(660L, "")>]
-    [<InlineData(1660L, "2706688198846")>]
-    let ``Unreadable scan and missing or checksum-invalid OCR digits prompt photo retry`` (userId: int64, ocrDigits: string) =
+    [<InlineData(660L, "", null)>]
+    [<InlineData(1660L, "2706688198846", null)>]
+    [<InlineData(2660L, "212 596 939", "prefix/307.jpg")>]
+    let ``Unusable scan and missing or checksum-invalid OCR digits prompt photo retry`` (userId: int64, ocrDigits: string, file: string) =
         task {
             do! fixture.ClearFakeCalls()
             do! fixture.TruncateCoupons()
@@ -548,7 +549,7 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             let badAzure = goodAzure.Replace("2706688198845", ocrDigits)
 
             let badFileId = $"bad-barcode-photo-{userId}"
-            let badBytes = [| byte 0x00; byte 0x01; byte 0x02; byte 0x03 |]
+            let badBytes = if isNull file then [| 0uy; 1uy; 2uy; 3uy |] else readImageBytes file
             do! fixture.SetTelegramFile(badFileId, badBytes)
             do! fixture.SetAzureOcrResponse(200, badAzure)
 
@@ -559,6 +560,8 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
                 "Expected barcode rejection message")
             Assert.True(findCallWithText calls1 user.Id "лучшем качестве",
                 "Expected re-upload suggestion")
+
+            Assert.Equal(not (isNull file), findCallWithText calls1 user.Id "22 или 27")
 
             let! count1 = getCouponCount ()
             Assert.Equal(0L, count1)

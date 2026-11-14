@@ -235,15 +235,32 @@ type OcrTests(output: ITestOutputHelper) =
         }
 
     [<Theory>]
-    [<InlineData(65, "2962392598399")>]
-    [<InlineData(2, "4997781598399")>]
+    [<InlineData("1946.jpg", "2707334739757", "2707334739757")>]
+    [<InlineData("1946.jpg", "2707334739758 2707334739757", "2707334739757")>]
+    [<InlineData("307.jpg", "212 596 939", null)>]
+    [<InlineData("307.jpg", "2707334739758", null)>]
+    [<InlineData("307.jpg", "1234567890128", "1234567890128")>]
+    member _.``Unexpected scan prefix uses checksum-valid printed digits``(file: string, text: string, expected: string) =
+        task {
+            let path = Path.Combine(AppContext.BaseDirectory, "Images", "prefix", file)
+            let ocr =
+                { new IBotOcr with
+                    member _.AnalyzeImageBytes _ = task { return { RawJson = "{}"; Text = text } } }
+            let engine = CouponOcrEngine(ocr, Microsoft.Extensions.Logging.Abstractions.NullLogger<CouponOcrEngine>.Instance, TimeProvider.System)
+            let! result = engine.Recognize(ReadOnlyMemory<byte>(File.ReadAllBytes(path)))
+            Assert.Equal(expected, result.barcode)
+        }
+
+    [<Theory>]
+    [<InlineData(65, "2796239259835")>]
+    [<InlineData(2, "2796260259835")>]
     member _.``Middle guard repair requires corroborating scan rows``(halfHeight: int, expected: string) =
         task {
-            let modules = ZXing.OneD.EAN13Writer().encode "2962392598399"
+            let modules = ZXing.OneD.EAN13Writer().encode "2796239259835"
             use image = new Image<L8>(500, 220, L8(230uy))
             for y in 110 - halfHeight .. 110 + halfHeight do
                 for x in 40 .. 419 do
-                    let dark = modules[(x - 40) / 4] <> (x = 82 || x = 213)
+                    let dark = modules[(x - 40) / 4] <> (x = 170 || x = 185)
                     image[x, y] <- L8(if dark then 25uy else 230uy)
             use stream = new MemoryStream()
             image.SaveAsJpeg(stream)
@@ -258,9 +275,9 @@ type OcrTests(output: ITestOutputHelper) =
     [<InlineData(24, false, true)>]
     member _.``Print streak repair requires a checksum error and corroborating print`` (firstModule: int, splitPrint: bool, checksumError: bool) =
         task {
-            let value = "2000000000015"
+            let value = "2700000000014"
             let modules = ZXing.OneD.EAN13Writer().encode value
-            let other = ZXing.OneD.EAN13Writer().encode "2000000000022"
+            let other = ZXing.OneD.EAN13Writer().encode "2700000000021"
             let pitch = 8
             let left = 100
             let bar =
