@@ -13,6 +13,8 @@
 
 After ordinary scans miss, an explicit EAN-13 checksum error from ZXing enables print-streak repair. The repair reconnects a split bar when multiple rows agree on one EAN-13 and two separate areas of surrounding print show the same gap. If the evidence is insufficient, the managed decoder retries at other image sizes.
 
+A checksum-valid managed scan also triggers repair if its accepted row skips one black–white pair before the end guard. The repaired number must decode on that same row after filling one gap, with both guard positions preserved.
+
 When a managed scan disagrees with the printed digits, the same checksum-gated repair can confirm the printed value. The bot keeps the scan value if repair cannot confirm the digits.
 
 Native library load or decode failures fall back to the managed decoder. The Linux native binaries require glibc 2.38 and libstdc++ with GLIBCXX_3.4.31; the Noble runtime image provides both.

@@ -288,7 +288,12 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                     None
                 else
                     logger.LogDebug("Barcode decoded by ZXing ({label}): {text}", label, res.Text)
-                    Some res.Text
+                    let repaired =
+                        try BarcodePrintStreak.tryDecodeSkippedRuns img res
+                        with ex ->
+                            logger.LogDebug(ex, "Could not verify the end guard on a managed scan")
+                            None
+                    Some (Option.defaultValue res.Text repaired)
 
             let clamp (v: int) (minv: int) (maxv: int) = max minv (min maxv v)
 

@@ -102,3 +102,46 @@ module internal BarcodePrintStreak =
         match candidates with
         | [| value |] -> Some value
         | _ -> None
+
+    let tryDecodeSkippedRuns (img: LuminanceSource) (result: Result) =
+        let first, last = result.ResultPoints[0], result.ResultPoints[1]
+        let vertical = first.X = last.X && first.Y <> last.Y
+        let view = if vertical then img.rotateCounterClockwise() else img
+        let y, firstX, lastX =
+            if vertical then img.Width - 1 - int first.X, first.Y, last.Y
+            else int first.Y, first.X, last.X
+        let row = BarcodeBinarizer(view).getBlackRow(y, null)
+        let reverse = firstX > lastX
+        if reverse then row.reverse()
+        let points = ResizeArray<ResultPoint>()
+        let hints = Dictionary<DecodeHintType, obj>()
+        hints.Add(DecodeHintType.NEED_RESULT_POINT_CALLBACK, ResultPointCallback(points.Add))
+        let replay = EAN13Reader().decodeRow(y, row, hints)
+        let xOf x = if reverse then float32 (row.Size - 1) - x else x
+        if isNull replay || replay.Text <> result.Text || points.Count <> 3
+           || points[0].X <> xOf firstX || points[2].X <> xOf lastX then None
+        else
+            // ZXing reports the end of the digits and the midpoint of the end guard separately.
+            let dataEnd = int points[1].X
+            let afterPair x = row.getNextSet(row.getNextUnset(x))
+            let guardStart = afterPair dataEnd
+            let guardEnd = row.getNextUnset(afterPair guardStart)
+            if dataEnd >= row.Size || not row[dataEnd] || guardEnd >= row.Size
+               || float32 (guardStart + guardEnd) / 2.0f <> points[2].X then None
+            else
+                let confirmedOnRow text =
+                    let reader = EAN13Reader()
+                    let mutable gap = row.getNextUnset(int points[0].X)
+                    let mutable confirmed = false
+                    while not confirmed && gap < dataEnd do
+                        let stop = row.getNextSet(gap)
+                        let filled = row.Clone() :?> BitArray
+                        filled.setRange(gap, stop)
+                        let recovered = reader.decodeRow(y, filled, null)
+                        confirmed <-
+                            not (isNull recovered) && recovered.Text = text
+                            && recovered.ResultPoints[0].X = points[0].X
+                            && recovered.ResultPoints[1].X = points[2].X
+                        gap <- row.getNextUnset(stop)
+                    confirmed
+                tryDecode view |> Option.filter confirmedOnRow
