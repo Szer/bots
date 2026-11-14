@@ -13,6 +13,7 @@
     <Compile Include="Services/CouponBarcodeImage.fs" />
     <Compile Include="Services/BarcodeLuminanceSource.fs" />
     <Compile Include="Services/BarcodeBinarizer.fs" />
+    <Compile Include="Services/BarcodePrintStreak.fs" />
     <Compile Include="Services/CouponOcrEngine.fs" />
     <Compile Include="Services/GitHubService.fs" />
     <Compile Include="Services/ReminderService.fs" />

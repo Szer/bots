@@ -236,6 +236,18 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
             logger.LogWarning(ex, "Native barcode decode failed; trying managed decoder")
             None
 
+    let tryRepairPrintStreak (imageBytes: ReadOnlyMemory<byte>) (source: Lazy<LuminanceSource>) =
+        try
+            if CouponBarcodeReader.hasChecksumError imageBytes then
+                use repair = botActivity.StartActivity("couponOcr.barcode.printStreak")
+                let value = BarcodePrintStreak.tryDecode source.Value
+                if not (isNull repair) then %repair.SetTag("barcode.found", value.IsSome)
+                value
+            else None
+        with ex ->
+            logger.LogDebug(ex, "Barcode checksum diagnostic or print-streak scan failed")
+            None
+
     let tryDecodeManaged (imageBytes: ReadOnlyMemory<byte>) =
         use activity = botActivity.StartActivity("couponOcr.barcode.managed")
         let mutable attempts = 0
@@ -288,19 +300,18 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 let cropped = img.crop(x, y, w, h)
                 decode decoder baseLabel cropped
 
-            let tryOnImage (labelPrefix: string) (img: Image<Rgba32>) =
+            let tryOnImage (labelPrefix: string) (luminance: BarcodeLuminanceSource) =
                 // Strategy:
                 // - Full image (fast path)
                 // - Top crops (barcodes are often in the upper half on receipt photos)
                 // - Middle band crops (covers centre region)
                 // - Bottom crops (useful for app screenshots)
                 // - Center-narrowed variants of the above (avoid noise on sides)
-                let luminance = BarcodeLuminanceSource(ImageSharpLuminanceSource<Rgba32>(img))
                 match decode reader (labelPrefix + ":full") luminance with
                 | Some t -> Some t
                 | None ->
-                    let w = img.Width
-                    let h = img.Height
+                    let w = luminance.Width
+                    let h = luminance.Height
 
                     // Top crops: from y=0, covering the upper portion
                     let topCrops =
@@ -363,8 +374,11 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                         // Break completes lower indices so crop priority is independent of scheduling.
                         results |> Array.tryPick id
 
+            let luminance (img: Image<Rgba32>) = BarcodeLuminanceSource(ImageSharpLuminanceSource<Rgba32>(img))
+            let source = luminance original
+
             let tryAll () =
-                match tryOnImage "orig" original with
+                match tryOnImage "orig" source with
                 | Some t -> Some t
                 | None ->
                     // Preprocess: grayscale + contrast helps with noisy receipt photos
@@ -375,7 +389,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                             ctx.Grayscale() |> ignore
                             ctx.Contrast(1.5f) |> ignore)
 
-                    match tryOnImage "gray" preprocessed with
+                    match tryOnImage "gray" (luminance preprocessed) with
                     | Some t -> Some t
                     | None ->
                         // Resize to a different width and retry. ZXing often behaves better
@@ -393,15 +407,16 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                                         %resize.SetTag("image.width", targetWidth)
                                         %resize.SetTag("image.height", targetHeight)
                                     source.Clone(fun ctx -> ctx.Resize(targetWidth, targetHeight) |> ignore)
-                                tryOnImage $"{label}{targetWidth}" resized
+                                tryOnImage $"{label}{targetWidth}" (luminance resized)
 
-                        let resizeTargets = [| 1000; 800; 1400 |]
-
-                        resizeTargets
-                        |> Array.tryPick (fun tw ->
-                            match tryResize "w" original tw with
-                            | Some t -> Some t
-                            | None -> tryResize "gw" preprocessed tw)
+                        match tryRepairPrintStreak imageBytes (lazy (source :> LuminanceSource)) with
+                        | Some text -> Some text
+                        | None ->
+                            [| 1000; 800; 1400 |]
+                            |> Array.tryPick (fun tw ->
+                                match tryResize "w" original tw with
+                                | Some t -> Some t
+                                | None -> tryResize "gw" preprocessed tw)
 
             let result = tryAll ()
             if not (isNull activity) then
@@ -420,13 +435,13 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
 
     let tryDecodeBarcode (imageBytes: ReadOnlyMemory<byte>) =
         use activity = botActivity.StartActivity("couponOcr.barcode")
-        let result =
+        let result, managed =
             match tryDecodeNative imageBytes with
-            | Some text -> text
-            | None -> tryDecodeManaged imageBytes
+            | Some text -> text, false
+            | None -> tryDecodeManaged imageBytes, true
         if not (isNull activity) then
             %activity.SetTag("barcode.found", not (String.IsNullOrWhiteSpace result))
-        result
+        result, managed
 
     let parseFromText (nowUtc: DateTime) (ocrText: string) =
         let amounts = CouponOcrParsing.findEuroAmounts ocrText
@@ -489,7 +504,7 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                     return analysis, failed
                 }
 
-            let barcode = tryDecodeBarcode imageBytes
+            let barcode, managed = tryDecodeBarcode imageBytes
             let! ocrAnalysis, backendFailed = ocrTask
             let ocrText = if isNull ocrAnalysis then null else ocrAnalysis.Text
             use parse = botActivity.StartActivity("couponOcr.parse")
@@ -500,18 +515,26 @@ type CouponOcrEngine(azureTextOcr: IBotOcr, logger: ILogger<CouponOcrEngine>, ti
                 else
                     parseFromText nowUtc ocrText
 
-            let barcode =
-                if not (String.IsNullOrWhiteSpace barcode) then
-                    barcode
-                elif not (String.IsNullOrWhiteSpace ocrText) then
-                    let m = Regex.Match(ocrText, @"\b(\d{13})\b")
-                    if m.Success then
-                        logger.LogDebug("Barcode found via OCR text fallback: {text}", m.Groups.[1].Value)
-                        m.Groups.[1].Value
-                    else
-                        noneBarcode
+            let printed =
+                if String.IsNullOrWhiteSpace ocrText then None
                 else
-                    noneBarcode
+                    let digits = Regex.Match(ocrText, @"\b(\d{13})\b")
+                    if digits.Success then Some digits.Value else None
+
+            let barcode =
+                match printed with
+                | Some text when String.IsNullOrWhiteSpace barcode ->
+                    logger.LogDebug("Barcode found via OCR text fallback: {text}", text)
+                    text
+                | Some text when managed && text <> barcode ->
+                    let source = lazy (
+                        use stream = new MemoryStream(imageBytes.ToArray())
+                        use image = Image.Load<Rgba32>(stream)
+                        BarcodeLuminanceSource(ImageSharpLuminanceSource<Rgba32>(image)) :> LuminanceSource)
+                    match tryRepairPrintStreak imageBytes source with
+                    | Some repaired when repaired = text -> repaired
+                    | _ -> barcode
+                | _ -> barcode
 
             return
                 { couponValue = couponValue

@@ -6,7 +6,7 @@ open SixLabors.ImageSharp
 open SixLabors.ImageSharp.PixelFormats
 
 module CouponBarcodeReader =
-    let tryDecode (imageBytes: ReadOnlyMemory<byte>) =
+    let private scan reportErrors evaluate (imageBytes: ReadOnlyMemory<byte>) =
         // Resolve the library before constructing objects with native finalizers.
         let format = ZXingCpp.BarcodeFormat.Parse("EAN13")
         use ms = new MemoryStream(imageBytes.ToArray())
@@ -20,9 +20,9 @@ module CouponBarcodeReader =
         reader.TryRotate <- true
         reader.TryInvert <- false
         reader.TryDownscale <- true
-        reader.MaxNumberOfSymbols <- 1
-        reader.MinLineCount <- 2
-        reader.ReturnErrors <- false
+        reader.MaxNumberOfSymbols <- if reportErrors then 0 else 1
+        reader.MinLineCount <- if reportErrors then 1 else 2
+        reader.ReturnErrors <- reportErrors
         // ImageView borrows the pixel buffer throughout native decoding.
         use _pin = Memory<byte>(pixels).Pin()
         let decode x y width height =
@@ -34,12 +34,7 @@ module CouponBarcodeReader =
                 try reader.From(view)
                 finally GC.KeepAlive(view)
             try
-                results
-                |> Array.tryPick (fun barcode ->
-                    if barcode.IsValid && not (String.IsNullOrWhiteSpace barcode.Text) then
-                        Some barcode.Text
-                    else
-                        None)
+                results |> Array.tryPick evaluate
             finally
                 for barcode in results do
                     barcode.Dispose()
@@ -59,3 +54,14 @@ module CouponBarcodeReader =
                         let height = max 1 (int (Math.Round(float image.Height * bottom)) - y)
                         decode x y width height))
         result
+
+    let tryDecode imageBytes =
+        scan false (fun barcode ->
+            if barcode.IsValid && not (String.IsNullOrWhiteSpace barcode.Text) then Some barcode.Text
+            else None) imageBytes
+
+    let hasChecksumError imageBytes =
+        scan true (fun barcode ->
+            if barcode.ErrorType = ZXingCpp.ErrorType.Checksum then Some ()
+            else None) imageBytes
+        |> Option.isSome
