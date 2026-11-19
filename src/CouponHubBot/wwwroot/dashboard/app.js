@@ -217,7 +217,7 @@
       const name = element("span", "member-identity");
       name.append(element("span", "mobile-member-name", row.name + (row.id === state.viewerId ? " · ты" : "")));
       if (row.username) name.append(element("span", "member-username", "@" + row.username));
-      name.append(element("span", "member-activity", "Взято " + integer.format(row.takes) + " · добавлено " + integer.format(row.adds)));
+      name.append(element("span", "member-activity", "Взято " + integer.format(row.takes) + " · добавлено " + integer.format(row.adds) + " · возвращено " + integer.format(row.returns)));
       const value = element("span", "member-highlight");
       value.append(metric.kind === "metric" ? metricBadge(row, metric, metricUnit(metric.key)) : element("span", "metric " + countTone(row, metric), format(row[metric.key], metricUnit(metric.key))));
       if (metric.key === "returnPct") value.append(element("span", "cell-note", integer.format(row.returns) + " из " + integer.format(row.takes)));
