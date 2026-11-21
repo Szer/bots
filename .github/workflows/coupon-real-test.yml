@@ -431,6 +431,7 @@ jobs:
           | base64 -d | gunzip > "$HOME/.coupon-test/tg.session"
 
     - name: Run real-Telegram suite
+      id: real_suite
       env:
         # Explicit opt-in required in addition to credentials (RealAssemblyFixture.fs)
         # — this workflow is the one deliberate, workflow_dispatch-only path that is
@@ -455,6 +456,20 @@ jobs:
         dotnet test tests/CouponHubBot.RealTests -c Release
         --logger "trx;LogFileName=real-test-results.trx"
         --logger "console;verbosity=detailed"
+
+    - name: Revoke test group invitations
+      if: always() && steps.real_suite.outcome != 'skipped'
+      env:
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+      run: |
+        set -o pipefail
+        docker run --rm --network host -e PGPASSWORD=admin postgres:17.10 \
+          psql -h 127.0.0.1 -p 15434 -U admin -d coupon_hub_bot -At -F ' ' \
+          -c 'SELECT chat_id, link FROM community_invite WHERE NOT consumed' |
+        while read -r chat link; do
+          curl --silent --fail --data-urlencode "chat_id=$chat" --data-urlencode "invite_link=$link" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/revokeChatInviteLink" > /dev/null || exit 1
+        done
 
     - name: Upload test results
       uses: actions/upload-artifact@v4

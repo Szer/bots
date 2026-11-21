@@ -261,15 +261,6 @@ ON CONFLICT (photo_file_id) DO UPDATE SET raw_response = EXCLUDED.raw_response;
             do! conn.ExecuteAsync(sql, {| photoFileId = photoFileId; rawResponse = rawResponse |}) |> taskIgnore
         }
 
-    member _.ConfirmInvitation(chatId: int64, link: string, applicant: int64) = task {
-        use! conn = openConn()
-        do! conn.ExecuteAsync(
-            """UPDATE "user" u SET invited_by=i.sponsor FROM community_invite i
-               WHERE i.link=@link AND i.chat_id=@chat AND i.applicant=@id AND i.new_user
-                 AND u.id=i.applicant AND u.invited_by IS NULL""",
-            {| chat = chatId; link = link; id = applicant |}) |> taskIgnore
-    }
-
     member _.InvitedBy(id: int64) = task {
         use! conn = openConn()
         let! sponsor = conn.QuerySingleAsync<Nullable<int64>>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = id |})

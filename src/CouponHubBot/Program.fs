@@ -284,7 +284,7 @@ WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx _ra
             do! bot.OnUpdate(update)
         with ex ->
             logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.UpdateId)
-            if update.ChatJoinRequest.IsSome || (update.ChatMember |> Option.exists (fun change -> change.InviteLink.IsSome)) then
+            if update.ChatMember |> Option.exists (fun change -> change.InviteLink.IsSome) then
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw ex
     }) app
 

@@ -6,10 +6,17 @@ open Npgsql
 open Microsoft.Extensions.Options
 open BotInfra
 open CouponHubBot
-open Funogram.Telegram.Types
 open Funogram.Telegram
 
 type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOptions<BotConfiguration>) =
+    let createLink (conn: NpgsqlConnection) (tx: NpgsqlTransaction) (chatId: int64) (sponsor: int64) = task {
+        let! invite = tg.CallExn(Req.CreateChatInviteLink.Make(chatId, memberLimit = 1L))
+        do! conn.ExecuteAsync(
+            "INSERT INTO community_invite(link, chat_id, sponsor) VALUES (@link,@chat,@sponsor)",
+            {| link = invite.InviteLink; chat = chatId; sponsor = sponsor |}, tx) |> taskIgnore
+        return invite.InviteLink
+    }
+
     member _.GetLink(chatId: int64, sponsor: int64) = task {
         use conn = new NpgsqlConnection(connectionString)
         do! conn.OpenAsync()
@@ -17,81 +24,43 @@ type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOpti
         let key = {| sponsor = sponsor; chat = chatId |}
         let! _ = conn.QuerySingleAsync<int64>("""SELECT id FROM "user" WHERE id=@sponsor FOR UPDATE""", key, tx)
         let! existing = conn.QuerySingleOrDefaultAsync<string>(
-            "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND applicant IS NULL", key, tx)
+            "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND NOT consumed", key, tx)
         if not (isNull existing) then return existing
         else
-            let! invite = tg.CallExn(Req.CreateChatInviteLink.Make(chatId, createsJoinRequest = true))
-            do! conn.ExecuteAsync(
-                "INSERT INTO community_invite(link, chat_id, sponsor) VALUES (@link,@chat,@sponsor)",
-                {| link = invite.InviteLink; chat = chatId; sponsor = sponsor |}, tx) |> taskIgnore
+            let! link = createLink conn tx chatId sponsor
             do! tx.CommitAsync()
-            return invite.InviteLink
+            return link
     }
 
-    member private _.Claim(chatId: int64, link: string, applicant: int64, updateId: int64) = task {
-        use conn = new NpgsqlConnection(connectionString)
-        let key = {| chat = chatId; link = link; applicant = applicant; update = updateId |}
-        // Commit the winner before approval so even an ambiguous Telegram timeout cannot admit a second person.
-        return! conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
-            """UPDATE community_invite SET applicant=@applicant, request_update=@update,
-                   new_user=CASE WHEN applicant IS NULL THEN NOT EXISTS
-                       (SELECT 1 FROM "user" WHERE id=@applicant) ELSE new_user END
-               WHERE chat_id=@chat AND link=@link AND sponsor<>@applicant AND NOT retired
-                 AND (applicant IS NULL OR (applicant=@applicant AND request_update=@update))
-               RETURNING sponsor""", key)
-    }
-
-    member private _.Approve(chatId: int64, link: string, owner: int64, request: ChatJoinRequest) = task {
+    member _.Joined(chatId: int64, link: string, applicant: int64, date: DateTime, updateId: int64) = task {
         use conn = new NpgsqlConnection(connectionString)
         do! conn.OpenAsync()
         use! tx = conn.BeginTransactionAsync()
-        let! finished = conn.QuerySingleAsync<bool>(
-            "SELECT finished FROM community_invite WHERE link=@link FOR UPDATE", {| link = link |}, tx)
-        if not finished then
-            let! sponsor = tg.CallExn(Req.GetChatMember.Make(chatId, owner))
-            let eligible = TelegramMembershipService.IsAdmitted sponsor
-            if eligible then
-                let! result =
-                    match request.QueryId with
-                    | Some query -> tg.Call(Req.AnswerChatJoinRequestQuery.Make(query, "approve"))
-                    | None -> tg.Call(Req.ApproveChatJoinRequest.Make(chatId, request.From.Id))
-                let admitted =
-                    match result with
-                    | Ok true -> true
-                    | Error err when err.Description.Contains("USER_ALREADY_PARTICIPANT") -> false
-                    | Error err when err.Description.Contains("HIDE_REQUESTER_MISSING") -> false
-                    | _ -> failwith "Telegram join approval failed"
-                if admitted then
-                    do! conn.ExecuteAsync(
-                        """INSERT INTO "user"(id, username, first_name, last_name, invited_by)
-                           VALUES (@id,@username,@first,@last,@sponsor)
-                           ON CONFLICT (id) DO UPDATE SET invited_by=EXCLUDED.invited_by
-                           WHERE "user".invited_by IS NULL AND (SELECT new_user FROM community_invite WHERE link=@link)""",
-                        {| id = request.From.Id; username = Option.toObj request.From.Username
-                           link = link; first = request.From.FirstName; last = Option.toObj request.From.LastName; sponsor = owner |}, tx) |> taskIgnore
-            do! conn.ExecuteAsync("UPDATE community_invite SET finished=true WHERE link=@link", {| link = link |}, tx) |> taskIgnore
+        let key = {| chat = chatId; link = link; applicant = applicant; date = date.ToUniversalTime(); update = updateId |}
+        let! owner = conn.QuerySingleOrDefaultAsync<Nullable<int64>>(
+            """SELECT u.id FROM community_invite i JOIN "user" u ON u.id=i.sponsor
+               WHERE i.chat_id=@chat AND i.link=@link FOR NO KEY UPDATE OF u""", key, tx)
+        if owner.HasValue then
+            let! recorded = conn.ExecuteAsync(
+                """INSERT INTO community_invite_join(link, applicant, joined_at, update_id) VALUES (@link,@applicant,@date,@update)
+                   ON CONFLICT DO NOTHING""", key, tx)
+            if recorded = 1 then
+                let! _ = conn.QuerySingleAsync<int64>("""SELECT id FROM "user" WHERE id=@applicant FOR NO KEY UPDATE""", key, tx)
+                do! conn.ExecuteAsync(
+                    """UPDATE "user" SET invited_by=(
+                           SELECT i.sponsor FROM community_invite_join j JOIN community_invite i USING (link)
+                           WHERE j.applicant=@applicant AND i.chat_id=@chat
+                           ORDER BY j.joined_at DESC, j.update_id DESC LIMIT 1)
+                       WHERE id=@applicant""", key, tx) |> taskIgnore
+                let! consumed = conn.ExecuteAsync(
+                    "UPDATE community_invite SET consumed=true WHERE link=@link AND NOT consumed", key, tx)
+                if consumed = 1 then
+                    let! revoked = tg.Call(Req.RevokeChatInviteLink.Make(chatId, link))
+                    match revoked with
+                    | Ok _ -> ()
+                    | Error err when err.Description.Contains("INVITE_HASH_EXPIRED") -> ()
+                    | Error _ -> failwith "Telegram invite revocation failed"
+                    if options.Value.ManagedInvitesEnabled then
+                        do! createLink conn tx chatId owner.Value |> taskIgnore
         do! tx.CommitAsync()
-    }
-
-    member this.Handle(updateId: int64, request: ChatJoinRequest) = task {
-        let chatId = request.Chat.Id
-        match request.InviteLink with
-        | Some invite when options.Value.ManagedInvitesEnabled && chatId = options.Value.CommunityChatId ->
-            let! owner = this.Claim(chatId, invite.InviteLink, request.From.Id, updateId)
-            if owner.HasValue then
-                do! this.Approve(chatId, invite.InviteLink, owner.Value, request)
-                let! revoked = tg.Call(Req.RevokeChatInviteLink.Make(request.Chat.Id, invite.InviteLink))
-                match revoked with
-                | Ok _ -> ()
-                | Error err when err.Description.Contains("INVITE_HASH_EXPIRED") -> ()
-                | Error _ -> failwith "Telegram invite revocation failed"
-                let! _ = this.GetLink(request.Chat.Id, owner.Value)
-                use conn = new NpgsqlConnection(connectionString)
-                do! conn.ExecuteAsync("UPDATE community_invite SET retired=true WHERE link=@link",
-                                      {| link = invite.InviteLink |}) |> taskIgnore
-            else
-                match request.QueryId with
-                | Some query -> do! tg.CallExn(Req.AnswerChatJoinRequestQuery.Make(query, "queue")) |> taskIgnore
-                | None -> ()
-        | _ -> ()
     }

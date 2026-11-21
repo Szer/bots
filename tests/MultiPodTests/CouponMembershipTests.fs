@@ -50,7 +50,7 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
         let key = {| sponsor = sponsor.Id |}
         let activeLink () = conn.QuerySingleAsync<string>(
-            "SELECT link FROM community_invite WHERE sponsor=@sponsor AND applicant IS NULL", key)
+            "SELECT link FROM community_invite WHERE sponsor=@sponsor AND NOT consumed", key)
         let send pod update = task {
             use! response = fixture.SendUpdateTo(pod, update)
             Assert.True(response.IsSuccessStatusCode)
@@ -62,90 +62,41 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         let! creates = fixture.GetFakeCalls("createChatInviteLink")
         let create = Assert.Single(creates)
         use parameters = System.Text.Json.JsonDocument.Parse(create.Body)
-        Assert.True(parameters.RootElement.GetProperty("creates_join_request").GetBoolean())
+        Assert.Equal(1, parameters.RootElement.GetProperty("member_limit").GetInt32())
+        Assert.False(parameters.RootElement.TryGetProperty("creates_join_request") |> fst)
         let! replies = fixture.GetFakeCalls("sendMessage")
         Assert.Equal(2, countCallsWithText replies sponsor.Id first)
-        let chat = Tg.chat(id = fixture.CommunityChatId)
-        let invite = ChatInviteLink.Create(first, Tg.user(), true, false, false)
-        let request id =
-            let user = Tg.user(id = id)
-            let join = ChatJoinRequest.Create(chat, user, id, DateTime.UtcNow, inviteLink = invite)
-            Update.Create(updateId = id, chatJoinRequest = join)
-        let one, two = request 969101L, request 969102L
-        do! Task.WhenAll([| send 0 one; send 1 two |]) :> Task
-        do! send 1 one
-        do! send 0 two
-        let! approvals = fixture.GetFakeCalls("approveChatJoinRequest")
-        Assert.Single(approvals) |> ignore
-        let! winner = conn.QuerySingleAsync<int64>("SELECT applicant FROM community_invite WHERE link=@link", {| link = first |})
-        let! invited = conn.QuerySingleAsync<int64>("""SELECT id FROM "user" WHERE invited_by=@sponsor""", key)
-        Assert.Equal(winner, invited)
-        let! second = activeLink()
-        Assert.NotEqual<string>(first, second)
-        do! issue 1
-        let! allCreates = fixture.GetFakeCalls("createChatInviteLink")
-        Assert.Equal(2, allCreates.Length)
         let legacy = Tg.user(id = 969104L)
         do! send 0 (Tg.dmMessage("/start", legacy))
-        let secondInvite = { invite with InviteLink = second }
-        let rejoin = ChatJoinRequest.Create(chat, legacy, legacy.Id, DateTime.UtcNow, inviteLink = secondInvite, queryId = "test-invite-query")
-        do! send 1 (Update.Create(updateId = legacy.Id, chatJoinRequest = rejoin))
-        let! isLegacy = conn.QuerySingleAsync<bool>("""SELECT invited_by IS NULL FROM "user" WHERE id=@id""", {| id = legacy.Id |})
-        Assert.True(isLegacy)
-        let! answers = fixture.GetFakeCalls("answerChatJoinRequestQuery")
-        Assert.Single(answers) |> ignore
-    }
-
-    [<Fact>]
-    let approvalRetryKeepsOriginalApplicant () = task {
-        let sponsor = Tg.user(id = 969200L)
-        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
-        use! issue = fixture.SendUpdateTo(0, Tg.dmMessage("/invite", sponsor))
-        Assert.True(issue.IsSuccessStatusCode)
-        let! link = conn.QuerySingleAsync<string>("SELECT link FROM community_invite WHERE sponsor=@id", {| id = sponsor.Id |})
-        let invite = ChatInviteLink.Create(link, Tg.user(), true, false, false)
-        let request chatId userId invitation =
-            let request = ChatJoinRequest.Create(Tg.chat(id = chatId), Tg.user(id = userId), userId, DateTime.UtcNow, inviteLink = invitation)
-            Update.Create(updateId = userId, chatJoinRequest = request)
-        let send pod chat uid invitation = fixture.SendUpdateTo(pod, request chat uid invitation)
-        let chat = fixture.CommunityChatId
-        let applicant = 969201L
-        do! fixture.ClearFakeCalls()
-        use! foreign = send 0 (chat - 1L) applicant invite
-        use! unknown = send 1 chat applicant { invite with InviteLink = "unknown" }
-        use! self = send 1 chat sponsor.Id invite
-        let! untouched = fixture.GetFakeCalls("approveChatJoinRequest")
-        Assert.Empty untouched
-        do! fixture.SetMethodError("approveChatJoinRequest", true, errorCode = 503)
-        let! failed = send 0 chat applicant invite
-        do! fixture.SetMethodError("approveChatJoinRequest", false)
-        use failedResponse = failed
-        Assert.False(failedResponse.IsSuccessStatusCode)
-        use! loser = send 1 chat (applicant + 1L) invite
-        use! retry = send 1 chat applicant invite
-        Assert.True(retry.IsSuccessStatusCode)
-        let! invited = conn.QuerySingleAsync<int64>("""SELECT id FROM "user" WHERE invited_by=@id""", {| id = sponsor.Id |})
-        Assert.Equal(applicant, invited)
-        let! attempts = fixture.GetFakeCalls("approveChatJoinRequest")
-        Assert.Equal(2, attempts.Length)
-    }
-
-    [<Fact>]
-    let formerMemberCannotSponsorAnAdmission () = task {
-        let sponsor = Tg.user(id = 969300L)
-        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
-        use! issue = fixture.SendUpdateTo(0, Tg.dmMessage("/invite", sponsor))
-        Assert.True(issue.IsSuccessStatusCode)
-        let! link = conn.QuerySingleAsync<string>("SELECT link FROM community_invite WHERE sponsor=@id", {| id = sponsor.Id |})
-        do! fixture.SetChatMemberStatus(sponsor.Id, "left")
-        do! fixture.ClearFakeCalls()
-        let invite = ChatInviteLink.Create(link, Tg.user(), true, false, false)
-        let applicant = Tg.user(id = 969301L)
-        let request = ChatJoinRequest.Create(Tg.chat(id = fixture.CommunityChatId), applicant, applicant.Id, DateTime.UtcNow, inviteLink = invite)
-        use! response = fixture.SendUpdateTo(1, Update.Create(updateId = applicant.Id, chatJoinRequest = request))
-        Assert.True(response.IsSuccessStatusCode)
-        let! approvals = fixture.GetFakeCalls("approveChatJoinRequest")
-        Assert.Empty approvals
+        let joinedAt = DateTime.UtcNow
+        let join link id =
+            let invite = ChatInviteLink.Create(link, Tg.user(), false, false, false)
+            let transition = ChatMemberUpdated.Create(Tg.chat(id = fixture.CommunityChatId), legacy, joinedAt,
+                                ChatMember.Left(ChatMemberLeft.Create("left", legacy)),
+                                ChatMember.Member(ChatMemberMember.Create("member", legacy)), inviteLink = invite)
+            Update.Create(updateId = id, chatMember = transition)
+        do! send 1 (join "unknown" 969101L)
+        let used = join first 969102L
+        do! fixture.SetMethodError("revokeChatInviteLink", true, errorCode = 503)
+        use! failed = fixture.SendUpdateTo(0, used)
+        do! fixture.SetMethodError("revokeChatInviteLink", false)
+        Assert.False(failed.IsSuccessStatusCode)
+        do! Task.WhenAll([| send 0 used; send 1 used |]) :> Task
+        let! second = activeLink()
+        Assert.NotEqual<string>(first, second)
+        let! invitedBy = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})
+        Assert.Equal(sponsor.Id, invitedBy)
         let! revoked = fixture.GetFakeCalls("revokeChatInviteLink")
-        Assert.Single(revoked) |> ignore
+        Assert.Equal(2, revoked.Length)
+        let! allCreates = fixture.GetFakeCalls("createChatInviteLink")
+        Assert.Equal(2, allCreates.Length)
+        let laterSponsor = Tg.user(id = 969105L)
+        do! send 1 (Tg.dmMessage("/invite", laterSponsor))
+        let! laterLink = conn.QuerySingleAsync<string>("SELECT link FROM community_invite WHERE sponsor=@id", {| id = laterSponsor.Id |})
+        do! send 0 (join laterLink 969106L)
+        do! send 1 (join second 969103L)
+        let! current = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})
+        Assert.Equal(laterSponsor.Id, current)
+        let! admissions = conn.QuerySingleAsync<int>("SELECT count(*)::int FROM community_invite_join WHERE applicant=@id", {| id = legacy.Id |})
+        Assert.Equal(3, admissions)
     }

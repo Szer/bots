@@ -179,12 +179,15 @@ type BotService(
             try
                 logger.LogInformation("BotService.OnUpdate: UpdateId={UpdateId}, Message={HasMessage}, CallbackQuery={HasCallback}",
                     update.UpdateId, update.Message.IsSome, update.CallbackQuery.IsSome)
-                match update.ChatJoinRequest, update.ChatMember, update.CallbackQuery, update.Message with
-                | Some request, _, _, _ -> do! invites.Handle(update.UpdateId, request)
-                | None, Some chatMemberUpdated, _, _ ->
+                match update.ChatMember, update.CallbackQuery, update.Message with
+                | Some chatMemberUpdated, _, _ ->
                     let! transition = membership.OnChatMemberUpdated(chatMemberUpdated)
+                    let present memberStatus =
+                        match memberStatus with
+                        | ChatMember.Restricted restricted -> restricted.IsMember
+                        | other -> TelegramMembershipService.IsAdmitted other
                     match transition with
-                    | Some true ->
+                    | Some _ when present chatMemberUpdated.NewChatMember ->
                         // Registers the joining user so coupon history has a "user" row —
                         // mirrors handlePrivateMessage's UpsertUser. Never done on leave/ban.
                         let joinedUser = Tg.chatMemberUser chatMemberUpdated.NewChatMember
@@ -197,18 +200,18 @@ type BotService(
                               updated_at = time.GetUtcNow().UtcDateTime }
                             |> db.UpsertUser |> taskIgnore
                         match chatMemberUpdated.InviteLink with
-                        | Some invite when invite.CreatesJoinRequest ->
-                            do! db.ConfirmInvitation(chatMemberUpdated.Chat.Id, invite.InviteLink, joinedUser.Id)
+                        | Some invite when not (present chatMemberUpdated.OldChatMember) ->
+                            do! invites.Joined(chatMemberUpdated.Chat.Id, invite.InviteLink, joinedUser.Id, chatMemberUpdated.Date, update.UpdateId)
                         | _ -> ()
                     | _ -> ()
-                | None, None, Some cq, _ ->
+                | None, Some cq, _ ->
                     do! callbackHandler.HandleCallbackQuery cq
-                | None, None, None, Some msg ->
+                | None, None, Some msg ->
                     if (msg.Chat.Type = ChatType.Group || msg.Chat.Type = ChatType.SuperGroup)
                        && msg.Chat.Id = options.Value.CommunityChatId then
                         do! handleCommunityMessage msg
                     do! handlePrivateMessage msg
-                | None, None, None, None ->
+                | None, None, None ->
                     ()
             with ex ->
                 if not (isNull top) then
