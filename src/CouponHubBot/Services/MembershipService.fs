@@ -17,11 +17,6 @@ type TelegramMembershipService(
     logger: ILogger<TelegramMembershipService>,
     time: TimeProvider
 ) =
-    let isMemberOfChat (cm: ChatMember) =
-        match cm with
-        | ChatMember.Owner _ | ChatMember.Administrator _ | ChatMember.Member _ -> true
-        | ChatMember.Restricted _ | ChatMember.Left _ | ChatMember.Banned _ -> false
-
     let rec checkMembership (chatId: int64) userId maxAge =
         task {
             let! entry = db.GetMembershipEntry(chatId, userId)
@@ -30,12 +25,17 @@ type TelegramMembershipService(
                 return entry.is_member.Value
             else
                 let! cm = tg.CallExn(Funogram.Telegram.Req.GetChatMember.Make(chatId, userId))
-                let isMember = isMemberOfChat cm
+                let isMember = TelegramMembershipService.IsAdmitted cm
                 // A concurrent membership change or refresh invalidates this lookup's revision.
                 let! saved = db.TryCacheMembership(chatId, userId, entry.revision, isMember, now)
                 if saved then return isMember
                 else return! checkMembership chatId userId maxAge
         }
+
+    static member IsAdmitted (cm: ChatMember) =
+        match cm with
+        | ChatMember.Owner _ | ChatMember.Administrator _ | ChatMember.Member _ -> true
+        | ChatMember.Restricted _ | ChatMember.Left _ | ChatMember.Banned _ -> false
 
     static member MaxCacheAge = TimeSpan.FromHours 1.0
 
@@ -45,7 +45,7 @@ type TelegramMembershipService(
             if update.Chat.Id = options.Value.CommunityChatId then
                 let uid = (Tg.chatMemberUser update.NewChatMember).Id
                 let status = Tg.chatMemberStatus update.NewChatMember
-                let isMember = isMemberOfChat update.NewChatMember
+                let isMember = TelegramMembershipService.IsAdmitted update.NewChatMember
                 do! db.InvalidateMembership(update.Chat.Id, uid)
                 %span.SetTag("userId", uid)
                 %span.SetTag("isMember", isMember)

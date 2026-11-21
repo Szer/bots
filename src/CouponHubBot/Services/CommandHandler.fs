@@ -14,6 +14,7 @@ type CommandHandler(
     tg: ITelegramApi,
     options: IOptions<BotConfiguration>,
     db: DbService,
+    invites: CommunityInvites,
     notifications: TelegramNotificationService,
     couponFlow: CouponFlowHandler,
     membership: TelegramMembershipService,
@@ -138,10 +139,16 @@ type CommandHandler(
                     let! stats = db.GetUserContributionStats(user.id)
                     let! actions = db.GetUserRecentActions(user.id, 10)
                     let header = BotHelpers.formatWhoisHeader user isMember stats
+                    let! sponsor = db.InvitedBy user.id
+                    let origin =
+                        match sponsor with
+                        | Some id -> $"\nПо приглашению: {id}"
+                        | None when options.Value.ManagedInvitesEnabled -> "\nПо приглашению: Telegram"
+                        | None -> ""
                     let actionsTable =
                         if actions.Length = 0 then "Нет действий."
                         else BotHelpers.formatWhoisActionsTable actions
-                    let html = $"{header}\n<pre>{BotHelpers.htmlEscape actionsTable}</pre>"
+                    let html = $"{header}{origin}\n<pre>{BotHelpers.htmlEscape actionsTable}</pre>"
                     do! BotHelpers.sendHtml tg chatId html
                 | None ->
                     let! allUsers = db.GetAllUsers()
@@ -536,6 +543,9 @@ type CommandHandler(
             // user.id always equals msg.From.Id here: BotService only dispatches private
             // messages whose From is present, and `user` is upserted from that From.
             match msg.Text with
+            | Some "/invite" when options.Value.ManagedInvitesEnabled ->
+                let! link = invites.GetLink(options.Value.CommunityChatId, user.id)
+                do! sendText msg.Chat.Id $"Отправь эту ссылку одному человеку в личные сообщения. По ней можно вступить один раз.\n{link}"
             | Some "/dashboard" | Some "/start dashboard" ->
                 recordCommand "dashboard"
                 do! handleDashboard user.id msg.Chat.Id

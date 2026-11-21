@@ -18,6 +18,7 @@ type BotService(
     options: IOptions<BotConfiguration>,
     db: DbService,
     membership: TelegramMembershipService,
+    invites: CommunityInvites,
     couponFlow: CouponFlowHandler,
     commandHandler: CommandHandler,
     callbackHandler: CallbackHandler,
@@ -166,20 +167,21 @@ type BotService(
 
     member _.OnUpdate(update: Update) =
         task {
-            let updateBodyJson =
-                try FunogramJson.serialize update
-                with e -> e.Message
-            use top =
-                botActivity
-                    .StartActivity("onUpdate")
-                    .SetTag("updateBodyObject", update)
-                    .SetTag("updateBodyJson", updateBodyJson)
-                    .SetTag("updateId", update.UpdateId)
+            use top = botActivity.StartActivity("onUpdate").SetTag("updateId", update.UpdateId)
+            let containsInvitation =
+                update.ChatJoinRequest.IsSome
+                || (update.ChatMember |> Option.exists (fun change -> change.InviteLink.IsSome))
+            if not containsInvitation then
+                let updateBodyJson =
+                    try FunogramJson.serialize update
+                    with e -> e.Message
+                %top.SetTag("updateBodyObject", update).SetTag("updateBodyJson", updateBodyJson)
             try
                 logger.LogInformation("BotService.OnUpdate: UpdateId={UpdateId}, Message={HasMessage}, CallbackQuery={HasCallback}",
                     update.UpdateId, update.Message.IsSome, update.CallbackQuery.IsSome)
-                match update.ChatMember, update.CallbackQuery, update.Message with
-                | Some chatMemberUpdated, _, _ ->
+                match update.ChatJoinRequest, update.ChatMember, update.CallbackQuery, update.Message with
+                | Some request, _, _, _ -> do! invites.Handle(update.UpdateId, request)
+                | None, Some chatMemberUpdated, _, _ ->
                     let! transition = membership.OnChatMemberUpdated(chatMemberUpdated)
                     match transition with
                     | Some true ->
@@ -194,15 +196,19 @@ type BotService(
                               created_at = time.GetUtcNow().UtcDateTime
                               updated_at = time.GetUtcNow().UtcDateTime }
                             |> db.UpsertUser |> taskIgnore
+                        match chatMemberUpdated.InviteLink with
+                        | Some invite when invite.CreatesJoinRequest ->
+                            do! db.ConfirmInvitation(chatMemberUpdated.Chat.Id, invite.InviteLink, joinedUser.Id)
+                        | _ -> ()
                     | _ -> ()
-                | None, Some cq, _ ->
+                | None, None, Some cq, _ ->
                     do! callbackHandler.HandleCallbackQuery cq
-                | None, None, Some msg ->
+                | None, None, None, Some msg ->
                     if (msg.Chat.Type = ChatType.Group || msg.Chat.Type = ChatType.SuperGroup)
                        && msg.Chat.Id = options.Value.CommunityChatId then
                         do! handleCommunityMessage msg
                     do! handlePrivateMessage msg
-                | None, None, None ->
+                | None, None, None, None ->
                     ()
             with ex ->
                 if not (isNull top) then

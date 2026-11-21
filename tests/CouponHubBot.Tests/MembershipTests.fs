@@ -41,3 +41,13 @@ type MembershipTests(fixture: DefaultCouponHubTestContainers) =
 
 
 
+
+    [<Fact>]
+    let inviteIsDisabledByDefault () = task {
+        do! fixture.ClearFakeCalls()
+        let user = Tg.user(id = 969103L)
+        use! response = fixture.SendUpdate(Tg.dmMessage("/invite", user))
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+        let! creates = fixture.GetFakeCalls("createChatInviteLink")
+        Assert.Empty creates
+    }

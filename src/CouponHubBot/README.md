@@ -63,3 +63,9 @@ See [README.dev.md](README.dev.md) for local development setup, OCR testing, and
 ## License
 
 MIT. See [root LICENSE](../../LICENSE).
+
+### Personal invitations
+
+Enable `MANAGED_INVITES_ENABLED` and reload settings to show **Ссылка для приглашения** in the private command menu. The bot needs the administrator right to invite users and webhook delivery of `chat_join_request` and `chat_member`. For exclusive bot-managed admission, revoke other active invitations and turn off members’ permission to add users directly.
+
+A member can send their current link to one person. The bot approves the first eligible request for that link, revokes it, and creates a replacement available through `/invite`. A forwarded link can be claimed by anyone who receives it. Admins can see the original inviter in `/whois`. An empty inviter denotes admission through Telegram.
