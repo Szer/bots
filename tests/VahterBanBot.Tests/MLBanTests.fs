@@ -2,28 +2,11 @@ module VahterBanBot.Tests.MLBanTests
 
 open System.Net
 open System.Text.Json
-open System.Threading.Tasks
 open VahterBanBot.Tests.ContainerTestBase
 open BotTestInfra
 open VahterBanBot.Types
 open VahterBanBot.Utils
 open Xunit
-
-/// Channel posts can be fire-and-forget (e.g. the Detected Spam card and its
-/// AllLogs mirror), so poll for the matching sendMessage call instead of
-/// asserting on a single snapshot.
-let private tryFindChannelPost (fixture: MlEnabledVahterTestContainers) (channelId: int64) (marker: string) = task {
-    let mutable found = None
-    let mutable attempts = 0
-    while found.IsNone && attempts < 40 do
-        let! calls = fixture.GetFakeCalls "sendMessage"
-        found <- calls |> Array.tryFind (fun c ->
-            c.Body.Contains $"\"chat_id\":{channelId}" && c.Body.Contains marker)
-        if found.IsNone then
-            attempts <- attempts + 1
-            do! Task.Delay 250
-    return found
-}
 
 type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture) =
 
