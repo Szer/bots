@@ -762,6 +762,46 @@ type MLBanTests(fixture: MlEnabledVahterTestContainers, _unused: MlAwaitFixture)
     }
 
     [<Fact>]
+    let ``Forwarded rich message with button rows reaches spam moderation`` () = task {
+        let update = Tg.quickMsg(chat = fixture.ChatsToMonitor[0], text = null)
+        let msg = update.Message.Value
+        let json = $$$"""{
+          "update_id":{{{update.UpdateId}}},
+          "message":{
+            "message_id":{{{msg.MessageId}}},
+            "from":{"id":{{{msg.From.Value.Id}}},"is_bot":false,"first_name":"Sender"},
+            "chat":{"id":{{{msg.Chat.Id}}},"type":"supergroup","title":"Test group"},
+            "date":{{{System.DateTimeOffset.UtcNow.ToUnixTimeSeconds()}}},
+            "forward_origin":{"type":"user","date":1,"sender_user":{"id":777,"is_bot":true,"first_name":"Source"}},
+            "forward_from":{"id":777,"is_bot":true,"first_name":"Source"},"forward_date":1,
+            "rich_message":{"blocks":[
+              {"type":"paragraph","text":[{"type":"custom_emoji","custom_emoji_id":"1","alternative_text":"*"},{"type":"bold","text":" offer "},{"type":"custom_emoji","custom_emoji_id":"2","alternative_text":"*"}]},
+              {"type":"paragraph","text":{"type":"bold","text":"details"}},
+              {"type":"paragraph","text":{"type":"bold","text":[{"type":"custom_emoji","custom_emoji_id":"3","alternative_text":"+"}," more"]}},
+              {"type":"buttons","align":"center","buttons":[
+                {"text":[{"type":"custom_emoji","custom_emoji_id":"4","alternative_text":"+"}," first"],"style":"primary","url":"https://example.org/first"},
+                {"text":[{"type":"custom_emoji","custom_emoji_id":"5","alternative_text":"+"}," second"],"style":"primary","url":"https://example.org/second"}]},
+              {"type":"buttons","align":"center","buttons":[
+                {"text":[{"type":"custom_emoji","custom_emoji_id":"6","alternative_text":"+"}," third"],"style":"primary","url":"https://example.org/third"},
+                {"text":[{"type":"custom_emoji","custom_emoji_id":"7","alternative_text":"+"}," fourth"],"style":"primary","url":"https://example.org/fourth"}]},
+              {"type":"buttons","align":"center","buttons":[
+                {"text":[{"type":"custom_emoji","custom_emoji_id":"8","alternative_text":"+"}," last"],"style":"primary","url":"https://2222222.example.org"}]}]}
+          }}"""
+        use! response = fixture.SendMessage json
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+        let! stored = fixture.TryGetDbMessage msg
+        Assert.True(stored.IsSome)
+        let expected =
+            String.concat "\n"
+                [ "* offer *"; "details"; "+ more"; "+ first"; "https://example.org/first"
+                  "+ second"; "https://example.org/second"; "+ third"; "https://example.org/third"
+                  "+ fourth"; "https://example.org/fourth"; "+ last"; "https://2222222.example.org" ]
+        Assert.Equal(expected, stored.Value.text)
+        let! deleted = fixture.MessageIsAutoDeleted msg
+        Assert.True deleted
+    }
+
+    [<Fact>]
     let ``Rich-only message with spam in table cell triggers auto-delete`` () = task {
         // Real-world shape: rich_message table, no text/caption at all —
         // without rich enrichment such a message never reaches the ML gate.
