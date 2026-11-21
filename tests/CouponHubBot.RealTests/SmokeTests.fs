@@ -1,6 +1,9 @@
 namespace CouponHubBot.RealTests
 
 open System
+open System.Threading.Tasks
+open Dapper
+open Npgsql
 open Xunit
 
 /// Coverage item 1 (contract): "/start, /help reply."
@@ -9,6 +12,34 @@ open Xunit
 /// point — true for every test EXCEPT MembershipGateRealTests, which is why that one
 /// must run in isolation rather than as part of this suite (see its doc comment).
 type SmokeTests(fx: RealAssemblyFixture) =
+
+    let verifyPersonalJoin link = task {
+        let sponsor = fx.UserClient.Me.id
+        let username = Environment.GetEnvironmentVariable("JOINER_USERNAME")
+        let! applicant = fx.UserClient.ResolveUserByUsername(username.Trim().TrimStart('@'))
+        Assert.True((applicant <> sponsor), "The participant and the MTProto sponsor must use different accounts.")
+        use conn = new NpgsqlConnection(fx.DbConnectionString)
+        let key = {| chat = fx.Env.TestChatId; sponsor = sponsor; applicant = applicant; link = link |}
+        let proof = """
+            SELECT EXISTS (
+                SELECT 1 FROM community_invite_join j
+                JOIN community_invite i USING (link)
+                JOIN "user" u ON u.id=j.applicant
+                WHERE i.chat_id=@chat AND j.link=@link AND i.sponsor=@sponsor
+                  AND j.applicant=@applicant AND u.invited_by=@sponsor AND i.consumed
+            )"""
+        let! alreadyRecorded = conn.QuerySingleAsync<bool>(proof, key)
+        Assert.False(alreadyRecorded, "Expected a fresh invite before the participant joined.")
+        let! _ = fx.UserClient.SendText(applicant, $"Проверка приглашения в тестовую группу. Открой ссылку и нажми «Вступить» в течение 10 минут.\n{link}")
+        let deadline = DateTime.UtcNow.AddMinutes(10.)
+        let mutable matched = false
+        while not matched && DateTime.UtcNow < deadline do
+            let! found = conn.QuerySingleAsync<bool>(proof, key)
+            matched <- found
+            if not matched then do! Task.Delay(TimeSpan.FromSeconds 2.)
+        Assert.True(matched, "No matching join receipt and sponsor attribution within ten minutes.")
+        printfn "Verified the membership update matched the issued link, the expected participant, and the MTProto sponsor."
+    }
 
     [<Fact>]
     member _.``start replies with a member welcome``() =
@@ -49,6 +80,8 @@ type SmokeTests(fx: RealAssemblyFixture) =
                     let! second = issue()
                     Assert.True(first.StartsWith("https://t.me/+"))
                     Assert.True((first = second))
+                    if Environment.GetEnvironmentVariable("VERIFY_PERSONAL_JOIN") = "true" then
+                        do! verifyPersonalJoin first
                     return Ok ()
                 with ex -> return Error ex
             }

@@ -6,6 +6,12 @@ post to real Telegram. Never run it locally or from an agent; the CI workflow th
 dispatches it is the only sanctioned runner. Local `dotnet build` (not `dotnet test`) is
 fine and is how you validate a new file compiles.
 
+## Human-assisted invitation check
+
+Set the repository secret `COUPON_CI_JOINER_USERNAME` to the participant’s Telegram username. The participant must use a different account from the MTProto sponsor, be outside the dedicated test group, and be able to receive a private message from the sponsor.
+
+Dispatch `coupon-real-test.yml` on the feature branch with `verify_personal_join=true`. The sponsor sends the link privately. Tap **Join** within ten minutes. The test checks the exact link, test chat, joining account, sponsoring account, and persisted inviter in the transient database. The participant can leave the test group afterwards.
+
 ## RULE: every coupon add MUST be idempotent
 
 The suite runs SERIALLY over ONE shared transient Postgres and ONE Telegram account, with
