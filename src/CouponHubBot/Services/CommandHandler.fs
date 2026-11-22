@@ -545,7 +545,9 @@ type CommandHandler(
             match msg.Text with
             | Some "/invite" when options.Value.ManagedInvitesEnabled ->
                 let! link = invites.GetLink(options.Value.CommunityChatId, user.id, msg.MessageId, msg.Date)
-                do! sendText msg.Chat.Id $"Отправь эту ссылку одному человеку в личные сообщения. По ней можно вступить один раз.\n{link}"
+                match link with
+                | None -> ()
+                | Some link -> do! sendText msg.Chat.Id $"Отправь эту ссылку одному человеку в личные сообщения. По ней можно вступить один раз.\n{link}"
             | Some "/dashboard" | Some "/start dashboard" ->
                 recordCommand "dashboard"
                 do! handleDashboard user.id msg.Chat.Id

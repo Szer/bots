@@ -18,14 +18,11 @@ type SmokeTests(fx: RealAssemblyFixture) =
         let key = {| chat = fx.Env.TestChatId; sponsor = sponsor; applicant = applicant; link = link |}
         let proof = """
             SELECT EXISTS (
-                SELECT 1 FROM community_invite_join j
-                JOIN community_invite i USING (link)
-                JOIN "user" u ON u.id=j.applicant
-                JOIN community_invite_event e ON e.data->>'inviteId'=i.invite_id::text
-                WHERE i.chat_id=@chat AND j.link=@link AND i.sponsor=@sponsor
-                  AND j.applicant=@applicant AND u.invited_by=@sponsor AND i.consumed
-                  AND e.event_type='invite_link_redeemed' AND (e.data->>'actorId')::bigint=@applicant
-                  AND (e.data->>'sponsorId')::bigint=@sponsor AND (e.data->>'updateId')::bigint=j.update_id
+                SELECT 1 FROM community_invite_event e JOIN "user" u ON u.id=@applicant
+                WHERE e.event_type='invite_link_redeemed' AND e.data->>'inviteId'=community_invite_key(@link)
+                  AND (e.data->>'chatId')::bigint=@chat AND (e.data->>'actorId')::bigint=@applicant
+                  AND (e.data->>'sponsorId')::bigint=@sponsor AND u.invited_by=@sponsor
+                  AND NOT EXISTS (SELECT 1 FROM active_community_invite WHERE link=@link)
             )"""
         let deadline = DateTime.UtcNow.AddMinutes(10.)
         let mutable matched = false
@@ -56,7 +53,7 @@ type SmokeTests(fx: RealAssemblyFixture) =
         let mutable link = ""
         while String.IsNullOrEmpty link && DateTime.UtcNow < deadline do
             let! issued = conn.QuerySingleOrDefaultAsync<string>(
-                "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND NOT consumed",
+                "SELECT link FROM active_community_invite WHERE chat_id=@chat AND sponsor=@sponsor",
                 {| chat = fx.Env.TestChatId; sponsor = sponsor |})
             link <- issued
             if String.IsNullOrEmpty link then do! Task.Delay(TimeSpan.FromSeconds 2.)

@@ -50,7 +50,7 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
         let key = {| sponsor = sponsor.Id |}
         let activeLink () = conn.QuerySingleAsync<string>(
-            "SELECT link FROM community_invite WHERE sponsor=@sponsor AND NOT consumed", key)
+            "SELECT link FROM active_community_invite WHERE sponsor=@sponsor", key)
         let send pod update = task {
             use! response = fixture.SendUpdateTo(pod, update)
             Assert.True(response.IsSuccessStatusCode)
@@ -105,11 +105,21 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         Assert.Equal(2, allCreates.Length)
         let laterSponsor = Tg.user(id = 969105L)
         do! send 1 (Tg.dmMessage("/invite", laterSponsor))
-        let! laterLink = conn.QuerySingleAsync<string>("SELECT link FROM community_invite WHERE sponsor=@id", {| id = laterSponsor.Id |})
+        let! laterLink = conn.QuerySingleAsync<string>("SELECT link FROM active_community_invite WHERE sponsor=@id", {| id = laterSponsor.Id |})
         do! send 0 (join laterLink 969106L)
         do! send 1 (join second 969103L)
         let! current = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})
         Assert.Equal(laterSponsor.Id, current)
-        let! admissions = conn.QuerySingleAsync<int>("SELECT count(*)::int FROM community_invite_join WHERE applicant=@id", {| id = legacy.Id |})
+        let! admissions = conn.QuerySingleAsync<int>("SELECT count(*)::int FROM community_invite_event WHERE event_type='invite_link_redeemed' AND (data->>'actorId')::bigint=@id", {| id = legacy.Id |})
         Assert.Equal(3, admissions)
+        let! savedLink = activeLink()
+        do! send 0 (join first 969100L)
+        let! afterLateJoin = activeLink()
+        Assert.Equal<string>(savedLink, afterLateJoin)
+        let! latestSponsor = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})
+        Assert.Equal(laterSponsor.Id, latestSponsor)
+        let! historicJoins = conn.QuerySingleAsync<int>(
+            """SELECT count(*)::int FROM community_invite_event WHERE event_type='invite_link_redeemed'
+               AND data->>'inviteId'=community_invite_key(@first)""", {| first = first |})
+        Assert.Equal(2, historicJoins)
     }

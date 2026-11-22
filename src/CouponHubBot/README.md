@@ -70,4 +70,6 @@ Enable `MANAGED_INVITES_ENABLED` and reload settings to show **Ссылка дл
 
 Telegram admits one member at a time through each personal link. On the join notification, the bot records the sponsor, revokes the link and generates a replacement. Anyone receiving the link can use it first. Admins see the sponsor of the latest recorded invitation in `/whois`, including for returning members. Disabling the feature stops issuance; outstanding Telegram links remain usable until revoked.
 
-The append-only `community_invite_event` stream records `invite_link_created` for bot issuance and rotation, `invite_link_obtained` per distinct private command, and `invite_link_redeemed` per recorded join. Each payload identifies the chat, sponsor, actor kind and invite UUID. User actions include the actor’s Telegram ID. Order by `stream_version` for processing order or `created_at` for occurrence time.
+Only `active_community_invite` stores usable invitation URLs, one per chat and sponsor.
+
+The append-only `community_invite_event` stream records `invite_link_created` for bot issuance and rotation, `invite_link_obtained` per distinct private command, and `invite_link_redeemed` per recorded join. Each payload identifies the chat, sponsor, actor kind and SHA-256 digest of the invite URL. User actions include the actor’s Telegram ID. Order by `stream_version` for processing order or `created_at` for occurrence time.
