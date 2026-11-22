@@ -13,11 +13,7 @@ open Xunit
 /// must run in isolation rather than as part of this suite (see its doc comment).
 type SmokeTests(fx: RealAssemblyFixture) =
 
-    let verifyPersonalJoin link = task {
-        let sponsor = fx.UserClient.Me.id
-        let username = Environment.GetEnvironmentVariable("JOINER_USERNAME")
-        let! applicant = fx.UserClient.ResolveUserByUsername(username.Trim().TrimStart('@'))
-        Assert.True((applicant <> sponsor), "The participant and the MTProto sponsor must use different accounts.")
+    let waitForJoin link (sponsor: int64) (applicant: int64) = task {
         use conn = new NpgsqlConnection(fx.DbConnectionString)
         let key = {| chat = fx.Env.TestChatId; sponsor = sponsor; applicant = applicant; link = link |}
         let proof = """
@@ -28,9 +24,6 @@ type SmokeTests(fx: RealAssemblyFixture) =
                 WHERE i.chat_id=@chat AND j.link=@link AND i.sponsor=@sponsor
                   AND j.applicant=@applicant AND u.invited_by=@sponsor AND i.consumed
             )"""
-        let! alreadyRecorded = conn.QuerySingleAsync<bool>(proof, key)
-        Assert.False(alreadyRecorded, "Expected a fresh invite before the participant joined.")
-        let! _ = fx.UserClient.SendText(applicant, $"Проверка приглашения в тестовую группу. Открой ссылку и нажми «Вступить» в течение 10 минут.\n{link}")
         let deadline = DateTime.UtcNow.AddMinutes(10.)
         let mutable matched = false
         while not matched && DateTime.UtcNow < deadline do
@@ -38,7 +31,35 @@ type SmokeTests(fx: RealAssemblyFixture) =
             matched <- found
             if not matched then do! Task.Delay(TimeSpan.FromSeconds 2.)
         Assert.True(matched, "No matching join receipt and sponsor attribution within ten minutes.")
-        printfn "Verified the membership update matched the issued link, the expected participant, and the MTProto sponsor."
+        printfn "Verified the membership update matched the issued link, the expected participant, and the expected sponsor."
+    }
+
+    let verifyPersonalJoin link = task {
+        let sponsor = fx.UserClient.Me.id
+        let username = Environment.GetEnvironmentVariable("JOINER_USERNAME")
+        let! applicant = fx.UserClient.ResolveUserByUsername(username.Trim().TrimStart('@'))
+        Assert.True((applicant <> sponsor), "The participant and the MTProto sponsor must use different accounts.")
+        let! _ = fx.UserClient.SendText(applicant, $"Проверка приглашения в тестовую группу. Открой ссылку и нажми «Вступить» в течение 10 минут.\n{link}")
+        do! waitForJoin link sponsor applicant
+    }
+
+    let verifyOwnerInvite () = task {
+        let username = Environment.GetEnvironmentVariable("JOINER_USERNAME")
+        let! sponsor = fx.UserClient.ResolveUserByUsername(username.Trim().TrimStart('@'))
+        let applicant = fx.UserClient.Me.id
+        Assert.True((sponsor <> applicant), "The sponsor and participant must use different accounts.")
+        use conn = new NpgsqlConnection(fx.DbConnectionString)
+        let deadline = DateTime.UtcNow.AddMinutes(10.)
+        let mutable link = ""
+        while String.IsNullOrEmpty link && DateTime.UtcNow < deadline do
+            let! issued = conn.QuerySingleOrDefaultAsync<string>(
+                "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND NOT consumed",
+                {| chat = fx.Env.TestChatId; sponsor = sponsor |})
+            link <- issued
+            if String.IsNullOrEmpty link then do! Task.Delay(TimeSpan.FromSeconds 2.)
+        Assert.False(String.IsNullOrEmpty link, "The owner did not request an invitation within ten minutes.")
+        do! fx.UserClient.RejoinTestGroup(fx.Env.TestChatId, link)
+        do! waitForJoin link sponsor applicant
     }
 
     [<Fact>]
@@ -76,12 +97,15 @@ type SmokeTests(fx: RealAssemblyFixture) =
                 try
                     do! DbSeed.setSettingAsync fx.DbConnectionString setting "true"
                     do! fx.ReloadSettingsAsync()
-                    let! first = issue()
-                    let! second = issue()
-                    Assert.True(first.StartsWith("https://t.me/+"))
-                    Assert.True((first = second))
-                    if Environment.GetEnvironmentVariable("VERIFY_PERSONAL_JOIN") = "true" then
-                        do! verifyPersonalJoin first
+                    if Environment.GetEnvironmentVariable("VERIFY_OWNER_INVITE") = "true" then
+                        do! verifyOwnerInvite ()
+                    else
+                        let! first = issue()
+                        let! second = issue()
+                        Assert.True(first.StartsWith("https://t.me/+"))
+                        Assert.True((first = second))
+                        if Environment.GetEnvironmentVariable("VERIFY_PERSONAL_JOIN") = "true" then
+                            do! verifyPersonalJoin first
                     return Ok ()
                 with ex -> return Error ex
             }

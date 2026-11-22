@@ -12,6 +12,8 @@ Set the repository secret `COUPON_CI_JOINER_USERNAME` to the participant’s Tel
 
 Dispatch `coupon-real-test.yml` on the feature branch with `verify_personal_join=true`. The sponsor sends the link privately. Tap **Join** within ten minutes. The test checks the exact link, test chat, joining account, sponsoring account, and persisted inviter in the transient database. The participant can leave the test group afterwards.
 
+For the reverse direction, dispatch with `verify_owner_invite=true`. The configured human requests `/invite` privately from the test bot. The MTProto account checks that the link points to its configured test group, leaves, and rejoins with that link. The database receipt must identify the human as sponsor.
+
 ## RULE: every coupon add MUST be idempotent
 
 The suite runs SERIALLY over ONE shared transient Postgres and ONE Telegram account, with

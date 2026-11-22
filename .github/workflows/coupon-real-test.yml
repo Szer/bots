@@ -30,6 +30,10 @@ name: "CouponHubBot: Real Telegram test (AKS)"
 on:
   workflow_dispatch:
     inputs:
+      verify_owner_invite:
+        type: boolean
+        default: false
+        description: Wait for the owner to request a link and rejoin with the MTProto account
       verify_personal_join:
         type: boolean
         default: false
@@ -444,7 +448,8 @@ jobs:
         COUPON_REAL_TESTS: "1"
         SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
         VERIFY_PERSONAL_JOIN: ${{ inputs.verify_personal_join }}
-        JOINER_USERNAME: ${{ inputs.verify_personal_join && secrets.COUPON_CI_JOINER_USERNAME || '' }}
+        VERIFY_OWNER_INVITE: ${{ inputs.verify_owner_invite }}
+        JOINER_USERNAME: ${{ (inputs.verify_personal_join || inputs.verify_owner_invite) && secrets.COUPON_CI_JOINER_USERNAME || '' }}
         COUPON_REAL_MODE: remote
         COUPON_TEST_BOT_USERNAME: ${{ secrets.COUPON_CI_BOT_USERNAME }}
         COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
@@ -461,14 +466,14 @@ jobs:
         COUPON_TEST_DB_URL: "Server=127.0.0.1;Port=15434;Database=coupon_hub_bot;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;"
       run: |
         args=()
-        if [[ "$VERIFY_PERSONAL_JOIN" == "true" ]]; then
+        if [[ "$VERIFY_PERSONAL_JOIN" == "true" || "$VERIFY_OWNER_INVITE" == "true" ]]; then
           test -n "$JOINER_USERNAME" || { echo "::error::Configure COUPON_CI_JOINER_USERNAME first"; exit 1; }
           args+=(--filter 'FullyQualifiedName~PersonalInviteIsStableUntilRedemption')
         fi
         dotnet test tests/CouponHubBot.RealTests -c Release "${args[@]}" \
           --results-directory tests/CouponHubBot.RealTests/TestResults \
           --logger "trx;LogFileName=real-test-results.trx" --logger "console;verbosity=detailed"
-        if [[ "$VERIFY_PERSONAL_JOIN" == "true" ]]; then
+        if [[ "$VERIFY_PERSONAL_JOIN" == "true" || "$VERIFY_OWNER_INVITE" == "true" ]]; then
           python3 - <<'PYTEST'
         from pathlib import Path
         from xml.etree import ElementTree

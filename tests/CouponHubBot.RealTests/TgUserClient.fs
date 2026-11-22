@@ -183,6 +183,27 @@ type TgUserClient(apiId: string, apiHash: string, sessionPath: string, phone: st
             return user
         }
 
+    member _.RejoinTestGroup(chatId: int64, link: string) = task {
+        let prefix = "https://t.me/+"
+        if chatId >= 0L || not (link.StartsWith(prefix, StringComparison.Ordinal)) then
+            invalidArg "link" "Expected a private test-group invitation."
+        let hash = link.Substring(prefix.Length)
+        let! preview = client.Messages_CheckChatInvite(hash)
+        match preview with
+        | :? ChatInviteAlready as joined when joined.chat.ID = peerKey chatId ->
+            match joined.chat with
+            | :? Channel as group when chatId <= -1_000_000_000_000L ->
+                let! _ = client.Channels_LeaveChannel(InputChannel(group.id, group.access_hash))
+                ()
+            | :? Chat as group when chatId > -1_000_000_000_000L ->
+                let! _ = client.Messages_DeleteChatUser(group.id, InputUserSelf())
+                ()
+            | _ -> failwith "The invite and test group have different peer types."
+        | _ -> failwith "Expected the MTProto account to already belong to the configured test group."
+        let! _ = client.Messages_ImportChatInvite(hash)
+        ()
+    }
+
     /// Sends a text message and returns its message id.
     member _.SendText(chatId: int64, text: string) : Task<int> =
         task {
