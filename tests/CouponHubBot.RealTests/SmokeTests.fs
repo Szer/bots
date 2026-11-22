@@ -22,7 +22,7 @@ type SmokeTests(fx: RealAssemblyFixture) =
                 WHERE e.event_type='invite_link_redeemed' AND e.data->>'inviteId'=community_invite_key(@link)
                   AND (e.data->>'chatId')::bigint=@chat AND (e.data->>'actorId')::bigint=@applicant
                   AND (e.data->>'sponsorId')::bigint=@sponsor AND u.invited_by=@sponsor
-                  AND NOT EXISTS (SELECT 1 FROM active_community_invite WHERE link=@link)
+                  AND NOT EXISTS (SELECT 1 FROM "user" WHERE id=@sponsor AND invite_link=@link)
             )"""
         let deadline = DateTime.UtcNow.AddMinutes(10.)
         let mutable matched = false
@@ -53,7 +53,7 @@ type SmokeTests(fx: RealAssemblyFixture) =
         let mutable link = ""
         while String.IsNullOrEmpty link && DateTime.UtcNow < deadline do
             let! issued = conn.QuerySingleOrDefaultAsync<string>(
-                "SELECT link FROM active_community_invite WHERE chat_id=@chat AND sponsor=@sponsor",
+                """SELECT invite_link FROM "user" WHERE invite_chat_id=@chat AND id=@sponsor""",
                 {| chat = fx.Env.TestChatId; sponsor = sponsor |})
             link <- issued
             if String.IsNullOrEmpty link then do! Task.Delay(TimeSpan.FromSeconds 2.)

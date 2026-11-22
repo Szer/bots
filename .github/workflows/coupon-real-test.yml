@@ -491,7 +491,7 @@ jobs:
         set -o pipefail
         docker run --rm --network host -e PGPASSWORD=admin postgres:17.10 \
           psql -h 127.0.0.1 -p 15434 -U admin -d coupon_hub_bot -At -F ' ' \
-          -c 'SELECT chat_id, link FROM active_community_invite' |
+          -c 'SELECT invite_chat_id, invite_link FROM "user" WHERE invite_link IS NOT NULL' |
         while read -r chat link; do
           curl --silent --fail --data-urlencode "chat_id=$chat" --data-urlencode "invite_link=$link" \
             "https://api.telegram.org/bot${BOT_TOKEN}/revokeChatInviteLink" > /dev/null || exit 1

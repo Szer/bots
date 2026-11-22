@@ -50,7 +50,7 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
         let key = {| sponsor = sponsor.Id |}
         let activeLink () = conn.QuerySingleAsync<string>(
-            "SELECT link FROM active_community_invite WHERE sponsor=@sponsor", key)
+            """SELECT invite_link FROM "user" WHERE id=@sponsor""", key)
         let send pod update = task {
             use! response = fixture.SendUpdateTo(pod, update)
             Assert.True(response.IsSuccessStatusCode)
@@ -105,7 +105,7 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         Assert.Equal(2, allCreates.Length)
         let laterSponsor = Tg.user(id = 969105L)
         do! send 1 (Tg.dmMessage("/invite", laterSponsor))
-        let! laterLink = conn.QuerySingleAsync<string>("SELECT link FROM active_community_invite WHERE sponsor=@id", {| id = laterSponsor.Id |})
+        let! laterLink = conn.QuerySingleAsync<string>("""SELECT invite_link FROM "user" WHERE id=@id""", {| id = laterSponsor.Id |})
         do! send 0 (join laterLink 969106L)
         do! send 1 (join second 969103L)
         let! current = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})
@@ -122,4 +122,31 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
             """SELECT count(*)::int FROM community_invite_event WHERE event_type='invite_link_redeemed'
                AND data->>'inviteId'=community_invite_key(@first)""", {| first = first |})
         Assert.Equal(2, historicJoins)
+    }
+
+    [<Fact>]
+    let inviteForPreviousCommunityIsReplaced () = task {
+        let sponsor = Tg.user(id = 969110L)
+        use conn = new Npgsql.NpgsqlConnection(fixture.DbConnectionString)
+        use! welcome = fixture.SendUpdateTo(0, Tg.dmMessage("/start", sponsor))
+        Assert.True(welcome.IsSuccessStatusCode)
+        let oldChat = fixture.CommunityChatId - 1L
+        let oldLink = "https://t.me/+synthetic-previous-community"
+        let! seeded = conn.ExecuteAsync(
+            """UPDATE "user" SET invite_chat_id=@chat, invite_link=@link WHERE id=@id""",
+            {| chat = oldChat; link = oldLink; id = sponsor.Id |})
+        Assert.Equal(1, seeded)
+        do! fixture.ClearFakeCalls()
+        use! reply = fixture.SendUpdateTo(1, Tg.dmMessage("/invite", sponsor))
+        Assert.True(reply.IsSuccessStatusCode)
+        let! revoked = fixture.GetFakeCalls("revokeChatInviteLink")
+        use revoke = System.Text.Json.JsonDocument.Parse(Assert.Single(revoked).Body)
+        Assert.Equal(oldChat, revoke.RootElement.GetProperty("chat_id").GetInt64())
+        Assert.Equal(oldLink, revoke.RootElement.GetProperty("invite_link").GetString())
+        let! link = conn.QuerySingleAsync<string>(
+            """SELECT invite_link FROM "user" WHERE id=@id AND invite_chat_id=@chat""",
+            {| id = sponsor.Id; chat = fixture.CommunityChatId |})
+        Assert.NotEqual<string>(oldLink, link)
+        let! messages = fixture.GetFakeCalls("sendMessage")
+        Assert.Equal(1, countCallsWithText messages sponsor.Id link)
     }

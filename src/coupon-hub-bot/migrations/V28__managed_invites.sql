@@ -1,14 +1,11 @@
 INSERT INTO bot_setting (key, value, type, feature_group, description)
 VALUES ('MANAGED_INVITES_ENABLED', 'false', 'FEATURE_FLAG', 'COMMUNITY', 'Issue personal single-use community invitations');
 
-ALTER TABLE "user" ADD COLUMN invited_by bigint REFERENCES "user"(id);
-CREATE TABLE active_community_invite (
-    chat_id bigint NOT NULL,
-    sponsor bigint NOT NULL REFERENCES "user"(id),
-    link text NOT NULL UNIQUE,
-    PRIMARY KEY (chat_id, sponsor)
-);
-GRANT SELECT, INSERT, DELETE ON active_community_invite TO coupon_hub_bot_service;
+ALTER TABLE "user"
+    ADD COLUMN invited_by bigint REFERENCES "user"(id),
+    ADD COLUMN invite_chat_id bigint,
+    ADD COLUMN invite_link text,
+    ADD CHECK ((invite_link IS NULL) = (invite_chat_id IS NULL));
 
 CREATE TABLE community_invite_event (
     id bigserial PRIMARY KEY,
