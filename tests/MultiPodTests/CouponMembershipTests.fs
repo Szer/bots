@@ -56,8 +56,8 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
             Assert.True(response.IsSuccessStatusCode)
         }
         do! fixture.ClearFakeCalls()
-        let issue pod = send pod (Tg.dmMessage("/invite", sponsor))
-        do! Task.WhenAll([| issue 0; issue 1 |]) :> Task
+        let command = Tg.dmMessage("/invite", sponsor)
+        do! Task.WhenAll([| send 0 command; send 1 (Tg.dmMessage("/invite", sponsor)) |]) :> Task
         let! first = activeLink()
         let! creates = fixture.GetFakeCalls("createChatInviteLink")
         let create = Assert.Single(creates)
@@ -82,6 +82,19 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         do! fixture.SetMethodError("revokeChatInviteLink", false)
         Assert.False(failed.IsSuccessStatusCode)
         do! Task.WhenAll([| send 0 used; send 1 used |]) :> Task
+        do! send 1 command
+        let stream = $"coupon-invite:{fixture.CommunityChatId}:{sponsor.Id}"
+        let! events = conn.QueryAsync<string>(
+            """SELECT event_type FROM community_invite_event WHERE stream_id=@stream ORDER BY stream_version""", {| stream = stream |})
+        Assert.Equal<string>([| "invite_link_created"; "invite_link_obtained"; "invite_link_obtained"; "invite_link_redeemed"; "invite_link_created" |], Seq.toArray events)
+        let! actorsMatch = conn.QuerySingleAsync<bool>(
+            """SELECT bool_and(CASE event_type
+                   WHEN 'invite_link_obtained' THEN (data->>'actorId')::bigint=@sponsor
+                   WHEN 'invite_link_redeemed' THEN (data->>'actorId')::bigint=@applicant
+                   ELSE data->>'actorKind'='bot' END)
+               FROM community_invite_event WHERE stream_id=@stream""",
+            {| stream = stream; sponsor = sponsor.Id; applicant = legacy.Id |})
+        Assert.True(actorsMatch)
         let! second = activeLink()
         Assert.NotEqual<string>(first, second)
         let! invitedBy = conn.QuerySingleAsync<int64>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = legacy.Id |})

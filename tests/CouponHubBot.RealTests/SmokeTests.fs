@@ -21,8 +21,11 @@ type SmokeTests(fx: RealAssemblyFixture) =
                 SELECT 1 FROM community_invite_join j
                 JOIN community_invite i USING (link)
                 JOIN "user" u ON u.id=j.applicant
+                JOIN community_invite_event e ON e.data->>'inviteId'=i.invite_id::text
                 WHERE i.chat_id=@chat AND j.link=@link AND i.sponsor=@sponsor
                   AND j.applicant=@applicant AND u.invited_by=@sponsor AND i.consumed
+                  AND e.event_type='invite_link_redeemed' AND (e.data->>'actorId')::bigint=@applicant
+                  AND (e.data->>'sponsorId')::bigint=@sponsor AND (e.data->>'updateId')::bigint=j.update_id
             )"""
         let deadline = DateTime.UtcNow.AddMinutes(10.)
         let mutable matched = false

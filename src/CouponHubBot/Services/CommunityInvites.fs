@@ -17,17 +17,29 @@ type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOpti
         return invite.InviteLink
     }
 
-    member _.GetLink(chatId: int64, sponsor: int64) = task {
+    member _.GetLink(chatId: int64, sponsor: int64, messageId: int64, date: DateTime) = task {
         use conn = new NpgsqlConnection(connectionString)
         do! conn.OpenAsync()
         use! tx = conn.BeginTransactionAsync()
-        let key = {| sponsor = sponsor; chat = chatId |}
+        let key = {| sponsor = sponsor; chat = chatId; message = messageId; stream = $"coupon-invite:{chatId}:{sponsor}" |}
         let! _ = conn.QuerySingleAsync<int64>("""SELECT id FROM "user" WHERE id=@sponsor FOR UPDATE""", key, tx)
-        let! existing = conn.QuerySingleOrDefaultAsync<string>(
-            "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND NOT consumed", key, tx)
-        if not (isNull existing) then return existing
+        let! previous = conn.QuerySingleOrDefaultAsync<string>(
+            """SELECT i.link FROM community_invite_event e
+               JOIN community_invite i ON i.invite_id=(e.data->>'inviteId')::uuid
+               WHERE e.stream_id=@stream AND e.event_type='invite_link_obtained'
+                 AND (e.data->>'messageId')::bigint=@message""", key, tx)
+        if not (isNull previous) then return previous
         else
-            let! link = createLink conn tx chatId sponsor
+            let! existing = conn.QuerySingleOrDefaultAsync<string>(
+                "SELECT link FROM community_invite WHERE chat_id=@chat AND sponsor=@sponsor AND NOT consumed", key, tx)
+            let! link =
+                if isNull existing then createLink conn tx chatId sponsor
+                else System.Threading.Tasks.Task.FromResult existing
+            do! conn.ExecuteAsync(
+                """SELECT append_community_invite_event(i, 'invite_link_obtained',
+                       jsonb_build_object('actorKind','user','actorId',i.sponsor,'messageId',@message), @date)
+                   FROM community_invite i WHERE i.link=@link""",
+                {| link = link; message = messageId; date = date.ToUniversalTime() |}, tx) |> taskIgnore
             do! tx.CommitAsync()
             return link
     }
