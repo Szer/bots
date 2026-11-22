@@ -82,6 +82,14 @@ type CouponMembershipTests(fixture: CouponMultiPodContainers) =
         use! failed = fixture.SendUpdateTo(0, used)
         do! fixture.SetMethodError("revokeChatInviteLink", false)
         Assert.False(failed.IsSuccessStatusCode)
+        let! afterFailure = activeLink()
+        Assert.Equal<string>(first, afterFailure)
+        let! rolledBack = conn.QuerySingleAsync<bool>(
+            """SELECT invited_by IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM community_invite_event WHERE event_type='invite_link_redeemed'
+                     AND (data->>'actorId')::bigint=@id)
+               FROM "user" WHERE id=@id""", {| id = legacy.Id |})
+        Assert.True(rolledBack)
         do! Task.WhenAll([| send 0 used; send 1 used |]) :> Task
         do! send 1 command
         let stream = $"coupon-invite:{fixture.CommunityChatId}:{sponsor.Id}"
