@@ -6,6 +6,7 @@
     <Compile Include="Types.fs" />
     <Compile Include="Services/DbService.fs" />
     <Compile Include="Services/MembershipService.fs" />
+    <Compile Include="Services/CommunityInvites.fs" />
     <Compile Include="Services/DashboardAuth.fs" />
     <Compile Include="Services/DashboardService.fs" />
     <Compile Include="Services/NotificationService.fs" />

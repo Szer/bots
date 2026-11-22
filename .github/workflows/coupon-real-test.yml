@@ -29,6 +29,15 @@ name: "CouponHubBot: Real Telegram test (AKS)"
 
 on:
   workflow_dispatch:
+    inputs:
+      verify_owner_invite:
+        type: boolean
+        default: false
+        description: Wait for the owner to request a link and rejoin with the MTProto account
+      verify_personal_join:
+        type: boolean
+        default: false
+        description: Send an invitation to the configured test participant and wait for a real join
 
 concurrency:
   group: coupon-aks-real-test
@@ -431,12 +440,16 @@ jobs:
           | base64 -d | gunzip > "$HOME/.coupon-test/tg.session"
 
     - name: Run real-Telegram suite
+      id: real_suite
       env:
         # Explicit opt-in required in addition to credentials (RealAssemblyFixture.fs)
         # — this workflow is the one deliberate, workflow_dispatch-only path that is
         # meant to set it. Never set this for any other job/workflow.
         COUPON_REAL_TESTS: "1"
         SIXLABORS_LICENSE_KEY: ${{ secrets.SIXLABORS_LICENSE_KEY }}
+        VERIFY_PERSONAL_JOIN: ${{ inputs.verify_personal_join }}
+        VERIFY_OWNER_INVITE: ${{ inputs.verify_owner_invite }}
+        JOINER_USERNAME: ${{ (inputs.verify_personal_join || inputs.verify_owner_invite) && secrets.COUPON_CI_JOINER_USERNAME || '' }}
         COUPON_REAL_MODE: remote
         COUPON_TEST_BOT_USERNAME: ${{ secrets.COUPON_CI_BOT_USERNAME }}
         COUPON_TEST_CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
@@ -451,10 +464,39 @@ jobs:
         COUPON_BOT_BASE_URL: ${{ env.PUBLIC_URL }}
         COUPON_BOT_AUTH_TOKEN: ${{ secrets.COUPON_WEBHOOK_SECRET }}
         COUPON_TEST_DB_URL: "Server=127.0.0.1;Port=15434;Database=coupon_hub_bot;User Id=coupon_hub_bot_service;Password=coupon_hub_bot_service;Include Error Detail=true;"
-      run: >-
-        dotnet test tests/CouponHubBot.RealTests -c Release
-        --logger "trx;LogFileName=real-test-results.trx"
-        --logger "console;verbosity=detailed"
+      run: |
+        args=()
+        if [[ "$VERIFY_PERSONAL_JOIN" == "true" || "$VERIFY_OWNER_INVITE" == "true" ]]; then
+          test -n "$JOINER_USERNAME" || { echo "::error::Configure COUPON_CI_JOINER_USERNAME first"; exit 1; }
+          args+=(--filter 'FullyQualifiedName~PersonalInviteIsStableUntilRedemption')
+        fi
+        dotnet test tests/CouponHubBot.RealTests -c Release "${args[@]}" \
+          --results-directory tests/CouponHubBot.RealTests/TestResults \
+          --logger "trx;LogFileName=real-test-results.trx" --logger "console;verbosity=detailed"
+        if [[ "$VERIFY_PERSONAL_JOIN" == "true" || "$VERIFY_OWNER_INVITE" == "true" ]]; then
+          python3 - <<'PYTEST'
+        from pathlib import Path
+        from xml.etree import ElementTree
+        report = Path("tests/CouponHubBot.RealTests/TestResults/real-test-results.trx")
+        result, = ElementTree.parse(report).findall(".//{*}UnitTestResult")
+        assert result.get("outcome") == "Passed", "Live join test must execute and pass"
+        PYTEST
+        fi
+
+    - name: Revoke test group invitations
+      if: always() && steps.real_suite.outcome != 'skipped'
+      env:
+        CHAT_ID: ${{ secrets.COUPON_CI_CHAT_ID }}
+        BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
+      run: |
+        set -o pipefail
+        docker run --rm --network host -e PGPASSWORD=admin postgres:17.10 \
+          psql -h 127.0.0.1 -p 15434 -U admin -d coupon_hub_bot -At \
+          -c 'SELECT invite_link FROM "user" WHERE invite_link IS NOT NULL' |
+        while IFS= read -r link; do
+          curl --silent --fail --data-urlencode "chat_id=$CHAT_ID" --data-urlencode "invite_link=$link" \
+            "https://api.telegram.org/bot${BOT_TOKEN}/revokeChatInviteLink" > /dev/null || exit 1
+        done
 
     - name: Upload test results
       uses: actions/upload-artifact@v4

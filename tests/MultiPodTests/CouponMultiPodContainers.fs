@@ -46,6 +46,7 @@ type CouponMultiPodContainers() =
             do! conn.OpenAsync()
             let settings =
                 [ "COMMUNITY_CHAT_ID", string this.CommunityChatId, "FREE_FORM", "CORE"
+                  "MANAGED_INVITES_ENABLED", "true", "FEATURE_FLAG", "COMMUNITY"
                   "TEST_MODE", "true", "FEATURE_FLAG", "CORE"
                   "REMINDER_RUN_ON_START", "false", "FEATURE_FLAG", "REMINDER" ]
             for (key, value, typ, group) in settings do

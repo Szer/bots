@@ -29,6 +29,7 @@ type GitHubServiceIsConfiguredTests() =
           FeedbackGitHubIssues = false
           WebhookUrl = ""
           DashboardUrl = ""
+          ManagedInvitesEnabled = false
           DashboardEnabled = false
           TestMode = true
           MaxTakenCoupons = 6

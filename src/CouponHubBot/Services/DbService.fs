@@ -261,6 +261,12 @@ ON CONFLICT (photo_file_id) DO UPDATE SET raw_response = EXCLUDED.raw_response;
             do! conn.ExecuteAsync(sql, {| photoFileId = photoFileId; rawResponse = rawResponse |}) |> taskIgnore
         }
 
+    member _.InvitedBy(id: int64) = task {
+        use! conn = openConn()
+        let! sponsor = conn.QuerySingleAsync<Nullable<int64>>("""SELECT invited_by FROM "user" WHERE id=@id""", {| id = id |})
+        return Option.ofNullable sponsor
+    }
+
     member _.UpsertUser(user: DbUser) =
         task {
             use! conn = openConn()

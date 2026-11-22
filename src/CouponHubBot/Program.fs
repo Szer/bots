@@ -65,6 +65,7 @@ let buildBotConf () =
       FeedbackGitHubIssues = getSettingOr "FEEDBACK_GITHUB_ISSUES" "false" |> bool.Parse
       WebhookUrl = getSettingOr "WEBHOOK_URL" (getEnvOr "WEBHOOK_URL" "")
       DashboardUrl = getSettingOr "DASHBOARD_URL" ""
+      ManagedInvitesEnabled = getSettingOr "MANAGED_INVITES_ENABLED" "false" |> bool.Parse
       DashboardEnabled = getSettingOr "DASHBOARD_ENABLED" "false" |> bool.Parse
       TestMode = getSettingOr "TEST_MODE" "false" |> bool.Parse
       MaxTakenCoupons = getSettingOr "MAX_TAKEN_COUPONS" "6" |> int
@@ -141,6 +142,7 @@ if botConfOptions.Value.TestMode then
 
 %builder
     .Services
+    .AddSingleton<CommunityInvites>(fun sp -> CommunityInvites(connString, sp.GetRequiredService<_>(), sp.GetRequiredService<_>()))
     .AddSingleton<BotService>()
     .AddSingleton<CouponFlowHandler>()
     .AddSingleton<BatchDebounce>()
@@ -154,7 +156,8 @@ if botConfOptions.Value.TestMode then
         new DashboardService(connString, sp.GetRequiredService<TimeProvider>(), sp.GetRequiredService<ITelegramApi>()))
     .AddSingleton<TelegramNotificationService>()
     .AddHostedService<MembershipCacheCleanupService>()
-    .AddHostedService<BotCommandsSetupService>()
+    .AddSingleton<BotCommandsSetupService>()
+    .AddHostedService<BotCommandsSetupService>(fun sp -> sp.GetRequiredService<BotCommandsSetupService>())
     .AddHostedService<WebhookRegistrationService>()
     .AddHostedService<BatchRecoveryService>()
     .AddSingleton<ReminderService>()
@@ -265,6 +268,7 @@ SettingsDump.mapConfigDumpEndpoint
             return Results.Text("Access Denied", statusCode = 401)
         else
             reloadSettings()
+            do! ctx.RequestServices.GetRequiredService<BotCommandsSetupService>().Refresh()
             do! notifyOtherPods()
             ctx.RequestServices.GetRequiredService<ILogger<Root>>().LogInformation "Settings reloaded"
             return Results.Ok "Settings reloaded"
@@ -280,6 +284,8 @@ WebhookHost.mapWebhookEndpoints webhookCfg FunogramJson.parseUpdate (fun ctx _ra
             do! bot.OnUpdate(update)
         with ex ->
             logger.LogError(ex, "Unhandled error in update handler for {UpdateId}", update.UpdateId)
+            if update.ChatMember |> Option.exists (fun change -> change.InviteLink.IsSome) then
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw ex
     }) app
 
 app.Run()
