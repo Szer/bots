@@ -8,11 +8,6 @@ open BotInfra
 open CouponHubBot
 open Funogram.Telegram
 
-[<CLIMutable>]
-type private CurrentInvite =
-    { invite_chat_id: Nullable<int64>
-      invite_link: string | null }
-
 type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOptions<BotConfiguration>) =
     let revokeLink (chatId: int64) (link: string) = task {
         let! result = tg.Call(Req.RevokeChatInviteLink.Make(chatId, link))
@@ -25,7 +20,7 @@ type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOpti
     let createLink (conn: NpgsqlConnection) (tx: NpgsqlTransaction) (chatId: int64) (sponsor: int64) = task {
         let! invite = tg.CallExn(Req.CreateChatInviteLink.Make(chatId, memberLimit = 1L))
         do! conn.ExecuteAsync(
-            """UPDATE "user" SET invite_link=@link, invite_chat_id=@chat WHERE id=@sponsor;
+            """UPDATE "user" SET invite_link=@link WHERE id=@sponsor;
                SELECT append_community_invite_event(@chat,@sponsor,@link,'invite_link_created','{"actorKind":"bot"}',clock_timestamp())""",
             {| link = invite.InviteLink; chat = chatId; sponsor = sponsor |}, tx) |> taskIgnore
         return invite.InviteLink
@@ -35,27 +30,19 @@ type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOpti
         use conn = new NpgsqlConnection(connectionString)
         do! conn.OpenAsync()
         use! tx = conn.BeginTransactionAsync()
-        let key = {| sponsor = sponsor; chat = chatId; message = messageId; stream = $"coupon-invite:{chatId}:{sponsor}" |}
-        let! current = conn.QuerySingleAsync<CurrentInvite>(
-            """SELECT invite_link, invite_chat_id FROM "user" WHERE id=@sponsor FOR UPDATE""", key, tx)
-        let! previous = conn.QuerySingleOrDefaultAsync<string>(
-            """SELECT data->>'inviteId' FROM community_invite_event
-               WHERE stream_id=@stream AND event_type='invite_link_obtained'
-                 AND (data->>'messageId')::bigint=@message""", key, tx)
-        if not (isNull previous) then
-            let! link = conn.QuerySingleOrDefaultAsync<string>(
-                """SELECT invite_link FROM "user" WHERE id=@sponsor AND invite_chat_id=@chat
-                   AND community_invite_key(invite_link)=@previous""", {| chat = chatId; sponsor = sponsor; previous = previous |}, tx)
-            return Option.ofObj link
+        let! current = conn.QuerySingleAsync<string>(
+            """SELECT invite_link FROM "user" WHERE id=@sponsor FOR UPDATE""", {| sponsor = sponsor |}, tx)
+        let! replay = conn.QuerySingleOrDefaultAsync<Nullable<bool>>(
+            """SELECT COALESCE(data->>'inviteId'=community_invite_key(@current), false)
+               FROM community_invite_event WHERE stream_id=@stream AND event_type='invite_link_obtained'
+                 AND (data->>'messageId')::bigint=@message""",
+            {| current = current; message = messageId; stream = $"coupon-invite:{chatId}:{sponsor}" |}, tx)
+        if replay.HasValue then
+            return if replay.Value then Option.ofObj current else None
         else
-            let! link = task {
-                match current.invite_link with
-                | null -> return! createLink conn tx chatId sponsor
-                | link when current.invite_chat_id.Value = chatId -> return link
-                | link ->
-                    do! revokeLink current.invite_chat_id.Value link
-                    return! createLink conn tx chatId sponsor
-            }
+            let! link =
+                if isNull current then createLink conn tx chatId sponsor
+                else System.Threading.Tasks.Task.FromResult current
             do! conn.ExecuteAsync(
                 """SELECT append_community_invite_event(@chat,@sponsor,@link,'invite_link_obtained',
                        jsonb_build_object('actorKind','user','actorId',@sponsor,'messageId',@message), @date)""",
@@ -88,9 +75,8 @@ type CommunityInvites(connectionString: string, tg: ITelegramApi, options: IOpti
                            ORDER BY created_at DESC, (data->>'updateId')::bigint DESC LIMIT 1)
                        WHERE id=@applicant""", key, tx) |> taskIgnore
                 let! consumed = conn.ExecuteAsync(
-                    """UPDATE "user" SET invite_link=NULL, invite_chat_id=NULL
-                       WHERE id=@sponsor AND invite_chat_id=@chat AND invite_link=@link""",
-                    {| sponsor = owner.Value; chat = chatId; link = link |}, tx)
+                    """UPDATE "user" SET invite_link=NULL WHERE id=@sponsor AND invite_link=@link""",
+                    {| sponsor = owner.Value; link = link |}, tx)
                 if consumed = 1 then
                     do! revokeLink chatId link
                     if options.Value.ManagedInvitesEnabled then

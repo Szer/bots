@@ -3,9 +3,7 @@ VALUES ('MANAGED_INVITES_ENABLED', 'false', 'FEATURE_FLAG', 'COMMUNITY', 'Issue 
 
 ALTER TABLE "user"
     ADD COLUMN invited_by bigint REFERENCES "user"(id),
-    ADD COLUMN invite_chat_id bigint,
-    ADD COLUMN invite_link text,
-    ADD CHECK ((invite_link IS NULL) = (invite_chat_id IS NULL));
+    ADD COLUMN invite_link text;
 
 CREATE TABLE community_invite_event (
     id bigserial PRIMARY KEY,

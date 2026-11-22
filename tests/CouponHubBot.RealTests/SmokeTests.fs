@@ -53,8 +53,8 @@ type SmokeTests(fx: RealAssemblyFixture) =
         let mutable link = ""
         while String.IsNullOrEmpty link && DateTime.UtcNow < deadline do
             let! issued = conn.QuerySingleOrDefaultAsync<string>(
-                """SELECT invite_link FROM "user" WHERE invite_chat_id=@chat AND id=@sponsor""",
-                {| chat = fx.Env.TestChatId; sponsor = sponsor |})
+                """SELECT invite_link FROM "user" WHERE id=@sponsor""",
+                {| sponsor = sponsor |})
             link <- issued
             if String.IsNullOrEmpty link then do! Task.Delay(TimeSpan.FromSeconds 2.)
         Assert.False(String.IsNullOrEmpty link, "The owner did not request an invitation within ten minutes.")
