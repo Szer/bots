@@ -29,9 +29,9 @@ module BatchTestHelpers =
     let stripBarcodeFromAzureJson (azureJson: string) =
         let json = System.Text.Json.Nodes.JsonNode.Parse(azureJson)
         let result = json["analyzeResult"]
-        let lines = result["content"].GetValue<string>().Split('\n')
-        let text = lines |> Array.filter (fun line -> not (System.Text.RegularExpressions.Regex.IsMatch(line, @"^\d{13}$")))
-        result["content"] <- System.Text.Json.Nodes.JsonValue.Create(String.concat "\n" text)
+        let content = result["content"].GetValue<string>()
+        let stripped = System.Text.RegularExpressions.Regex.Replace(content, @"\b\d{13}\b", "")
+        result["content"] <- System.Text.Json.Nodes.JsonValue.Create(stripped)
         json.ToJsonString()
 
     // ── Call-filter helpers ─────────────────────────────────────────────
