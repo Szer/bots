@@ -191,14 +191,10 @@ type VahterTestContainers(mlEnabled: bool, extraEnvVars: (string * string) list)
     member this.Uri = this.BotHttp.BaseAddress
 
     member this.SetOcrText(text: string) = task {
-        let ocrJson =
-            $"""{{"modelVersion":"2023-10-01","metadata":{{"width":1020,"height":638}},"readResult":{{"blocks":[{{"lines":[{{"text":"{text}","boundingPolygon":[{{"x":1,"y":24}},{{"x":1005,"y":27}},{{"x":1004,"y":377}},{{"x":0,"y":371}}],"words":[{{"text":"{text}","confidence":0.9}}]}}]}}]}}}}"""
-        this.SetAzureOcrResponse(200, ocrJson) |> Async.AwaitTask |> Async.RunSynchronously
+        let ocrJson = JsonSerializer.Serialize({| status = "succeeded"; analyzeResult = {| modelId = "prebuilt-read"; content = text; pages = Array.empty<obj> |} |})
+        do! this.SetAzureOcrResponse(200, ocrJson)
     }
 
-    /// Counts calls the bot has made to Azure Computer Vision's `/computervision/` endpoint
-    /// (i.e. real OCR analyze calls; Azure OpenAI / LLM calls go through `/openai/` and are
-    /// excluded). Used to verify cache hit/miss behavior in OCR cache tests.
     member this.GetAzureOcrAnalyzeCallCount() = task {
         if not this.OcrEnabled then
             return 0
@@ -209,7 +205,7 @@ type VahterTestContainers(mlEnabled: bool, extraEnvVars: (string * string) list)
             use doc = JsonDocument.Parse(json)
             return
                 doc.RootElement.EnumerateArray()
-                |> Seq.filter (fun el -> el.GetProperty("url").GetString().StartsWith("/computervision/"))
+                |> Seq.filter (fun el -> el.GetProperty("url").GetString().StartsWith("/documentintelligence/documentModels/prebuilt-read:analyze"))
                 |> Seq.length
     }
 

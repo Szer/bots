@@ -127,9 +127,6 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
-// OCR: register shared IBotOcr, backed by the Azure AI Vision Image Analysis SDK. Retry +
-// per-attempt timeout live inside the SDK's own pipeline (Azure.Core — honors Retry-After, runs on
-// the real wall-clock). Singleton so the memoized ImageAnalysisClient is shared across requests.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddSingleton<IBotOcr>(fun sp ->
     AzureBotOcr(

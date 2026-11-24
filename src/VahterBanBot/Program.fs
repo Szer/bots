@@ -277,7 +277,7 @@ WebhookHost.configureSharedServices webhookCfg builder
     .AddHostedService<BotCommandsSetupService>()
     .AddHostedService<UpdateChatAdmins>()
 
-// OCR: register shared IBotOcr (Azure AI Vision SDK; SDK-native retry), then the VahterBanBot
+// OCR: register shared IBotOcr (Document Intelligence SDK; SDK-native retry), then the VahterBanBot
 // adapter that keeps the IComputerVision interface.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddSingleton<IBotOcr>(fun sp ->

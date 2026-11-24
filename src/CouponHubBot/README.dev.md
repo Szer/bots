@@ -82,8 +82,7 @@ docker compose -f src/coupon-hub-bot/docker-compose.dev.yml --profile smoke up -
 ```
 
 This starts Postgres (15432), runs Flyway migrations, seeds `bot_setting` from a
-prod snapshot (`dev-bot-settings.sql` — includes `OCR_ENABLED=true`,
-`AZURE_OCR_ENDPOINT=...`, etc.), and runs the bot on host port 5000. Default
+prod snapshot (`dev-bot-settings.sql`), and runs the bot on host port 5000. Default
 `up` (without `--profile smoke`) brings only Postgres + Flyway + the
 settings seed for the Rider workflow.
 
@@ -114,9 +113,8 @@ curl "https://api.telegram.org/bot<BOT_TELEGRAM_TOKEN>/getWebhookInfo"
 
 ### 5. (Optional) Tweak bot_setting
 
-`OCR_ENABLED`, `AZURE_OCR_ENDPOINT`, `FEEDBACK_ADMINS`, etc. are already
-seeded from the prod snapshot — no manual flip needed for OCR. To change a
-value mid-session and have the bot pick it up without a restart:
+The dev seed enables OCR. Set `AZURE_OCR_ENDPOINT` and `AZURE_OCR_KEY` in
+`.env.local` for your Document Intelligence resource. To change a database setting mid-session:
 
 ```bash
 docker exec -it coupon-hub-postgres-dev psql -U admin -d coupon_hub_bot \
@@ -160,7 +158,7 @@ OCR is extracted into `CouponOcrEngine` and tested separately without Docker con
 
 ### Environment Variables (required for Azure calls)
 
-Tests make real HTTP calls to Azure Computer Vision:
+On a cache miss, tests with both variables set call Azure Document Intelligence.
 - `AZURE_OCR_ENDPOINT` — base URL (e.g. `https://<name>.cognitiveservices.azure.com`)
 - `AZURE_OCR_KEY`
 

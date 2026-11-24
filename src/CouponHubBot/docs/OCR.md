@@ -2,13 +2,14 @@
 
 ## Overview
 
-`CouponOcrEngine` combines barcode scanning (ZXing) with Azure Computer Vision text OCR to extract coupon data from photos.
+`CouponOcrEngine` combines barcode scanning (ZXing) with Azure Document Intelligence text OCR to extract coupon data from photos.
 
 ## Components
 
 - **ZXingCpp** + ImageSharp — EAN-13 scanning on grayscale images, followed by horizontal crops
 - **ZXing.Net** + ImageSharp bindings — fallback with rotation, contrast and resizing; luminance is shared across crops
-- **AzureOcrService** — calls Azure Computer Vision `imageanalysis:analyze` endpoint
+- **AzureBotOcr** — submits images to `prebuilt-read` and polls for the recognized text through the Document Intelligence SDK.
+  Configure `AZURE_OCR_ENDPOINT` and `AZURE_OCR_KEY` for a resource that supports Document Intelligence.
 - **CouponOcrEngine** — orchestrates both, returns `CouponOCR` record
 
 After ordinary scans miss, an explicit EAN-13 checksum error from ZXing enables print-streak repair. The repair reconnects a split bar when multiple rows agree on one EAN-13 and two separate areas of surrounding print show the same gap. If the evidence is insufficient, the managed decoder retries at other image sizes.
@@ -41,5 +42,5 @@ Generation checks the number’s format and checksum and decodes the image back 
 Env vars:
 - `OCR_ENABLED` — enable/disable OCR (default: false)
 - `OCR_MAX_FILE_SIZE_BYTES` — max photo size for OCR processing
-- `AZURE_OCR_ENDPOINT` — Azure Computer Vision endpoint URL
+- `AZURE_OCR_ENDPOINT` — Azure Document Intelligence endpoint URL
 - `AZURE_OCR_KEY` — Azure API key

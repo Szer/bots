@@ -110,12 +110,8 @@ type BatchResilienceTests(fixture: OcrCouponHubTestContainers) =
             Assert.Equal<int list>(List.sort mids, Array.toList replyMids)
         }
 
-    /// Same shape as above but Azure returns 200 with an empty body. Same
-    /// outcome: barcode from ZXing, no money/date from text → "partial".
-    /// Belt-and-suspenders with the 403 case so a future change to error
-    /// handling in AzureBotOcr can't silently regress one path.
     [<Fact>]
-    let ``Azure OCR returns 200 with empty body: items go to needs_input "partial", no crash`` () =
+    let ``Completed OCR with no text leaves the item partial`` () =
         task {
             do! setupBatchTest ()
 
@@ -127,7 +123,7 @@ type BatchResilienceTests(fixture: OcrCouponHubTestContainers) =
             let goodA = "10_50_2026-01-17_2026-01-26_2706688198845.jpg"
             do! fixture.SetTelegramFile("ae-1", readImageBytes goodA)
 
-            do! fixture.SetAzureOcrResponse(200, "{}")
+            do! fixture.SetAzureOcrResponse(200, """{"status":"succeeded","analyzeResult":{"modelId":"prebuilt-read","content":"","pages":[]}}""")
 
             let! _ = fixture.SendUpdate(Tg.dmAlbumPhoto(user, mgid, fileId = "ae-1", messageId = 9501))
             let! batchId = waitForBatchByUser fixture user.Id 5000

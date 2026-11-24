@@ -8,10 +8,7 @@
 --     -c "DELETE FROM bot_setting;"
 --   docker compose -f src/coupon-hub-bot/docker-compose.dev.yml run --rm seed-bot-settings
 --
--- Note: secrets (tokens, OCR key) still come from .env.local. AZURE_OCR_ENDPOINT
--- below is the prod endpoint; OCR calls will only succeed if AZURE_OCR_KEY in
--- .env.local is the matching key (or you point the endpoint at your own Azure
--- resource).
+-- Local OCR uses AZURE_OCR_ENDPOINT and AZURE_OCR_KEY from .env.local.
 
 INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('MAX_TAKEN_COUPONS',      '6',                                                    'FREE_FORM',    'coupons',     'Max coupons a single user can hold at once'),
@@ -19,7 +16,6 @@ INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('FEEDBACK_ADMINS',        '432506904;509847134',                                  'FREE_FORM',    'feedback',    'Telegram user ids (; , or space separated) who receive /feedback reports'),
     ('GITHUB_REPO',            'Szer/bots',                                            'FREE_FORM',    'feedback',    'owner/repo used by /feedback to open GitHub issues'),
     ('FEEDBACK_GITHUB_ISSUES', 'false',                                                'FEATURE_FLAG', 'feedback',    'Open a GitHub issue in GITHUB_REPO for every /feedback (private feedback -> public repo, keep off unless intended)'),
-    ('AZURE_OCR_ENDPOINT',     'https://szer-vision-ocr.cognitiveservices.azure.com', 'FREE_FORM',    'ocr',         'Azure Computer Vision resource base URL'),
     ('OCR_ENABLED',            'true',                                                 'FEATURE_FLAG', 'ocr',         'Master toggle for Azure OCR pre-fill of coupon fields'),
     ('OCR_MAX_FILE_SIZE_BYTES','20971520',                                             'FREE_FORM',    'ocr',         'Maximum photo size in bytes that will be sent to Azure OCR'),
     ('REMINDER_HOUR_DUBLIN',   '10',                                                   'FREE_FORM',    'reminders',   'Hour of day (Europe/Dublin) to send daily reminders'),

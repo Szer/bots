@@ -78,67 +78,28 @@ module private AzureCache =
         let safeName = Path.GetFileName(imageFileName)
         Path.Combine(cacheDir, safeName + ".azure.json")
 
-type private AzureOcrCachingHandler(cachePath: string, allowNetwork: bool, log: string -> unit) =
-    inherit HttpMessageHandler()
+module private Replay =
+    let content (json: string) =
+        let stream =
+            { new MemoryStream(Encoding.UTF8.GetBytes(json)) with
+                override _.CanSeek = false }
+        new StreamContent(stream)
 
-    let invoker = new HttpMessageInvoker(new HttpClientHandler())
-
-    override _.SendAsync(request: HttpRequestMessage, cancellationToken: Threading.CancellationToken) =
-        task {
-            let dir = Path.GetDirectoryName(cachePath)
-            if not (String.IsNullOrWhiteSpace dir) then
-                Directory.CreateDirectory(dir) |> ignore
-
-            if File.Exists(cachePath) then
-                log $"Azure OCR cache hit: {Path.GetFileName(cachePath)}"
-                let json: string = File.ReadAllText(cachePath, Encoding.UTF8)
-                let resp = new HttpResponseMessage(HttpStatusCode.OK)
-                resp.Content <- new StringContent(json, Encoding.UTF8, "application/json")
-                return resp
-            else
-                if not allowNetwork then
-                    return (failwithf
-                        "Azure OCR cache miss (%s) and AZURE_OCR_ENDPOINT/AZURE_OCR_KEY are not set. Either set env vars to fetch & populate cache, or add the cache file to git."
-                        (Path.GetFileName(cachePath)))
-                else
-                    // Buffer request content so we can both cache and forward.
-                    let! bodyBytes = request.Content.ReadAsByteArrayAsync(cancellationToken)
-                    let newContent = new ByteArrayContent(bodyBytes)
-                    // Preserve content headers (especially Content-Type).
-                    for h: Collections.Generic.KeyValuePair<string, Collections.Generic.IEnumerable<string>> in request.Content.Headers do
-                        newContent.Headers.TryAddWithoutValidation(h.Key, h.Value) |> ignore
-                    request.Content <- newContent
-
-                    log $"Azure OCR cache miss: {Path.GetFileName(cachePath)} (fetching from Azure)"
-                    use! response = invoker.SendAsync(request, cancellationToken)
-                    let! json: string = response.Content.ReadAsStringAsync(cancellationToken)
-
-                    // Cache raw Azure JSON response for future runs.
-                    File.WriteAllText(cachePath, json, Encoding.UTF8)
-                    log $"Azure OCR cached: {Path.GetFileName(cachePath)}"
-
-                    // Replace content so downstream can read it.
-                    let outResp = new HttpResponseMessage(response.StatusCode)
-                    outResp.ReasonPhrase <- response.ReasonPhrase
-                    for h: Collections.Generic.KeyValuePair<string, Collections.Generic.IEnumerable<string>> in response.Headers do
-                        outResp.Headers.TryAddWithoutValidation(h.Key, h.Value) |> ignore
-                    outResp.Content <- new StringContent(json, Encoding.UTF8, "application/json")
-                    return outResp
-        }
-
-/// Captures the request URI the SDK actually targets and returns a minimal valid 200 OCR body,
-/// so a test can assert how a configured endpoint is turned into a request path.
-type private RequestCapturingHandler() =
+type private ReplayHandler(json: string) =
     inherit HttpMessageHandler()
     let mutable lastUri : Uri | null = null
     member _.LastUri = lastUri
-    override _.SendAsync(request: HttpRequestMessage, _cancellationToken: Threading.CancellationToken) =
+    override _.SendAsync(request, _) =
         task {
-            lastUri <- request.RequestUri
-            let json = """{"modelVersion":"2023-10-01","metadata":{"width":1,"height":1},"readResult":{"blocks":[]}}"""
-            let resp = new HttpResponseMessage(HttpStatusCode.OK)
-            resp.Content <- new StringContent(json, Encoding.UTF8, "application/json")
-            return resp
+            if request.Method = HttpMethod.Post then
+                lastUri <- request.RequestUri
+                let response = new HttpResponseMessage(HttpStatusCode.Accepted)
+                response.Headers.Add("Operation-Location", Uri(lastUri, "/documentintelligence/documentModels/prebuilt-read/analyzeResults/00000000-0000-0000-0000-000000000001").AbsoluteUri)
+                return response
+            else
+                let response = new HttpResponseMessage(HttpStatusCode.OK)
+                response.Content <- Replay.content json
+                return response
         }
 
 module private Parsing =
@@ -201,8 +162,17 @@ type OcrTests(output: ITestOutputHelper) =
 
         let cacheDir = AzureCache.getCacheDir ()
         let cachePath = AzureCache.cachePathForImageFileName cacheDir imageFileName
-        let handler = new AzureOcrCachingHandler(cachePath, allowNetwork, fun s -> output.WriteLine(s))
-        let http = new HttpClient(handler)
+        let http, saveResponse =
+            if File.Exists(cachePath) then
+                new HttpClient(new ReplayHandler(File.ReadAllText(cachePath))), None
+            elif allowNetwork then
+                let save (json: string) = task {
+                    Directory.CreateDirectory(cacheDir) |> ignore
+                    do! File.WriteAllTextAsync(cachePath, json)
+                }
+                new HttpClient(), Some save
+            else
+                failwithf "Missing OCR fixture %s" cachePath
 
         let ocrOptions: IOptions<BotOcrConfig> =
             LiveOptions(
@@ -222,7 +192,7 @@ type OcrTests(output: ITestOutputHelper) =
 
         let engine: CouponOcrEngine =
             CouponOcrEngine(azure, XUnitLogging.XUnitLogger<CouponOcrEngine>(output, logs), timeProvider)
-        engine, http, logs
+        engine, http, logs, saveResponse
 
     [<Theory>]
     [<InlineData("2054.jpg", "2707300564987")>]
@@ -506,14 +476,14 @@ type OcrTests(output: ITestOutputHelper) =
             if not (File.Exists(path)) then
                 failwithf "Image file not found: '%s' (looked in '%s')" fileName imagesDir
 
-            let engine, http, logs = buildEngine fileName
+            let engine, http, logs, saveResponse = buildEngine fileName
             use _http = http
 
             let nameNoExt = Path.GetFileNameWithoutExtension(path)
             let expected = Parsing.parseExpectedFromFileName nameNoExt
 
             let bytes = File.ReadAllBytes(path)
-            let! res = engine.Recognize(ReadOnlyMemory<byte>(bytes))
+            let! res = engine.Recognize(ReadOnlyMemory<byte>(bytes), ?saveResponse = saveResponse)
 
             // couponValue
             Assert.True(res.couponValue.HasValue, $"Expected couponValue from '{nameNoExt}'")
@@ -597,11 +567,11 @@ type OcrTests(output: ITestOutputHelper) =
             if not (File.Exists(path)) then
                 failwithf "Image file not found: '%s' (looked in '%s')" fileName imagesDir
 
-            let engine, http, logs = buildEngine fileName
+            let engine, http, logs, saveResponse = buildEngine fileName
             use _http = http
 
             let bytes = File.ReadAllBytes(path)
-            let! res = engine.Recognize(ReadOnlyMemory<byte>(bytes))
+            let! res = engine.Recognize(ReadOnlyMemory<byte>(bytes), ?saveResponse = saveResponse)
 
             let assertMoney (label: string) (expected: string) (actual: Nullable<decimal>) =
                 let exp = Decimal.Parse(expected, NumberStyles.Number, CultureInfo.InvariantCulture)
@@ -632,14 +602,10 @@ type OcrTests(output: ITestOutputHelper) =
                 Assert.Equal(expectedBarcode, res.barcode)
         }
 
-    // Regression for the prod 404 (2026-06-29): AZURE_OCR_ENDPOINT was stored as the *full* analyze
-    // URL (path + query). The old hand-rolled client stripped it to the host; the SDK appends its own
-    // path, so the full URL doubled the path -> 404. AzureBotOcr must normalize the endpoint to the
-    // resource origin so the SDK targets exactly /computervision/imageanalysis:analyze.
     [<Fact>]
     member _.``Full analyze-URL endpoint is normalized to the resource origin``() =
         task {
-            let handler = new RequestCapturingHandler()
+            let handler = new ReplayHandler("""{"status":"succeeded","analyzeResult":{"modelId":"prebuilt-read","content":"test content","pages":[]}}""")
             use http = new HttpClient(handler)
             let ocrOptions: IOptions<BotOcrConfig> =
                 LiveOptions(
@@ -652,28 +618,23 @@ type OcrTests(output: ITestOutputHelper) =
             let azure =
                 AzureBotOcr(ocrOptions, XUnitLogging.XUnitLogger<AzureBotOcr>(output, ResizeArray()), transport) :> IBotOcr
 
-            let! _ = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy; 2uy; 3uy |]))
+            let! result = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy; 2uy; 3uy |]))
 
+            Assert.Equal("test content", result.Text)
             match handler.LastUri with
             | null -> failwith "SDK made no request"
             | uri ->
                 Assert.Equal("example.cognitiveservices.azure.com", uri.Host)
-                // Single, correct path — not the doubled ".../imageanalysis:analyze/computervision/..." that 404s.
-                Assert.Equal("/computervision/imageanalysis:analyze", uri.AbsolutePath)
+                Assert.Equal("/documentintelligence/documentModels/prebuilt-read:analyze", uri.AbsolutePath)
         }
 
-    // Regression for prod trace 03c18ceac4f43ff2209ab92ccf002276 (2026-08-12): a 60x42 Telegram photo
-    // (height 42 < Azure's documented 50px minimum) made Azure return HTTP 400 InvalidImageSize.
-    // AzureBotOcr must degrade gracefully to "no OCR text" without an Error-level log, since a tiny
-    // image is an expected, foreseeable input — not a broken OCR backend.
     [<Fact>]
     member _.``Below-minimum image dimension is skipped gracefully, not logged as an error``() =
         task {
             let handler = { new HttpMessageHandler() with
                                 member _.SendAsync(_req, _ct) =
                                     task {
-                                        // Exact body Azure returned in the production incident.
-                                        let body = """{"error":{"code":"InvalidRequest","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000.","innererror":{"code":"InvalidImageSize","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000."}}}"""
+                                        let body = """{"error":{"code":"InvalidRequest","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000.","innererror":{"code":"InvalidContentDimensions","message":"The image dimension is not allowed to be smaller than 50 and larger than 16000."}}}"""
                                         let resp = new HttpResponseMessage(HttpStatusCode.BadRequest)
                                         resp.Content <- new StringContent(body, Encoding.UTF8, "application/json")
                                         return resp
