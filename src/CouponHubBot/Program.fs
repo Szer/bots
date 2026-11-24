@@ -57,8 +57,8 @@ let buildBotConf () =
       AddCouponReminderLookbackDays = getSettingOr "ADD_COUPON_REMINDER_LOOKBACK_DAYS" "2" |> int
       OcrEnabled = getSettingOr "OCR_ENABLED" "false" |> bool.Parse
       OcrMaxFileSizeBytes = getSettingOr "OCR_MAX_FILE_SIZE_BYTES" (string (20L * 1024L * 1024L)) |> int64
-      AzureOcrEndpoint = getSettingOr "AZURE_OCR_ENDPOINT" (getEnvOr "AZURE_OCR_ENDPOINT" "")
-      AzureOcrKey = getEnvOr "AZURE_OCR_KEY" ""
+      AzureOcrEndpoint = getSettingOr "DOCUMENT_INTELLIGENCE_ENDPOINT" (getEnvOr "DOCUMENT_INTELLIGENCE_ENDPOINT" "")
+      AzureOcrKey = getEnvOr "DOCUMENT_INTELLIGENCE_KEY" ""
       FeedbackAdminIds = getSettingOr "FEEDBACK_ADMINS" (getEnvOr "FEEDBACK_ADMINS" "") |> parseAdmins
       GitHubToken = getEnvOr "GITHUB_TOKEN" ""
       GitHubRepo = getSettingOr "GITHUB_REPO" (getEnvOr "GITHUB_REPO" "Szer/bots")
@@ -127,9 +127,6 @@ if botConfOptions.Value.TestMode then
     %builder.Services.AddSingleton<FakeTimeProvider>(fake)
     %builder.Services.AddSingleton<TimeProvider>(fake :> TimeProvider)
 
-// OCR: register shared IBotOcr, backed by the Azure AI Vision Image Analysis SDK. Retry +
-// per-attempt timeout live inside the SDK's own pipeline (Azure.Core — honors Retry-After, runs on
-// the real wall-clock). Singleton so the memoized ImageAnalysisClient is shared across requests.
 %builder.Services.AddSingleton<IOptions<BotOcrConfig>>(botOcrOptions)
 %builder.Services.AddSingleton<IBotOcr>(fun sp ->
     AzureBotOcr(

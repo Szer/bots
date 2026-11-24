@@ -26,42 +26,13 @@ module BatchTestHelpers =
     let readAzureCacheJson (fileName: string) =
         File.ReadAllText(Path.Combine(solutionDirPath, "tests", "CouponHubBot.Ocr.Tests", "AzureCache", fileName + ".azure.json"))
 
-    /// Azure JSON with any 13-digit barcode text line removed (forces
-    /// CouponOcrEngine's text-fallback to NOT find a barcode either).
     let stripBarcodeFromAzureJson (azureJson: string) =
-        let doc = JsonDocument.Parse(azureJson)
-        use ms = new MemoryStream()
-        let opts = JsonWriterOptions(Indented = false)
-        use writer = new Utf8JsonWriter(ms, opts)
-        let rec writeElement (el: JsonElement) =
-            match el.ValueKind with
-            | JsonValueKind.Object ->
-                writer.WriteStartObject()
-                for prop in el.EnumerateObject() do
-                    writer.WritePropertyName(prop.Name)
-                    writeElement prop.Value
-                writer.WriteEndObject()
-            | JsonValueKind.Array ->
-                writer.WriteStartArray()
-                let mutable items = el.EnumerateArray() |> Seq.toArray
-                if items.Length > 0
-                   && items |> Array.exists (fun it ->
-                       it.ValueKind = JsonValueKind.Object
-                       && (match it.TryGetProperty("text") with
-                           | true, t -> System.Text.RegularExpressions.Regex.IsMatch(t.GetString(), @"^\d{13}$")
-                           | _ -> false)) then
-                    items <- items |> Array.filter (fun it ->
-                        not (it.ValueKind = JsonValueKind.Object
-                             && (match it.TryGetProperty("text") with
-                                 | true, t -> System.Text.RegularExpressions.Regex.IsMatch(t.GetString(), @"^\d{13}$")
-                                 | _ -> false)))
-                for item in items do
-                    writeElement item
-                writer.WriteEndArray()
-            | _ -> el.WriteTo(writer)
-        writeElement doc.RootElement
-        writer.Flush()
-        System.Text.Encoding.UTF8.GetString(ms.ToArray())
+        let json = System.Text.Json.Nodes.JsonNode.Parse(azureJson)
+        let result = json["analyzeResult"]
+        let content = result["content"].GetValue<string>()
+        let stripped = System.Text.RegularExpressions.Regex.Replace(content, @"\b\d{13}\b", "")
+        result["content"] <- System.Text.Json.Nodes.JsonValue.Create(stripped)
+        json.ToJsonString()
 
     // ── Call-filter helpers ─────────────────────────────────────────────
 

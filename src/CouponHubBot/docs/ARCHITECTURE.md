@@ -21,7 +21,6 @@ src/CouponHubBot/
     ├── AddFlowService.fs # /add wizard state machine
     ├── ReminderService.fs # Scheduled reminders (expiring coupons, monthly stats)
     ├── GitHubService.fs  # GitHub API client (feedback issues, agent assignment)
-    ├── AzureOcrService.fs # Azure Computer Vision OCR client
     └── CouponOcrEngine.fs # Barcode + text OCR processing
 ```
 

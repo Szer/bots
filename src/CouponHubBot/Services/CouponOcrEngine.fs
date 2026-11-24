@@ -121,11 +121,14 @@ module private CouponOcrParsing =
                         let parts = endText.Split([| '/'; '.'; '-' |])
                         let endDate =
                             match parts with
-                            | [| day; month |] ->
-                                // Receipt ranges use day/month; a missing end year follows the start date.
-                                match tryParseDateAny nowUtc $"{day}/{month}/{a.Year}" with
-                                | Some b when b < a -> tryParseDateAny nowUtc $"{day}/{month}/{a.Year + 1}"
-                                | result -> result
+                            | [| day; month |]
+                            | [| day; month; _ |] when parts.Length = 2 || parts[2].Length = 1 ->
+                                let inferred =
+                                    match tryParseDateAny nowUtc $"{day}/{month}/{a.Year}" with
+                                    | Some b when b < a -> tryParseDateAny nowUtc $"{day}/{month}/{a.Year + 1}"
+                                    | result -> result
+                                inferred |> Option.filter (fun b ->
+                                    parts.Length = 2 || b.ToString("yy", CultureInfo.InvariantCulture).StartsWith(parts[2]))
                             | _ -> tryParseDateAny nowUtc endText
                         endDate |> Option.map (fun b -> a.Date, b.Date)
                     | None -> None
@@ -164,7 +167,7 @@ module private CouponOcrParsing =
                 // Fallback for some layouts:
                 // "SAVE €10" + "When you spend €50"
                 let mSave = Regex.Match(text, @"(?i)\b(save|off)\s*€\s*(?<v>\d{1,3}(?:[.,]\d{1,2})?)\b")
-                let mSpend = Regex.Match(text, @"(?i)\b(spend|when you spend)\s*€\s*(?<mc>\d{1,3}(?:[.,]\d{1,2})?)\b")
+                let mSpend = Regex.Match(text, @"(?i)\b(spend|when you spend)\s*[€$]\s*(?<mc>\d{1,3}(?:[.,]\d{1,2})?)\b")
                 if mSave.Success && mSpend.Success then
                     match parseDecimalInvariant mSave.Groups.["v"].Value, parseDecimalInvariant mSpend.Groups.["mc"].Value with
                     | Some v, Some mc -> Some(v, mc)

@@ -75,7 +75,7 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             let! retained = fixture.QuerySingle<int64>("SELECT count(*) FROM coupon_ocr WHERE photo_file_id = @photo", {| photo = fileId |})
             Assert.Equal(1L, retained)
             let updated = System.Text.Json.Nodes.JsonNode.Parse(rawJson)
-            updated["modelVersion"] <- System.Text.Json.Nodes.JsonValue.Create("updated-model")
+            updated["analyzeResult"]["modelId"] <- System.Text.Json.Nodes.JsonValue.Create("updated-model")
             let updatedJson = updated.ToJsonString()
             do! fixture.SetAzureOcrResponse(200, updatedJson)
             let! repeated = fixture.SendUpdate(makeUpdate ())
@@ -88,43 +88,7 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             do! fixture.TruncateBatches()
         }
 
-    /// Returns Azure OCR JSON with any 13-digit barcode text line removed,
-    /// so the OCR text fallback won't find a barcode either.
-    let stripBarcodeFromAzureJson (azureJson: string) =
-        let doc = JsonDocument.Parse(azureJson)
-        use ms = new MemoryStream()
-        let opts = JsonWriterOptions(Indented = false)
-        use writer = new Utf8JsonWriter(ms, opts)
-        let rec writeElement (el: JsonElement) =
-            match el.ValueKind with
-            | JsonValueKind.Object ->
-                writer.WriteStartObject()
-                for prop in el.EnumerateObject() do
-                    writer.WritePropertyName(prop.Name)
-                    writeElement prop.Value
-                writer.WriteEndObject()
-            | JsonValueKind.Array ->
-                writer.WriteStartArray()
-                let mutable items = el.EnumerateArray() |> Seq.toArray
-                // Filter out line objects whose "text" is exactly 13 digits (barcode).
-                if items.Length > 0
-                   && items |> Array.exists (fun it ->
-                       it.ValueKind = JsonValueKind.Object
-                       && (match it.TryGetProperty("text") with
-                           | true, t -> System.Text.RegularExpressions.Regex.IsMatch(t.GetString(), @"^\d{13}$")
-                           | _ -> false)) then
-                    items <- items |> Array.filter (fun it ->
-                        not (it.ValueKind = JsonValueKind.Object
-                             && (match it.TryGetProperty("text") with
-                                 | true, t -> System.Text.RegularExpressions.Regex.IsMatch(t.GetString(), @"^\d{13}$")
-                                 | _ -> false)))
-                for item in items do
-                    writeElement item
-                writer.WriteEndArray()
-            | _ -> el.WriteTo(writer)
-        writeElement doc.RootElement
-        writer.Flush()
-        System.Text.Encoding.UTF8.GetString(ms.ToArray())
+    let stripBarcodeFromAzureJson = BatchTestHelpers.stripBarcodeFromAzureJson
 
     let getLatestExpiresIso () =
         fixture.QuerySingle<string>("SELECT expires_at::text FROM coupon ORDER BY id DESC LIMIT 1", null)
@@ -496,11 +460,8 @@ FROM coupon_ocr WHERE photo_file_id = @photo;
             let fileId = "ocr-photo-partial"
 
             do! fixture.SetTelegramFile(fileId, readImageBytes fileName)
-            // Real Image Analysis 4.0 shape: text lives in readResult.blocks[].lines[].text (the SDK
-            // does not expose a top-level readResult.content). Amounts only, no date -> the wizard
-            // should prefill discount/min_check, then ask for the expiry date.
             let partialBody =
-                """{"modelVersion":"2023-10-01","metadata":{"width":100,"height":100},"readResult":{"blocks":[{"lines":[{"text":"SAVE €10","boundingPolygon":[{"x":0,"y":0},{"x":10,"y":0},{"x":10,"y":5},{"x":0,"y":5}],"words":[]},{"text":"When you spend €50","boundingPolygon":[{"x":0,"y":6},{"x":10,"y":6},{"x":10,"y":11},{"x":0,"y":11}],"words":[]}]}]}}"""
+                """{"status":"succeeded","analyzeResult":{"apiVersion":"2024-11-30","modelId":"prebuilt-read","stringIndexType":"textElements","content":"SAVE €10\nWhen you spend €50","pages":[]}}"""
             do! fixture.SetAzureOcrResponse(200, partialBody)
 
             let! _ = fixture.SendUpdate(Tg.dmMessage("/add", user))

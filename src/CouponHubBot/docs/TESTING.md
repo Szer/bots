@@ -73,9 +73,9 @@ Always parse `call.Body` through `JsonDocument.Parse(...)` and compare strings v
 
 ## FakeAzureOcrApi
 
-Mock Azure Computer Vision OCR API.
+The OCR fake accepts a submission and serves the result at the operation URL.
 
-- Endpoint: `POST /computervision/imageanalysis:analyze?overload=stream&api-version=2024-02-01&features=read`
+- Endpoint: `POST /documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30`
 - Test endpoints:
   - `POST /test/mock/response` with `{ status, body }` — override response (usually `body` from `tests/CouponHubBot.Ocr.Tests/AzureCache/*.azure.json`)
   - `GET /test/calls` / `DELETE /test/calls` — debug

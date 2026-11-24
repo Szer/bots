@@ -211,6 +211,9 @@ jobs:
           exit 1
         fi
 
+    - name: Check Document Intelligence configuration
+      run: kubectl -n "$NAMESPACE" get secret bot-document-read -o name
+
     - name: Deploy Postgres
       # Flyway/the seed step below run `docker run ... --network host` on
       # this runner directly, NOT as in-cluster Jobs — they consume zero AKS
@@ -297,7 +300,7 @@ jobs:
             -- This keeps real Telegram user ids out of CI configuration entirely — do
             -- not "fix" this by adding a secret back.
             ('FEEDBACK_ADMINS',        '',                     'FREE_FORM',    'feedback',    'Empty on purpose — the real-test suite sets this at runtime via COUPON_TEST_DB_URL + /reload-settings, see comment above'),
-            ('OCR_ENABLED',            'true',                 'FEATURE_FLAG', 'ocr',         'OCR cost is negligible; endpoint/key come from env (AZURE_OCR_ENDPOINT/KEY via the coupon-bot-env Secret), not this table'),
+            ('OCR_ENABLED',            'true',                 'FEATURE_FLAG', 'ocr',         'Enable OCR for real coupon photo recognition'),
             ('MAX_TAKEN_COUPONS',      '6',                    'FREE_FORM',    'coupons',     'Match prod'),
             ('REMINDER_RUN_ON_START',  'false',                'FEATURE_FLAG', 'reminders',   'Reminders are driven on demand via /test/run-reminder instead'),
             ('REMINDER_HOUR_DUBLIN',   '10',                   'FREE_FORM',    'reminders',   'Irrelevant given REMINDER_RUN_ON_START=false; set for parity with prod'),
@@ -330,8 +333,6 @@ jobs:
         # see the "why" comment in bot-deployment.yaml; do not add it here.
         BOT_TOKEN: ${{ secrets.COUPON_CI_BOT_TOKEN }}
         WEBHOOK_SECRET: ${{ secrets.COUPON_WEBHOOK_SECRET }}
-        OCR_ENDPOINT: ${{ secrets.COUPON_AZURE_OCR_ENDPOINT }}
-        OCR_KEY: ${{ secrets.COUPON_AZURE_OCR_KEY }}
       run: |
         # WEBHOOK_URL drives the bot's own startup-time setWebhook call — see
         # the "Verify webhook self-registration" step below for why CI no
@@ -345,8 +346,6 @@ jobs:
           --from-literal=BOT_TELEGRAM_TOKEN="$BOT_TOKEN" \
           --from-literal=BOT_AUTH_TOKEN="$WEBHOOK_SECRET" \
           --from-literal=ASPNETCORE_URLS="http://0.0.0.0:5000" \
-          --from-literal=AZURE_OCR_ENDPOINT="$OCR_ENDPOINT" \
-          --from-literal=AZURE_OCR_KEY="$OCR_KEY" \
           --from-literal=WEBHOOK_URL="${{ env.PUBLIC_URL }}/bot" \
           --dry-run=client -o yaml \
         | kubectl label -f - coupon-ci=transient --local -o yaml \
