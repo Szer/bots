@@ -76,6 +76,22 @@ probe() {
     return 1
 }
 
+probe_postgres() {
+    local attempt result
+    for attempt in 1 2 3; do
+        if result=$(probe postgres env LC_ALL=C PGCONNECT_TIMEOUT=5 psql "$1" -v ON_ERROR_STOP=1 -t -A -c "SELECT 1;"); then
+            echo "ok"
+            return 0
+        fi
+        if [[ "$result" != *"timeout expired"* || "$attempt" == 3 ]]; then
+            echo "$result"
+            return 1
+        fi
+        log "Retrying PostgreSQL connection after timeout (attempt $((attempt + 1))/3)"
+        sleep "$((5 * attempt))"
+    done
+}
+
 # probe_optional NAME cmd [args...]
 # Same mechanics as probe() (never aborts, echoes a single-line status), but
 # for a source that is OPTIONAL evidence — enrichment, not core evidence. A
