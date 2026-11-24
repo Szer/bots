@@ -153,8 +153,8 @@ type OcrTests(output: ITestOutputHelper) =
 
     let buildEngine (imageFileName: string) =
         let logs = ResizeArray<string>()
-        let endpoint = Environment.GetEnvironmentVariable("AZURE_OCR_ENDPOINT")
-        let key = Environment.GetEnvironmentVariable("AZURE_OCR_KEY")
+        let endpoint = Environment.GetEnvironmentVariable("DOCUMENT_INTELLIGENCE_ENDPOINT")
+        let key = Environment.GetEnvironmentVariable("DOCUMENT_INTELLIGENCE_KEY")
         let allowNetwork = (not (String.IsNullOrWhiteSpace endpoint) && not (String.IsNullOrWhiteSpace key))
 
         let effectiveEndpoint = if String.IsNullOrWhiteSpace endpoint then "https://example.com" else endpoint

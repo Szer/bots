@@ -29,7 +29,7 @@ module private CouponTestConfig =
               "BOT_AUTH_TOKEN", secret
               "TELEGRAM_API_URL", "http://fake-tg-api:8080"
               "GITHUB_TOKEN", ""
-              "AZURE_OCR_KEY", (if ocrEnabled then "fake-key" else "")
+              "DOCUMENT_INTELLIGENCE_KEY", (if ocrEnabled then "fake-key" else "")
               "BOT_FIXED_UTC_NOW", fixedUtcNow.ToString("o")
           ]
           PostgresImage = "postgres:17.10" }
@@ -54,7 +54,7 @@ type CouponHubTestContainers(seedExpiringToday: bool, ocrEnabled: bool, ?instanc
                 "ADD_COUPON_REMINDER_LOOKBACK_DAYS", "2",       "FREE_FORM", "REMINDER"
                 "OCR_ENABLED",             (if ocrEnabled then "true" else "false"), "FEATURE_FLAG", "OCR"
                 "OCR_MAX_FILE_SIZE_BYTES", "52428800",             "FREE_FORM", "OCR"
-                "AZURE_OCR_ENDPOINT",      (if ocrEnabled then $"http://{CouponTestConfig.fakeAzureAlias}:8081" else ""), "FREE_FORM", "OCR"
+                "DOCUMENT_INTELLIGENCE_ENDPOINT",      (if ocrEnabled then $"http://{CouponTestConfig.fakeAzureAlias}:8081" else ""), "FREE_FORM", "OCR"
                 "FEEDBACK_ADMINS",         "900,901",              "FREE_FORM", "CORE"
                 "GITHUB_REPO",             "",                     "FREE_FORM", "CORE"
                 "FEEDBACK_GITHUB_ISSUES",  "false",                "FEATURE_FLAG", "feedback"

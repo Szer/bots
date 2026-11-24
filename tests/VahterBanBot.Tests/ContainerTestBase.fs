@@ -85,7 +85,7 @@ module private VahterTestConfig =
         let envVars =
             if mlEnabled then
                 envVars @ [
-                    "AZURE_OCR_KEY", "secret-ocr-key"
+                    "DOCUMENT_INTELLIGENCE_KEY", "secret-ocr-key"
                     "AZURE_OPENAI_KEY", "fake-llm-key"
                 ]
             else envVars
@@ -162,7 +162,7 @@ type VahterTestContainers(mlEnabled: bool, extraEnvVars: (string * string) list)
                     "ML_SPAM_AUTOBAN_SCORE_THRESHOLD",     "-4.0",  "FREE_FORM",    "ML_SPAM_AUTOBAN"
                     "OCR_ENABLED",                         "true",  "FEATURE_FLAG", "OCR"
                     "OCR_MAX_FILE_SIZE_BYTES",             (20L * 1024L * 1024L).ToString(), "FREE_FORM", "OCR"
-                    "AZURE_OCR_ENDPOINT",                  $"http://{VahterTestConfig.fakeAzureAlias}:8081", "FREE_FORM", "OCR"
+                    "DOCUMENT_INTELLIGENCE_ENDPOINT",                  $"http://{VahterTestConfig.fakeAzureAlias}:8081", "FREE_FORM", "OCR"
                     "REACTION_SPAM_ENABLED",               "true",  "FEATURE_FLAG", "REACTION_SPAM"
                     "REACTION_SPAM_MIN_MESSAGES",          "3",     "FREE_FORM",    "REACTION_SPAM"
                     "REACTION_SPAM_MAX_REACTIONS",         "5",     "FREE_FORM",    "REACTION_SPAM"

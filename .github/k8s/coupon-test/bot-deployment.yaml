@@ -7,10 +7,8 @@
 # a tag that can never collide with prod's `:<sha>`/`:latest` tags from
 # _bot-deploy.yml.
 #
-# Env comes entirely from the `coupon-bot-env` Secret the workflow creates
-# from GH secrets (DATABASE_URL points at the in-cluster coupon-test-postgres
-# service; BOT_TELEGRAM_TOKEN/BOT_AUTH_TOKEN/AZURE_OCR_* etc.) — nothing here
-# is a value, only the key name of what the Secret must provide.
+# The workflow supplies Telegram and database credentials. The persistent
+# bot-document-read Secret supplies the Document Intelligence endpoint and key.
 #
 # GITHUB_TOKEN is deliberately NOT one of those keys: GitHubService.IsConfigured
 # requires a non-empty GITHUB_TOKEN, and this CI run's bot_setting seed (see
@@ -53,6 +51,8 @@ spec:
         envFrom:
         - secretRef:
             name: coupon-bot-env
+        - secretRef:
+            name: bot-document-read
         readinessProbe:
           httpGet:
             path: /healthz

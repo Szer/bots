@@ -8,7 +8,7 @@
 --     -c "DELETE FROM bot_setting;"
 --   docker compose -f src/coupon-hub-bot/docker-compose.dev.yml run --rm seed-bot-settings
 --
--- Local OCR uses AZURE_OCR_ENDPOINT and AZURE_OCR_KEY from .env.local.
+-- Local OCR uses DOCUMENT_INTELLIGENCE_ENDPOINT and DOCUMENT_INTELLIGENCE_KEY from .env.local.
 
 INSERT INTO bot_setting (key, value, type, feature_group, description) VALUES
     ('MAX_TAKEN_COUPONS',      '6',                                                    'FREE_FORM',    'coupons',     'Max coupons a single user can hold at once'),

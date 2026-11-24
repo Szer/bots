@@ -113,7 +113,7 @@ curl "https://api.telegram.org/bot<BOT_TELEGRAM_TOKEN>/getWebhookInfo"
 
 ### 5. (Optional) Tweak bot_setting
 
-The dev seed enables OCR. Set `AZURE_OCR_ENDPOINT` and `AZURE_OCR_KEY` in
+The dev seed enables OCR. Set `DOCUMENT_INTELLIGENCE_ENDPOINT` and `DOCUMENT_INTELLIGENCE_KEY` in
 `.env.local` for your Document Intelligence resource. To change a database setting mid-session:
 
 ```bash
@@ -159,8 +159,8 @@ OCR is extracted into `CouponOcrEngine` and tested separately without Docker con
 ### Environment Variables (required for Azure calls)
 
 On a cache miss, tests with both variables set call Azure Document Intelligence.
-- `AZURE_OCR_ENDPOINT` — base URL (e.g. `https://<name>.cognitiveservices.azure.com`)
-- `AZURE_OCR_KEY`
+- `DOCUMENT_INTELLIGENCE_ENDPOINT` — base URL (e.g. `https://<name>.cognitiveservices.azure.com`)
+- `DOCUMENT_INTELLIGENCE_KEY`
 
 If not set:
 - If cache files exist in `tests/CouponHubBot.Ocr.Tests/AzureCache/` — tests pass without Azure
