@@ -154,7 +154,7 @@ cmd_gather() {
         -G "${LOKI_URL}/loki/api/v1/labels") || true
     argocd_status=$(probe "argocd" curl -sSf --connect-timeout 5 --max-time 20 \
         "${ARGOCD_URL}/api/v1/applications/${app_name}" -H "${auth_header}") || true
-    postgres_status=$(probe "postgres" env PGCONNECT_TIMEOUT=5 psql "${database_url}" -v ON_ERROR_STOP=1 -t -A -c "SELECT 1;") || true
+    postgres_status=$(probe_postgres "${database_url}") || true
 
     local sources_json
     sources_json=$(jq -n --arg p "$prom_status" --arg l "$loki_status" --arg a "$argocd_status" --arg d "$postgres_status" \

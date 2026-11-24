@@ -83,7 +83,7 @@ prom_query() {
 
 log "Verifying connectivity for bot=${BOT} (db=${DB_NAME}, query_set=${QUERY_SET})..."
 
-POSTGRES_STATUS=$(probe "postgres" env PGCONNECT_TIMEOUT=5 psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -t -A -c "SELECT 1;") || true
+POSTGRES_STATUS=$(probe_postgres "${DATABASE_URL}") || true
 PROM_STATUS=$(probe "prometheus" curl -sSf --connect-timeout 5 --max-time 20 \
     -G "${PROMETHEUS_URL}/api/v1/query" --data-urlencode "query=vector(1)") || true
 
