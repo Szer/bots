@@ -119,3 +119,12 @@ let ``WebP sticker is submitted as a full-resolution PNG`` () =
     Assert.Equal<byte>([| 137uy; 80uy; 78uy; 71uy; 13uy; 10uy; 26uy; 10uy |], png[0..7])
     Assert.Equal(64, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png[16..19]))
     Assert.Equal(64, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png[20..23]))
+
+[<Fact>]
+let ``550 pixel sticker retains its dimensions for OCR`` () =
+    use bitmap = new SkiaSharp.SKBitmap(550, 550)
+    bitmap.Erase(SkiaSharp.SKColors.White)
+    use webp = bitmap.Encode(SkiaSharp.SKEncodedImageFormat.Webp, 100)
+    let png = prepareReadImage (webp.ToArray())
+    Assert.Equal(550, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png[16..19]))
+    Assert.Equal(550, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png[20..23]))

@@ -44,7 +44,7 @@ let selectEligibleOcrTarget (maxBytes: int64) (sticker: Sticker) : Result<OcrFil
         if isWithinSizeLimit maxBytes fileRef then Ok fileRef
         else Error "sticker-too-large"
 
-/// Telegram WebP stickers and thumbnails fit within 512 pixels on each axis.
+/// Bound WebP decoding to one megapixel before allocating the bitmap.
 let prepareReadImage (bytes: byte array) =
     let isWebP =
         bytes.Length >= 12
@@ -53,7 +53,7 @@ let prepareReadImage (bytes: byte array) =
     if isWebP then
         use data = SkiaSharp.SKData.CreateCopy(bytes)
         use codec = SkiaSharp.SKCodec.Create(data)
-        if isNull codec || codec.Info.Width > 512 || codec.Info.Height > 512 then
+        if isNull codec || int64 codec.Info.Width * int64 codec.Info.Height > 1_048_576L then
             invalidArg (nameof bytes) "Invalid Telegram WebP sticker dimensions"
         use bitmap = SkiaSharp.SKBitmap.Decode(codec)
         if isNull bitmap then invalidArg (nameof bytes) "Invalid WebP sticker"
