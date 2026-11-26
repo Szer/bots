@@ -178,7 +178,7 @@ type OcrTests(output: ITestOutputHelper) =
             LiveOptions(
                 // Keep OCR enabled so we always go through HttpClient (cache handler may short-circuit).
                 { OcrEnabled = true
-                  SoftDeadlineSeconds = None
+                  DeadlineSeconds = BotOcrConfig.DefaultDeadlineSeconds
                   OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                   AzureOcrEndpoint = effectiveEndpoint
                   AzureOcrKey = effectiveKey })
@@ -612,7 +612,7 @@ type OcrTests(output: ITestOutputHelper) =
             let ocrOptions: IOptions<BotOcrConfig> =
                 LiveOptions(
                     { OcrEnabled = true
-                      SoftDeadlineSeconds = None
+                      DeadlineSeconds = BotOcrConfig.DefaultDeadlineSeconds
                       OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                       // The exact shape prod had: full analyze URL with path + query.
                       AzureOcrEndpoint = "https://example.cognitiveservices.azure.com/computervision/imageanalysis:analyze?overload=stream&api-version=2024-02-01&features=read"
@@ -646,7 +646,7 @@ type OcrTests(output: ITestOutputHelper) =
             let ocrOptions: IOptions<BotOcrConfig> =
                 LiveOptions(
                     { OcrEnabled = true
-                      SoftDeadlineSeconds = None
+                      DeadlineSeconds = BotOcrConfig.DefaultDeadlineSeconds
                       OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                       AzureOcrEndpoint = "https://example.cognitiveservices.azure.com"
                       AzureOcrKey = "test-key" })
@@ -678,3 +678,25 @@ type OcrTests(output: ITestOutputHelper) =
                 |> Seq.toList
             Assert.False(List.isEmpty skipLogs, $"Expected a Debug/Information skip log, got: {logs |> Seq.toList}")
         }
+
+    [<Fact>]
+    member _.``Configured deadline cancels a stalled OCR request and returns no analysis``() = task {
+        let handler =
+            { new HttpMessageHandler() with
+                member _.SendAsync(_, cancellation) = task {
+                    do! Task.Delay(TimeSpan.FromSeconds 10., cancellation)
+                    return new HttpResponseMessage(HttpStatusCode.InternalServerError)
+                } }
+        use http = new HttpClient(handler)
+        let config =
+            { OcrEnabled = true
+              DeadlineSeconds = 1
+              OcrMaxFileSizeBytes = 1024L
+              AzureOcrEndpoint = "https://example.cognitiveservices.azure.com"
+              AzureOcrKey = "test-key" }
+        let transport = new Azure.Core.Pipeline.HttpClientTransport(http)
+        let logger = XUnitLogging.XUnitLogger<AzureBotOcr>(output, ResizeArray())
+        let azure = AzureBotOcr(LiveOptions(config), logger, transport) :> IBotOcr
+        let! result = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy |])).WaitAsync(TimeSpan.FromSeconds 4.)
+        Assert.Null(result)
+    }

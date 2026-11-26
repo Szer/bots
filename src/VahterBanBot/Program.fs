@@ -91,7 +91,7 @@ let buildBotConf settings =
           | v -> int64 v |> TimeSpan.FromSeconds |> Some
       UpdateChatAdmins = getSettingOr "UPDATE_CHAT_ADMINS" "false" |> bool.Parse
       OcrEnabled = getSettingOr "OCR_ENABLED" "false" |> bool.Parse
-      OcrDeadlineSeconds = boundedSeconds "OCR_DEADLINE_SECONDS" "5" 1 5
+      OcrDeadlineSeconds = boundedSeconds "OCR_DEADLINE_SECONDS" (string BotOcrConfig.DefaultDeadlineSeconds) 1 BotOcrConfig.DefaultDeadlineSeconds
       OcrMaxFileSizeBytes = getSettingOr "OCR_MAX_FILE_SIZE_BYTES" (string (20L * 1024L * 1024L)) |> int64
       AzureOcrEndpoint = getSettingOr "DOCUMENT_INTELLIGENCE_ENDPOINT" (getEnvOr "DOCUMENT_INTELLIGENCE_ENDPOINT" "")
       AzureOcrKey = getEnvOr "DOCUMENT_INTELLIGENCE_KEY" ""
@@ -204,7 +204,7 @@ let buildBotConf settings =
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
-      SoftDeadlineSeconds = Some c.OcrDeadlineSeconds
+      DeadlineSeconds = c.OcrDeadlineSeconds
       OcrMaxFileSizeBytes = c.OcrMaxFileSizeBytes
       AzureOcrEndpoint    = c.AzureOcrEndpoint
       AzureOcrKey         = c.AzureOcrKey }
