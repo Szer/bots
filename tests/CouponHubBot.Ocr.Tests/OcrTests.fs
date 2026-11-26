@@ -178,6 +178,7 @@ type OcrTests(output: ITestOutputHelper) =
             LiveOptions(
                 // Keep OCR enabled so we always go through HttpClient (cache handler may short-circuit).
                 { OcrEnabled = true
+                  SoftDeadlineSeconds = None
                   OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                   AzureOcrEndpoint = effectiveEndpoint
                   AzureOcrKey = effectiveKey })
@@ -611,6 +612,7 @@ type OcrTests(output: ITestOutputHelper) =
             let ocrOptions: IOptions<BotOcrConfig> =
                 LiveOptions(
                     { OcrEnabled = true
+                      SoftDeadlineSeconds = None
                       OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                       // The exact shape prod had: full analyze URL with path + query.
                       AzureOcrEndpoint = "https://example.cognitiveservices.azure.com/computervision/imageanalysis:analyze?overload=stream&api-version=2024-02-01&features=read"
@@ -644,6 +646,7 @@ type OcrTests(output: ITestOutputHelper) =
             let ocrOptions: IOptions<BotOcrConfig> =
                 LiveOptions(
                     { OcrEnabled = true
+                      SoftDeadlineSeconds = None
                       OcrMaxFileSizeBytes = 50L * 1024L * 1024L
                       AzureOcrEndpoint = "https://example.cognitiveservices.azure.com"
                       AzureOcrKey = "test-key" })
