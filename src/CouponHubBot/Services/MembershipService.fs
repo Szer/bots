@@ -10,6 +10,9 @@ open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 
+[<RequireQualifiedAccess>]
+type BotAccess = Allowed | NonMember | Quarantined
+
 type TelegramMembershipService(
     db: DbService,
     tg: ITelegramApi,
@@ -69,6 +72,15 @@ type TelegramMembershipService(
         }
 
     member this.IsMember(userId) = this.IsMember(userId, TelegramMembershipService.MaxCacheAge)
+
+    member this.GetAccess(userId, ?maxAge: TimeSpan) =
+        task {
+            let! memberOfChat = this.IsMember(userId, defaultArg maxAge TelegramMembershipService.MaxCacheAge)
+            if not memberOfChat then return BotAccess.NonMember
+            else
+                let! quarantined = db.IsQuarantined(userId)
+                return if quarantined then BotAccess.Quarantined else BotAccess.Allowed
+        }
 
 type MembershipCacheCleanupService(db: DbService, logger: ILogger<MembershipCacheCleanupService>) =
     inherit BackgroundService()

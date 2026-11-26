@@ -396,6 +396,7 @@
 
   async function denialMessage(response, fallback) {
     const body = await response.json().catch(() => null);
+    if (body?.error === "quarantined") return "Доступ к боту временно ограничен. Обратись к администраторам сообщества.";
     return body?.error === "dashboard_disabled" ? "Статистика пока доступна только администраторам." : fallback;
   }
 

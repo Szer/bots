@@ -20,6 +20,11 @@ Telegram bot for collaborative coupon management in a private Russian-speaking c
 - `/used <id>` — mark coupon as used
 - `/return <id>` — return coupon to available pool
 
+### Admin commands
+
+- `/quarantine <Telegram ID>` blocks a registered user’s bot and dashboard access.
+- `/unquarantine <Telegram ID>` restores access for community members.
+
 ### Rules
 
 - **Take limit**: max **4** coupons at a time (race-safe)

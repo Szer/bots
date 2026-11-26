@@ -27,7 +27,7 @@ type BotService(
     time: TimeProvider
 ) =
     let sendText = BotHelpers.sendText tg
-    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership logger sendText
+    let ensureBotAccess = BotHelpers.ensureBotAccess membership logger sendText
 
     let handleCommunityMessage (msg: Message) =
         task {
@@ -70,10 +70,10 @@ type BotService(
             | Some from when msg.Chat.Type = ChatType.Private ->
                 %a.SetTag("fromId", from.Id)
                 %a.SetTag("text", Option.toObj msg.Text)
-                let! ok = ensureCommunityMember from.Id msg.Chat.Id
-                if not ok then %a.SetTag("isMember", false) else
+                let! ok = ensureBotAccess from.Id msg.Chat.Id
+                if not ok then %a.SetTag("accessAllowed", false) else
 
-                %a.SetTag("isMember", true)
+                %a.SetTag("accessAllowed", true)
                 let! user =
                     { id = from.Id
                       username = Option.toObj from.Username

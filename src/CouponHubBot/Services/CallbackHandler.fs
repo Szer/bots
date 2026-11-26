@@ -24,7 +24,7 @@ type CallbackHandler(
     logger: ILogger<CallbackHandler>
 ) =
     let sendText = BotHelpers.sendText tg
-    let ensureCommunityMember = BotHelpers.ensureCommunityMember membership logger sendText
+    let ensureBotAccess = BotHelpers.ensureBotAccess membership logger sendText
 
     member private _.EditBulkOrSend (batch: PendingAddBatch) (text: string) =
         task {
@@ -165,7 +165,7 @@ type CallbackHandler(
                     let chatId = chat.Id
                     %a.SetTag("chatId", chatId)
                     %a.SetTag("fromId", cq.From.Id)
-                    let! ok = ensureCommunityMember cq.From.Id chatId
+                    let! ok = ensureBotAccess cq.From.Id chatId
                     if not ok then () else
 
                     let! user =

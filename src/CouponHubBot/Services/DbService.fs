@@ -201,6 +201,22 @@ VALUES (@coupon_id, @user_id, @event_type, @subject_user_id);
 """
         conn.ExecuteAsync(sql, {| coupon_id = couponId; user_id = userId; event_type = eventType; subject_user_id = Option.toNullable subjectUserId |}, tx) |> taskIgnore
 
+    member _.IsQuarantined(userId: int64) =
+        task {
+            use! conn = openConn()
+            return! conn.QuerySingleAsync<bool>(
+                """SELECT EXISTS (SELECT 1 FROM "user" WHERE id = @userId AND quarantined)""", {| userId = userId |})
+        }
+
+    member _.SetQuarantine(userId: int64, quarantined: bool) =
+        task {
+            use! conn = openConn()
+            let! rows = conn.ExecuteAsync(
+                """UPDATE "user" SET quarantined = @quarantined WHERE id = @userId""",
+                {| userId = userId; quarantined = quarantined |})
+            return rows > 0
+        }
+
     member _.GetMembershipEntry(chatId: int64, userId: int64) =
         task {
             use! conn = openConn()
