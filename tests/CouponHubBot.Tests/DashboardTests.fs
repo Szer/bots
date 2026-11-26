@@ -198,6 +198,21 @@ type DashboardTests(fixture: DashboardTestContainers) =
         }
 
     [<Fact>]
+    let ``Quarantine blocks dashboard login and an existing session on another replica`` () =
+        task {
+            let targetId = 22904L
+            use! registered = fixture.SendUpdate(Tg.dmMessage("/start", Tg.user(id = targetId)))
+            %registered.EnsureSuccessStatusCode()
+            let! token = login targetId
+            use! restricted = fixture.SendUpdate(Tg.dmMessage($"/quarantine {targetId}", Tg.user(id = 900L)))
+            %restricted.EnsureSuccessStatusCode()
+            use! denied = postProof 0 (DashboardTestData.proof fixture.Now targetId)
+            Assert.Equal(HttpStatusCode.Forbidden, denied.StatusCode)
+            use! stats = getStats 1 token 30
+            Assert.Equal(HttpStatusCode.Forbidden, stats.StatusCode)
+        }
+
+    [<Fact>]
     let ``Disabled dashboard blocks new and existing member sessions on both replicas but allows admins`` () =
         task {
             let! memberToken = login 22001L

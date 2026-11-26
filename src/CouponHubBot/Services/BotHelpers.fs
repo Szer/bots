@@ -687,11 +687,15 @@ let getLargestPhotoFileId (msg: Message) =
         Some p.FileId
     | _ -> None
 
-let ensureCommunityMember (membership: TelegramMembershipService) (logger: ILogger) (sendText: int64 -> string -> System.Threading.Tasks.Task<unit>) (userId: int64) (chatId: int64) =
+let ensureBotAccess (membership: TelegramMembershipService) (logger: ILogger) (sendText: int64 -> string -> System.Threading.Tasks.Task<unit>) (userId: int64) (chatId: int64) =
     task {
-        let! isMember = membership.IsMember(userId)
-        if not isMember then
+        match! membership.GetAccess(userId) with
+        | BotAccess.Allowed -> return true
+        | BotAccess.NonMember ->
             logger.LogWarning("Membership denied for user {UserId}", userId)
             do! sendText chatId "Бот доступен только членам сообщества. Если ты точно в чате — напиши /start ещё раз."
-        return isMember
+            return false
+        | BotAccess.Quarantined ->
+            do! sendText chatId "Доступ к боту временно ограничен. Обратись к администраторам сообщества."
+            return false
     }

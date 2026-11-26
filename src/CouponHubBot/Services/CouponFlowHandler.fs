@@ -745,10 +745,10 @@ type CouponFlowHandler(
             | None ->
                 if not (isNull a) then %a.SetTag("outcome", "batch_missing")
             | Some batch ->
-                let! isMember = membership.IsMember(batch.user_id)
-                if not isMember then
-                    if not (isNull a) then %a.SetTag("outcome", "not_member")
-                    logger.LogWarning("Batch {BatchId} dropped: user {UserId} is not a community member", batchId, batch.user_id)
+                let! access = membership.GetAccess(batch.user_id)
+                if access <> BotAccess.Allowed then
+                    if not (isNull a) then %a.SetTag("outcome", "access_denied")
+                    logger.LogWarning("Batch {BatchId} dropped: user {UserId} denied access ({Access})", batchId, batch.user_id, access)
                     do! db.ClearBatch batchId
                 else
 

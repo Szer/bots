@@ -51,3 +51,37 @@ type MembershipTests(fixture: DefaultCouponHubTestContainers) =
         let! creates = fixture.GetFakeCalls("createChatInviteLink")
         Assert.Empty creates
     }
+
+    [<Fact>]
+    let ``Quarantine blocks member actions until an admin lifts it and preserves non-member reply`` () =
+        task {
+            let target = Tg.user(id = 969104L)
+            let admin = Tg.user(id = 900L)
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+            do! fixture.SetChatMemberStatus(admin.Id, "member")
+            let send update = task {
+                use! response = fixture.SendUpdate(update)
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode)
+            }
+            let expectReply update text = task {
+                do! fixture.ClearFakeCalls()
+                do! send update
+                let! calls = fixture.GetFakeCalls("sendMessage")
+                Assert.True(findCallWithText calls target.Id text)
+            }
+            do! send (Tg.dmMessage("/start", target))
+            do! send (Tg.dmMessage($"/quarantine {target.Id}", admin))
+            do! expectReply (Tg.dmMessage("/feedback", target)) "Обратись к администраторам"
+            let! pending = fixture.QuerySingle<int>("SELECT count(*) FROM pending_feedback WHERE user_id = @id", {| id = target.Id |})
+            Assert.Equal(0, pending)
+            do! expectReply (Tg.dmCallback("take:1", target)) "Обратись к администраторам"
+            do! expectReply (Tg.dmMessage($"/unquarantine {target.Id}", target)) "Обратись к администраторам"
+            do! fixture.SetChatMemberStatus(target.Id, "left")
+            do! fixture.InvalidateMembershipCache()
+            do! expectReply (Tg.dmMessage("/start", target)) "только членам"
+            do! fixture.SetChatMemberStatus(target.Id, "member")
+            do! fixture.InvalidateMembershipCache()
+            do! expectReply (Tg.dmMessage("/start", target)) "Обратись к администраторам"
+            do! send (Tg.dmMessage($"/unquarantine {target.Id}", admin))
+            do! expectReply (Tg.dmMessage("/start", target)) "Привет"
+        }

@@ -644,6 +644,23 @@ type CommandHandler(
                 match t.Split([|' '|], System.StringSplitOptions.RemoveEmptyEntries) |> Array.tryLast |> Option.bind BotHelpers.parseInt with
                 | Some couponId -> do! handleUndo user.id msg.Chat.Id couponId
                 | None -> ()
+            | Some text when text = "/quarantine" || text.StartsWith("/quarantine ")
+                             || text = "/unquarantine" || text.StartsWith("/unquarantine ") ->
+                if options.Value.FeedbackAdminIds |> Array.contains user.id then
+                    let args = text.Split(' ', System.StringSplitOptions.RemoveEmptyEntries)
+                    let command = args[0]
+                    let target =
+                        match args with
+                        | [| _; id |] -> Int64.TryParse(id)
+                        | _ -> false, 0L
+                    match target with
+                    | true, id when id > 0L ->
+                        let quarantined = command = "/quarantine"
+                        let! found = db.SetQuarantine(id, quarantined)
+                        if not found then do! sendText msg.Chat.Id "Пользователь не найден."
+                        elif quarantined then do! sendText msg.Chat.Id $"Доступ к боту для пользователя {id} ограничен."
+                        else do! sendText msg.Chat.Id $"Ограничение для пользователя {id} снято."
+                    | _ -> do! sendText msg.Chat.Id $"Формат: {command} <Telegram ID>"
             | Some "/balances" ->
                 recordCommand "balances"
                 do! handleBalances user.id msg.Chat.Id

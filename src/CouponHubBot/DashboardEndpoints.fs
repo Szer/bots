@@ -16,6 +16,9 @@ module DashboardEndpoints =
     let private disabled () =
         Results.Json({| error = "dashboard_disabled" |}, statusCode = StatusCodes.Status403Forbidden)
 
+    let private quarantined () =
+        Results.Json({| error = "quarantined" |}, statusCode = StatusCodes.Status403Forbidden)
+
     let configure (builder: WebApplicationBuilder) =
         %builder.Services.AddRateLimiter(fun limiter ->
             limiter.RejectionStatusCode <- StatusCodes.Status429TooManyRequests
@@ -65,8 +68,9 @@ module DashboardEndpoints =
                     | None -> return Results.Unauthorized()
                     | Some userId when not (DashboardAuth.isEnabledFor options.Value userId) -> return disabled()
                     | Some userId ->
-                        let! isMember = membership.IsMember(userId, TimeSpan.FromMinutes 1.0)
-                        if not isMember || communityId <> options.Value.CommunityChatId then
+                        let! access = membership.GetAccess(userId, TimeSpan.FromMinutes 1.0)
+                        if access = BotAccess.Quarantined then return quarantined()
+                        elif access = BotAccess.NonMember || communityId <> options.Value.CommunityChatId then
                             return Results.StatusCode(StatusCodes.Status403Forbidden)
                         elif not (DashboardAuth.isEnabledFor options.Value userId) then
                             return disabled()
@@ -90,8 +94,9 @@ module DashboardEndpoints =
                 | None -> return Results.Unauthorized()
                 | Some userId when not (DashboardAuth.isEnabledFor options.Value userId) -> return disabled()
                 | Some userId ->
-                    let! isMember = membership.IsMember(userId, TimeSpan.FromMinutes 1.0)
-                    if not isMember then return Results.StatusCode(StatusCodes.Status403Forbidden)
+                    let! access = membership.GetAccess(userId, TimeSpan.FromMinutes 1.0)
+                    if access = BotAccess.Quarantined then return quarantined()
+                    elif access = BotAccess.NonMember then return Results.StatusCode(StatusCodes.Status403Forbidden)
                     else
                         match Int32.TryParse(string ctx.Request.Query["days"]) with
                         | true, days when List.contains days [ 0; 30; 90; 365 ] ->
