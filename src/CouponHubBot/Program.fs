@@ -73,6 +73,7 @@ let buildBotConf () =
 
 let ocrConfigOf (c: BotConfiguration) =
     { OcrEnabled          = c.OcrEnabled
+      DeadlineSeconds = BotOcrConfig.DefaultDeadlineSeconds
       OcrMaxFileSizeBytes = c.OcrMaxFileSizeBytes
       AzureOcrEndpoint    = c.AzureOcrEndpoint
       AzureOcrKey         = c.AzureOcrKey }
