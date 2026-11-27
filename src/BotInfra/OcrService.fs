@@ -60,6 +60,13 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
                     cached <- Some (want, c)
                     c)
 
+    let isCancellation (failure: exn) =
+        match failure with
+        | :? OperationCanceledException -> true
+        | :? AggregateException as retries ->
+            retries.Flatten().InnerExceptions |> Seq.exists (fun attempt -> attempt :? OperationCanceledException)
+        | _ -> false
+
     let hasInvalidDimensions (failure: RequestFailedException) =
         try
             use body = JsonDocument.Parse(failure.GetRawResponse().Content.ToMemory())
@@ -96,7 +103,7 @@ type AzureBotOcr(options: IOptions<BotOcrConfig>, logger: ILogger<AzureBotOcr>, 
                         let rawJson = operation.GetRawResponse().Content.ToString()
                         return { RawJson = rawJson; Text = text }
                     with
-                    | :? OperationCanceledException when deadline.IsCancellationRequested ->
+                    | failure when deadline.IsCancellationRequested && isCancellation failure ->
                         logger.LogWarning("Azure OCR exceeded its {DeadlineSeconds}-second deadline", seconds)
                         return (null: OcrAnalysis | null)
                     | :? RequestFailedException as rfe when rfe.Status = 400 && hasInvalidDimensions rfe ->
