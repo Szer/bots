@@ -679,24 +679,31 @@ type OcrTests(output: ITestOutputHelper) =
             Assert.False(List.isEmpty skipLogs, $"Expected a Debug/Information skip log, got: {logs |> Seq.toList}")
         }
 
-    [<Fact>]
-    member _.``Configured deadline cancels a stalled OCR request and returns no analysis``() = task {
+    [<Theory>]
+    [<InlineData(1, 1)>]
+    [<InlineData(5, 2)>]
+    member _.``Configured deadline cancels a stalled OCR request and returns no analysis``(seconds: int, expectedAttempts: int) = task {
+        let mutable attempts = 0
         let handler =
             { new HttpMessageHandler() with
                 member _.SendAsync(_, cancellation) = task {
+                    attempts <- attempts + 1
                     do! Task.Delay(TimeSpan.FromSeconds 10., cancellation)
                     return new HttpResponseMessage(HttpStatusCode.InternalServerError)
                 } }
         use http = new HttpClient(handler)
         let config =
             { OcrEnabled = true
-              DeadlineSeconds = 1
+              DeadlineSeconds = seconds
               OcrMaxFileSizeBytes = 1024L
               AzureOcrEndpoint = "https://example.cognitiveservices.azure.com"
               AzureOcrKey = "test-key" }
         let transport = new Azure.Core.Pipeline.HttpClientTransport(http)
-        let logger = XUnitLogging.XUnitLogger<AzureBotOcr>(output, ResizeArray())
+        let logs = ResizeArray<string>()
+        let logger = XUnitLogging.XUnitLogger<AzureBotOcr>(output, logs)
         let azure = AzureBotOcr(LiveOptions(config), logger, transport) :> IBotOcr
-        let! result = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy |])).WaitAsync(TimeSpan.FromSeconds 4.)
+        let! result = azure.AnalyzeImageBytes(ReadOnlyMemory<byte>([| 1uy |])).WaitAsync(TimeSpan.FromSeconds 8.)
         Assert.Null(result)
+        Assert.Equal(expectedAttempts, attempts)
+        Assert.StartsWith("[Warning]", Assert.Single(logs))
     }
